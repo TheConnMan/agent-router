@@ -1,6 +1,6 @@
 use crate::error::{Error, Result};
 use crate::run::Dispatch;
-use crate::runtime::{home_dir, truncated_title};
+use crate::runtime::home_dir;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -118,6 +118,7 @@ pub fn spawn_on_initialized_rpc(
 pub fn dispatch(
     cwd: &Path,
     task: &str,
+    name: &str,
     model: Option<&str>,
     effort: Option<&str>,
 ) -> Result<Dispatch> {
@@ -128,7 +129,7 @@ pub fn dispatch(
         match spawn_on_initialized_rpc(&mut client, cwd, task, model, effort) {
             SpawnAttempt::Started(thread_id) => Ok(Dispatch {
                 job_id: Some(thread_id),
-                job_name: truncated_title(task),
+                job_name: name.to_string(),
             }),
             SpawnAttempt::TurnFailed { thread_id, error } => Err(Error::Command(format!(
                 "app-server started thread {thread_id} but its first turn failed: {error}"
@@ -140,7 +141,7 @@ pub fn dispatch(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (cwd, task, model, effort);
+        let _ = (cwd, task, name, model, effort);
         Err(Error::Command(
             "codex app-server daemon transport is unavailable on this platform".to_string(),
         ))

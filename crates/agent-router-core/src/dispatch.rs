@@ -17,22 +17,29 @@ pub fn dispatch(decision: &crate::decide::Decision, request: &Request) -> Result
             request.dir.display()
         )));
     }
+    let name = request
+        .name
+        .clone()
+        .unwrap_or_else(|| crate::runtime::truncated_title(request.task));
     match decision.provider {
         Provider::Codex => codex::dispatch(
             request.dir,
             &codex_prompt(request.task, request.read_only),
+            &name,
             decision.model.as_deref(),
             decision.effort.as_deref(),
         ),
         Provider::Claude => claude::dispatch(
             request.dir,
             request.task,
+            &name,
             decision.model.as_deref(),
             decision.effort.as_deref(),
         ),
         Provider::Opencode => opencode::dispatch(
             request.dir,
             request.task,
+            &name,
             decision.model.as_deref(),
             decision.effort.as_deref(),
         ),

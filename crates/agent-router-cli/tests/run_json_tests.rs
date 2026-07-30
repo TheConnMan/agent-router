@@ -46,6 +46,13 @@ struct CliFixture {
 #[cfg(unix)]
 impl CliFixture {
     fn new() -> Self {
+        Self::listing_agent_named(None)
+    }
+
+    /// `listed` is the name the fake `claude agents` listing advertises, which is what the router
+    /// matches against to resolve the short id of the job it just spawned. None means the name
+    /// derived from the task.
+    fn listing_agent_named(listed: Option<&str>) -> Self {
         let root = TempDir::new();
         let home = root.path.join("home");
         let bin = root.path.join("bin");
@@ -56,11 +63,12 @@ impl CliFixture {
         let task = "雪".repeat(45);
         let name = task.chars().take(40).collect::<String>();
         let spawn_log = root.path.join("claude.argv");
+        let listed = listed.unwrap_or(&name);
         let agents = json!([{
             "id": "claude exact id",
             "sessionId": "claude full id",
             "cwd": cwd,
-            "name": name,
+            "name": listed,
             "startedAt": i64::MAX,
             "kind": "background",
             "state": "working"
@@ -92,7 +100,8 @@ impl CliFixture {
         }
     }
 
-    fn run(&self, json: bool) -> Output {
+    /// The router binary against this fixture's fake PATH, home, and decision log.
+    fn router(&self) -> Command {
         let bin = self.root.path.join("bin");
         let home = self.root.path.join("home");
         let sessions = self.root.path.join("empty codex sessions");
@@ -104,15 +113,25 @@ impl CliFixture {
         );
         let mut command = Command::new(env!("CARGO_BIN_EXE_agent-router"));
         command
-            .arg("run")
-            .arg(&self.task)
-            .arg("--dir")
-            .arg(&self.cwd)
-            .arg("--provider")
-            .arg("claude")
             .env("HOME", home)
             .env("CODEX_SESSIONS_DIR", sessions)
             .env("PATH", path);
+        command
+    }
+
+    fn run_command(&self) -> Command {
+        let mut command = self.router();
+        command
+            .arg("run")
+            .arg(&self.task)
+            .arg("--dir")
+            .arg(&self.cwd);
+        command
+    }
+
+    fn run(&self, json: bool) -> Output {
+        let mut command = self.run_command();
+        command.arg("--provider").arg("claude");
         if json {
             command.arg("--json");
         }
@@ -202,6 +221,120 @@ fn human_output_reports_the_job_without_a_viewer_instruction() {
     assert!(stdout.contains(&fixture.name), "{stdout}");
     assert!(!stdout.contains("agent-viewer"), "{stdout}");
     assert!(!stdout.contains("watch:"), "{stdout}");
+}
+
+/// bonus-drain reconciles inflight work by matching the name it chose against the decision log and
+/// `claude agents --json`, so `--name` has to survive the whole path verbatim, not just the argv.
+#[cfg(unix)]
+#[test]
+fn a_supplied_name_reaches_the_spawned_job_and_the_decision_log_verbatim() {
+    let name = "Bonus: abc-123";
+    let fixture = CliFixture::listing_agent_named(Some(name));
+    assert_ne!(fixture.name, name, "the task must not derive this name");
+
+    let output = fixture
+        .run_command()
+        .arg("--provider")
+        .arg("claude")
+        .arg("--name")
+        .arg(name)
+        .arg("--json")
+        .output()
+        .expect("run router");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("router json");
+
+    assert_eq!(value["dispatch"]["job_name"], name);
+    assert_eq!(value["dispatch"]["job_id"], "claude exact id");
+    let argv = wait_for_text(&fixture.spawn_log);
+    let expected = ["--bg", "--model", "opus[1m]", "--name", name, &fixture.task];
+    assert_eq!(argv.lines().collect::<Vec<_>>(), expected);
+
+    let logged = fixture
+        .router()
+        .arg("log")
+        .arg("--limit")
+        .arg("1")
+        .arg("--json")
+        .output()
+        .expect("read decision log");
+    assert!(
+        logged.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&logged.stderr)
+    );
+    let rows: Value = serde_json::from_slice(&logged.stdout).expect("log json");
+    assert_eq!(rows[0]["job_name"], name);
+}
+
+/// The auto path picks its model from the complexity tiers, so a `--model` alongside it can only be
+/// silently dropped. That has to be loud.
+#[cfg(unix)]
+#[test]
+fn auto_provider_with_an_explicit_model_fails_naming_both_flags() {
+    let fixture = CliFixture::new();
+
+    let output = fixture
+        .run_command()
+        .arg("--provider")
+        .arg("auto")
+        .arg("--model")
+        .arg("sonnet")
+        .output()
+        .expect("run router");
+
+    assert!(
+        !output.status.success(),
+        "an ignored --model must not exit zero, stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--provider"), "stderr: {stderr}");
+    assert!(stderr.contains("--model"), "stderr: {stderr}");
+    assert!(!fixture.spawn_log.exists(), "the rejected pair ran claude");
+}
+
+/// Complementary half of the auto-plus-model guard: an explicit provider paired with an explicit
+/// model must be allowed through, and the model must actually reach the spawned claude argv. Do
+/// not delete this as redundant with the auto-provider rejection test above; that test only
+/// covers the reject branch of the guard, this one covers the accept branch.
+#[cfg(unix)]
+#[test]
+fn explicit_provider_with_an_explicit_model_succeeds_and_forwards_the_model() {
+    let fixture = CliFixture::new();
+
+    let output = fixture
+        .run_command()
+        .arg("--provider")
+        .arg("claude")
+        .arg("--model")
+        .arg("sonnet")
+        .output()
+        .expect("run router");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(
+        wait_for_text(&fixture.spawn_log)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "--bg",
+            "--model",
+            "sonnet",
+            "--name",
+            &fixture.name,
+            &fixture.task
+        ]
+    );
 }
 
 #[cfg(target_os = "linux")]
