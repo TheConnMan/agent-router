@@ -16,5 +16,11 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      # The managed OpenCode tests run the router under `unshare -Urn` to get an isolated
+      # network namespace. Ubuntu restricts unprivileged user namespaces by default, which
+      # makes unshare fail and surfaces as a fixture that never starts, so lift the restriction
+      # rather than letting those tests silently stop covering the loopback checks.
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Run tests
         run: cargo test --workspace --locked
