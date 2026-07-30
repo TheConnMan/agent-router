@@ -26,9 +26,12 @@ enum Command {
         /// auto (classify), or codex/claude/opencode to skip classification.
         #[arg(long, default_value = "auto")]
         provider: String,
-        /// Model override, honoured only with an explicit --provider.
+        /// Model override, requires an explicit --provider.
         #[arg(long)]
         model: Option<String>,
+        /// Job name (defaults to the first 40 characters of the task).
+        #[arg(long)]
+        name: Option<String>,
         /// Read-only work: skip the Codex execution-mode preamble.
         #[arg(long)]
         read_only: bool,
@@ -119,10 +122,11 @@ fn run(cli: Cli) -> agent_router_core::Result<()> {
             dir,
             provider,
             model,
+            name,
             read_only,
             dry_run,
             json,
-        } => route(task, dir, provider, model, read_only, dry_run, json),
+        } => route(task, dir, provider, model, name, read_only, dry_run, json),
         Command::Usage { json } => usage(json),
         Command::Log { limit, json } => log(limit, json),
         Command::Parity { .. } => unreachable!("parity has a command specific exit path"),
@@ -260,11 +264,14 @@ fn kind_label(difference: &Difference) -> &'static str {
     }
 }
 
+// Parameters are the run subcommand's clap flags passed straight through, so the count tracks the CLI surface.
+#[allow(clippy::too_many_arguments)]
 fn route(
     task: String,
     dir: Option<PathBuf>,
     provider: String,
     model: Option<String>,
+    name: Option<String>,
     read_only: bool,
     dry_run: bool,
     json: bool,
@@ -279,6 +286,7 @@ fn route(
         dir: &dir,
         provider: agent_router_core::run::parse_provider(&provider)?,
         model,
+        name,
         read_only,
         dry_run,
     };

@@ -1,6 +1,6 @@
 use crate::error::{Error, Result};
 use crate::run::Dispatch;
-use crate::runtime::{canonicalize_dir, now_ms, router_log_path, spawn_detached, truncated_title};
+use crate::runtime::{canonicalize_dir, now_ms, router_log_path, spawn_detached};
 use serde::Deserialize;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -26,21 +26,30 @@ struct AgentRow {
 pub fn dispatch(
     cwd: &Path,
     task: &str,
+    name: &str,
     model: Option<&str>,
     effort: Option<&str>,
 ) -> Result<Dispatch> {
-    dispatch_with_binary(Path::new("claude"), cwd, task, model, effort, ID_TIMEOUT)
+    dispatch_with_binary(
+        Path::new("claude"),
+        cwd,
+        task,
+        name,
+        model,
+        effort,
+        ID_TIMEOUT,
+    )
 }
 
 pub fn dispatch_with_binary(
     binary: &Path,
     cwd: &Path,
     task: &str,
+    name: &str,
     model: Option<&str>,
     effort: Option<&str>,
     timeout: Duration,
 ) -> Result<Dispatch> {
-    let name = truncated_title(task);
     let dispatched_at = now_ms();
     let mut command = Command::new(binary);
     command
@@ -51,13 +60,13 @@ pub fn dispatch_with_binary(
     if let Some(effort) = effort {
         command.arg("--effort").arg(effort);
     }
-    command.arg("--name").arg(&name).arg(task);
+    command.arg("--name").arg(name).arg(task);
     spawn_detached(command, &router_log_path("claude"))?;
 
-    let job_id = resolve_short_id(binary, &name, cwd, dispatched_at, timeout);
+    let job_id = resolve_short_id(binary, name, cwd, dispatched_at, timeout);
     Ok(Dispatch {
         job_id,
-        job_name: name,
+        job_name: name.to_string(),
     })
 }
 

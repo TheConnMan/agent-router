@@ -290,6 +290,7 @@ fn claude_uses_background_argv_and_excludes_a_prior_same_name_and_cwd() {
         &binary,
         &cwd,
         &task,
+        &name,
         Some("opus[1m]"),
         None,
         Duration::from_millis(250),
@@ -321,6 +322,7 @@ fn claude_argv_carries_the_decided_effort_and_omits_the_flag_without_one() {
             &binary,
             &cwd,
             task,
+            &name,
             Some("sonnet"),
             effort,
             Duration::from_millis(25),
@@ -362,6 +364,7 @@ fn claude_running_job_keeps_its_name_when_the_id_is_not_yet_published() {
         &binary,
         &cwd,
         task,
+        &name,
         Some("opus[1m]"),
         None,
         Duration::from_millis(25),
@@ -370,6 +373,52 @@ fn claude_running_job_keeps_its_name_when_the_id_is_not_yet_published() {
 
     assert_eq!(dispatch.job_id, None);
     assert_eq!(dispatch.job_name, name);
+}
+
+/// The caller owns the job name. bonus-drain names its jobs "Bonus: <id>" and reconciles inflight
+/// work by matching that exact string against `claude agents --json`, so re-deriving or truncating
+/// the name here orphans a running job.
+#[cfg(unix)]
+#[test]
+fn claude_spawns_and_finds_the_job_under_the_caller_supplied_name_verbatim() {
+    let root = TempDir::new("claude-supplied-name");
+    let cwd = root.path.join("working");
+    fs::create_dir(&cwd).expect("create cwd");
+    let task = "drain the bonus backlog entry and report every file it changed";
+    let name = "Bonus: abc-123";
+    assert_ne!(
+        truncated_title(task),
+        name,
+        "the task must not derive this name"
+    );
+    let listing = json!([{
+        "id": "supplied name job",
+        "sessionId": "full supplied name job",
+        "cwd": cwd,
+        "name": name,
+        "startedAt": i64::MAX,
+        "kind": "background",
+        "state": "working"
+    }]);
+    let (binary, log) = fake_claude(&root.path, &listing);
+
+    let dispatch = dispatch_with_binary(
+        &binary,
+        &cwd,
+        task,
+        name,
+        Some("opus[1m]"),
+        None,
+        Duration::from_millis(250),
+    )
+    .expect("claude dispatch");
+
+    assert_eq!(dispatch.job_name, name);
+    assert_eq!(dispatch.job_id.as_deref(), Some("supplied name job"));
+    assert_eq!(
+        wait_for_text(&log).lines().collect::<Vec<_>>(),
+        vec!["--bg", "--model", "opus[1m]", "--name", name, task]
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -466,6 +515,7 @@ fn codex_decision_effort_reaches_turn_start_at_the_dispatch_boundary() {
         dir: &root.path,
         provider: Some(Provider::Codex),
         model: None,
+        name: None,
         read_only: true,
         dry_run: false,
     };
@@ -616,7 +666,12 @@ fn opencode_managed_create_and_prompt_return_the_exact_created_identity() {
     let task = "雪".repeat(45);
 
     let dispatch = client
-        .dispatch(cwd, &task, Some("openai/gpt-5.6-sol"))
+        .dispatch(
+            cwd,
+            &task,
+            &truncated_title(&task),
+            Some("openai/gpt-5.6-sol"),
+        )
         .expect("managed dispatch");
 
     assert_eq!(dispatch.job_id.as_deref(), Some("session/雪?exact"));
@@ -656,6 +711,34 @@ fn opencode_managed_create_and_prompt_return_the_exact_created_identity() {
     }
 }
 
+/// The same caller-owned name reaches the OpenCode session, so a job dispatched to any provider is
+/// findable under the name the caller chose.
+#[test]
+fn opencode_session_identity_uses_the_caller_supplied_name_verbatim() {
+    let (address, server) = loopback_server(vec![
+        (200, "application/json", r#"{"id":"session supplied name"}"#),
+        (204, "application/json", ""),
+    ]);
+    let client =
+        ManagedClient::for_loopback_test(address, "router test secret").expect("loopback client");
+    let task = "雪".repeat(45);
+    let name = "Bonus: abc-123";
+    assert_ne!(
+        truncated_title(&task),
+        name,
+        "the task must not derive this name"
+    );
+
+    let dispatch = client
+        .dispatch(Path::new("/tmp"), &task, name, None)
+        .expect("managed dispatch");
+
+    assert_eq!(dispatch.job_name, name);
+    assert_eq!(dispatch.job_id.as_deref(), Some("session supplied name"));
+    let requests = server.join().expect("server thread");
+    assert_eq!(requests[0].body["title"], json!(name));
+}
+
 #[test]
 fn opencode_prompt_failure_names_the_created_session_and_never_creates_another() {
     let (address, server) = loopback_server(vec![
@@ -670,7 +753,12 @@ fn opencode_prompt_failure_names_the_created_session_and_never_creates_another()
         ManagedClient::for_loopback_test(address, "router test secret").expect("loopback client");
 
     let error = client
-        .dispatch(Path::new("/tmp"), "one submission", None)
+        .dispatch(
+            Path::new("/tmp"),
+            "one submission",
+            &truncated_title("one submission"),
+            None,
+        )
         .expect_err("prompt failure must be visible");
 
     assert!(error.to_string().contains("session already created"));
