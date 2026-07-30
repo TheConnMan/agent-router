@@ -337,6 +337,76 @@ fn explicit_provider_with_an_explicit_model_succeeds_and_forwards_the_model() {
     );
 }
 
+/// MCP scoping is a claude only capability, so naming another provider alongside the flags must
+/// exit nonzero and say which flag is the problem, rather than dispatching a job that quietly
+/// ignores the scoping the caller asked for.
+#[cfg(unix)]
+#[test]
+fn mcp_scoping_with_an_explicit_non_claude_provider_exits_nonzero() {
+    let root = TempDir::new();
+    let bin = root.path.join("bin");
+    let home = root.path.join("home");
+    let cwd = root.path.join("working");
+    fs::create_dir_all(&bin).expect("create bin");
+    fs::create_dir_all(&home).expect("create home");
+    fs::create_dir_all(&cwd).expect("create cwd");
+    let config = root.path.join("scoped.mcp.json");
+    fs::write(&config, r#"{"mcpServers":{}}"#).expect("write config");
+    // A sandbox PATH holding no provider binaries, so nothing real can be dispatched.
+    let path = bin.display().to_string();
+    let route = |provider: &str, flags: &[&str]| -> Output {
+        Command::new(env!("CARGO_BIN_EXE_agent-router"))
+            .arg("run")
+            .arg("must reject scoping for other providers")
+            .arg("--dir")
+            .arg(&cwd)
+            .arg("--provider")
+            .arg(provider)
+            .args(flags)
+            .env("HOME", &home)
+            .env("PATH", &path)
+            .output()
+            .expect("run router")
+    };
+
+    let config_arg = config.to_string_lossy().to_string();
+    for provider in ["codex", "opencode"] {
+        let output = route(provider, &["--mcp-config", &config_arg]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(
+            !output.status.success(),
+            "{provider} accepted --mcp-config: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            stderr.contains("--mcp-config"),
+            "{provider} did not name the rejected flag: {stderr}"
+        );
+        // The flag must be parsed and then refused, not rejected as unknown.
+        assert!(
+            !stderr.contains("unexpected argument"),
+            "{provider} does not accept --mcp-config at all: {stderr}"
+        );
+    }
+
+    let output = route("opencode", &["--strict-mcp-config"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "opencode accepted --strict-mcp-config: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        stderr.contains("--strict-mcp-config"),
+        "opencode did not name the rejected flag: {stderr}"
+    );
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "opencode does not accept --strict-mcp-config at all: {stderr}"
+    );
+}
+
 #[cfg(target_os = "linux")]
 fn fake_opencode_cli(root: &Path, log: &Path) -> PathBuf {
     let binary = root.join("opencode");

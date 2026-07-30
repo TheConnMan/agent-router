@@ -293,6 +293,8 @@ fn claude_uses_background_argv_and_excludes_a_prior_same_name_and_cwd() {
         &name,
         Some("opus[1m]"),
         None,
+        &[],
+        false,
         Duration::from_millis(250),
     )
     .expect("claude dispatch");
@@ -325,6 +327,8 @@ fn claude_argv_carries_the_decided_effort_and_omits_the_flag_without_one() {
             &name,
             Some("sonnet"),
             effort,
+            &[],
+            false,
             Duration::from_millis(25),
         )
         .expect("claude dispatch");
@@ -339,6 +343,287 @@ fn claude_argv_carries_the_decided_effort_and_omits_the_flag_without_one() {
         };
         assert_eq!(argv, expected, "argv for effort {effort:?}");
     }
+}
+
+/// MCP scoping reaches claude only if the argv order is exact: every `--mcp-config` first, then
+/// `--strict-mcp-config`, which terminates claude's variadic config list so `--name` and the
+/// prompt are not swallowed as further config paths.
+#[cfg(unix)]
+#[test]
+fn claude_argv_places_mcp_scoping_between_the_model_flags_and_the_name() {
+    let root = TempDir::new("claude-mcp");
+    let cwd = root.path.join("working");
+    fs::create_dir(&cwd).expect("create cwd");
+    let first = root.path.join("first.mcp.json");
+    let second = root.path.join("second.mcp.json");
+    fs::write(&first, r#"{"mcpServers":{}}"#).expect("write first config");
+    fs::write(&second, r#"{"mcpServers":{}}"#).expect("write second config");
+    let first_arg = first.to_string_lossy().to_string();
+    let second_arg = second.to_string_lossy().to_string();
+    let task = "route one scoped task";
+    let name = truncated_title(task);
+
+    struct ArgvCase<'a> {
+        effort: Option<&'a str>,
+        configs: Vec<PathBuf>,
+        strict: bool,
+        expected: Vec<&'a str>,
+    }
+
+    let cases = [
+        ArgvCase {
+            effort: Some("high"),
+            configs: vec![first.clone(), second.clone()],
+            strict: true,
+            expected: vec![
+                "--bg",
+                "--model",
+                "sonnet",
+                "--effort",
+                "high",
+                "--mcp-config",
+                &first_arg,
+                "--mcp-config",
+                &second_arg,
+                "--strict-mcp-config",
+                "--name",
+                &name,
+                task,
+            ],
+        },
+        ArgvCase {
+            effort: None,
+            configs: Vec::new(),
+            strict: true,
+            expected: vec![
+                "--bg",
+                "--model",
+                "sonnet",
+                "--strict-mcp-config",
+                "--name",
+                &name,
+                task,
+            ],
+        },
+        ArgvCase {
+            effort: Some("high"),
+            configs: vec![first.clone(), second.clone()],
+            strict: false,
+            expected: vec![
+                "--bg",
+                "--model",
+                "sonnet",
+                "--effort",
+                "high",
+                "--mcp-config",
+                &first_arg,
+                "--mcp-config",
+                &second_arg,
+                "--name",
+                &name,
+                task,
+            ],
+        },
+    ];
+
+    for (index, case) in cases.into_iter().enumerate() {
+        let spawn = TempDir::new("claude-mcp-spawn");
+        let (binary, log) = fake_claude(&spawn.path, &json!([]));
+
+        dispatch_with_binary(
+            &binary,
+            &cwd,
+            task,
+            &name,
+            Some("sonnet"),
+            case.effort,
+            &case.configs,
+            case.strict,
+            Duration::from_millis(25),
+        )
+        .expect("claude dispatch");
+
+        assert_eq!(
+            wait_for_text(&log).lines().collect::<Vec<_>>(),
+            case.expected,
+            "argv for case {index}"
+        );
+    }
+}
+
+/// MCP configs hold server credentials, so an unreadable one must fail by naming the path and
+/// nothing else, and must fail before claude is spawned rather than after a job is already running.
+#[cfg(unix)]
+#[test]
+fn unreadable_mcp_config_names_the_path_without_its_body_and_spawns_nothing() {
+    let root = TempDir::new("claude-mcp-unreadable");
+    let cwd = root.path.join("working");
+    fs::create_dir(&cwd).expect("create cwd");
+    let secret = "MCP_CONFIG_SECRET_517304";
+    let source_line = format!("\"command\": \"runner\", \"env\": {{\"TOKEN\": \"{secret}\"}}");
+    let body = r#"{"mcpServers":{"scoped":{SERVER}}}"#.replace("SERVER", &source_line);
+    let config = root.path.join("unreadable.mcp.json");
+    fs::write(&config, &body).expect("write config");
+    let mut permissions = fs::metadata(&config)
+        .expect("config metadata")
+        .permissions();
+    permissions.set_mode(0o000);
+    fs::set_permissions(&config, permissions).expect("make config unreadable");
+    let (binary, log) = fake_claude(&root.path, &json!([]));
+
+    let error = dispatch_with_binary(
+        &binary,
+        &cwd,
+        "route one scoped task",
+        &truncated_title("route one scoped task"),
+        Some("sonnet"),
+        None,
+        std::slice::from_ref(&config),
+        false,
+        Duration::from_millis(25),
+    )
+    .expect_err("an unreadable MCP config must fail");
+
+    let path = config.display().to_string();
+    for rendered in [format!("{error}"), format!("{error:?}")] {
+        assert!(
+            rendered.contains(&path),
+            "the error hid which config failed: {rendered}"
+        );
+        assert!(
+            !rendered.contains(secret),
+            "the error exposed the config secret: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&source_line),
+            "the error exposed a config source line: {rendered}"
+        );
+    }
+    assert!(
+        !log.exists(),
+        "claude was spawned despite an unreadable MCP config"
+    );
+}
+
+/// The unreadable case cannot prove the body is never read, because an unreadable file has no
+/// body to leak. This one can: the config is readable and holds a secret, so an implementation
+/// that inlined the contents onto the argv would publish it to `ps` and fail here.
+#[cfg(unix)]
+#[test]
+fn readable_mcp_config_reaches_claude_by_path_and_never_by_its_contents() {
+    let root = TempDir::new("claude-mcp-readable");
+    let cwd = root.path.join("working");
+    fs::create_dir(&cwd).expect("create cwd");
+    let secret = "MCP_READABLE_SECRET_884213";
+    let body =
+        format!(r#"{{"mcpServers":{{"scoped":{{"command":"x","env":{{"TOKEN":"{secret}"}}}}}}}}"#);
+    let config = root.path.join("readable.mcp.json");
+    fs::write(&config, &body).expect("write config");
+    let (binary, log) = fake_claude(&root.path, &json!([]));
+
+    dispatch_with_binary(
+        &binary,
+        &cwd,
+        "route one scoped task",
+        &truncated_title("route one scoped task"),
+        Some("sonnet"),
+        None,
+        std::slice::from_ref(&config),
+        true,
+        Duration::from_millis(25),
+    )
+    .expect("a readable MCP config must dispatch");
+
+    let argv = wait_for_text(&log);
+    assert!(
+        argv.contains(&config.display().to_string()),
+        "the config path never reached claude: {argv}"
+    );
+    assert!(
+        !argv.contains(secret),
+        "the config body leaked onto the argv: {argv}"
+    );
+}
+
+/// The job is spawned with `current_dir(cwd)`, so a relative config resolved there would name a
+/// different file than the one preflighted. Resolution must anchor at the router process cwd.
+#[cfg(unix)]
+#[test]
+fn relative_mcp_config_resolves_against_the_router_cwd_not_the_job_cwd() {
+    let root = TempDir::new("claude-mcp-relative");
+    let cwd = root.path.join("working");
+    fs::create_dir(&cwd).expect("create cwd");
+    let relative = PathBuf::from("definitely-absent-relative-config.json");
+    let router_cwd = std::env::current_dir().expect("router cwd");
+    let (binary, log) = fake_claude(&root.path, &json!([]));
+
+    let error = dispatch_with_binary(
+        &binary,
+        &cwd,
+        "route one scoped task",
+        &truncated_title("route one scoped task"),
+        Some("sonnet"),
+        None,
+        std::slice::from_ref(&relative),
+        false,
+        Duration::from_millis(25),
+    )
+    .expect_err("an absent MCP config must fail");
+
+    let rendered = format!("{error}");
+    assert!(
+        rendered.contains(&router_cwd.join(&relative).display().to_string()),
+        "the config was not resolved against the router cwd: {rendered}"
+    );
+    assert!(
+        !rendered.contains(&cwd.display().to_string()),
+        "the config was resolved against the job cwd: {rendered}"
+    );
+    assert!(
+        !log.exists(),
+        "claude was spawned despite an absent MCP config"
+    );
+}
+
+/// A path that stats fine but is not a regular file must be refused rather than handed to claude.
+/// A directory stands in for the whole not-a-regular-file class because a fifo would hang the
+/// router on open with no writer, turning a regression into a CI hang instead of a failure.
+#[cfg(unix)]
+#[test]
+fn directory_mcp_config_is_refused_as_not_a_regular_file_and_spawns_nothing() {
+    let root = TempDir::new("claude-mcp-directory");
+    let cwd = root.path.join("working");
+    fs::create_dir(&cwd).expect("create cwd");
+    let config = root.path.join("config.mcp.json");
+    fs::create_dir(&config).expect("create directory config");
+    let (binary, log) = fake_claude(&root.path, &json!([]));
+
+    let error = dispatch_with_binary(
+        &binary,
+        &cwd,
+        "route one scoped task",
+        &truncated_title("route one scoped task"),
+        Some("sonnet"),
+        None,
+        std::slice::from_ref(&config),
+        false,
+        Duration::from_millis(25),
+    )
+    .expect_err("a directory MCP config must fail");
+
+    let rendered = format!("{error}");
+    assert!(
+        rendered.contains(&config.display().to_string()),
+        "the error hid which config failed: {rendered}"
+    );
+    assert!(
+        rendered.contains("is not a regular file"),
+        "the error did not name the failure kind: {rendered}"
+    );
+    assert!(
+        !log.exists(),
+        "claude was spawned despite a directory MCP config"
+    );
 }
 
 #[cfg(unix)]
@@ -367,6 +652,8 @@ fn claude_running_job_keeps_its_name_when_the_id_is_not_yet_published() {
         &name,
         Some("opus[1m]"),
         None,
+        &[],
+        false,
         Duration::from_millis(25),
     )
     .expect("the background job is running even before its id is listed");
@@ -409,6 +696,8 @@ fn claude_spawns_and_finds_the_job_under_the_caller_supplied_name_verbatim() {
         name,
         Some("opus[1m]"),
         None,
+        &[],
+        false,
         Duration::from_millis(250),
     )
     .expect("claude dispatch");
@@ -517,6 +806,8 @@ fn codex_decision_effort_reaches_turn_start_at_the_dispatch_boundary() {
         model: None,
         name: None,
         dry_run: false,
+        mcp_configs: &[],
+        strict_mcp_config: false,
     };
 
     let dispatched = dispatch_decision(&decision, &request).expect("codex dispatch");
@@ -539,6 +830,51 @@ fn codex_decision_effort_reaches_turn_start_at_the_dispatch_boundary() {
         requests[2]["params"]["input"][0]["text"],
         "exercise the real dispatch seam"
     );
+}
+
+/// Only claude accepts MCP scoping, so an auto decision that lands on another provider must fail
+/// at the dispatch seam. Silently dropping the flags would run the job with the caller's scoping
+/// ignored, which is the failure this rejection exists to prevent.
+#[cfg(target_os = "linux")]
+#[test]
+fn mcp_scoping_on_a_non_claude_decision_fails_before_any_provider_work() {
+    let root = TempDir::new("mcp-scoping-non-claude");
+    let decision = decide_explicit(
+        Provider::Codex,
+        None,
+        UsageSnapshot::full(),
+        &agent_router_core::Config::default(),
+    );
+    assert_eq!(decision.provider, Provider::Codex);
+    let configs = vec![root.path.join("scoped.mcp.json")];
+    let empty: Vec<PathBuf> = Vec::new();
+
+    for (mcp_configs, strict_mcp_config, flag) in [
+        (configs.as_slice(), false, "--mcp-config"),
+        (empty.as_slice(), true, "--strict-mcp-config"),
+    ] {
+        let request = Request {
+            task: "exercise the scoping rejection",
+            dir: &root.path,
+            // Auto: the caller named no provider, so only the decision knows it is codex.
+            provider: None,
+            model: None,
+            name: None,
+            dry_run: false,
+            mcp_configs,
+            strict_mcp_config,
+        };
+
+        let error = dispatch_decision(&decision, &request)
+            .expect_err("scoping must be rejected for a non-claude provider");
+
+        let rendered = error.to_string();
+        assert!(rendered.contains(flag), "the error hid {flag}: {rendered}");
+        assert!(
+            rendered.contains("codex"),
+            "the error hid the provider that cannot honour {flag}: {rendered}"
+        );
+    }
 }
 
 #[derive(Debug)]

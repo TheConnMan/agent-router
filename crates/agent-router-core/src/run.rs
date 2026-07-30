@@ -8,7 +8,7 @@ use crate::error::{Error, Result};
 use crate::log::{DecisionLog, Entry};
 use crate::provider::Provider;
 use crate::usage::UsageSnapshot;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// What the caller asked for.
 #[derive(Debug, Clone)]
@@ -24,6 +24,11 @@ pub struct Request<'a> {
     pub name: Option<String>,
     /// Decide and log without dispatching.
     pub dry_run: bool,
+    /// MCP config paths forwarded to a claude job, by path only: they may carry server secrets, so
+    /// they are never read or logged here.
+    pub mcp_configs: &'a [PathBuf],
+    /// Replace the claude job's inherited MCP servers with the named configs.
+    pub strict_mcp_config: bool,
 }
 
 /// What the dispatch produced.
@@ -76,6 +81,10 @@ pub fn run(request: &Request, config: &Config) -> Result<Outcome> {
     let log = DecisionLog::open()?;
 
     if request.dry_run {
+        // A dry run is how a caller checks an invocation before committing to it, so the claude
+        // only scoping flags refuse here too, for the provider the decision landed on: reporting a
+        // clean route would hide that the real run would have dropped them.
+        crate::dispatch::reject_mcp_scoping(request, decision.provider)?;
         let log_id = log.record(&Entry {
             task: request.task,
             dir: request.dir,

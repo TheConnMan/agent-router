@@ -29,6 +29,8 @@ pub fn dispatch(
     name: &str,
     model: Option<&str>,
     effort: Option<&str>,
+    mcp_configs: &[PathBuf],
+    strict_mcp_config: bool,
 ) -> Result<Dispatch> {
     dispatch_with_binary(
         Path::new("claude"),
@@ -37,10 +39,13 @@ pub fn dispatch(
         name,
         model,
         effort,
+        mcp_configs,
+        strict_mcp_config,
         ID_TIMEOUT,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn dispatch_with_binary(
     binary: &Path,
     cwd: &Path,
@@ -48,8 +53,12 @@ pub fn dispatch_with_binary(
     name: &str,
     model: Option<&str>,
     effort: Option<&str>,
+    mcp_configs: &[PathBuf],
+    strict_mcp_config: bool,
     timeout: Duration,
 ) -> Result<Dispatch> {
+    let resolved_configs = resolve_mcp_configs(mcp_configs)?;
+
     let dispatched_at = now_ms();
     let mut command = Command::new(binary);
     command
@@ -60,6 +69,14 @@ pub fn dispatch_with_binary(
     if let Some(effort) = effort {
         command.arg("--effort").arg(effort);
     }
+    for config in &resolved_configs {
+        command.arg("--mcp-config").arg(config);
+    }
+    if strict_mcp_config {
+        // --mcp-config is variadic, so the boolean --strict-mcp-config must follow every path: it
+        // terminates the value list and stops --name and the prompt being read as more configs.
+        command.arg("--strict-mcp-config");
+    }
     command.arg("--name").arg(name).arg(task);
     spawn_detached(command, &router_log_path("claude"))?;
 
@@ -68,6 +85,48 @@ pub fn dispatch_with_binary(
         job_id,
         job_name: name.to_string(),
     })
+}
+
+/// An MCP config can carry server credentials, so it is passed by path only: this proves the path
+/// is a readable regular file before a job exists, and never reads a byte of the body. The
+/// resolved absolute paths are returned because they, not the paths as typed, are what claude is
+/// handed.
+fn resolve_mcp_configs(mcp_configs: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    // Both failure paths below report the same thing, so the message is built in one place and
+    // cannot drift.
+    let unreadable = |config: &Path, error: std::io::Error| {
+        Error::Command(format!(
+            "MCP config {} is unreadable: {error}",
+            config.display()
+        ))
+    };
+    let mut resolved_configs = Vec::with_capacity(mcp_configs.len());
+    for config in mcp_configs {
+        // The caller typed the path in their own shell, but the job is spawned with
+        // current_dir(cwd), so a relative path would mean two different files. Resolving against
+        // the router cwd once, lexically, keeps the preflighted file and the file on the argv the
+        // same one, which is why the resolved path is what claude is handed.
+        let config = std::path::absolute(config).map_err(|error| {
+            Error::Command(format!(
+                "MCP config {} is unresolvable: {error}",
+                config.display()
+            ))
+        })?;
+        // metadata follows symlinks and never blocks, unlike opening a fifo with no writer, which
+        // would hang the router: so the kind is checked before anything is opened.
+        let metadata = std::fs::metadata(&config).map_err(|error| unreadable(&config, error))?;
+        if !metadata.is_file() {
+            return Err(Error::Command(format!(
+                "MCP config {} is not a regular file",
+                config.display()
+            )));
+        }
+        // A regular file can still be unreadable, and that must fail here rather than inside the
+        // detached child.
+        std::fs::File::open(&config).map_err(|error| unreadable(&config, error))?;
+        resolved_configs.push(config);
+    }
+    Ok(resolved_configs)
 }
 
 fn resolve_short_id(
