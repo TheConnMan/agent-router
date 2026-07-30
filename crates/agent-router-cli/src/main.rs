@@ -123,7 +123,6 @@ fn outcome_json(outcome: &Outcome) -> serde_json::Value {
         "dry_run": outcome.dispatch.is_none(),
         "log_id": outcome.log_id,
         "log_error": outcome.log_error,
-        "watch": "agent-viewer",
     })
 }
 
@@ -153,9 +152,6 @@ fn print_outcome(outcome: &Outcome) {
             db_path(),
             error.as_deref().unwrap_or("unknown error")
         ),
-    }
-    if outcome.dispatch.is_some() {
-        println!("watch: agent-viewer");
     }
 }
 

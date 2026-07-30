@@ -4,6 +4,7 @@
 
 use crate::decide::Decision;
 use crate::error::Result;
+use crate::runtime::{home_dir, now_ms};
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
@@ -131,7 +132,7 @@ impl DecisionLog {
                 ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28
             )",
             rusqlite::params![
-                agent_viewer_core::spawn::now_ms(),
+                now_ms(),
                 entry.task,
                 entry.dir.to_string_lossy(),
                 entry.requested,
@@ -200,7 +201,7 @@ impl DecisionLog {
 }
 
 pub fn default_db_path() -> PathBuf {
-    agent_viewer_core::home_dir().join(".local/state/agent-router/router.db")
+    home_dir().join(".local/state/agent-router/router.db")
 }
 
 /// The log holds full task text, so its directory is the owner's alone.
@@ -346,11 +347,8 @@ mod tests {
     fn an_explicit_provider_row_has_no_classification_columns() {
         let dir = tempfile::tempdir().expect("tempdir");
         let log = DecisionLog::open_at(&dir.path().join("router.db")).expect("opens");
-        let decision = crate::decide::decide_explicit(
-            agent_viewer_core::BackendKind::Opencode,
-            None,
-            UsageSnapshot::full(),
-        );
+        let decision =
+            crate::decide::decide_explicit(crate::Provider::Opencode, None, UsageSnapshot::full());
         log.record(&Entry {
             task: "t",
             dir: Path::new("/tmp"),

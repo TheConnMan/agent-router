@@ -2,8 +2,8 @@
 
 use crate::classify::{Classification, Confidence};
 use crate::config::Config;
+use crate::provider::Provider;
 use crate::usage::UsageSnapshot;
-use agent_viewer_core::BackendKind;
 
 /// Claude bg jobs are pinned to opus[1m] by house policy, never chosen per task.
 pub const CLAUDE_MODEL: &str = "opus[1m]";
@@ -48,7 +48,7 @@ impl Gate {
 /// One routing decision: where the task goes, with what model and effort, and why.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Decision {
-    pub provider: BackendKind,
+    pub provider: Provider,
     /// The model to spawn with. None means the backend resolves its own default.
     pub model: Option<String>,
     /// Codex reasoning effort. None for every other provider.
@@ -85,9 +85,9 @@ pub fn decide(classification: Classification, usage: UsageSnapshot, config: &Con
 
     // A hard gate is Claude, full stop. Headroom modulates a verdict; it never overrides a gate.
     let mut provider = if hard_gate {
-        BackendKind::Claude
+        Provider::Claude
     } else {
-        classification.verdict.backend()
+        classification.verdict.provider()
     };
 
     if !hard_gate {
@@ -135,7 +135,7 @@ pub fn decide(classification: Classification, usage: UsageSnapshot, config: &Con
 /// PURE: the decision for a caller-named provider. No classification runs, but the usage
 /// snapshot is still recorded, because the log is the tuning data for the auto path.
 pub fn decide_explicit(
-    provider: BackendKind,
+    provider: Provider,
     model: Option<String>,
     usage: UsageSnapshot,
 ) -> Decision {
@@ -152,41 +152,41 @@ pub fn decide_explicit(
 
 /// PURE: the model policy. Claude bg jobs are always opus[1m]; codex and opencode resolve their
 /// own defaults.
-fn model_for(provider: BackendKind) -> Option<String> {
+fn model_for(provider: Provider) -> Option<String> {
     match provider {
-        BackendKind::Claude => Some(CLAUDE_MODEL.to_string()),
-        BackendKind::Codex | BackendKind::Opencode => None,
+        Provider::Claude => Some(CLAUDE_MODEL.to_string()),
+        Provider::Codex | Provider::Opencode => None,
     }
 }
 
-fn effort_for(provider: BackendKind) -> Option<String> {
+fn effort_for(provider: Provider) -> Option<String> {
     match provider {
-        BackendKind::Codex => Some(CODEX_EFFORT.to_string()),
-        BackendKind::Claude | BackendKind::Opencode => None,
+        Provider::Codex => Some(CODEX_EFFORT.to_string()),
+        Provider::Claude | Provider::Opencode => None,
     }
 }
 
 /// PURE: the other member of the Codex/Claude pair. opencode is explicit-only, so it is never
 /// the counterparty of a headroom comparison and maps to Claude's side of the pair.
-fn other_provider(provider: BackendKind) -> BackendKind {
+fn other_provider(provider: Provider) -> Provider {
     match provider {
-        BackendKind::Codex => BackendKind::Claude,
-        BackendKind::Claude | BackendKind::Opencode => BackendKind::Codex,
+        Provider::Codex => Provider::Claude,
+        Provider::Claude | Provider::Opencode => Provider::Codex,
     }
 }
 
-fn weekly_used(usage: &UsageSnapshot, provider: BackendKind) -> f64 {
+fn weekly_used(usage: &UsageSnapshot, provider: Provider) -> f64 {
     match provider {
-        BackendKind::Codex => usage.codex.weekly_pct,
+        Provider::Codex => usage.codex.weekly_pct,
         // opencode has no usage source in the MVP, so it reads as the Claude side it rides on.
-        BackendKind::Claude | BackendKind::Opencode => usage.claude.weekly_pct,
+        Provider::Claude | Provider::Opencode => usage.claude.weekly_pct,
     }
 }
 
 /// PURE: the one-line reason, the string the CLI prints and the viewer will show.
 fn rationale(
     classification: &Classification,
-    provider: BackendKind,
+    provider: Provider,
     gates: &[Gate],
     usage: &UsageSnapshot,
 ) -> String {
@@ -264,7 +264,7 @@ mod tests {
         missing_connector: bool,
         codex_weekly: f64,
         claude_weekly: f64,
-        want_provider: BackendKind,
+        want_provider: Provider,
         want_gates: Vec<Gate>,
     }
 
@@ -280,7 +280,7 @@ mod tests {
                 missing_connector: false,
                 codex_weekly: 60.0,
                 claude_weekly: 10.0,
-                want_provider: BackendKind::Codex,
+                want_provider: Provider::Codex,
                 want_gates: vec![],
             },
             Case {
@@ -291,7 +291,7 @@ mod tests {
                 missing_connector: false,
                 codex_weekly: 90.0,
                 claude_weekly: 5.0,
-                want_provider: BackendKind::Codex,
+                want_provider: Provider::Codex,
                 want_gates: vec![],
             },
             Case {
@@ -302,7 +302,7 @@ mod tests {
                 missing_connector: false,
                 codex_weekly: 97.0,
                 claude_weekly: 40.0,
-                want_provider: BackendKind::Claude,
+                want_provider: Provider::Claude,
                 want_gates: vec![Gate::FlippedOnExhaustion],
             },
             Case {
@@ -313,7 +313,7 @@ mod tests {
                 missing_connector: false,
                 codex_weekly: 40.0,
                 claude_weekly: 99.0,
-                want_provider: BackendKind::Codex,
+                want_provider: Provider::Codex,
                 want_gates: vec![Gate::FlippedOnExhaustion],
             },
             Case {
@@ -324,7 +324,7 @@ mod tests {
                 missing_connector: false,
                 codex_weekly: 50.0,
                 claude_weekly: 30.0,
-                want_provider: BackendKind::Codex,
+                want_provider: Provider::Codex,
                 want_gates: vec![],
             },
             Case {
@@ -335,7 +335,7 @@ mod tests {
                 missing_connector: false,
                 codex_weekly: 55.0,
                 claude_weekly: 30.0,
-                want_provider: BackendKind::Codex,
+                want_provider: Provider::Codex,
                 want_gates: vec![],
             },
             Case {
@@ -346,7 +346,7 @@ mod tests {
                 missing_connector: false,
                 codex_weekly: 80.0,
                 claude_weekly: 30.0,
-                want_provider: BackendKind::Claude,
+                want_provider: Provider::Claude,
                 want_gates: vec![Gate::HeadroomTiebreak],
             },
             Case {
@@ -357,7 +357,7 @@ mod tests {
                 missing_connector: false,
                 codex_weekly: 0.0,
                 claude_weekly: 99.0,
-                want_provider: BackendKind::Claude,
+                want_provider: Provider::Claude,
                 want_gates: vec![Gate::ClaudeSignals],
             },
             Case {
@@ -368,7 +368,7 @@ mod tests {
                 missing_connector: true,
                 codex_weekly: 10.0,
                 claude_weekly: 95.0,
-                want_provider: BackendKind::Claude,
+                want_provider: Provider::Claude,
                 want_gates: vec![Gate::MissingConnector],
             },
             Case {
@@ -379,7 +379,7 @@ mod tests {
                 missing_connector: false,
                 codex_weekly: 98.0,
                 claude_weekly: 99.0,
-                want_provider: BackendKind::Codex,
+                want_provider: Provider::Codex,
                 want_gates: vec![Gate::OverCeiling],
             },
             Case {
@@ -390,7 +390,7 @@ mod tests {
                 missing_connector: false,
                 codex_weekly: 98.0,
                 claude_weekly: 99.0,
-                want_provider: BackendKind::Claude,
+                want_provider: Provider::Claude,
                 want_gates: vec![Gate::OverCeiling],
             },
         ];
@@ -426,7 +426,7 @@ mod tests {
             usage(config.hard_ceiling_pct, 40.0),
             &config,
         );
-        assert_eq!(decision.provider, BackendKind::Claude);
+        assert_eq!(decision.provider, Provider::Claude);
         assert!(decision.gates.contains(&Gate::FlippedOnExhaustion));
     }
 
@@ -438,7 +438,7 @@ mod tests {
             usage(98.0, 97.5),
             &config,
         );
-        assert_eq!(decision.provider, BackendKind::Codex);
+        assert_eq!(decision.provider, Provider::Codex);
         assert!(!decision.gates.contains(&Gate::FlippedOnExhaustion));
         assert!(decision.gates.contains(&Gate::OverCeiling));
     }
@@ -453,7 +453,7 @@ mod tests {
             usage(0.0, 99.0),
             &config,
         );
-        assert_eq!(decision.provider, BackendKind::Claude);
+        assert_eq!(decision.provider, Provider::Claude);
         assert_eq!(decision.gate_tags(), vec!["classifier_failed"]);
         assert_eq!(decision.model.as_deref(), Some(CLAUDE_MODEL));
     }
@@ -480,8 +480,8 @@ mod tests {
 
     #[test]
     fn an_explicit_provider_skips_classification_but_keeps_the_usage_snapshot() {
-        let decision = decide_explicit(BackendKind::Opencode, None, usage(71.0, 50.0));
-        assert_eq!(decision.provider, BackendKind::Opencode);
+        let decision = decide_explicit(Provider::Opencode, None, usage(71.0, 50.0));
+        assert_eq!(decision.provider, Provider::Opencode);
         assert!(decision.classification.is_none());
         assert_eq!(decision.gate_tags(), vec!["explicit_provider"]);
         assert_eq!(decision.usage.codex.weekly_pct, 71.0);
@@ -490,7 +490,7 @@ mod tests {
 
         // An explicitly requested model overrides the per-provider default.
         let pinned = decide_explicit(
-            BackendKind::Claude,
+            Provider::Claude,
             Some("sonnet".to_string()),
             usage(0.0, 0.0),
         );

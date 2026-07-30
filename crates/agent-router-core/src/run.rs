@@ -6,8 +6,8 @@ use crate::config::Config;
 use crate::decide::{Decision, decide, decide_explicit};
 use crate::error::{Error, Result};
 use crate::log::{DecisionLog, Entry};
+use crate::provider::Provider;
 use crate::usage::UsageSnapshot;
-use agent_viewer_core::BackendKind;
 use std::path::Path;
 
 /// What the caller asked for.
@@ -16,7 +16,7 @@ pub struct Request<'a> {
     pub task: &'a str,
     pub dir: &'a Path,
     /// None means auto: classify and let the engine choose.
-    pub provider: Option<BackendKind>,
+    pub provider: Option<Provider>,
     /// An explicit model override, only honoured on the explicit-provider path.
     pub model: Option<String>,
     /// Read-only work: the Codex execution-mode preamble is skipped.
@@ -49,6 +49,12 @@ pub struct Outcome {
 
 /// IMPURE: run one task through the router.
 pub fn run(request: &Request, config: &Config) -> Result<Outcome> {
+    if !request.dir.is_dir() {
+        return Err(Error::Command(format!(
+            "target directory does not exist: {}",
+            request.dir.display()
+        )));
+    }
     let usage = UsageSnapshot::read();
     let decision = match request.provider {
         Some(provider) => decide_explicit(provider, request.model.clone(), usage),
@@ -117,12 +123,12 @@ pub fn run(request: &Request, config: &Config) -> Result<Outcome> {
 }
 
 /// PURE: the provider a `--provider` value names. None for "auto".
-pub fn parse_provider(value: &str) -> Result<Option<BackendKind>> {
+pub fn parse_provider(value: &str) -> Result<Option<Provider>> {
     match value {
         "auto" => Ok(None),
-        "codex" => Ok(Some(BackendKind::Codex)),
-        "claude" => Ok(Some(BackendKind::Claude)),
-        "opencode" => Ok(Some(BackendKind::Opencode)),
+        "codex" => Ok(Some(Provider::Codex)),
+        "claude" => Ok(Some(Provider::Claude)),
+        "opencode" => Ok(Some(Provider::Opencode)),
         other => Err(Error::Command(format!(
             "unknown provider {other:?}: expected auto, codex, claude, or opencode"
         ))),
@@ -138,15 +144,15 @@ mod tests {
         assert_eq!(parse_provider("auto").expect("auto"), None);
         assert_eq!(
             parse_provider("codex").expect("codex"),
-            Some(BackendKind::Codex)
+            Some(Provider::Codex)
         );
         assert_eq!(
             parse_provider("claude").expect("claude"),
-            Some(BackendKind::Claude)
+            Some(Provider::Claude)
         );
         assert_eq!(
             parse_provider("opencode").expect("opencode"),
-            Some(BackendKind::Opencode)
+            Some(Provider::Opencode)
         );
         assert!(parse_provider("gpt").is_err());
     }

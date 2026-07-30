@@ -3,6 +3,8 @@
 //! to the fallback classification, because ambiguity is itself a Claude signal.
 
 use crate::config::Config;
+use crate::provider::Provider;
+use crate::runtime::home_dir;
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -16,10 +18,10 @@ pub enum Verdict {
 }
 
 impl Verdict {
-    pub fn backend(self) -> agent_viewer_core::BackendKind {
+    pub const fn provider(self) -> Provider {
         match self {
-            Verdict::Codex => agent_viewer_core::BackendKind::Codex,
-            Verdict::Claude => agent_viewer_core::BackendKind::Claude,
+            Verdict::Codex => Provider::Codex,
+            Verdict::Claude => Provider::Claude,
         }
     }
 }
@@ -114,7 +116,7 @@ pub fn classifier_command(prompt: &str) -> Command {
         .arg("--strict-mcp-config")
         .arg(prompt);
     // Run from home, never the task dir: nothing about the task's own project should be loaded.
-    let home = agent_viewer_core::home_dir();
+    let home = home_dir();
     if home.is_dir() {
         cmd.current_dir(&home);
     }

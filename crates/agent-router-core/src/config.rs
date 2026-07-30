@@ -2,6 +2,7 @@
 //! classifier scores gate 5 against. Written with defaults on first run.
 
 use crate::error::Result;
+use crate::runtime::home_dir;
 use std::path::{Path, PathBuf};
 
 /// Weekly percent at which a provider counts as exhausted.
@@ -75,7 +76,7 @@ impl Config {
 }
 
 pub fn default_config_path() -> PathBuf {
-    agent_viewer_core::home_dir().join(".config/agent-router/config.toml")
+    home_dir().join(".config/agent-router/config.toml")
 }
 
 #[cfg(test)]

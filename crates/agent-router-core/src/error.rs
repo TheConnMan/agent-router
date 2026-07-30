@@ -8,8 +8,6 @@ pub enum Error {
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
     Toml(#[from] toml::de::Error),
-    #[error(transparent)]
-    Viewer(#[from] agent_viewer_core::error::Error),
     #[error("{0}")]
     Command(String),
 }

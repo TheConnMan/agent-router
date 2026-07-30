@@ -4,6 +4,7 @@
 //! Both readers FAIL OPEN: any missing file, network failure, or unparseable payload reads as
 //! full headroom, because a usage read must never be the thing that blocks a dispatch.
 
+use crate::runtime::{default_codex_home, home_dir};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -146,7 +147,7 @@ fn fetch_claude_usage() -> Option<String> {
 }
 
 fn claude_oauth_token() -> Option<String> {
-    let path = agent_viewer_core::home_dir().join(".claude/.credentials.json");
+    let path = home_dir().join(".claude/.credentials.json");
     let value: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
     value
@@ -167,7 +168,7 @@ pub fn codex_sessions_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("CODEX_SESSIONS_DIR") {
         return PathBuf::from(dir);
     }
-    agent_viewer_core::default_codex_home().join("sessions")
+    default_codex_home().join("sessions")
 }
 
 /// The Codex snapshot from `sessions_dir`, scanning the `scan_n` newest rollouts newest-first.
@@ -283,10 +284,7 @@ fn expire(window: Option<&serde_json::Value>, now: i64) -> (f64, i64) {
 
 /// Current time as epoch seconds (0 if the system clock predates the epoch).
 pub fn now_epoch() -> i64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|since| since.as_secs() as i64)
-        .unwrap_or(0)
+    crate::runtime::now_epoch()
 }
 
 fn is_fresh(path: &Path, max_age: Duration) -> bool {
@@ -355,7 +353,7 @@ pub fn parse_rfc3339_epoch(timestamp: &str) -> Option<i64> {
 }
 
 /// PURE: days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's algorithm,
-/// the same one viewer-core's `rfc3339_millis` uses).
+/// the civil date conversion used by the provider timestamp parsers).
 fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let adjusted_year = year - i64::from(month <= 2);
     let era = if adjusted_year >= 0 {

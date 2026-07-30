@@ -1,9 +1,3 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
-
-# agent-viewer-core depends on vt100 directly and its workspace patches it to a vendored
-# copy; a path dependency on that crate has to carry the same patch or the vendored fork
-# is silently swapped for the registry version.
-[patch.crates-io]
-vt100 = { path = "../agent-viewer/vendor/vt100" }
