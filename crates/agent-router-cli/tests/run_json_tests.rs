@@ -407,6 +407,65 @@ fn mcp_scoping_with_an_explicit_non_claude_provider_exits_nonzero() {
     );
 }
 
+/// An empty `--name` is `Some("")`, which beats the derived default name and would spawn a job with
+/// an empty name. `resolve_short_id` matches agent rows by name, so that job becomes unresolvable and
+/// silently orphaned, which is exactly what the flag exists to prevent.
+#[cfg(unix)]
+#[test]
+fn an_empty_name_is_rejected_naming_the_flag() {
+    let fixture = CliFixture::new();
+
+    let output = fixture
+        .run_command()
+        .arg("--provider")
+        .arg("claude")
+        .arg("--name")
+        .arg("")
+        .output()
+        .expect("run router");
+
+    assert!(
+        !output.status.success(),
+        "an empty --name must not exit zero, stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--name"), "stderr: {stderr}");
+    assert!(
+        !fixture.spawn_log.exists(),
+        "the rejected empty name ran claude"
+    );
+}
+
+/// Whitespace-only names must be rejected identically to an empty name: trimmed, they are just as
+/// empty, and would produce the same unresolvable, orphaned job.
+#[cfg(unix)]
+#[test]
+fn a_whitespace_only_name_is_rejected_naming_the_flag() {
+    let fixture = CliFixture::new();
+
+    let output = fixture
+        .run_command()
+        .arg("--provider")
+        .arg("claude")
+        .arg("--name")
+        .arg("   ")
+        .output()
+        .expect("run router");
+
+    assert!(
+        !output.status.success(),
+        "a whitespace-only --name must not exit zero, stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--name"), "stderr: {stderr}");
+    assert!(
+        !fixture.spawn_log.exists(),
+        "the rejected whitespace-only name ran claude"
+    );
+}
+
 #[cfg(target_os = "linux")]
 fn fake_opencode_cli(root: &Path, log: &Path) -> PathBuf {
     let binary = root.join("opencode");
