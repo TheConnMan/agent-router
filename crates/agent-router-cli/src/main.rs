@@ -32,9 +32,6 @@ enum Command {
         /// Job name (defaults to the first 40 characters of the task).
         #[arg(long)]
         name: Option<String>,
-        /// Read-only work: skip the Codex execution-mode preamble.
-        #[arg(long)]
-        read_only: bool,
         /// Decide and log without dispatching.
         #[arg(long)]
         dry_run: bool,
@@ -123,10 +120,9 @@ fn run(cli: Cli) -> agent_router_core::Result<()> {
             provider,
             model,
             name,
-            read_only,
             dry_run,
             json,
-        } => route(task, dir, provider, model, name, read_only, dry_run, json),
+        } => route(task, dir, provider, model, name, dry_run, json),
         Command::Usage { json } => usage(json),
         Command::Log { limit, json } => log(limit, json),
         Command::Parity { .. } => unreachable!("parity has a command specific exit path"),
@@ -272,7 +268,6 @@ fn route(
     provider: String,
     model: Option<String>,
     name: Option<String>,
-    read_only: bool,
     dry_run: bool,
     json: bool,
 ) -> agent_router_core::Result<()> {
@@ -287,7 +282,6 @@ fn route(
         provider: agent_router_core::run::parse_provider(&provider)?,
         model,
         name,
-        read_only,
         dry_run,
     };
     let outcome = agent_router_core::run::run(&request, &config)?;
