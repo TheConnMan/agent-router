@@ -94,7 +94,11 @@ pub fn claude_headroom() -> Headroom {
         let _ = std::fs::write(cache, &body);
         return headroom;
     }
-    // The API is unreachable: a stale cache still beats pretending nothing is known.
+    // The API is unreachable: a stale cache still beats pretending nothing is known. A cached
+    // window whose reset has since passed is NOT zeroed here, deliberately: `usage.sh` reports
+    // the cached utilization as-is, and the two must not disagree about the same cache file.
+    // The Codex reader zeroes expired windows because its source is a rollout event that can be
+    // days old by design, which the 5-minute Claude cache is not.
     std::fs::read_to_string(cache)
         .ok()
         .as_deref()

@@ -40,7 +40,11 @@ pub struct Dispatch {
 pub struct Outcome {
     pub decision: Decision,
     pub dispatch: Option<Dispatch>,
-    pub log_id: i64,
+    /// None when the row could not be written. A job that is already running must still be
+    /// reported to the caller, so a logging failure downgrades to `log_error` rather than
+    /// swallowing the job identity behind an Err.
+    pub log_id: Option<i64>,
+    pub log_error: Option<String>,
 }
 
 /// IMPURE: run one task through the router.
@@ -70,7 +74,8 @@ pub fn run(request: &Request, config: &Config) -> Result<Outcome> {
         return Ok(Outcome {
             decision,
             dispatch: None,
-            log_id,
+            log_id: Some(log_id),
+            log_error: None,
         });
     }
 
@@ -85,7 +90,7 @@ pub fn run(request: &Request, config: &Config) -> Result<Outcome> {
         ),
         Err(e) => (None, None, format!("error: {e}")),
     };
-    let log_id = log.record(&Entry {
+    let recorded = log.record(&Entry {
         task: request.task,
         dir: request.dir,
         requested,
@@ -94,12 +99,20 @@ pub fn run(request: &Request, config: &Config) -> Result<Outcome> {
         job_id: job_id.as_deref(),
         job_name: job_name.as_deref(),
         outcome: &outcome,
-    })?;
+    });
+    // The dispatch decides the result, not the logging: once a job is running, returning Err
+    // because a row could not be written would hide the job identity from the caller, who would
+    // then reasonably retry and run the task twice.
     let dispatch = dispatched?;
+    let (log_id, log_error) = match recorded {
+        Ok(id) => (Some(id), None),
+        Err(e) => (None, Some(e.to_string())),
+    };
     Ok(Outcome {
         decision,
         dispatch: Some(dispatch),
         log_id,
+        log_error,
     })
 }
 

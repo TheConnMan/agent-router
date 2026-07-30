@@ -122,6 +122,7 @@ fn outcome_json(outcome: &Outcome) -> serde_json::Value {
         "dispatch": outcome.dispatch,
         "dry_run": outcome.dispatch.is_none(),
         "log_id": outcome.log_id,
+        "log_error": outcome.log_error,
         "watch": "agent-viewer",
     })
 }
@@ -144,7 +145,15 @@ fn print_outcome(outcome: &Outcome) {
     }
     println!("{line}");
     println!("why: {}", decision.rationale);
-    println!("log: row {} in {}", outcome.log_id, db_path());
+    match (outcome.log_id, &outcome.log_error) {
+        (Some(id), _) => println!("log: row {id} in {}", db_path()),
+        // The job is running regardless, so this is a warning on stderr, not a failure.
+        (None, error) => eprintln!(
+            "log: NOT RECORDED in {}: {}",
+            db_path(),
+            error.as_deref().unwrap_or("unknown error")
+        ),
+    }
     if outcome.dispatch.is_some() {
         println!("watch: agent-viewer");
     }

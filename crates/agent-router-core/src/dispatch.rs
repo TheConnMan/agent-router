@@ -17,8 +17,6 @@ pub const CODEX_PREAMBLE: &str = "Edit the files directly, right now, with your 
 /// this is the only way to get one, and missing it is not a failure: the job is running either
 /// way and its name still finds it.
 const CLAUDE_ID_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-/// How far back a matching claude job may have been created and still count as ours.
-const CLAUDE_ID_RECENCY_MS: i64 = 120_000;
 
 /// IMPURE: spawn the job the decision chose.
 pub fn dispatch(decision: &crate::decide::Decision, request: &Request) -> Result<Dispatch> {
@@ -47,8 +45,14 @@ pub fn dispatch(decision: &crate::decide::Decision, request: &Request) -> Result
         }
         BackendKind::Claude => {
             let mut backend = agent_viewer_core::claude::ClaudeBackend::new();
+            // Stamped BEFORE the spawn: the job we are about to create starts after this
+            // instant, so any job that already existed is excluded by construction. A fixed
+            // look-back window instead would hand back the earlier job's id whenever the same
+            // task ran twice in the same directory, since it is visible on the first poll and
+            // the new one is not.
+            let dispatched_at = agent_viewer_core::spawn::now_ms();
             backend.spawn(request.dir, request.task, decision.model.as_deref())?;
-            let job_id = resolve_claude_short_id(&mut backend, &name, request.dir);
+            let job_id = resolve_claude_short_id(&mut backend, &name, request.dir, dispatched_at);
             Ok(Dispatch {
                 job_id,
                 job_name: name,
@@ -81,8 +85,8 @@ fn resolve_claude_short_id(
     backend: &mut agent_viewer_core::claude::ClaudeBackend,
     name: &str,
     dir: &Path,
+    since: i64,
 ) -> Option<String> {
-    let since = agent_viewer_core::spawn::now_ms() - CLAUDE_ID_RECENCY_MS;
     let deadline = std::time::Instant::now() + CLAUDE_ID_TIMEOUT;
     loop {
         if let Ok(sessions) = backend.list()
@@ -97,9 +101,10 @@ fn resolve_claude_short_id(
     }
 }
 
-/// PURE: the short id of the newest claude job whose name and cwd match ours and which was
-/// created no earlier than `since_ms`. The recency bound is what keeps a previous job with the
-/// same first 40 characters of prompt from being reported as this dispatch.
+/// PURE: the short id of the newest claude job whose name and cwd match ours and which started
+/// no earlier than `since_ms` (the instant just before our own spawn). That bound is what keeps
+/// an earlier job with the same first 40 characters of prompt, in the same directory, from being
+/// reported as this dispatch.
 pub fn pick_claude_job(
     sessions: &[Session],
     name: &str,
@@ -189,13 +194,24 @@ mod tests {
     }
 
     #[test]
-    fn an_older_job_with_the_same_name_and_dir_is_not_ours() {
-        // The exact confusion the recency bound exists for: two dispatches of the same task in
-        // the same dir, where the first must not be reported as the second.
-        let sessions = vec![session("old", "do a thing", "/tmp", 1_000)];
+    fn a_job_that_started_before_our_dispatch_is_not_ours() {
+        // The exact confusion the bound exists for: the same task dispatched twice in the same
+        // directory. `since_ms` is stamped just before the second spawn, so the first job is
+        // excluded even though it matches on name, dir, and backend.
+        let dispatched_at = 5_000;
+        let sessions = vec![session("old", "do a thing", "/tmp", 4_999)];
         assert_eq!(
-            pick_claude_job(&sessions, "do a thing", Path::new("/tmp"), 5_000),
+            pick_claude_job(&sessions, "do a thing", Path::new("/tmp"), dispatched_at),
             None
+        );
+        // ... and the job that starts after it is.
+        let sessions = vec![
+            session("old", "do a thing", "/tmp", 4_999),
+            session("new", "do a thing", "/tmp", 5_001),
+        ];
+        assert_eq!(
+            pick_claude_job(&sessions, "do a thing", Path::new("/tmp"), dispatched_at),
+            Some("new".to_string())
         );
     }
 
