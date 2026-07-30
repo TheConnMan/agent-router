@@ -74,9 +74,7 @@ pub fn run(request: &Request, config: &Config) -> Result<Outcome> {
         });
     }
 
-    let dispatched: Result<Dispatch> = Err(Error::Command(
-        "dispatch is not wired yet; use --dry-run".to_string(),
-    ));
+    let dispatched = crate::dispatch::dispatch(&decision, request);
     // The decision is logged either way: a dispatch that failed is exactly the row worth
     // keeping, and losing it would hide the failure from the tuning data.
     let (job_id, job_name, outcome) = match &dispatched {

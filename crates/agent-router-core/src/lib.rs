@@ -4,6 +4,7 @@
 pub mod classify;
 pub mod config;
 pub mod decide;
+pub mod dispatch;
 pub mod error;
 pub mod log;
 pub mod run;
