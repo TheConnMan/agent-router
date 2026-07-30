@@ -150,8 +150,8 @@ fn run_json_preserves_provider_decision_and_dispatched_job_identity() {
 
     assert_eq!(value["provider"], "claude");
     assert_eq!(value["model"], "opus[1m]");
-    // An explicit provider is unscored, so it runs at the standard complexity tier.
-    assert_eq!(value["effort"], "high");
+    // The router forces no effort: each model runs at its own default.
+    assert_eq!(value["effort"], Value::Null);
     assert_eq!(value["gates"], json!(["explicit_provider"]));
     assert_eq!(value["classification"], Value::Null);
     assert!(value["usage"]["claude"].is_object());
@@ -179,8 +179,6 @@ fn run_json_preserves_provider_decision_and_dispatched_job_identity() {
             "--bg",
             "--model",
             "opus[1m]",
-            "--effort",
-            "high",
             "--name",
             &fixture.name,
             &fixture.task

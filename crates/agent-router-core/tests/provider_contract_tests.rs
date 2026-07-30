@@ -457,8 +457,10 @@ fn codex_decision_effort_reaches_turn_start_at_the_dispatch_boundary() {
         UsageSnapshot::full(),
         &agent_router_core::Config::default(),
     );
-    // An explicit provider is unscored, so it runs at the standard tier.
-    assert_eq!(decision.effort.as_deref(), Some("medium"));
+    // An explicit provider is unscored, so it runs at the high tier, and the router forces no
+    // reasoning effort at all.
+    assert_eq!(decision.model.as_deref(), Some("gpt-5.6-sol"));
+    assert_eq!(decision.effort, None);
     let request = Request {
         task: "exercise the real dispatch seam",
         dir: &root.path,
@@ -477,8 +479,11 @@ fn codex_decision_effort_reaches_turn_start_at_the_dispatch_boundary() {
     assert_eq!(requests[0]["method"], "initialize");
     assert_eq!(requests[1]["method"], "thread/start");
     assert_eq!(requests[2]["method"], "turn/start");
-    assert_eq!(requests[2]["params"]["effort"], "medium");
-    assert_eq!(requests[1]["params"]["model"], "gpt-5.6-terra");
+    assert!(
+        requests[2]["params"].get("effort").is_none(),
+        "the router must leave the model's own default effort in place"
+    );
+    assert_eq!(requests[1]["params"]["model"], "gpt-5.6-sol");
 }
 
 #[derive(Debug)]

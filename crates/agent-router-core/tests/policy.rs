@@ -34,7 +34,7 @@ fn scored(
         missing_connector,
         verdict,
         confidence,
-        complexity: Complexity::Standard,
+        complexity: Complexity::High,
         rationale: "fixture".to_string(),
         classifier_failed: false,
     }
@@ -57,7 +57,6 @@ fn written_defaults_round_trip_with_codex_policy() {
     assert_eq!(created.policy.default_provider, DefaultProvider::Codex);
     assert!(created.policy.weekly_routing);
     assert!(!created.policy.usage_failover_changes_model);
-    assert!(!created.policy.usage_failover_changes_effort);
     assert!(created.parity.roots.is_empty());
     assert!(created.parity.exceptions.is_empty());
     assert_eq!(
@@ -67,10 +66,6 @@ fn written_defaults_round_trip_with_codex_policy() {
     assert_eq!(document["policy"]["weekly_routing"].as_bool(), Some(true));
     assert_eq!(
         document["policy"]["usage_failover_changes_model"].as_bool(),
-        Some(false)
-    );
-    assert_eq!(
-        document["policy"]["usage_failover_changes_effort"].as_bool(),
         Some(false)
     );
     assert_eq!(
@@ -95,7 +90,6 @@ default_provider = "claude"
     assert_eq!(config.policy.default_provider, DefaultProvider::Claude);
     assert!(config.policy.weekly_routing);
     assert!(!config.policy.usage_failover_changes_model);
-    assert!(!config.policy.usage_failover_changes_effort);
     assert_eq!(config.connectors, Config::default().connectors);
     assert_eq!(config.hard_ceiling_pct, Config::default().hard_ceiling_pct);
 }
@@ -197,7 +191,7 @@ fn configured_claude_default_controls_a_failed_classifier_decision() {
 
     assert_eq!(decision.provider, Provider::Claude);
     assert_eq!(decision.model.as_deref(), Some("opus[1m]"));
-    assert_eq!(decision.effort.as_deref(), Some("high"));
+    assert_eq!(decision.effort, None);
     assert_eq!(decision.gates, vec![Gate::ClassifierFailed]);
 }
 
@@ -234,8 +228,8 @@ fn failed_classifier_remains_eligible_for_weekly_routing() {
     );
 
     assert_eq!(decision.provider, Provider::Claude);
-    assert_eq!(decision.model.as_deref(), Some("gpt-5.6-terra"));
-    assert_eq!(decision.effort.as_deref(), Some("medium"));
+    assert_eq!(decision.model.as_deref(), Some("gpt-5.6-sol"));
+    assert_eq!(decision.effort, None);
     assert_eq!(
         decision.gates,
         vec![
@@ -257,7 +251,7 @@ fn capability_pins_force_claude_and_skip_weekly_routing() {
     assert_eq!(missing_connector.provider, Provider::Claude);
     assert_eq!(missing_connector.gates, vec![Gate::MissingConnector]);
     assert_eq!(missing_connector.model.as_deref(), Some("opus[1m]"));
-    assert_eq!(missing_connector.effort.as_deref(), Some("high"));
+    assert_eq!(missing_connector.effort, None);
 
     let claude_signals = decide(
         scored(Verdict::Codex, Confidence::High, 2, false),
@@ -267,7 +261,7 @@ fn capability_pins_force_claude_and_skip_weekly_routing() {
     assert_eq!(claude_signals.provider, Provider::Claude);
     assert_eq!(claude_signals.gates, vec![Gate::ClaudeSignals]);
     assert_eq!(claude_signals.model.as_deref(), Some("opus[1m]"));
-    assert_eq!(claude_signals.effort.as_deref(), Some("high"));
+    assert_eq!(claude_signals.effort, None);
 }
 
 #[test]
@@ -282,8 +276,8 @@ fn disabled_weekly_routing_blocks_both_flip_directions() {
     );
     assert_eq!(codex.provider, Provider::Codex);
     assert_eq!(codex.gates, vec![Gate::WeeklyRoutingDisabled]);
-    assert_eq!(codex.model.as_deref(), Some("gpt-5.6-terra"));
-    assert_eq!(codex.effort.as_deref(), Some("medium"));
+    assert_eq!(codex.model.as_deref(), Some("gpt-5.6-sol"));
+    assert_eq!(codex.effort, None);
 
     let claude = decide(
         scored(Verdict::Claude, Confidence::High, 0, false),
@@ -293,7 +287,7 @@ fn disabled_weekly_routing_blocks_both_flip_directions() {
     assert_eq!(claude.provider, Provider::Claude);
     assert_eq!(claude.gates, vec![Gate::WeeklyRoutingDisabled]);
     assert_eq!(claude.model.as_deref(), Some("opus[1m]"));
-    assert_eq!(claude.effort.as_deref(), Some("high"));
+    assert_eq!(claude.effort, None);
 }
 
 #[test]
@@ -306,8 +300,8 @@ fn weekly_failover_pins_both_outputs_in_both_directions_by_default() {
         &config,
     );
     assert_eq!(to_claude.provider, Provider::Claude);
-    assert_eq!(to_claude.model.as_deref(), Some("gpt-5.6-terra"));
-    assert_eq!(to_claude.effort.as_deref(), Some("medium"));
+    assert_eq!(to_claude.model.as_deref(), Some("gpt-5.6-sol"));
+    assert_eq!(to_claude.effort, None);
     assert_eq!(
         to_claude.gates,
         vec![Gate::FlippedOnExhaustion, Gate::UsageFailoverPinned]
@@ -320,58 +314,39 @@ fn weekly_failover_pins_both_outputs_in_both_directions_by_default() {
     );
     assert_eq!(to_codex.provider, Provider::Codex);
     assert_eq!(to_codex.model.as_deref(), Some("opus[1m]"));
-    assert_eq!(to_codex.effort.as_deref(), Some("high"));
+    assert_eq!(to_codex.effort, None);
     assert_eq!(
         to_codex.gates,
         vec![Gate::FlippedOnExhaustion, Gate::UsageFailoverPinned]
     );
 }
 
+/// The model is the only thing a usage failover can move, so the flag decides between the new
+/// provider's tier and the pinned prior one, and the pinned gate reports exactly that.
 #[test]
-fn model_and_effort_failover_flags_are_independent() {
+fn the_model_failover_flag_decides_which_providers_tier_survives_a_flip() {
     struct Case {
         model_changes: bool,
-        effort_changes: bool,
         expected_model: Option<&'static str>,
-        expected_effort: Option<&'static str>,
-        pinned: bool,
+        expected_gates: Vec<Gate>,
     }
 
     let cases = [
         Case {
             model_changes: false,
-            effort_changes: false,
-            expected_model: Some("gpt-5.6-terra"),
-            expected_effort: Some("medium"),
-            pinned: true,
+            expected_model: Some("gpt-5.6-sol"),
+            expected_gates: vec![Gate::FlippedOnExhaustion, Gate::UsageFailoverPinned],
         },
         Case {
             model_changes: true,
-            effort_changes: false,
             expected_model: Some("opus[1m]"),
-            expected_effort: Some("medium"),
-            pinned: true,
-        },
-        Case {
-            model_changes: false,
-            effort_changes: true,
-            expected_model: Some("gpt-5.6-terra"),
-            expected_effort: Some("high"),
-            pinned: true,
-        },
-        Case {
-            model_changes: true,
-            effort_changes: true,
-            expected_model: Some("opus[1m]"),
-            expected_effort: Some("high"),
-            pinned: false,
+            expected_gates: vec![Gate::FlippedOnExhaustion],
         },
     ];
 
     for case in cases {
         let mut config = Config::default();
         config.policy.usage_failover_changes_model = case.model_changes;
-        config.policy.usage_failover_changes_effort = case.effort_changes;
 
         let decision = decide(
             scored(Verdict::Codex, Confidence::High, 0, false),
@@ -381,15 +356,8 @@ fn model_and_effort_failover_flags_are_independent() {
 
         assert_eq!(decision.provider, Provider::Claude);
         assert_eq!(decision.model.as_deref(), case.expected_model);
-        assert_eq!(decision.effort.as_deref(), case.expected_effort);
-        assert_eq!(
-            decision.gates,
-            if case.pinned {
-                vec![Gate::FlippedOnExhaustion, Gate::UsageFailoverPinned]
-            } else {
-                vec![Gate::FlippedOnExhaustion]
-            }
-        );
+        assert_eq!(decision.effort, None);
+        assert_eq!(decision.gates, case.expected_gates);
     }
 }
 
@@ -418,8 +386,8 @@ fn explicit_provider_decisions_remain_outside_policy_routing() {
     let config = Config::default();
     let codex = decide_explicit(Provider::Codex, None, snapshot, &config);
     assert_eq!(codex.provider, Provider::Codex);
-    assert_eq!(codex.model.as_deref(), Some("gpt-5.6-terra"));
-    assert_eq!(codex.effort.as_deref(), Some("medium"));
+    assert_eq!(codex.model.as_deref(), Some("gpt-5.6-sol"));
+    assert_eq!(codex.effort, None);
     assert_eq!(codex.gates, vec![Gate::ExplicitProvider]);
     assert!(codex.classification.is_none());
 
@@ -431,7 +399,7 @@ fn explicit_provider_decisions_remain_outside_policy_routing() {
     );
     assert_eq!(claude.provider, Provider::Claude);
     assert_eq!(claude.model.as_deref(), Some("sonnet"));
-    assert_eq!(claude.effort.as_deref(), Some("high"));
+    assert_eq!(claude.effort, None);
     assert_eq!(claude.gates, vec![Gate::ExplicitProvider]);
     assert!(claude.classification.is_none());
 
