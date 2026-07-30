@@ -25,7 +25,6 @@ pub enum DefaultProvider {
 pub struct Policy {
     pub default_provider: DefaultProvider,
     pub weekly_routing: bool,
-    pub usage_failover_changes_model: bool,
 }
 
 impl Default for Policy {
@@ -33,7 +32,6 @@ impl Default for Policy {
         Policy {
             default_provider: DefaultProvider::Codex,
             weekly_routing: true,
-            usage_failover_changes_model: false,
         }
     }
 }
