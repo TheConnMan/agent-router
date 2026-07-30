@@ -22,8 +22,6 @@ pub struct Request<'a> {
     pub model: Option<String>,
     /// The job name. None derives it from the task.
     pub name: Option<String>,
-    /// Read-only work: the Codex execution-mode preamble is skipped.
-    pub read_only: bool,
     /// Decide and log without dispatching.
     pub dry_run: bool,
 }

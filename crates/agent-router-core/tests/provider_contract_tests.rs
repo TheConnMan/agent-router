@@ -516,7 +516,6 @@ fn codex_decision_effort_reaches_turn_start_at_the_dispatch_boundary() {
         provider: Some(Provider::Codex),
         model: None,
         name: None,
-        read_only: true,
         dry_run: false,
     };
 
@@ -534,6 +533,12 @@ fn codex_decision_effort_reaches_turn_start_at_the_dispatch_boundary() {
         "the router must leave the model's own default effort in place"
     );
     assert_eq!(requests[1]["params"]["model"], "gpt-5.6-sol");
+    // The task reaches Codex verbatim. The router prepends nothing: an execution-mode preamble
+    // here fought the repo's own AGENTS.md and showed up as boilerplate on every routed session.
+    assert_eq!(
+        requests[2]["params"]["input"][0]["text"],
+        "exercise the real dispatch seam"
+    );
 }
 
 #[derive(Debug)]
