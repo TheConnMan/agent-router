@@ -126,6 +126,13 @@ Scoring is one small strict JSON answer, so either engine can do it. The choice 
 weekly budget the per task classifier call is drawn from. If Claude weekly budget is the scarce
 resource, set this to `"codex"`.
 
+Two consequences of `"codex"` worth knowing. Scoring runs with every tool disabled, so it cannot
+read a file even though the sandbox is read only. And it writes a session rollout per scored task
+rather than running ephemeral, deliberately: `codex_headroom` reads the newest rollout carrying a
+`rate_limits` event, so an ephemeral classifier would spend Codex quota invisibly and leave the
+router deciding against a frozen percentage. The cost is one session file per automatically routed
+task.
+
 ### `claude_model` and `codex_model`
 
 Defaults `"haiku"` and `"gpt-5.6-luna"`. The model each engine scores with. Both are kept

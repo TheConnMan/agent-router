@@ -20,11 +20,13 @@ log: row 87 in /home/you/.local/state/agent-router/router.db
 1. **Classify.** One small model call scores the task against a fixed twelve criterion rubric and
    returns strict JSON: six "Codex ready" criteria, six "Claude signal" criteria, a verdict, a
    confidence, and a complexity tier. The call is deliberately hermetic. On the Claude engine it
-   runs with `--safe-mode` and `--strict-mcp-config`; on the Codex engine with `--ephemeral`,
+   runs with `--safe-mode` and `--strict-mcp-config`; on the Codex engine with
    `--ignore-user-config`, `--ignore-rules`, and `project_doc_max_bytes=0`. Either way no project
-   `CLAUDE.md`, `AGENTS.md`, skill, plugin, hook, or MCP server can shift the score. If the call
-   fails or times out, the configured default provider stays in force and the decision is tagged
-   `classifier_failed`.
+   `CLAUDE.md`, `AGENTS.md`, skill, plugin, hook, or MCP server can shift the score. The Codex
+   engine additionally runs with its shell, browser, computer use, image, app, and skill search
+   tools disabled: scoring needs no tool, and a task carrying an injected instruction must have
+   nothing to reach for. If the call fails or times out, the configured default provider stays in
+   force and the decision is tagged `classifier_failed`.
 2. **Apply hard gates.** A missing connector or two or more Claude signals pins the task to Claude
    regardless of usage. These are capability decisions, so headroom never overrides them.
 3. **Modulate on weekly headroom.** A confident verdict is flipped only when its provider is at or
