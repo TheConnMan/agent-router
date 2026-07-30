@@ -1,8 +1,8 @@
-//! The classifier: one Claude Haiku call that scores a task against the routing rubric and
-//! returns strict JSON. Every failure retains the configured default and stays eligible for
-//! weekly routing.
+//! The classifier: one small-model call that scores a task against the routing rubric and
+//! returns strict JSON. Which engine and model make that call is configured; every failure
+//! retains the configured default and stays eligible for weekly routing.
 
-use crate::config::{Config, DefaultProvider};
+use crate::config::{Classifier, ClassifierEngine, Config, DefaultProvider};
 use crate::provider::Provider;
 use crate::runtime::home_dir;
 use std::io::Read;
@@ -110,13 +110,15 @@ impl Classification {
     }
 }
 
-/// IMPURE: score `task` with Claude Haiku. Never fails: an unusable answer becomes the fallback.
+/// IMPURE: score `task` with the configured classifier engine. Never fails: an unusable answer
+/// becomes the fallback.
 pub fn classify(task: &str, config: &Config) -> Classification {
     let prompt = classifier_prompt(task, &config.connectors);
     let timeout = Duration::from_secs(config.classifier_timeout_secs);
-    let cmd = classifier_command(&prompt);
-    match capture(cmd, timeout) {
-        Ok(stdout) => match parse_classifier_output(&stdout) {
+    let engine = config.classifier.engine;
+    let cmd = classifier_command(&prompt, &config.classifier);
+    match capture(cmd, engine.name(), timeout) {
+        Ok(stdout) => match parse_classifier_output(&stdout, engine) {
             Some(classification) => classification,
             None => Classification::fallback("unparseable json", config.policy.default_provider),
         },
@@ -124,8 +126,16 @@ pub fn classify(task: &str, config: &Config) -> Classification {
     }
 }
 
-/// PURE builder: the classifier invocation. Every flag here is about the CLI's own startup cost,
-/// which dominated this call and is the whole reason the 30s timeout is viable.
+/// PURE builder: the classifier invocation for the configured engine.
+pub fn classifier_command(prompt: &str, classifier: &Classifier) -> Command {
+    match classifier.engine {
+        ClassifierEngine::Claude => claude_classifier_command(prompt, &classifier.claude_model),
+        ClassifierEngine::Codex => codex_classifier_command(prompt, &classifier.codex_model),
+    }
+}
+
+/// PURE builder: the claude classifier invocation. Every flag here is about the CLI's own startup
+/// cost, which dominated this call and is the whole reason the 30s timeout is viable.
 ///
 /// Measured on this box 2026-07-30: plain `claude -p --model haiku --output-format json` spent
 /// ~14s before it even issued the API request (hooks, plugin sync, auto-memory, CLAUDE.md
@@ -138,24 +148,59 @@ pub fn classify(task: &str, config: &Config) -> Classification {
 ///
 /// `--safe-mode` also makes the scoring hermetic, which matters independently of speed: the
 /// verdict must not shift because a project's CLAUDE.md or a skill happened to load.
-pub fn classifier_command(prompt: &str) -> Command {
+pub fn claude_classifier_command(prompt: &str, model: &str) -> Command {
     let mut cmd = Command::new("claude");
     cmd.env("CLAUDE_SUBPROCESS", "1")
         .arg("-p")
         .arg("--model")
-        .arg("haiku")
+        .arg(model)
         .arg("--output-format")
         .arg("json")
         .arg("--no-session-persistence")
         .arg("--safe-mode")
         .arg("--strict-mcp-config")
         .arg(prompt);
-    // Run from home, never the task dir: nothing about the task's own project should be loaded.
+    run_from_home(&mut cmd);
+    cmd
+}
+
+/// PURE builder: the codex classifier invocation. Same posture as the claude one, expressed in
+/// codex's own flags: every customization off, so the score depends on the rubric and the task
+/// and on nothing else this box happens to have configured.
+///
+/// Measured on this box 2026-07-30, scoring the fixed prompt from home: 4-8s wall against
+/// claude haiku's 12-16s, so it clears the same 30s deadline with room to spare.
+/// `--ignore-user-config` is the load-bearing one (it drops `~/.codex/config.toml` and with it
+/// every MCP server, which was ~3.7k of prompt and most of the wall time); `--ephemeral` keeps
+/// scoring out of the session history, `--ignore-rules` drops execpolicy, `-c
+/// project_doc_max_bytes=0` suppresses AGENTS.md discovery, and `--skip-git-repo-check` is
+/// required because home is not a repository. The sandbox is read-only: scoring reads a prompt
+/// and answers, and must never be able to touch the box.
+pub fn codex_classifier_command(prompt: &str, model: &str) -> Command {
+    let mut cmd = Command::new("codex");
+    cmd.arg("exec")
+        .arg("--model")
+        .arg(model)
+        .arg("--json")
+        .arg("--sandbox")
+        .arg("read-only")
+        .arg("--skip-git-repo-check")
+        .arg("--ephemeral")
+        .arg("--ignore-user-config")
+        .arg("--ignore-rules")
+        .arg("-c")
+        .arg("project_doc_max_bytes=0")
+        .arg(prompt);
+    run_from_home(&mut cmd);
+    cmd
+}
+
+/// Run from home, never the task dir: nothing about the task's own project should be loaded.
+fn run_from_home(cmd: &mut Command) {
     let home = home_dir();
     if home.is_dir() {
         cmd.current_dir(&home);
     }
-    cmd
 }
 
 /// PURE: the classifier prompt. The rubric is verbatim from the routing plan; the connector
@@ -192,13 +237,40 @@ codex_ready and claude_signals are exactly six booleans each, in the order liste
     )
 }
 
-/// PURE: the classification out of `claude -p --output-format json` stdout. The envelope's
-/// `result` field carries the model's text, which is then parsed as the classification. None
-/// when either layer is unusable.
-pub fn parse_classifier_output(stdout: &str) -> Option<Classification> {
+/// PURE: the classification out of `engine`'s stdout. Each engine wraps the model's text in its
+/// own envelope, so unwrapping is per engine and the classification parse below is shared.
+pub fn parse_classifier_output(stdout: &str, engine: ClassifierEngine) -> Option<Classification> {
+    let text = match engine {
+        ClassifierEngine::Claude => claude_answer(stdout)?,
+        ClassifierEngine::Codex => codex_answer(stdout)?,
+    };
+    parse_classification(&text)
+}
+
+/// PURE: the model's text out of `claude -p --output-format json` stdout, which is one JSON
+/// envelope whose `result` field carries the answer.
+fn claude_answer(stdout: &str) -> Option<String> {
     let envelope: serde_json::Value = serde_json::from_str(stdout.trim()).ok()?;
-    let result = envelope.get("result")?.as_str()?;
-    parse_classification(result)
+    Some(envelope.get("result")?.as_str()?.to_string())
+}
+
+/// PURE: the model's text out of `codex exec --json` stdout, which is JSONL: thread and turn
+/// events interleaved with items. The answer is the last completed `agent_message`, taken from
+/// the end so a preamble message cannot be mistaken for the verdict. Anything unparseable or of
+/// another shape is skipped rather than failing, because the stream carries non-item lines by
+/// design and a failed turn simply never emits an agent message.
+fn codex_answer(stdout: &str) -> Option<String> {
+    stdout.lines().rev().find_map(|line| {
+        let event: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+        if event.get("type")?.as_str()? != "item.completed" {
+            return None;
+        }
+        let item = event.get("item")?;
+        if item.get("type")?.as_str()? != "agent_message" {
+            return None;
+        }
+        Some(item.get("text")?.as_str()?.to_string())
+    })
 }
 
 /// PURE: the classification out of the model's own text, tolerating a code fence or a sentence
@@ -217,15 +289,23 @@ pub fn parse_classification(text: &str) -> Option<Classification> {
 
 /// IMPURE: run `cmd` to completion within `timeout`, returning stdout. The failure is a
 /// sentence naming what went wrong, since it lands in the fallback's rationale and in the
-/// decision log.
-fn capture(mut cmd: Command, timeout: Duration) -> std::result::Result<String, String> {
+/// decision log. `engine` names the CLI in those messages, so a fallback says which classifier
+/// failed rather than always blaming claude.
+fn capture(
+    mut cmd: Command,
+    engine: &str,
+    timeout: Duration,
+) -> std::result::Result<String, String> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     let mut child = cmd
         .spawn()
-        .map_err(|e| format!("could not run claude: {e}"))?;
-    let mut stdout = child.stdout.take().ok_or("claude gave no stdout pipe")?;
+        .map_err(|e| format!("could not run {engine}: {e}"))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("{engine} gave no stdout pipe"))?;
     // A reader thread, not a read after wait: a classifier answer larger than the pipe buffer
     // would otherwise block the child forever and read as a timeout.
     let (tx, rx) = std::sync::mpsc::channel();
@@ -242,9 +322,9 @@ fn capture(mut cmd: Command, timeout: Duration) -> std::result::Result<String, S
                     .recv_timeout(Duration::from_secs(2))
                     .ok()
                     .flatten()
-                    .ok_or_else(|| "claude stdout was unreadable".to_string());
+                    .ok_or_else(|| format!("{engine} stdout was unreadable"));
             }
-            Ok(Some(status)) => return Err(format!("claude exited {status}")),
+            Ok(Some(status)) => return Err(format!("{engine} exited {status}")),
             Ok(None) => {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
@@ -253,7 +333,7 @@ fn capture(mut cmd: Command, timeout: Duration) -> std::result::Result<String, S
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Err(e) => return Err(format!("could not wait for claude: {e}")),
+            Err(e) => return Err(format!("could not wait for {engine}: {e}")),
         }
     }
 }
@@ -275,6 +355,33 @@ mod tests {
         .to_string()
     }
 
+    fn parse_claude(stdout: &str) -> Option<Classification> {
+        parse_classifier_output(stdout, ClassifierEngine::Claude)
+    }
+
+    /// The live JSONL shape of `codex exec --json`: thread and turn events around the items,
+    /// with the answer carried by a completed `agent_message`.
+    fn stream(answer: &str) -> String {
+        [
+            serde_json::json!({"type": "thread.started", "thread_id": "019fb3ab-8d2a-7d21"}),
+            serde_json::json!({"type": "turn.started"}),
+            serde_json::json!({
+                "type": "item.completed",
+                "item": {"id": "item_0", "type": "agent_message", "text": answer},
+            }),
+            serde_json::json!({
+                "type": "turn.completed",
+                "usage": {"input_tokens": 17512, "output_tokens": 132},
+            }),
+        ]
+        .map(|event| event.to_string())
+        .join("\n")
+    }
+
+    fn parse_codex(stdout: &str) -> Option<Classification> {
+        parse_classifier_output(stdout, ClassifierEngine::Codex)
+    }
+
     const GOOD: &str = r#"{"codex_ready":[true,true,true,true,true,true],
         "claude_signals":[false,false,false,false,false,false],
         "missing_connector":false,"verdict":"codex","confidence":"high",
@@ -282,7 +389,7 @@ mod tests {
 
     #[test]
     fn a_well_formed_answer_parses_out_of_the_cli_envelope() {
-        let got = parse_classifier_output(&envelope(GOOD)).expect("parses");
+        let got = parse_claude(&envelope(GOOD)).expect("parses");
         assert_eq!(got.verdict, Verdict::Codex);
         assert_eq!(got.confidence, Confidence::High);
         assert_eq!(got.codex_ready_count(), 6);
@@ -294,7 +401,7 @@ mod tests {
     #[test]
     fn a_fenced_or_prefaced_answer_still_parses() {
         let fenced = format!("Here is the scoring:\n```json\n{GOOD}\n```\n");
-        let got = parse_classifier_output(&envelope(&fenced)).expect("parses");
+        let got = parse_claude(&envelope(&fenced)).expect("parses");
         assert_eq!(got.verdict, Verdict::Codex);
     }
 
@@ -304,7 +411,7 @@ mod tests {
             "claude_signals":[true,false,true,false,true,false],
             "missing_connector":true,"verdict":"claude","confidence":"medium",
             "rationale":"needs n8n"}"#;
-        let got = parse_classifier_output(&envelope(text)).expect("parses");
+        let got = parse_claude(&envelope(text)).expect("parses");
         assert_eq!(got.claude_signals, [true, false, true, false, true, false]);
         assert_eq!(got.codex_ready, [true, false, false, true, false, false]);
         assert_eq!(got.claude_signal_count(), 3);
@@ -316,16 +423,16 @@ mod tests {
     fn unusable_answers_are_none_so_the_caller_falls_back() {
         // Prose with no object, an object missing required fields, a bogus enum value, and an
         // envelope with no result field at all.
-        assert!(parse_classifier_output(&envelope("I cannot score this task.")).is_none());
-        assert!(parse_classifier_output(&envelope(r#"{"verdict":"codex"}"#)).is_none());
+        assert!(parse_claude(&envelope("I cannot score this task.")).is_none());
+        assert!(parse_claude(&envelope(r#"{"verdict":"codex"}"#)).is_none());
         assert!(
-            parse_classifier_output(&envelope(
+            parse_claude(&envelope(
                 &GOOD.replace("\"confidence\":\"high\"", "\"confidence\":\"certain\"")
             ))
             .is_none()
         );
-        assert!(parse_classifier_output(r#"{"type":"result","is_error":true}"#).is_none());
-        assert!(parse_classifier_output("not json at all").is_none());
+        assert!(parse_claude(r#"{"type":"result","is_error":true}"#).is_none());
+        assert!(parse_claude("not json at all").is_none());
     }
 
     /// Complexity is what picks the model, so each value must survive the parse, and an answer
@@ -342,26 +449,26 @@ mod tests {
                 "\"missing_connector\":false",
                 &format!("\"missing_connector\":false,\"complexity\":\"{answer}\""),
             );
-            let got = parse_classifier_output(&envelope(&text)).expect("parses");
+            let got = parse_claude(&envelope(&text)).expect("parses");
             assert_eq!(got.complexity, want);
             assert_eq!(got.verdict, Verdict::Codex, "complexity is not the verdict");
         }
 
         assert!(!GOOD.contains("complexity"), "the fixture omits the field");
-        let omitted = parse_classifier_output(&envelope(GOOD)).expect("parses");
+        let omitted = parse_claude(&envelope(GOOD)).expect("parses");
         assert_eq!(omitted.complexity, Complexity::High);
 
         let bogus = GOOD.replace(
             "\"missing_connector\":false",
             "\"missing_connector\":false,\"complexity\":\"epic\"",
         );
-        assert!(parse_classifier_output(&envelope(&bogus)).is_none());
+        assert!(parse_claude(&envelope(&bogus)).is_none());
     }
 
     #[test]
     fn an_array_of_the_wrong_length_is_rejected_rather_than_padded() {
         let short = GOOD.replace("[true,true,true,true,true,true]", "[true,true,true]");
-        assert!(parse_classifier_output(&envelope(&short)).is_none());
+        assert!(parse_claude(&envelope(&short)).is_none());
     }
 
     #[test]
@@ -370,7 +477,7 @@ mod tests {
             "\"missing_connector\":false",
             "\"missing_connector\":false,\"classifier_failed\":true",
         );
-        let got = parse_classifier_output(&envelope(&text)).expect("parses");
+        let got = parse_claude(&envelope(&text)).expect("parses");
         assert!(
             !got.classifier_failed,
             "only the fallback constructor may flag a classifier failure"
@@ -422,17 +529,20 @@ mod tests {
         assert!(prompt.contains("complexity is \"low\", \"medium\", \"high\", or \"ultra\""));
     }
 
+    fn args_of(cmd: &Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
     /// The startup-stripping flags are the reason the classifier fits its timeout at all, so they
     /// are pinned: losing one silently doubles the call and every task starts falling back to
     /// claude with `classifier_failed`.
     #[test]
-    fn the_classifier_invocation_pins_the_startup_stripping_flags() {
-        let cmd = classifier_command("score this");
+    fn the_claude_invocation_pins_the_startup_stripping_flags() {
+        let cmd = claude_classifier_command("score this", "haiku");
         assert_eq!(cmd.get_program(), std::ffi::OsStr::new("claude"));
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
+        let args = args_of(&cmd);
         for flag in [
             "-p",
             "--output-format",
@@ -457,12 +567,133 @@ mod tests {
         assert_eq!(subprocess.as_deref(), Some("1"));
     }
 
+    /// Same contract on the codex side: these flags are what make the call fast and hermetic, and
+    /// the read-only sandbox is what keeps a scoring call from touching the box.
+    #[test]
+    fn the_codex_invocation_pins_its_hermetic_flags_and_a_read_only_sandbox() {
+        let cmd = codex_classifier_command("score this", "gpt-5.6-luna");
+        assert_eq!(cmd.get_program(), std::ffi::OsStr::new("codex"));
+        let args = args_of(&cmd);
+        assert_eq!(args.first().map(String::as_str), Some("exec"));
+        for flag in [
+            "--json",
+            "--skip-git-repo-check",
+            "--ephemeral",
+            "--ignore-user-config",
+            "--ignore-rules",
+        ] {
+            assert!(args.contains(&flag.to_string()), "{flag} must be passed");
+        }
+        let sandbox = args.iter().position(|a| a == "--sandbox").expect("sandbox");
+        assert_eq!(args[sandbox + 1], "read-only");
+        let config = args.iter().position(|a| a == "-c").expect("-c");
+        assert_eq!(args[config + 1], "project_doc_max_bytes=0");
+        let model = args.iter().position(|a| a == "--model").expect("--model");
+        assert_eq!(args[model + 1], "gpt-5.6-luna");
+        assert_eq!(args.last().map(String::as_str), Some("score this"));
+    }
+
+    /// The engine setting is what picks the CLI, and each engine takes its own configured model
+    /// rather than the other's.
+    #[test]
+    fn the_engine_setting_picks_the_cli_and_that_engines_model() {
+        let mut classifier = Classifier {
+            engine: ClassifierEngine::Claude,
+            claude_model: "haiku".to_string(),
+            codex_model: "gpt-5.6-luna".to_string(),
+        };
+
+        let on_claude = classifier_command("score this", &classifier);
+        assert_eq!(on_claude.get_program(), std::ffi::OsStr::new("claude"));
+        assert!(args_of(&on_claude).contains(&"haiku".to_string()));
+        assert!(!args_of(&on_claude).contains(&"gpt-5.6-luna".to_string()));
+
+        classifier.engine = ClassifierEngine::Codex;
+        let on_codex = classifier_command("score this", &classifier);
+        assert_eq!(on_codex.get_program(), std::ffi::OsStr::new("codex"));
+        assert!(args_of(&on_codex).contains(&"gpt-5.6-luna".to_string()));
+        assert!(!args_of(&on_codex).contains(&"haiku".to_string()));
+
+        // A retuned model reaches the invocation; nothing pins the catalogue names in code.
+        classifier.codex_model = "gpt-5.6-terra".to_string();
+        let retuned = classifier_command("score this", &classifier);
+        assert!(args_of(&retuned).contains(&"gpt-5.6-terra".to_string()));
+    }
+
+    /// The codex envelope is JSONL rather than one object, so the answer is dug out of the event
+    /// stream. The same rubric answer must classify identically on either engine: the engine is
+    /// who scores, never what the score means.
+    #[test]
+    fn a_codex_answer_parses_out_of_the_jsonl_event_stream() {
+        let got = parse_codex(&stream(GOOD)).expect("parses");
+        assert_eq!(got, parse_claude(&envelope(GOOD)).expect("parses"));
+        assert_eq!(got.verdict, Verdict::Codex);
+        assert_eq!(got.confidence, Confidence::High);
+        assert!(!got.classifier_failed);
+
+        let fenced = format!("Here is the scoring:\n```json\n{GOOD}\n```\n");
+        assert_eq!(
+            parse_codex(&stream(&fenced)).expect("parses").verdict,
+            Verdict::Codex
+        );
+    }
+
+    /// A turn can emit several messages; the verdict is the last one, not a preamble.
+    #[test]
+    fn the_last_codex_agent_message_is_the_answer() {
+        let preamble = serde_json::json!({
+            "type": "item.completed",
+            "item": {"id": "item_0", "type": "agent_message", "text": "Scoring the task now."},
+        })
+        .to_string();
+        let stdout = format!("{preamble}\n{}", stream(GOOD));
+        assert_eq!(
+            parse_codex(&stdout).expect("parses").verdict,
+            Verdict::Codex
+        );
+    }
+
+    /// Reasoning and command items ride the same stream, and a failed turn emits no agent message
+    /// at all. None of those may be read as a verdict.
+    #[test]
+    fn codex_streams_without_a_usable_agent_message_are_none_so_the_caller_falls_back() {
+        // A turn that failed outright.
+        let failed = [
+            serde_json::json!({"type": "thread.started", "thread_id": "t"}),
+            serde_json::json!({"type": "turn.failed", "error": {"message": "model overloaded"}}),
+        ]
+        .map(|event| event.to_string())
+        .join("\n");
+        assert!(parse_codex(&failed).is_none());
+
+        // Non-message items must not be mined for a verdict, even when one contains the JSON.
+        let reasoning = serde_json::json!({
+            "type": "item.completed",
+            "item": {"id": "item_0", "type": "reasoning", "text": GOOD},
+        })
+        .to_string();
+        assert!(parse_codex(&reasoning).is_none());
+
+        // An agent message that is not a classification, and an empty stream.
+        assert!(parse_codex(&stream("I cannot score this task.")).is_none());
+        assert!(parse_codex("").is_none());
+        assert!(parse_codex("not json at all").is_none());
+    }
+
+    /// Each engine's envelope is read only by its own parser: reading a codex stream as a claude
+    /// envelope (or the reverse) must fail rather than half-parse.
+    #[test]
+    fn an_engines_output_does_not_parse_as_the_other_engines() {
+        assert!(parse_claude(&stream(GOOD)).is_none());
+        assert!(parse_codex(&envelope(GOOD)).is_none());
+    }
+
     #[test]
     fn capture_reports_a_timeout_rather_than_hanging() {
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg("sleep 5");
         let start = Instant::now();
-        let err = capture(cmd, Duration::from_millis(300)).expect_err("must time out");
+        let err = capture(cmd, "codex", Duration::from_millis(300)).expect_err("must time out");
         assert!(err.contains("timed out"), "got {err:?}");
         assert!(start.elapsed() < Duration::from_secs(2));
     }
@@ -471,11 +702,17 @@ mod tests {
     fn capture_returns_stdout_on_success_and_names_a_nonzero_exit() {
         let mut ok = Command::new("sh");
         ok.arg("-c").arg("printf hi");
-        assert_eq!(capture(ok, Duration::from_secs(5)), Ok("hi".to_string()));
+        assert_eq!(
+            capture(ok, "claude", Duration::from_secs(5)),
+            Ok("hi".to_string())
+        );
 
         let mut bad = Command::new("sh");
         bad.arg("-c").arg("exit 7");
-        let err = capture(bad, Duration::from_secs(5)).expect_err("must fail");
+        let err = capture(bad, "codex", Duration::from_secs(5)).expect_err("must fail");
         assert!(err.contains("exited"), "got {err:?}");
+        // The failure sentence lands in the decision log, so it must name the engine that
+        // actually ran rather than always blaming claude.
+        assert!(err.contains("codex"), "got {err:?}");
     }
 }
