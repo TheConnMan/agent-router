@@ -115,9 +115,6 @@ agent-router run "Refactor the parity scanner" --dry-run
 # Skip classification entirely and name the provider.
 agent-router run "Bump the lockfile" --provider codex --model gpt-5.6-luna
 
-# Read-only work: skip the Codex preamble that pushes it to edit files immediately.
-agent-router run "Explain how the headroom tiebreak works" --read-only
-
 # Route work in another directory.
 agent-router run "Fix the failing test" --dir ~/git/other-project
 ```
@@ -127,7 +124,6 @@ agent-router run "Fix the failing test" --dir ~/git/other-project
 | `--dir <PATH>` | current directory | Working directory for the dispatched job. |
 | `--provider <NAME>` | `auto` | `auto` classifies. `codex`, `claude`, or `opencode` skips classification. |
 | `--model <NAME>` | tier table | Model override. Honoured only alongside an explicit `--provider`. |
-| `--read-only` | off | Skips the Codex execution mode preamble for work that should not edit files. |
 | `--dry-run` | off | Decide and log, dispatch nothing. |
 | `--json` | off | Emit the full decision, including gates, classification, and usage. |
 

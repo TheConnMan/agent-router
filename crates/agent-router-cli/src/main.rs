@@ -29,9 +29,6 @@ enum Command {
         /// Model override, honoured only with an explicit --provider.
         #[arg(long)]
         model: Option<String>,
-        /// Read-only work: skip the Codex execution-mode preamble.
-        #[arg(long)]
-        read_only: bool,
         /// Decide and log without dispatching.
         #[arg(long)]
         dry_run: bool,
@@ -119,10 +116,9 @@ fn run(cli: Cli) -> agent_router_core::Result<()> {
             dir,
             provider,
             model,
-            read_only,
             dry_run,
             json,
-        } => route(task, dir, provider, model, read_only, dry_run, json),
+        } => route(task, dir, provider, model, dry_run, json),
         Command::Usage { json } => usage(json),
         Command::Log { limit, json } => log(limit, json),
         Command::Parity { .. } => unreachable!("parity has a command specific exit path"),
@@ -265,7 +261,6 @@ fn route(
     dir: Option<PathBuf>,
     provider: String,
     model: Option<String>,
-    read_only: bool,
     dry_run: bool,
     json: bool,
 ) -> agent_router_core::Result<()> {
@@ -279,7 +274,6 @@ fn route(
         dir: &dir,
         provider: agent_router_core::run::parse_provider(&provider)?,
         model,
-        read_only,
         dry_run,
     };
     let outcome = agent_router_core::run::run(&request, &config)?;

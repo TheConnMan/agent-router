@@ -19,8 +19,6 @@ pub struct Request<'a> {
     pub provider: Option<Provider>,
     /// An explicit model override, only honoured on the explicit-provider path.
     pub model: Option<String>,
-    /// Read-only work: the Codex execution-mode preamble is skipped.
-    pub read_only: bool,
     /// Decide and log without dispatching.
     pub dry_run: bool,
 }
