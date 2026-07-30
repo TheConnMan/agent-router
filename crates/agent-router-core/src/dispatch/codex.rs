@@ -58,6 +58,17 @@ pub fn thread_start_request(id: i64, cwd: &Path, model: Option<&str>) -> String 
     request(id, "thread/start", params)
 }
 
+pub fn thread_set_name_request(id: i64, thread_id: &str, name: &str) -> String {
+    request(
+        id,
+        "thread/name/set",
+        serde_json::json!({
+            "threadId": thread_id,
+            "name": name
+        }),
+    )
+}
+
 pub fn turn_start_request(id: i64, thread_id: &str, task: &str, effort: Option<&str>) -> String {
     let mut params = serde_json::json!({
         "threadId": thread_id,
@@ -97,6 +108,7 @@ pub fn spawn_on_initialized_rpc(
     rpc: &mut impl CodexRpc,
     cwd: &Path,
     task: &str,
+    name: &str,
     model: Option<&str>,
     effort: Option<&str>,
 ) -> SpawnAttempt {
@@ -109,7 +121,9 @@ pub fn spawn_on_initialized_rpc(
             "app-server thread/start returned no thread id: {thread_response}"
         )));
     };
-    match rpc.request(3, &turn_start_request(3, &thread_id, task, effort)) {
+    // The thread is already running, so a rejected name must not cost the caller its identity.
+    let _ = rpc.request(3, &thread_set_name_request(3, &thread_id, name));
+    match rpc.request(4, &turn_start_request(4, &thread_id, task, effort)) {
         Ok(_) => SpawnAttempt::Started(thread_id),
         Err(error) => SpawnAttempt::TurnFailed { thread_id, error },
     }
@@ -126,7 +140,7 @@ pub fn dispatch(
     {
         let daemon = ensure_daemon().map_err(Error::Command)?;
         let mut client = Client::connect(&daemon)?;
-        match spawn_on_initialized_rpc(&mut client, cwd, task, model, effort) {
+        match spawn_on_initialized_rpc(&mut client, cwd, task, name, model, effort) {
             SpawnAttempt::Started(thread_id) => Ok(Dispatch {
                 job_id: Some(thread_id),
                 job_name: name.to_string(),

@@ -2,8 +2,8 @@
 use agent_router_core::decide::decide_explicit;
 use agent_router_core::dispatch::claude::dispatch_with_binary;
 use agent_router_core::dispatch::codex::{
-    CodexRpc, SpawnAttempt, parse_thread_id, spawn_on_initialized_rpc, thread_start_request,
-    turn_start_request,
+    CodexRpc, SpawnAttempt, parse_thread_id, spawn_on_initialized_rpc, thread_set_name_request,
+    thread_start_request, turn_start_request,
 };
 #[cfg(target_os = "linux")]
 use agent_router_core::dispatch::dispatch as dispatch_decision;
@@ -93,6 +93,30 @@ fn codex_requests_pin_security_posture_and_put_effort_on_the_turn() {
     assert_eq!(turn["params"]["effort"], "xhigh");
 }
 
+/// The app-server names a thread through `thread/name/set`, whose params are exactly `threadId`
+/// and `name`. A name carrying spaces has to survive as one JSON string, because job names are
+/// human phrases that the caller later matches verbatim.
+#[test]
+fn codex_thread_name_request_pins_the_app_server_method_and_params() {
+    let named: Value = serde_json::from_str(&thread_set_name_request(
+        3,
+        "thread exact",
+        "Bonus: abc 123 drain",
+    ))
+    .expect("name request");
+
+    assert_eq!(named["jsonrpc"], "2.0");
+    assert_eq!(named["id"], 3);
+    assert_eq!(named["method"], "thread/name/set");
+    assert_eq!(named["params"]["threadId"], "thread exact");
+    assert_eq!(named["params"]["name"], "Bonus: abc 123 drain");
+    assert_eq!(
+        named["params"].as_object().expect("params object").len(),
+        2,
+        "params must carry exactly threadId and name, nothing extra"
+    );
+}
+
 #[test]
 fn codex_thread_identity_rejects_malformed_errors_and_other_response_ids() {
     assert_eq!(
@@ -151,10 +175,87 @@ impl CodexRpc for ScriptedRpc {
     }
 }
 
+/// A spawn names the thread between creating it and starting its turn, so the job is findable
+/// under the caller's name from the moment it runs.
+#[test]
+fn codex_spawn_names_the_thread_between_starting_it_and_its_first_turn() {
+    let mut rpc = ScriptedRpc::with_replies(vec![
+        Ok(r#"{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread named"}}}"#.to_string()),
+        Ok(r#"{"jsonrpc":"2.0","id":3,"result":{}}"#.to_string()),
+        Ok(r#"{"jsonrpc":"2.0","id":4,"result":{}}"#.to_string()),
+    ]);
+
+    let attempt = spawn_on_initialized_rpc(
+        &mut rpc,
+        Path::new("/tmp"),
+        "perform one task",
+        "Bonus: abc 123",
+        None,
+        Some("xhigh"),
+    );
+
+    match attempt {
+        SpawnAttempt::Started(thread_id) => assert_eq!(thread_id, "thread named"),
+        other => panic!("expected a started thread, got {other:?}"),
+    }
+    assert_eq!(rpc.requests.len(), 3);
+    assert_eq!(rpc.requests[0]["method"], "thread/start");
+    assert_eq!(rpc.requests[0]["id"], 2);
+    assert_eq!(rpc.requests[1]["method"], "thread/name/set");
+    assert_eq!(rpc.requests[1]["id"], 3);
+    assert_eq!(rpc.requests[1]["params"]["threadId"], "thread named");
+    assert_eq!(rpc.requests[1]["params"]["name"], "Bonus: abc 123");
+    assert_eq!(rpc.requests[2]["method"], "turn/start");
+    assert_eq!(rpc.requests[2]["id"], 4);
+    assert_eq!(rpc.requests[2]["params"]["threadId"], "thread named");
+    assert_eq!(
+        rpc.requests[2]["params"]["input"],
+        json!([{"type": "text", "text": "perform one task"}])
+    );
+    assert!(rpc.replies.is_empty());
+}
+
+/// Naming is cosmetic and the thread is already alive when it is attempted, so a rejected
+/// `thread/name/set` must not stop the turn or hide the thread id. Failing the dispatch here would
+/// make the caller start the work a second time.
+#[test]
+fn codex_thread_name_failure_still_starts_the_turn_and_returns_the_thread() {
+    let mut rpc = ScriptedRpc::with_replies(vec![
+        Ok(r#"{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread unnamed"}}}"#.to_string()),
+        Err(Error::Command("name rejected".to_string())),
+        Ok(r#"{"jsonrpc":"2.0","id":4,"result":{}}"#.to_string()),
+    ]);
+
+    let attempt = spawn_on_initialized_rpc(
+        &mut rpc,
+        Path::new("/tmp"),
+        "perform one task",
+        "Bonus: abc 123",
+        None,
+        Some("xhigh"),
+    );
+
+    match attempt {
+        SpawnAttempt::Started(thread_id) => assert_eq!(thread_id, "thread unnamed"),
+        other => panic!("a failed name must not cost the caller the running thread, got {other:?}"),
+    }
+    assert_eq!(rpc.requests.len(), 3);
+    assert_eq!(rpc.requests[0]["method"], "thread/start");
+    assert_eq!(rpc.requests[1]["method"], "thread/name/set");
+    assert_eq!(rpc.requests[2]["method"], "turn/start");
+    assert_eq!(rpc.requests[2]["id"], 4);
+    assert_eq!(
+        rpc.requests[2]["params"]["input"],
+        json!([{"type": "text", "text": "perform one task"}])
+    );
+    assert!(rpc.replies.is_empty());
+}
+
 #[test]
 fn codex_partial_creation_is_one_visible_failure_without_a_retry() {
     let mut rpc = ScriptedRpc::with_replies(vec![
         Ok(r#"{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread partial"}}}"#.to_string()),
+        Ok(r#"{"jsonrpc":"2.0","id":3,"result":{}}"#.to_string()),
         Err(Error::Command("turn rejected".to_string())),
     ]);
 
@@ -162,6 +263,7 @@ fn codex_partial_creation_is_one_visible_failure_without_a_retry() {
         &mut rpc,
         Path::new("/tmp"),
         "perform one task",
+        "Bonus: abc 123",
         None,
         Some("xhigh"),
     );
@@ -173,9 +275,10 @@ fn codex_partial_creation_is_one_visible_failure_without_a_retry() {
         }
         other => panic!("expected the existing thread to remain visible, got {other:?}"),
     }
-    assert_eq!(rpc.requests.len(), 2);
+    assert_eq!(rpc.requests.len(), 3);
     assert_eq!(rpc.requests[0]["method"], "thread/start");
-    assert_eq!(rpc.requests[1]["method"], "turn/start");
+    assert_eq!(rpc.requests[1]["method"], "thread/name/set");
+    assert_eq!(rpc.requests[2]["method"], "turn/start");
     assert!(rpc.replies.is_empty());
 }
 
@@ -753,7 +856,7 @@ fn codex_decision_effort_reaches_turn_start_at_the_dispatch_boundary() {
         let (stream, _) = listener.accept().expect("accept app server client");
         let mut socket = tungstenite::accept(stream).expect("accept websocket");
         let mut requests = Vec::new();
-        for request_id in 1..=3 {
+        for request_id in 1..=4 {
             let request = socket
                 .read()
                 .expect("read request")
@@ -818,16 +921,26 @@ fn codex_decision_effort_reaches_turn_start_at_the_dispatch_boundary() {
     let requests = server.join().expect("app server thread");
     assert_eq!(requests[0]["method"], "initialize");
     assert_eq!(requests[1]["method"], "thread/start");
-    assert_eq!(requests[2]["method"], "turn/start");
+    assert_eq!(requests[2]["method"], "thread/name/set");
+    assert_eq!(
+        requests[2]["params"]["threadId"], "thread through dispatch",
+        "the name must land on the thread the dispatch just created"
+    );
+    assert_eq!(
+        requests[2]["params"]["name"],
+        json!(dispatched.job_name),
+        "the job name the caller sees must be the name the thread carries"
+    );
+    assert_eq!(requests[3]["method"], "turn/start");
     assert!(
-        requests[2]["params"].get("effort").is_none(),
+        requests[3]["params"].get("effort").is_none(),
         "the router must leave the model's own default effort in place"
     );
     assert_eq!(requests[1]["params"]["model"], "gpt-5.6-sol");
     // The task reaches Codex verbatim. The router prepends nothing: an execution-mode preamble
     // here fought the repo's own AGENTS.md and showed up as boilerplate on every routed session.
     assert_eq!(
-        requests[2]["params"]["input"][0]["text"],
+        requests[3]["params"]["input"][0]["text"],
         "exercise the real dispatch seam"
     );
 }
