@@ -1,6 +1,6 @@
 use crate::error::{Error, Result};
 use crate::run::Dispatch;
-use crate::runtime::{home_dir, router_log_path, spawn_detached, truncated_title};
+use crate::runtime::{home_dir, router_log_path, spawn_detached};
 use base64::Engine as _;
 use rusqlite::OptionalExtension;
 use serde::Deserialize;
@@ -131,7 +131,13 @@ impl ManagedClient {
         })
     }
 
-    pub fn dispatch(&self, cwd: &Path, task: &str, model: Option<&str>) -> Result<Dispatch> {
+    pub fn dispatch(
+        &self,
+        cwd: &Path,
+        task: &str,
+        name: &str,
+        model: Option<&str>,
+    ) -> Result<Dispatch> {
         if !self.endpoint.ip().is_loopback() {
             return Err(Error::Command(
                 "managed OpenCode endpoint must be loopback".to_string(),
@@ -140,7 +146,7 @@ impl ManagedClient {
         let model = selected_model(model)?;
         let directory = encoded_path(cwd);
         let mut create = json!({
-            "title": truncated_title(task),
+            "title": name,
             "permission": managed_permission()
         });
         if let Some(model) = &model {
@@ -179,7 +185,7 @@ impl ManagedClient {
         }
         Ok(Dispatch {
             job_id: Some(created.id),
-            job_name: truncated_title(task),
+            job_name: name.to_string(),
         })
     }
 
@@ -288,29 +294,29 @@ impl Credentials {
 pub fn dispatch(
     cwd: &Path,
     task: &str,
+    name: &str,
     model: Option<&str>,
     _effort: Option<&str>,
 ) -> Result<Dispatch> {
     #[cfg(target_os = "linux")]
     {
-        ManagedClient::for_router()?.dispatch(cwd, task, model)
+        ManagedClient::for_router()?.dispatch(cwd, task, name, model)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        dispatch_cli(cwd, task, model)
+        dispatch_cli(cwd, task, name, model)
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn dispatch_cli(cwd: &Path, task: &str, model: Option<&str>) -> Result<Dispatch> {
-    let title = truncated_title(task);
+fn dispatch_cli(cwd: &Path, task: &str, name: &str, model: Option<&str>) -> Result<Dispatch> {
     let mut command = std::process::Command::new("opencode");
     command
         .arg("run")
         .arg("--dir")
         .arg(cwd)
         .arg("--title")
-        .arg(&title)
+        .arg(name)
         .env_remove("OPENCODE_SERVER_USERNAME")
         .env_remove("OPENCODE_SERVER_PASSWORD");
     if let Some(model) = model.filter(|model| *model != "default") {
@@ -320,7 +326,7 @@ fn dispatch_cli(cwd: &Path, task: &str, model: Option<&str>) -> Result<Dispatch>
     spawn_detached(command, &router_log_path("opencode"))?;
     Ok(Dispatch {
         job_id: None,
-        job_name: title,
+        job_name: name.to_string(),
     })
 }
 

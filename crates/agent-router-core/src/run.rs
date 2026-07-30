@@ -17,8 +17,11 @@ pub struct Request<'a> {
     pub dir: &'a Path,
     /// None means auto: classify and let the engine choose.
     pub provider: Option<Provider>,
-    /// An explicit model override, only honoured on the explicit-provider path.
+    /// An explicit model override. Requires an explicit provider: pairing it with auto is
+    /// rejected rather than silently dropped.
     pub model: Option<String>,
+    /// The job name. None derives it from the task.
+    pub name: Option<String>,
     /// Read-only work: the Codex execution-mode preamble is skipped.
     pub read_only: bool,
     /// Decide and log without dispatching.
@@ -49,6 +52,14 @@ pub struct Outcome {
 
 /// IMPURE: run one task through the router.
 pub fn run(request: &Request, config: &Config) -> Result<Outcome> {
+    // The auto path picks its model from the complexity tiers, so an override there could only be
+    // dropped. Rejecting the pair is the only way the caller hears about it.
+    if request.provider.is_none() && request.model.is_some() {
+        return Err(Error::Command(
+            "--model requires an explicit --provider: the auto path chooses its own model"
+                .to_string(),
+        ));
+    }
     if !request.dir.is_dir() {
         return Err(Error::Command(format!(
             "target directory does not exist: {}",
