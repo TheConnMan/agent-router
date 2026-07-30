@@ -36,6 +36,57 @@ impl Default for Policy {
     }
 }
 
+/// Which CLI runs the classifier call. Scoring is one small strict-JSON answer, so either engine
+/// can do it; the choice is about which weekly budget the per-task call is drawn from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClassifierEngine {
+    Claude,
+    Codex,
+}
+
+impl ClassifierEngine {
+    pub const fn name(self) -> &'static str {
+        match self {
+            ClassifierEngine::Claude => "claude",
+            ClassifierEngine::Codex => "codex",
+        }
+    }
+}
+
+/// The classifier call: which engine scores a task, and the model each engine scores it with.
+/// Both models are kept regardless of the engine in force, so flipping `engine` is a one-word
+/// edit rather than a re-pick of the model.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Classifier {
+    pub engine: ClassifierEngine,
+    /// The model used when `engine = "claude"`. Wants the cheapest model that holds the rubric.
+    pub claude_model: String,
+    /// The model used when `engine = "codex"`. Same intent, one tier down the codex catalogue.
+    pub codex_model: String,
+}
+
+impl Default for Classifier {
+    fn default() -> Classifier {
+        Classifier {
+            engine: ClassifierEngine::Claude,
+            claude_model: "haiku".to_string(),
+            codex_model: "gpt-5.6-luna".to_string(),
+        }
+    }
+}
+
+impl Classifier {
+    /// PURE: the model the configured engine scores with.
+    pub fn model(&self) -> &str {
+        match self.engine {
+            ClassifierEngine::Claude => &self.claude_model,
+            ClassifierEngine::Codex => &self.codex_model,
+        }
+    }
+}
+
 /// The per-provider model tiers, one model per task complexity. Each table is optional in the
 /// file and each key within it is optional, so an omitted section is exactly the defaults below.
 /// There is no effort table on purpose: the model is the toggle, and each model then runs at its
@@ -179,6 +230,8 @@ pub struct Config {
     /// absent here is what forces a task to Claude.
     pub connectors: Vec<String>,
     pub policy: Policy,
+    /// Which engine and model score a task.
+    pub classifier: Classifier,
     /// Which model each provider runs per task complexity.
     pub models: Models,
     pub parity: ParityConfig,
@@ -197,6 +250,7 @@ impl Default for Config {
                 "airtable".to_string(),
             ],
             policy: Policy::default(),
+            classifier: Classifier::default(),
             models: Models::default(),
             parity: ParityConfig::default(),
         }
@@ -305,6 +359,56 @@ mod tests {
         assert_eq!(partial.models.claude.ultra, "opus[1m]");
         assert_eq!(partial.models.claude.low, "sonnet");
         assert_eq!(partial.models.claude.high, "opus[1m]");
+    }
+
+    /// The classifier engine is the setting that decides which weekly budget the per-task scoring
+    /// call is drawn from, so an absent section must be the documented default and each key must
+    /// override on its own.
+    #[test]
+    fn the_classifier_engine_and_models_default_when_absent_and_override_one_key_at_a_time() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+
+        let defaults = Config::default();
+        assert_eq!(defaults.classifier.engine, ClassifierEngine::Claude);
+        assert_eq!(defaults.classifier.claude_model, "haiku");
+        assert_eq!(defaults.classifier.codex_model, "gpt-5.6-luna");
+        assert_eq!(defaults.classifier.model(), "haiku");
+
+        std::fs::write(&path, "hard_ceiling_pct = 90.0\n").expect("write");
+        let absent = Config::load_from(&path).expect("loads");
+        assert_eq!(absent.classifier, defaults.classifier);
+
+        // Flipping the engine alone is the whole switch: the codex model was already configured,
+        // so no second edit is needed to make the change take effect.
+        std::fs::write(&path, "[classifier]\nengine = \"codex\"\n").expect("write");
+        let flipped = Config::load_from(&path).expect("loads");
+        assert_eq!(flipped.classifier.engine, ClassifierEngine::Codex);
+        assert_eq!(flipped.classifier.model(), "gpt-5.6-luna");
+        assert_eq!(flipped.classifier.claude_model, "haiku");
+
+        std::fs::write(
+            &path,
+            "[classifier]\nengine = \"codex\"\ncodex_model = \"gpt-5.6-terra\"\n",
+        )
+        .expect("write");
+        let retuned = Config::load_from(&path).expect("loads");
+        assert_eq!(retuned.classifier.model(), "gpt-5.6-terra");
+
+        std::fs::write(&path, "[classifier]\nclaude_model = \"sonnet\"\n").expect("write");
+        let claude_only = Config::load_from(&path).expect("loads");
+        assert_eq!(claude_only.classifier.engine, ClassifierEngine::Claude);
+        assert_eq!(claude_only.classifier.model(), "sonnet");
+    }
+
+    /// An engine name that is not a supported CLI is an error, not a silent fall back to claude:
+    /// a typo must be visible rather than quietly routing every scoring call at the wrong budget.
+    #[test]
+    fn an_unknown_classifier_engine_is_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[classifier]\nengine = \"opencode\"\n").expect("write");
+        assert!(Config::load_from(&path).is_err());
     }
 
     #[test]
