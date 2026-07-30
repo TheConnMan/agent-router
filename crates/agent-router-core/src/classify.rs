@@ -1,8 +1,8 @@
 //! The classifier: one Claude Haiku call that scores a task against the routing rubric and
-//! returns strict JSON. Every failure (missing binary, timeout, prose instead of JSON) degrades
-//! to the fallback classification, because ambiguity is itself a Claude signal.
+//! returns strict JSON. Every failure retains the configured default and stays eligible for
+//! weekly routing.
 
-use crate::config::Config;
+use crate::config::{Config, DefaultProvider};
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -49,17 +49,20 @@ pub struct Classification {
 }
 
 impl Classification {
-    /// The classification used when the classifier could not answer: Claude, low confidence.
-    /// Ambiguity is itself a Claude signal, so an unavailable classifier must not silently
-    /// route work to Codex.
-    pub fn fallback(why: &str) -> Classification {
+    /// The classification used when the classifier could not answer. The configured default
+    /// remains eligible for weekly routing, so failure does not invent a capability signal.
+    pub fn fallback(why: &str, default_provider: DefaultProvider) -> Classification {
+        let (verdict, provider_name) = match default_provider {
+            DefaultProvider::Codex => (Verdict::Codex, "codex"),
+            DefaultProvider::Claude => (Verdict::Claude, "claude"),
+        };
         Classification {
             codex_ready: [false; 6],
             claude_signals: [false; 6],
             missing_connector: false,
-            verdict: Verdict::Claude,
+            verdict,
             confidence: Confidence::Low,
-            rationale: format!("classifier failed ({why}), defaulting to claude"),
+            rationale: format!("classifier failed ({why}), defaulting to {provider_name}"),
             classifier_failed: true,
         }
     }
@@ -81,9 +84,9 @@ pub fn classify(task: &str, config: &Config) -> Classification {
     match capture(cmd, timeout) {
         Ok(stdout) => match parse_classifier_output(&stdout) {
             Some(classification) => classification,
-            None => Classification::fallback("unparseable json"),
+            None => Classification::fallback("unparseable json", config.policy.default_provider),
         },
-        Err(why) => Classification::fallback(&why),
+        Err(why) => Classification::fallback(&why, config.policy.default_provider),
     }
 }
 
@@ -310,7 +313,7 @@ mod tests {
 
     #[test]
     fn the_fallback_is_low_confidence_claude_and_says_why() {
-        let got = Classification::fallback("timed out after 30s");
+        let got = Classification::fallback("timed out after 30s", DefaultProvider::Claude);
         assert_eq!(got.verdict, Verdict::Claude);
         assert_eq!(got.confidence, Confidence::Low);
         assert!(got.classifier_failed);

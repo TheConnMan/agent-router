@@ -7,11 +7,13 @@ pub mod decide;
 pub mod dispatch;
 pub mod error;
 pub mod log;
+pub mod parity;
 pub mod run;
 pub mod usage;
 
 pub use classify::{Classification, Confidence, Verdict};
-pub use config::Config;
+pub use config::{Config, DefaultProvider, ParityConfig, ParityException, ParityKind, Policy};
 pub use decide::{Decision, Gate};
 pub use error::{Error, Result};
+pub use parity::{Difference, ParityReport, ServerProjection, Status};
 pub use usage::{Headroom, UsageSnapshot};

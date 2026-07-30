@@ -11,6 +11,87 @@ const DEFAULT_HEADROOM_FLIP_GAP: f64 = 25.0;
 /// Ceiling on the classifier call.
 const DEFAULT_CLASSIFIER_TIMEOUT_SECS: u64 = 30;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DefaultProvider {
+    Codex,
+    Claude,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Policy {
+    pub default_provider: DefaultProvider,
+    pub weekly_routing: bool,
+    pub usage_failover_changes_model: bool,
+    pub usage_failover_changes_effort: bool,
+}
+
+impl Default for Policy {
+    fn default() -> Policy {
+        Policy {
+            default_provider: DefaultProvider::Codex,
+            weekly_routing: true,
+            usage_failover_changes_model: false,
+            usage_failover_changes_effort: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct ParityConfig {
+    pub roots: Vec<PathBuf>,
+    pub exceptions: Vec<ParityException>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "ParityExceptionDocument")]
+pub struct ParityException {
+    pub path: PathBuf,
+    pub reason: String,
+    pub server: Option<String>,
+    pub kind: Option<ParityKind>,
+}
+
+#[derive(serde::Deserialize)]
+struct ParityExceptionDocument {
+    path: PathBuf,
+    reason: String,
+    server: Option<String>,
+    kind: Option<ParityKind>,
+}
+
+impl TryFrom<ParityExceptionDocument> for ParityException {
+    type Error = String;
+
+    fn try_from(document: ParityExceptionDocument) -> std::result::Result<Self, Self::Error> {
+        if document.path.as_os_str().is_empty() {
+            return Err("parity exception path must not be empty".to_string());
+        }
+        if document.reason.trim().is_empty() {
+            return Err("parity exception reason must not be blank".to_string());
+        }
+        Ok(ParityException {
+            path: document.path,
+            reason: document.reason,
+            server: document.server,
+            kind: document.kind,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParityKind {
+    MissingInCodex,
+    MissingInClaude,
+    CommandDiffers,
+    ArgsDiffer,
+    EnvKeysDiffer,
+    StandaloneClaudeMd,
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -24,6 +105,8 @@ pub struct Config {
     /// ("Codex has every required connector") is scored against exactly this list, so anything
     /// absent here is what forces a task to Claude.
     pub connectors: Vec<String>,
+    pub policy: Policy,
+    pub parity: ParityConfig,
 }
 
 impl Default for Config {
@@ -38,6 +121,8 @@ impl Default for Config {
                 "gh (github)".to_string(),
                 "airtable".to_string(),
             ],
+            policy: Policy::default(),
+            parity: ParityConfig::default(),
         }
     }
 }

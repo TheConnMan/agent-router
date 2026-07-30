@@ -1,7 +1,7 @@
 //! The decision engine: hard gates first, then headroom modulation. Pure given its inputs.
 
 use crate::classify::{Classification, Confidence};
-use crate::config::Config;
+use crate::config::{Config, DefaultProvider};
 use crate::usage::UsageSnapshot;
 use agent_viewer_core::BackendKind;
 
@@ -17,7 +17,7 @@ pub const CODEX_EFFORT: &str = "xhigh";
 pub enum Gate {
     /// The caller named a provider, so no classification ran.
     ExplicitProvider,
-    /// The classifier could not answer; the fallback verdict is in force.
+    /// The classifier could not answer, so the configured default remains in force.
     ClassifierFailed,
     /// A required connector is missing: an automatic Claude decision regardless of shape.
     MissingConnector,
@@ -29,6 +29,10 @@ pub enum Gate {
     HeadroomTiebreak,
     /// Both providers are at or over the hard ceiling; the verdict provider was used anyway.
     OverCeiling,
+    /// Weekly usage routing is disabled by policy.
+    WeeklyRoutingDisabled,
+    /// Weekly usage changed the provider while at least one output stayed with the prior choice.
+    UsageFailoverPinned,
 }
 
 impl Gate {
@@ -41,6 +45,8 @@ impl Gate {
             Gate::FlippedOnExhaustion => "flipped_on_exhaustion",
             Gate::HeadroomTiebreak => "headroom_tiebreak",
             Gate::OverCeiling => "over_ceiling",
+            Gate::WeeklyRoutingDisabled => "weekly_routing_disabled",
+            Gate::UsageFailoverPinned => "usage_failover_pinned",
         }
     }
 }
@@ -69,62 +75,87 @@ impl Decision {
 /// PURE: the routing decision for a scored task.
 pub fn decide(classification: Classification, usage: UsageSnapshot, config: &Config) -> Decision {
     let mut gates = Vec::new();
-    let mut hard_gate = false;
-    if classification.classifier_failed {
-        gates.push(Gate::ClassifierFailed);
-        hard_gate = true;
-    }
+    let mut capability_pin = false;
     if classification.missing_connector {
         gates.push(Gate::MissingConnector);
-        hard_gate = true;
+        capability_pin = true;
     }
     if classification.claude_signal_count() >= 2 {
         gates.push(Gate::ClaudeSignals);
-        hard_gate = true;
+        capability_pin = true;
     }
 
-    // A hard gate is Claude, full stop. Headroom modulates a verdict; it never overrides a gate.
-    let mut provider = if hard_gate {
-        BackendKind::Claude
-    } else {
-        classification.verdict.backend()
+    let mut provider = match config.policy.default_provider {
+        DefaultProvider::Codex => BackendKind::Codex,
+        DefaultProvider::Claude => BackendKind::Claude,
     };
+    if capability_pin {
+        provider = BackendKind::Claude;
+    } else if classification.classifier_failed {
+        gates.push(Gate::ClassifierFailed);
+    } else {
+        provider = classification.verdict.backend();
+    }
 
-    if !hard_gate {
-        let other = other_provider(provider);
-        let used = weekly_used(&usage, provider);
-        let other_used = weekly_used(&usage, other);
-        match classification.confidence {
-            // A confident verdict survives any headroom difference except its own provider
-            // being effectively exhausted while the other still has room.
-            Confidence::High => {
-                if used >= config.hard_ceiling_pct && other_used < config.hard_ceiling_pct {
-                    provider = other;
-                    gates.push(Gate::FlippedOnExhaustion);
+    let pre_usage_provider = provider;
+    let mut model = model_for(pre_usage_provider);
+    let mut effort = effort_for(pre_usage_provider);
+    let both_over_ceiling = usage.claude.weekly_pct >= config.hard_ceiling_pct
+        && usage.codex.weekly_pct >= config.hard_ceiling_pct;
+
+    if !capability_pin {
+        if !config.policy.weekly_routing {
+            gates.push(Gate::WeeklyRoutingDisabled);
+        } else if !both_over_ceiling {
+            let other = other_provider(provider);
+            let used = weekly_used(&usage, provider);
+            let other_used = weekly_used(&usage, other);
+            let confidence = if classification.classifier_failed {
+                Confidence::High
+            } else {
+                classification.confidence
+            };
+            match confidence {
+                Confidence::High => {
+                    if used >= config.hard_ceiling_pct && other_used < config.hard_ceiling_pct {
+                        provider = other;
+                        gates.push(Gate::FlippedOnExhaustion);
+                    }
                 }
-            }
-            // A borderline verdict wins ties and small gaps; a large headroom gap flips it.
-            Confidence::Medium | Confidence::Low => {
-                if used - other_used > config.headroom_flip_gap {
-                    provider = other;
-                    gates.push(Gate::HeadroomTiebreak);
+                Confidence::Medium | Confidence::Low => {
+                    if used - other_used > config.headroom_flip_gap {
+                        provider = other;
+                        gates.push(Gate::HeadroomTiebreak);
+                    }
                 }
             }
         }
     }
 
-    if usage.claude.weekly_pct >= config.hard_ceiling_pct
-        && usage.codex.weekly_pct >= config.hard_ceiling_pct
-    {
-        // The router routes; refusing work over a ceiling is bonus-drain's job, not this one.
+    if provider != pre_usage_provider {
+        if config.policy.usage_failover_changes_model {
+            model = model_for(provider);
+        }
+        if config.policy.usage_failover_changes_effort {
+            effort = effort_for(provider);
+        }
+        if !config.policy.usage_failover_changes_model
+            || !config.policy.usage_failover_changes_effort
+        {
+            gates.push(Gate::UsageFailoverPinned);
+        }
+    }
+
+    if both_over_ceiling {
+        // The router routes; refusing work over a ceiling is bonus drain's job, not this one.
         gates.push(Gate::OverCeiling);
     }
 
     let rationale = rationale(&classification, provider, &gates, &usage);
     Decision {
         provider,
-        model: model_for(provider),
-        effort: effort_for(provider),
+        model,
+        effort,
         classification: Some(classification),
         gates,
         usage,
@@ -303,7 +334,7 @@ mod tests {
                 codex_weekly: 97.0,
                 claude_weekly: 40.0,
                 want_provider: BackendKind::Claude,
-                want_gates: vec![Gate::FlippedOnExhaustion],
+                want_gates: vec![Gate::FlippedOnExhaustion, Gate::UsageFailoverPinned],
             },
             Case {
                 label: "the exhaustion flip works in the other direction too",
@@ -314,7 +345,7 @@ mod tests {
                 codex_weekly: 40.0,
                 claude_weekly: 99.0,
                 want_provider: BackendKind::Codex,
-                want_gates: vec![Gate::FlippedOnExhaustion],
+                want_gates: vec![Gate::FlippedOnExhaustion, Gate::UsageFailoverPinned],
             },
             Case {
                 label: "a borderline verdict wins a small gap",
@@ -347,7 +378,7 @@ mod tests {
                 codex_weekly: 80.0,
                 claude_weekly: 30.0,
                 want_provider: BackendKind::Claude,
-                want_gates: vec![Gate::HeadroomTiebreak],
+                want_gates: vec![Gate::HeadroomTiebreak, Gate::UsageFailoverPinned],
             },
             Case {
                 label: "two claude signals force claude even with claude exhausted",
@@ -428,6 +459,7 @@ mod tests {
         );
         assert_eq!(decision.provider, BackendKind::Claude);
         assert!(decision.gates.contains(&Gate::FlippedOnExhaustion));
+        assert!(decision.gates.contains(&Gate::UsageFailoverPinned));
     }
 
     #[test]
@@ -444,18 +476,18 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_classifier_routes_to_claude_and_records_the_failure() {
+    fn a_failed_classifier_retains_the_configured_codex_default() {
         let config = Config::default();
         let decision = decide(
-            Classification::fallback("timed out after 30s"),
-            // Claude exhausted, Codex empty: the fallback still goes to Claude, because a hard
-            // gate is not a preference that headroom gets to overrule.
+            Classification::fallback("timed out after 30s", DefaultProvider::Codex),
+            // Claude exhaustion cannot move the configured Codex fallback.
             usage(0.0, 99.0),
             &config,
         );
-        assert_eq!(decision.provider, BackendKind::Claude);
+        assert_eq!(decision.provider, BackendKind::Codex);
         assert_eq!(decision.gate_tags(), vec!["classifier_failed"]);
-        assert_eq!(decision.model.as_deref(), Some(CLAUDE_MODEL));
+        assert_eq!(decision.model, None);
+        assert_eq!(decision.effort.as_deref(), Some(CODEX_EFFORT));
     }
 
     #[test]
