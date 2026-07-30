@@ -164,6 +164,23 @@ pub fn claude_classifier_command(prompt: &str, model: &str) -> Command {
     cmd
 }
 
+/// The capabilities the classifier is stripped of. Scoring reads a prompt and answers with one
+/// JSON object, so it needs no tool at all, and a tool left in the set is both prompt tokens and
+/// something an injected task could reach for: the read-only sandbox stops writes but not reads,
+/// and the call runs from home. Dropping the shell is what makes "the classifier cannot read your
+/// files" true by construction rather than by the model's good behaviour.
+///
+/// Measured on this box 2026-07-30: 15.2k prompt tokens and 2.5s against 18.3k and 6.7s with the
+/// full tool set.
+const DISABLED_FEATURES: [&str; 6] = [
+    "shell_tool",
+    "browser_use",
+    "computer_use",
+    "image_generation",
+    "apps",
+    "skill_search",
+];
+
 /// PURE builder: the codex classifier invocation. Same posture as the claude one, expressed in
 /// codex's own flags: every customization off, so the score depends on the rubric and the task
 /// and on nothing else this box happens to have configured.
@@ -171,11 +188,17 @@ pub fn claude_classifier_command(prompt: &str, model: &str) -> Command {
 /// Measured on this box 2026-07-30, scoring the fixed prompt from home: 4-8s wall against
 /// claude haiku's 12-16s, so it clears the same 30s deadline with room to spare.
 /// `--ignore-user-config` is the load-bearing one (it drops `~/.codex/config.toml` and with it
-/// every MCP server, which was ~3.7k of prompt and most of the wall time); `--ephemeral` keeps
-/// scoring out of the session history, `--ignore-rules` drops execpolicy, `-c
-/// project_doc_max_bytes=0` suppresses AGENTS.md discovery, and `--skip-git-repo-check` is
-/// required because home is not a repository. The sandbox is read-only: scoring reads a prompt
-/// and answers, and must never be able to touch the box.
+/// every MCP server, which was ~3.7k of prompt and most of the wall time); `--ignore-rules` drops
+/// execpolicy, `-c project_doc_max_bytes=0` suppresses AGENTS.md discovery, and
+/// `--skip-git-repo-check` is required because home is not a repository. The sandbox is read-only:
+/// scoring reads a prompt and answers, and must never be able to touch the box.
+///
+/// Deliberately NOT `--ephemeral`, though it would suit a throwaway call: `codex_headroom` reads
+/// the newest rollout carrying a `rate_limits` event, and an ephemeral run writes no rollout. On
+/// this engine the classifier fires on every auto-routed task, so suppressing those rollouts would
+/// let scoring burn codex quota while the router kept deciding against the last dispatched job's
+/// percentage, and a codex at its ceiling would keep reading as having headroom. Persisting the
+/// rollout costs a session file per task and keeps the routing input honest.
 pub fn codex_classifier_command(prompt: &str, model: &str) -> Command {
     let mut cmd = Command::new("codex");
     cmd.arg("exec")
@@ -185,12 +208,14 @@ pub fn codex_classifier_command(prompt: &str, model: &str) -> Command {
         .arg("--sandbox")
         .arg("read-only")
         .arg("--skip-git-repo-check")
-        .arg("--ephemeral")
         .arg("--ignore-user-config")
         .arg("--ignore-rules")
         .arg("-c")
-        .arg("project_doc_max_bytes=0")
-        .arg(prompt);
+        .arg("project_doc_max_bytes=0");
+    for feature in DISABLED_FEATURES {
+        cmd.arg("--disable").arg(feature);
+    }
+    cmd.arg(prompt);
     run_from_home(&mut cmd);
     cmd
 }
@@ -578,7 +603,6 @@ mod tests {
         for flag in [
             "--json",
             "--skip-git-repo-check",
-            "--ephemeral",
             "--ignore-user-config",
             "--ignore-rules",
         ] {
@@ -591,6 +615,50 @@ mod tests {
         let model = args.iter().position(|a| a == "--model").expect("--model");
         assert_eq!(args[model + 1], "gpt-5.6-luna");
         assert_eq!(args.last().map(String::as_str), Some("score this"));
+
+        // Scoring must reach the model with no tool it could be talked into using.
+        for feature in DISABLED_FEATURES {
+            let at = args
+                .iter()
+                .position(|a| a == feature)
+                .unwrap_or_else(|| panic!("{feature} must be passed"));
+            assert_eq!(args[at - 1], "--disable");
+        }
+
+        // `--ephemeral` would suppress the rollout that `codex_headroom` reads, so scoring would
+        // spend codex quota invisibly and the router would keep deciding on a stale percentage.
+        assert!(
+            !args.contains(&"--ephemeral".to_string()),
+            "the classifier rollout is what keeps the codex usage reading fresh"
+        );
+    }
+
+    /// codex rejects an unknown feature name outright, and its own list shows names do get
+    /// retired. A retirement would therefore make every scoring call exit nonzero, which the
+    /// router absorbs as `classifier_failed` and a silent fall back to the default provider on
+    /// every task. This is the loud version of that failure, run against the installed codex.
+    #[test]
+    fn every_disabled_feature_is_a_name_the_installed_codex_still_knows() {
+        let Ok(listed) = Command::new("codex").arg("features").arg("list").output() else {
+            // No codex on this box: it cannot be the classifier engine here either.
+            return;
+        };
+        if !listed.status.success() {
+            return;
+        }
+        let stdout = String::from_utf8_lossy(&listed.stdout);
+        let known: Vec<&str> = stdout
+            .lines()
+            .filter_map(|line| line.split_whitespace().next())
+            .collect();
+        assert!(!known.is_empty(), "`codex features list` printed nothing");
+        for feature in DISABLED_FEATURES {
+            assert!(
+                known.contains(&feature),
+                "codex no longer knows the feature `{feature}`, so every classifier call on the \
+                 codex engine would exit nonzero and fall back"
+            );
+        }
     }
 
     /// The engine setting is what picks the CLI, and each engine takes its own configured model
