@@ -63,6 +63,16 @@ pub fn run(request: &Request, config: &Config) -> Result<Outcome> {
                 .to_string(),
         ));
     }
+    // An empty or whitespace only name beats the derived default because it is Some, so it would
+    // reach the spawned job and orphan it. A loud error is correct, since a caller passing an
+    // empty name believes it set a specific one.
+    if let Some(name) = &request.name
+        && name.trim().is_empty()
+    {
+        return Err(Error::Command(
+            "--name must not be empty or whitespace only".to_string(),
+        ));
+    }
     if !request.dir.is_dir() {
         return Err(Error::Command(format!(
             "target directory does not exist: {}",
