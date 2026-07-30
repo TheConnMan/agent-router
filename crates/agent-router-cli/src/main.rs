@@ -1,7 +1,8 @@
 use agent_router_core::log::{DecisionLog, Row};
+use agent_router_core::parity::{Difference, ParityReport, ServerProjection, Status};
 use agent_router_core::run::{Outcome, Request};
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 #[command(
@@ -49,16 +50,65 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Compare project scoped Claude and Codex declarations.
+    Parity {
+        #[arg(long = "root")]
+        roots: Vec<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
-    match run(cli) {
-        Ok(()) => std::process::ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("agent-router: {e}");
-            std::process::ExitCode::FAILURE
+    match cli.command {
+        Command::Parity { roots, json } => parity_exit(roots, json),
+        command => match run(Cli { command }) {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("agent-router: {e}");
+                std::process::ExitCode::FAILURE
+            }
+        },
+    }
+}
+
+fn parity_exit(roots: Vec<PathBuf>, json: bool) -> std::process::ExitCode {
+    let config = match agent_router_core::Config::load() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!(
+                "agent-router: parity configuration error: {}",
+                escape_terminal_controls(&error.to_string())
+            );
+            return std::process::ExitCode::from(2);
         }
+    };
+    let report = match agent_router_core::parity::check(&roots, &config) {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!(
+                "agent-router: parity scan error while reading .mcp.json or \
+                 .codex/config.toml: {}",
+                escape_terminal_controls(&error.to_string())
+            );
+            return std::process::ExitCode::from(2);
+        }
+    };
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&parity_json(&report))
+                .expect("serializing a JSON value cannot fail")
+        );
+    } else {
+        print_parity(&report);
+    }
+
+    match report.status() {
+        Status::Aligned | Status::Intentional => std::process::ExitCode::SUCCESS,
+        Status::Drift => std::process::ExitCode::FAILURE,
     }
 }
 
@@ -75,6 +125,138 @@ fn run(cli: Cli) -> agent_router_core::Result<()> {
         } => route(task, dir, provider, model, read_only, dry_run, json),
         Command::Usage { json } => usage(json),
         Command::Log { limit, json } => log(limit, json),
+        Command::Parity { .. } => unreachable!("parity has a command specific exit path"),
+    }
+}
+
+fn print_parity(report: &ParityReport) {
+    println!("parity: {}", status_label(report.status()));
+    for project in &report.projects {
+        let differences = project_differences(report, project);
+        println!(
+            "{}: {}",
+            escape_terminal_controls(&project.to_string_lossy()),
+            status_label(difference_status(&differences))
+        );
+        for difference in differences {
+            match &difference.server {
+                Some(server) => {
+                    println!(
+                        "  {} server {}",
+                        kind_label(difference),
+                        escape_terminal_controls(server)
+                    );
+                }
+                None => println!("  {}", kind_label(difference)),
+            }
+            print_projection("claude", difference.claude.as_ref());
+            print_projection("codex", difference.codex.as_ref());
+            if let Some(reason) = &difference.intentional_reason {
+                println!("    reason: {}", escape_terminal_controls(reason));
+            }
+        }
+    }
+}
+
+fn print_projection(label: &str, projection: Option<&ServerProjection>) {
+    let Some(projection) = projection else {
+        return;
+    };
+    println!(
+        "    {label}: command {} args {} env keys {}",
+        escape_terminal_controls(projection.command.as_deref().unwrap_or("(unset)")),
+        escaped_string_list(&projection.args),
+        escaped_string_list(&projection.env_keys)
+    );
+}
+
+fn parity_json(report: &ParityReport) -> serde_json::Value {
+    let projects = report
+        .projects
+        .iter()
+        .map(|project| {
+            let differences = project_differences(report, project);
+            let status = difference_status(&differences);
+            let differences = differences
+                .into_iter()
+                .map(|difference| {
+                    serde_json::json!({
+                        "server": difference.server.as_deref(),
+                        "kind": difference.kind,
+                        "claude": &difference.claude,
+                        "codex": &difference.codex,
+                        "intentional_reason": difference.intentional_reason.as_deref(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            serde_json::json!({
+                "root": project,
+                "status": status,
+                "differences": differences,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    serde_json::json!({
+        "status": report.status(),
+        "projects": projects,
+    })
+}
+
+fn escaped_string_list(values: &[String]) -> String {
+    let json = serde_json::to_string(values).expect("serializing string lists cannot fail");
+    escape_terminal_controls(&json)
+}
+
+fn escape_terminal_controls(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if character.is_control() {
+            escaped.extend(character.escape_default());
+        } else {
+            escaped.push(character);
+        }
+    }
+    escaped
+}
+
+fn project_differences<'a>(report: &'a ParityReport, project: &Path) -> Vec<&'a Difference> {
+    report
+        .differences
+        .iter()
+        .filter(|difference| difference.root == project)
+        .collect()
+}
+
+fn difference_status(differences: &[&Difference]) -> Status {
+    if differences.is_empty() {
+        Status::Aligned
+    } else if differences
+        .iter()
+        .all(|difference| difference.intentional_reason.is_some())
+    {
+        Status::Intentional
+    } else {
+        Status::Drift
+    }
+}
+
+fn status_label(status: Status) -> &'static str {
+    match status {
+        Status::Aligned => "aligned",
+        Status::Intentional => "intentional",
+        Status::Drift => "drift",
+    }
+}
+
+fn kind_label(difference: &Difference) -> &'static str {
+    match difference.kind {
+        agent_router_core::ParityKind::MissingInCodex => "missing_in_codex",
+        agent_router_core::ParityKind::MissingInClaude => "missing_in_claude",
+        agent_router_core::ParityKind::CommandDiffers => "command_differs",
+        agent_router_core::ParityKind::ArgsDiffer => "args_differ",
+        agent_router_core::ParityKind::EnvKeysDiffer => "env_keys_differ",
+        agent_router_core::ParityKind::StandaloneClaudeMd => "standalone_claude_md",
     }
 }
 
