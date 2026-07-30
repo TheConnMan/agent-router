@@ -76,22 +76,8 @@ impl Classification {
 /// IMPURE: score `task` with Claude Haiku. Never fails: an unusable answer becomes the fallback.
 pub fn classify(task: &str, config: &Config) -> Classification {
     let prompt = classifier_prompt(task, &config.connectors);
-    let mut cmd = Command::new("claude");
-    cmd.arg("-p")
-        .arg("--model")
-        .arg("haiku")
-        .arg("--output-format")
-        .arg("json")
-        // No project MCP servers: the classifier is a scoring call, and loading whatever
-        // servers the task's cwd configures only adds startup latency to a timed call.
-        .arg("--strict-mcp-config")
-        .arg(&prompt);
-    // Run from home, not the task dir, for the same reason: no project config to load.
-    let home = agent_viewer_core::home_dir();
-    if home.is_dir() {
-        cmd.current_dir(&home);
-    }
     let timeout = Duration::from_secs(config.classifier_timeout_secs);
+    let cmd = classifier_command(&prompt);
     match capture(cmd, timeout) {
         Ok(stdout) => match parse_classifier_output(&stdout) {
             Some(classification) => classification,
@@ -99,6 +85,40 @@ pub fn classify(task: &str, config: &Config) -> Classification {
         },
         Err(why) => Classification::fallback(&why),
     }
+}
+
+/// PURE builder: the classifier invocation. Every flag here is about the CLI's own startup cost,
+/// which dominated this call and is the whole reason the 30s timeout is viable.
+///
+/// Measured on this box 2026-07-30: plain `claude -p --model haiku --output-format json` spent
+/// ~14s before it even issued the API request (hooks, plugin sync, auto-memory, CLAUDE.md
+/// discovery) and took 29-38s wall, so it lost a 30s deadline about half the time.
+/// `CLAUDE_SUBPROCESS=1` plus `--safe-mode` (all customizations off: CLAUDE.md, skills, plugins,
+/// hooks, MCP servers, commands, agents) took time-to-request to ~27ms and the whole call to
+/// 12-16s. `--bare` would do the same but is unusable here: it never reads OAuth or the keychain,
+/// so it answers "Not logged in". This is the same posture the compound-learning hooks use for
+/// their own haiku calls.
+///
+/// `--safe-mode` also makes the scoring hermetic, which matters independently of speed: the
+/// verdict must not shift because a project's CLAUDE.md or a skill happened to load.
+pub fn classifier_command(prompt: &str) -> Command {
+    let mut cmd = Command::new("claude");
+    cmd.env("CLAUDE_SUBPROCESS", "1")
+        .arg("-p")
+        .arg("--model")
+        .arg("haiku")
+        .arg("--output-format")
+        .arg("json")
+        .arg("--no-session-persistence")
+        .arg("--safe-mode")
+        .arg("--strict-mcp-config")
+        .arg(prompt);
+    // Run from home, never the task dir: nothing about the task's own project should be loaded.
+    let home = agent_viewer_core::home_dir();
+    if home.is_dir() {
+        cmd.current_dir(&home);
+    }
+    cmd
 }
 
 /// PURE: the classifier prompt. The rubric is verbatim from the routing plan; the connector
@@ -117,6 +137,8 @@ Claude when two or more hold: (1) requirements still being discovered, (2) depen
 Hard gates, applied before any scoring: a missing connector is an automatic Claude decision regardless of shape. Durable rule as tiebreaker: Codex executes contracts, Claude manages evolving programs. Difficulty alone never routes to Claude.
 
 Score each of the twelve criteria literally, as written. Do not invent signals: needing skill, care, or interpretation is not a Claude signal, and neither is being read-only, large, multi-repo, or long-running.
+
+Judge the task as stated, at the level of detail it is stated. When the task says the commands, metrics, baselines, or acceptance criteria are specified, take that as given and score criteria 1 to 3 as held; a summary that does not inline them is NOT requirements still being discovered. Signal 5 needs all four of strategy, implementation, evaluation, and remediation, not evaluation alone. Signal 2 needs the task to actually call for several agents exchanging findings.
 
 The connector inventory is authoritative: Codex on this box can reach {inventory}. Set missing_connector true ONLY when the task must reach a named system absent from that list. Never set it because you cannot see a connector yourself.
 
@@ -309,8 +331,50 @@ mod tests {
         assert!(prompt.contains("(6) live changes need repeated risk judgment"));
         assert!(prompt.contains("a missing connector is an automatic Claude decision"));
         assert!(prompt.contains("Difficulty alone never routes to Claude"));
+        // The anti-drift instructions are load-bearing: without them haiku reads a task summary
+        // that does not inline its metrics as "requirements still being discovered" and routes a
+        // bounded evaluation to claude.
+        assert!(prompt.contains("Judge the task as stated, at the level of detail it is stated."));
+        assert!(prompt.contains(
+            "Signal 5 needs all four of strategy, implementation, evaluation, and remediation"
+        ));
         assert!(prompt.contains("Codex on this box can reach local shell, airtable"));
         assert!(prompt.contains("do a thing"));
+    }
+
+    /// The startup-stripping flags are the reason the classifier fits its timeout at all, so they
+    /// are pinned: losing one silently doubles the call and every task starts falling back to
+    /// claude with `classifier_failed`.
+    #[test]
+    fn the_classifier_invocation_pins_the_startup_stripping_flags() {
+        let cmd = classifier_command("score this");
+        assert_eq!(cmd.get_program(), std::ffi::OsStr::new("claude"));
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        for flag in [
+            "-p",
+            "--output-format",
+            "json",
+            "--no-session-persistence",
+            "--safe-mode",
+            "--strict-mcp-config",
+        ] {
+            assert!(args.contains(&flag.to_string()), "{flag} must be passed");
+        }
+        let model = args.iter().position(|a| a == "--model").expect("--model");
+        assert_eq!(args[model + 1], "haiku");
+        assert_eq!(args.last().map(String::as_str), Some("score this"));
+
+        // `--safe-mode` disables hooks, but the env var is what keeps a hook-driven harness from
+        // treating this as a fresh interactive session.
+        let subprocess = cmd
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("CLAUDE_SUBPROCESS"))
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_string_lossy().into_owned());
+        assert_eq!(subprocess.as_deref(), Some("1"));
     }
 
     #[test]
