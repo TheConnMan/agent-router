@@ -258,7 +258,7 @@ mod tests {
             missing_connector: false,
             verdict: Verdict::Codex,
             confidence: Confidence::High,
-            complexity: Complexity::Hard,
+            complexity: Complexity::Ultra,
             rationale: "bounded contract".to_string(),
             classifier_failed: false,
         };
@@ -304,7 +304,7 @@ mod tests {
         assert_eq!(row.provider, "codex");
         assert_eq!(row.verdict.as_deref(), Some("codex"));
         assert_eq!(row.confidence.as_deref(), Some("high"));
-        assert_eq!(row.complexity.as_deref(), Some("hard"));
+        assert_eq!(row.complexity.as_deref(), Some("ultra"));
         assert_eq!(row.codex_ready_count, Some(5));
         assert_eq!(row.claude_signal_count, Some(1));
         assert_eq!(row.missing_connector, Some(false));

@@ -37,23 +37,29 @@ pub enum Confidence {
 }
 
 /// How much reasoning the task needs. Orthogonal to the verdict: either provider can take a
-/// trivial task. This is what scales the model and the effort the job runs at.
+/// simple task. This picks the model the job runs on; the model's own default effort then
+/// follows from it, because the model is the better toggle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Complexity {
-    Trivial,
-    /// The default: what an unscored, an old, or an unparseable answer reads as.
+    Low,
+    Medium,
+    /// The default: what an unscored, an old, or an unparseable answer reads as. Unscored work
+    /// errs toward capability, so it is high rather than the middle of the ladder.
     #[default]
-    Standard,
-    Hard,
+    High,
+    /// The rare top tier. On claude it is the only tier that reaches fable, so the rubric keeps
+    /// it deliberately hard to earn.
+    Ultra,
 }
 
 impl Complexity {
     pub fn tag(self) -> &'static str {
         match self {
-            Complexity::Trivial => "trivial",
-            Complexity::Standard => "standard",
-            Complexity::Hard => "hard",
+            Complexity::Low => "low",
+            Complexity::Medium => "medium",
+            Complexity::High => "high",
+            Complexity::Ultra => "ultra",
         }
     }
 }
@@ -66,7 +72,7 @@ pub struct Classification {
     pub missing_connector: bool,
     pub verdict: Verdict,
     pub confidence: Confidence,
-    /// Absent from an older log row or an answer that omitted it, which both read as standard.
+    /// Absent from an older log row or an answer that omitted it, which both read as high.
     #[serde(default)]
     pub complexity: Complexity,
     pub rationale: String,
@@ -89,7 +95,7 @@ impl Classification {
             missing_connector: false,
             verdict,
             confidence: Confidence::Low,
-            complexity: Complexity::Standard,
+            complexity: Complexity::High,
             rationale: format!("classifier failed ({why}), defaulting to {provider_name}"),
             classifier_failed: true,
         }
@@ -171,7 +177,7 @@ Score each of the twelve criteria literally, as written. Do not invent signals: 
 
 Judge the task as stated, at the level of detail it is stated. When the task says the commands, metrics, baselines, or acceptance criteria are specified, take that as given and score criteria 1 to 3 as held; a summary that does not inline them is NOT requirements still being discovered. Signal 5 needs all four of strategy, implementation, evaluation, and remediation, not evaluation alone. Signal 2 needs the task to actually call for several agents exchanging findings.
 
-Separately, and independently of the verdict, judge how much reasoning the task needs. complexity is "trivial" when it is conversational, one step, mechanical, or a single file with an obvious answer; "standard" for a normal well scoped implementation or investigation; "hard" when it spans several files or is subtle enough to need heavy reasoning or design judgment. Complexity is orthogonal to the provider: a trivial task can belong to either provider, and so can a hard one. Never let complexity change the verdict, and never let the verdict change complexity.
+Separately, and independently of the verdict, judge how much reasoning the task needs. complexity is "low" when it is conversational, one step, mechanical, or a single file with an obvious answer; "medium" for a normal well scoped implementation or investigation; "high" when it spans several files or is subtle enough to need heavy reasoning or design judgment; "ultra" only for the rare hardest work, where a wrong call is expensive and hard to reverse: architecture or plan review, a root cause hunt that has already defeated ordinary debugging, or a design decision that sets a direction. Ultra is not "large" or "long running", and it is not "important to the user": when torn between high and ultra, answer high. Complexity is orthogonal to the provider: a low task can belong to either provider, and so can an ultra one. Never let complexity change the verdict, and never let the verdict change complexity.
 
 The connector inventory is authoritative: Codex on this box can reach {inventory}. Set missing_connector true ONLY when the task must reach a named system absent from that list. Never set it because you cannot see a connector yourself.
 
@@ -181,8 +187,8 @@ TASK
 >>>
 
 Reply with exactly this JSON object, filled in:
-{{"codex_ready":[b,b,b,b,b,b],"claude_signals":[b,b,b,b,b,b],"missing_connector":false,"verdict":"codex","confidence":"high","complexity":"standard","rationale":"one sentence"}}
-codex_ready and claude_signals are exactly six booleans each, in the order listed above. verdict is "codex" or "claude". confidence is "high", "medium", or "low". complexity is "trivial", "standard", or "hard"."#
+{{"codex_ready":[b,b,b,b,b,b],"claude_signals":[b,b,b,b,b,b],"missing_connector":false,"verdict":"codex","confidence":"high","complexity":"medium","rationale":"one sentence"}}
+codex_ready and claude_signals are exactly six booleans each, in the order listed above. verdict is "codex" or "claude". confidence is "high", "medium", or "low". complexity is "low", "medium", "high", or "ultra"."#
     )
 }
 
@@ -322,15 +328,15 @@ mod tests {
         assert!(parse_classifier_output("not json at all").is_none());
     }
 
-    /// Complexity is what scales the model and the effort, so each value must survive the parse,
-    /// and an answer that omits the field must read as standard rather than failing the whole
-    /// classification.
+    /// Complexity is what picks the model, so each value must survive the parse, and an answer
+    /// that omits the field must read as high rather than failing the whole classification.
     #[test]
-    fn complexity_parses_and_an_omitted_one_reads_as_standard() {
+    fn complexity_parses_and_an_omitted_one_reads_as_high() {
         for (answer, want) in [
-            ("trivial", Complexity::Trivial),
-            ("standard", Complexity::Standard),
-            ("hard", Complexity::Hard),
+            ("low", Complexity::Low),
+            ("medium", Complexity::Medium),
+            ("high", Complexity::High),
+            ("ultra", Complexity::Ultra),
         ] {
             let text = GOOD.replace(
                 "\"missing_connector\":false",
@@ -343,7 +349,7 @@ mod tests {
 
         assert!(!GOOD.contains("complexity"), "the fixture omits the field");
         let omitted = parse_classifier_output(&envelope(GOOD)).expect("parses");
-        assert_eq!(omitted.complexity, Complexity::Standard);
+        assert_eq!(omitted.complexity, Complexity::High);
 
         let bogus = GOOD.replace(
             "\"missing_connector\":false",
@@ -376,6 +382,7 @@ mod tests {
         let got = Classification::fallback("timed out after 30s", DefaultProvider::Claude);
         assert_eq!(got.verdict, Verdict::Claude);
         assert_eq!(got.confidence, Confidence::Low);
+        assert_eq!(got.complexity, Complexity::High);
         assert!(got.classifier_failed);
         assert!(got.rationale.contains("timed out after 30s"));
     }
@@ -408,8 +415,11 @@ mod tests {
         assert!(prompt.contains("conversational, one step, mechanical, or a single file"));
         assert!(prompt.contains("a normal well scoped implementation or investigation"));
         assert!(prompt.contains("Complexity is orthogonal to the provider"));
-        assert!(prompt.contains("\"complexity\":\"standard\""));
-        assert!(prompt.contains("complexity is \"trivial\", \"standard\", or \"hard\""));
+        // Ultra is the only tier that reaches fable, so the brake on over-assigning it is
+        // load-bearing rather than decorative.
+        assert!(prompt.contains("when torn between high and ultra, answer high"));
+        assert!(prompt.contains("\"complexity\":\"medium\""));
+        assert!(prompt.contains("complexity is \"low\", \"medium\", \"high\", or \"ultra\""));
     }
 
     /// The startup-stripping flags are the reason the classifier fits its timeout at all, so they

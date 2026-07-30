@@ -25,7 +25,7 @@ fn scored(verdict: Verdict, confidence: Confidence) -> Classification {
         missing_connector: false,
         verdict,
         confidence,
-        complexity: Complexity::Standard,
+        complexity: Complexity::High,
         rationale: "fixture".to_string(),
         classifier_failed: false,
     }
