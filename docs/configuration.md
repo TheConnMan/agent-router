@@ -1,8 +1,15 @@
 # Configuration
 
 `agent-router` reads `~/.config/agent-router/config.toml`. The file is written with defaults the
-first time any command loads it, so the fastest way to see the current schema is to run
-`agent-router usage` once and open the file.
+first time a command that needs it loads it, so the fastest way to see the current schema is to run
+a throwaway decision once and open the file:
+
+```bash
+agent-router run "hello" --provider claude --dry-run
+cat ~/.config/agent-router/config.toml
+```
+
+`usage` and `log` do not read the config, so neither creates it.
 
 Two rules govern the whole file:
 
