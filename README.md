@@ -126,9 +126,9 @@ agent-router run "Fix the failing test" --dir ~/git/other-project
 | `--dir <PATH>` | current directory | Working directory for the dispatched job. |
 | `--provider <NAME>` | `auto` | `auto` classifies. `codex`, `claude`, or `opencode` skips classification. |
 | `--model <NAME>` | tier table | Model override. Requires an explicit `--provider`. Pairing it with `--provider auto` is rejected: the router exits nonzero naming both flags rather than dropping the override, because the auto path chooses its own model from the tier table. |
-| `--name <NAME>` | first 40 characters of the task | Name for the dispatched job. It reaches the `claude --bg --name` argv verbatim and is recorded as `job_name` in the decision log for every provider, so callers that reconcile inflight jobs by exact name depend on it. |
+| `--name <NAME>` | first 40 characters of the task | Name for the dispatched job. It reaches the `claude --bg --name` argv verbatim, names the Codex thread, and is recorded as `job_name` in the decision log for every provider, so callers that reconcile inflight jobs by exact name depend on it. An empty or whitespace only name is rejected. |
 | `--dry-run` | off | Decide and log, dispatch nothing. |
-| `--mcp-config <PATH>` | none | MCP config file for the dispatched Claude job. Repeatable. Rejected for any other provider. |
+| `--mcp-config <PATH>` | none | MCP config file for the dispatched Claude job. Repeatable. Rejected for any other provider, and the check runs after routing, so pairing it with `--provider auto` fails whenever classification lands on a provider other than Claude. |
 | `--strict-mcp-config` | off | Use only the `--mcp-config` files and drop every inherited MCP server. See the warning below before using it. |
 | `--json` | off | Emit the full decision, including gates, classification, and usage. |
 
