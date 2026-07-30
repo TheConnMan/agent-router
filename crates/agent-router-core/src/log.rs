@@ -39,6 +39,8 @@ pub struct Row {
     pub effort: Option<String>,
     pub verdict: Option<String>,
     pub confidence: Option<String>,
+    /// None for a row written before complexity scaling, and for an explicit provider.
+    pub complexity: Option<String>,
     pub codex_ready_count: Option<i64>,
     pub claude_signal_count: Option<i64>,
     pub missing_connector: Option<bool>,
@@ -64,6 +66,7 @@ CREATE TABLE IF NOT EXISTS decisions (
     effort              TEXT,
     verdict             TEXT,
     confidence          TEXT,
+    complexity          TEXT,
     codex_ready         TEXT,
     codex_ready_count   INTEGER,
     claude_signals      TEXT,
@@ -90,7 +93,7 @@ CREATE INDEX IF NOT EXISTS decisions_created_at ON decisions(created_at_ms);
 const SELECT_COLUMNS: &str = "\
 id, created_at_ms, task, dir, requested, provider, model, effort, verdict, confidence, \
 codex_ready_count, claude_signal_count, missing_connector, gates, claude_weekly_pct, \
-codex_weekly_pct, dry_run, job_id, job_name, outcome, rationale";
+codex_weekly_pct, dry_run, job_id, job_name, outcome, rationale, complexity";
 
 pub struct DecisionLog {
     conn: Connection,
@@ -111,6 +114,7 @@ impl DecisionLog {
         let conn = Connection::open(path)?;
         conn.busy_timeout(std::time::Duration::from_millis(500))?;
         conn.execute_batch(SCHEMA)?;
+        add_missing_columns(&conn)?;
         Ok(DecisionLog { conn })
     }
 
@@ -126,10 +130,11 @@ impl DecisionLog {
                 claude_signal_count, missing_connector, gates, rationale,
                 claude_five_hour_pct, claude_five_hour_reset, claude_weekly_pct,
                 claude_weekly_reset, codex_five_hour_pct, codex_five_hour_reset,
-                codex_weekly_pct, codex_weekly_reset, dry_run, job_id, job_name, outcome
+                codex_weekly_pct, codex_weekly_reset, dry_run, job_id, job_name, outcome,
+                complexity
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28
+                ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29
             )",
             rusqlite::params![
                 now_ms(),
@@ -160,6 +165,7 @@ impl DecisionLog {
                 entry.job_id,
                 entry.job_name,
                 entry.outcome,
+                classification.map(|c| c.complexity.tag()),
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -193,11 +199,24 @@ impl DecisionLog {
                     job_name: row.get(18)?,
                     outcome: row.get(19)?,
                     rationale: row.get(20)?,
+                    complexity: row.get(21)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<Row>>>()?;
         Ok(rows)
     }
+}
+
+/// IMPURE: bring a database written before complexity scaling up to the current schema. Guarded
+/// on the column being absent, because `ALTER TABLE ADD COLUMN` is an error when it is not.
+fn add_missing_columns(conn: &Connection) -> Result<()> {
+    let present: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('decisions') WHERE name = 'complexity'")?
+        .exists([])?;
+    if !present {
+        conn.execute("ALTER TABLE decisions ADD COLUMN complexity TEXT", [])?;
+    }
+    Ok(())
 }
 
 pub fn default_db_path() -> PathBuf {
@@ -228,7 +247,7 @@ fn bits(flags: &[bool; 6]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::classify::{Classification, Confidence, Verdict};
+    use crate::classify::{Classification, Complexity, Confidence, Verdict};
     use crate::config::Config;
     use crate::usage::{Headroom, UsageSnapshot};
 
@@ -239,6 +258,7 @@ mod tests {
             missing_connector: false,
             verdict: Verdict::Codex,
             confidence: Confidence::High,
+            complexity: Complexity::Hard,
             rationale: "bounded contract".to_string(),
             classifier_failed: false,
         };
@@ -284,6 +304,7 @@ mod tests {
         assert_eq!(row.provider, "codex");
         assert_eq!(row.verdict.as_deref(), Some("codex"));
         assert_eq!(row.confidence.as_deref(), Some("high"));
+        assert_eq!(row.complexity.as_deref(), Some("hard"));
         assert_eq!(row.codex_ready_count, Some(5));
         assert_eq!(row.claude_signal_count, Some(1));
         assert_eq!(row.missing_connector, Some(false));
@@ -347,8 +368,12 @@ mod tests {
     fn an_explicit_provider_row_has_no_classification_columns() {
         let dir = tempfile::tempdir().expect("tempdir");
         let log = DecisionLog::open_at(&dir.path().join("router.db")).expect("opens");
-        let decision =
-            crate::decide::decide_explicit(crate::Provider::Opencode, None, UsageSnapshot::full());
+        let decision = crate::decide::decide_explicit(
+            crate::Provider::Opencode,
+            None,
+            UsageSnapshot::full(),
+            &Config::default(),
+        );
         log.record(&Entry {
             task: "t",
             dir: Path::new("/tmp"),
@@ -405,6 +430,40 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o700);
+    }
+
+    /// A database written before complexity scaling gains the column on open, keeps its rows, and
+    /// reads them back with no complexity rather than failing the SELECT.
+    #[test]
+    fn an_older_database_gains_the_complexity_column_and_keeps_its_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("router.db");
+        let older = SCHEMA.replace("    complexity          TEXT,\n", "");
+        assert!(!older.contains("complexity"), "the older schema fixture");
+        {
+            let conn = rusqlite::Connection::open(&path).expect("create older database");
+            conn.execute_batch(&older).expect("older schema");
+            conn.execute(
+                "INSERT INTO decisions (
+                    created_at_ms, task, dir, requested, provider, gates, rationale,
+                    claude_five_hour_pct, claude_five_hour_reset, claude_weekly_pct,
+                    claude_weekly_reset, codex_five_hour_pct, codex_five_hour_reset,
+                    codex_weekly_pct, codex_weekly_reset, dry_run, outcome
+                ) VALUES (1, 'older row', '/tmp', 'auto', 'codex', '', 'why', 0, 0, 0, 0, 0, 0, \
+                 0, 0, 1, 'dry-run')",
+                [],
+            )
+            .expect("older row");
+        }
+
+        let log = DecisionLog::open_at(&path).expect("migrates on open");
+        let rows = log.recent(10).expect("reads the older row back");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].task, "older row");
+        assert_eq!(rows[0].complexity, None);
+
+        // The migration is idempotent: opening again must not try to add the column twice.
+        DecisionLog::open_at(&path).expect("reopens");
     }
 
     #[test]

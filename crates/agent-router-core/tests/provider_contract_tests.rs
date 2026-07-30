@@ -291,6 +291,7 @@ fn claude_uses_background_argv_and_excludes_a_prior_same_name_and_cwd() {
         &cwd,
         &task,
         Some("opus[1m]"),
+        None,
         Duration::from_millis(250),
     )
     .expect("claude dispatch");
@@ -301,6 +302,41 @@ fn claude_uses_background_argv_and_excludes_a_prior_same_name_and_cwd() {
         wait_for_text(&log).lines().collect::<Vec<_>>(),
         vec!["--bg", "--model", "opus[1m]", "--name", &name, &task]
     );
+}
+
+/// A claude job runs at the decided effort, which is what makes the trivial tier cheaper rather
+/// than only differently modelled. Deleting the `--effort` argv lines fails this test.
+#[cfg(unix)]
+#[test]
+fn claude_argv_carries_the_decided_effort_and_omits_the_flag_without_one() {
+    for effort in [Some("low"), None] {
+        let root = TempDir::new("claude-effort");
+        let cwd = root.path.join("working");
+        fs::create_dir(&cwd).expect("create cwd");
+        let task = "route one trivial task";
+        let name = truncated_title(task);
+        let (binary, log) = fake_claude(&root.path, &json!([]));
+
+        dispatch_with_binary(
+            &binary,
+            &cwd,
+            task,
+            Some("sonnet"),
+            effort,
+            Duration::from_millis(25),
+        )
+        .expect("claude dispatch");
+
+        let argv = wait_for_text(&log);
+        let argv = argv.lines().collect::<Vec<_>>();
+        let expected: Vec<&str> = match effort {
+            Some(effort) => vec![
+                "--bg", "--model", "sonnet", "--effort", effort, "--name", &name, task,
+            ],
+            None => vec!["--bg", "--model", "sonnet", "--name", &name, task],
+        };
+        assert_eq!(argv, expected, "argv for effort {effort:?}");
+    }
 }
 
 #[cfg(unix)]
@@ -327,6 +363,7 @@ fn claude_running_job_keeps_its_name_when_the_id_is_not_yet_published() {
         &cwd,
         task,
         Some("opus[1m]"),
+        None,
         Duration::from_millis(25),
     )
     .expect("the background job is running even before its id is listed");
@@ -414,8 +451,14 @@ fn codex_decision_effort_reaches_turn_start_at_the_dispatch_boundary() {
     fs::set_permissions(&binary, permissions).expect("make fake executable");
     let _path = PathGuard::prepend(&root.path);
 
-    let decision = decide_explicit(Provider::Codex, None, UsageSnapshot::full());
-    assert_eq!(decision.effort.as_deref(), Some("xhigh"));
+    let decision = decide_explicit(
+        Provider::Codex,
+        None,
+        UsageSnapshot::full(),
+        &agent_router_core::Config::default(),
+    );
+    // An explicit provider is unscored, so it runs at the standard tier.
+    assert_eq!(decision.effort.as_deref(), Some("medium"));
     let request = Request {
         task: "exercise the real dispatch seam",
         dir: &root.path,
@@ -434,7 +477,8 @@ fn codex_decision_effort_reaches_turn_start_at_the_dispatch_boundary() {
     assert_eq!(requests[0]["method"], "initialize");
     assert_eq!(requests[1]["method"], "thread/start");
     assert_eq!(requests[2]["method"], "turn/start");
-    assert_eq!(requests[2]["params"]["effort"], "xhigh");
+    assert_eq!(requests[2]["params"]["effort"], "medium");
+    assert_eq!(requests[1]["params"]["model"], "gpt-5.6-terra");
 }
 
 #[derive(Debug)]
