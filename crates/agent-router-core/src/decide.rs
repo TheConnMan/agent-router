@@ -30,8 +30,6 @@ pub enum Gate {
     OverCeiling,
     /// Weekly usage routing is disabled by policy.
     WeeklyRoutingDisabled,
-    /// Weekly usage changed the provider while the model stayed with the prior choice.
-    UsageFailoverPinned,
 }
 
 impl Gate {
@@ -45,7 +43,6 @@ impl Gate {
             Gate::HeadroomTiebreak => "headroom_tiebreak",
             Gate::OverCeiling => "over_ceiling",
             Gate::WeeklyRoutingDisabled => "weekly_routing_disabled",
-            Gate::UsageFailoverPinned => "usage_failover_pinned",
         }
     }
 }
@@ -133,13 +130,11 @@ pub fn decide(classification: Classification, usage: UsageSnapshot, config: &Con
     }
 
     if provider != pre_usage_provider {
-        // The task did not get simpler by moving, so the new provider's tiers are read at the
-        // same complexity rather than the old provider's model being carried across.
-        if config.policy.usage_failover_changes_model {
-            model = model_for(provider, complexity, config);
-        } else {
-            gates.push(Gate::UsageFailoverPinned);
-        }
+        // The job is dispatched to the provider it landed on, so its model is read from that
+        // provider's tiers. The task did not get simpler by moving, so the complexity is the
+        // same one; only the provider changed. Carrying the prior provider's model across would
+        // hand a backend a name it cannot resolve, since no model exists on both.
+        model = model_for(provider, complexity, config);
     }
 
     if both_over_ceiling {
@@ -327,7 +322,7 @@ mod tests {
                 codex_weekly: 97.0,
                 claude_weekly: 40.0,
                 want_provider: Provider::Claude,
-                want_gates: vec![Gate::FlippedOnExhaustion, Gate::UsageFailoverPinned],
+                want_gates: vec![Gate::FlippedOnExhaustion],
             },
             Case {
                 label: "the exhaustion flip works in the other direction too",
@@ -338,7 +333,7 @@ mod tests {
                 codex_weekly: 40.0,
                 claude_weekly: 99.0,
                 want_provider: Provider::Codex,
-                want_gates: vec![Gate::FlippedOnExhaustion, Gate::UsageFailoverPinned],
+                want_gates: vec![Gate::FlippedOnExhaustion],
             },
             Case {
                 label: "a borderline verdict wins a small gap",
@@ -371,7 +366,7 @@ mod tests {
                 codex_weekly: 80.0,
                 claude_weekly: 30.0,
                 want_provider: Provider::Claude,
-                want_gates: vec![Gate::HeadroomTiebreak, Gate::UsageFailoverPinned],
+                want_gates: vec![Gate::HeadroomTiebreak],
             },
             Case {
                 label: "two claude signals force claude even with claude exhausted",
@@ -452,7 +447,6 @@ mod tests {
         );
         assert_eq!(decision.provider, Provider::Claude);
         assert!(decision.gates.contains(&Gate::FlippedOnExhaustion));
-        assert!(decision.gates.contains(&Gate::UsageFailoverPinned));
     }
 
     #[test]
@@ -527,8 +521,7 @@ mod tests {
     /// rather than carrying the old provider's model across the flip.
     #[test]
     fn a_usage_failover_rederives_the_new_providers_tier_at_the_same_complexity() {
-        let mut config = Config::default();
-        config.policy.usage_failover_changes_model = true;
+        let config = Config::default();
 
         // Codex verdict, codex exhausted: lands on claude's low tier, not codex's.
         let to_claude = decide(
@@ -550,19 +543,28 @@ mod tests {
         assert_eq!(to_codex.model.as_deref(), Some("gpt-5.6-sol"));
     }
 
-    /// With the failover flag off, the model stays with the pre-flip provider's tier, which is
-    /// what `usage_failover_pinned` reports.
+    /// The regression this fix exists for: a flipped job must never be dispatched with the model
+    /// of the provider it just left, because no model name is valid on both backends.
     #[test]
-    fn a_pinned_usage_failover_keeps_the_prior_providers_tier() {
+    fn a_flipped_job_never_carries_the_other_providers_model() {
         let config = Config::default();
-        let decision = decide(
+        let to_claude = decide(
             at(Verdict::Codex, Complexity::Low),
             usage(99.0, 0.0),
             &config,
         );
-        assert_eq!(decision.provider, Provider::Claude);
-        assert_eq!(decision.model.as_deref(), Some("gpt-5.6-luna"));
-        assert!(decision.gates.contains(&Gate::UsageFailoverPinned));
+        assert_eq!(to_claude.provider, Provider::Claude);
+        assert_eq!(to_claude.model.as_deref(), Some("sonnet"));
+        assert_eq!(to_claude.gates, vec![Gate::FlippedOnExhaustion]);
+
+        let to_codex = decide(
+            at(Verdict::Claude, Complexity::Low),
+            usage(0.0, 99.0),
+            &config,
+        );
+        assert_eq!(to_codex.provider, Provider::Codex);
+        assert_eq!(to_codex.model.as_deref(), Some("gpt-5.6-luna"));
+        assert_eq!(to_codex.gates, vec![Gate::FlippedOnExhaustion]);
     }
 
     #[test]

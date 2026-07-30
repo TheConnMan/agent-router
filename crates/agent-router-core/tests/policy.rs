@@ -56,7 +56,6 @@ fn written_defaults_round_trip_with_codex_policy() {
 
     assert_eq!(created.policy.default_provider, DefaultProvider::Codex);
     assert!(created.policy.weekly_routing);
-    assert!(!created.policy.usage_failover_changes_model);
     assert!(created.parity.roots.is_empty());
     assert!(created.parity.exceptions.is_empty());
     assert_eq!(
@@ -64,10 +63,6 @@ fn written_defaults_round_trip_with_codex_policy() {
         Some("codex")
     );
     assert_eq!(document["policy"]["weekly_routing"].as_bool(), Some(true));
-    assert_eq!(
-        document["policy"]["usage_failover_changes_model"].as_bool(),
-        Some(false)
-    );
     assert_eq!(
         Config::load_from(&path).expect("reload written config"),
         created
@@ -89,7 +84,6 @@ default_provider = "claude"
 
     assert_eq!(config.policy.default_provider, DefaultProvider::Claude);
     assert!(config.policy.weekly_routing);
-    assert!(!config.policy.usage_failover_changes_model);
     assert_eq!(config.connectors, Config::default().connectors);
     assert_eq!(config.hard_ceiling_pct, Config::default().hard_ceiling_pct);
 }
@@ -228,15 +222,12 @@ fn failed_classifier_remains_eligible_for_weekly_routing() {
     );
 
     assert_eq!(decision.provider, Provider::Claude);
-    assert_eq!(decision.model.as_deref(), Some("gpt-5.6-sol"));
+    // The flip re-derives for claude: the codex fallback model must not survive the move.
+    assert_eq!(decision.model.as_deref(), Some("opus[1m]"));
     assert_eq!(decision.effort, None);
     assert_eq!(
         decision.gates,
-        vec![
-            Gate::ClassifierFailed,
-            Gate::FlippedOnExhaustion,
-            Gate::UsageFailoverPinned,
-        ]
+        vec![Gate::ClassifierFailed, Gate::FlippedOnExhaustion]
     );
 }
 
@@ -290,8 +281,11 @@ fn disabled_weekly_routing_blocks_both_flip_directions() {
     assert_eq!(claude.effort, None);
 }
 
+/// A weekly failover dispatches to the other provider, so the model must be re-derived for the
+/// provider actually receiving the job. Carrying the prior provider's model across a flip sends a
+/// name the target cannot resolve, in either direction.
 #[test]
-fn weekly_failover_pins_both_outputs_in_both_directions_by_default() {
+fn a_weekly_failover_rederives_the_model_for_the_provider_it_lands_on() {
     let config = Config::default();
 
     let to_claude = decide(
@@ -300,12 +294,9 @@ fn weekly_failover_pins_both_outputs_in_both_directions_by_default() {
         &config,
     );
     assert_eq!(to_claude.provider, Provider::Claude);
-    assert_eq!(to_claude.model.as_deref(), Some("gpt-5.6-sol"));
+    assert_eq!(to_claude.model.as_deref(), Some("opus[1m]"));
     assert_eq!(to_claude.effort, None);
-    assert_eq!(
-        to_claude.gates,
-        vec![Gate::FlippedOnExhaustion, Gate::UsageFailoverPinned]
-    );
+    assert_eq!(to_claude.gates, vec![Gate::FlippedOnExhaustion]);
 
     let to_codex = decide(
         scored(Verdict::Claude, Confidence::High, 0, false),
@@ -313,52 +304,9 @@ fn weekly_failover_pins_both_outputs_in_both_directions_by_default() {
         &config,
     );
     assert_eq!(to_codex.provider, Provider::Codex);
-    assert_eq!(to_codex.model.as_deref(), Some("opus[1m]"));
+    assert_eq!(to_codex.model.as_deref(), Some("gpt-5.6-sol"));
     assert_eq!(to_codex.effort, None);
-    assert_eq!(
-        to_codex.gates,
-        vec![Gate::FlippedOnExhaustion, Gate::UsageFailoverPinned]
-    );
-}
-
-/// The model is the only thing a usage failover can move, so the flag decides between the new
-/// provider's tier and the pinned prior one, and the pinned gate reports exactly that.
-#[test]
-fn the_model_failover_flag_decides_which_providers_tier_survives_a_flip() {
-    struct Case {
-        model_changes: bool,
-        expected_model: Option<&'static str>,
-        expected_gates: Vec<Gate>,
-    }
-
-    let cases = [
-        Case {
-            model_changes: false,
-            expected_model: Some("gpt-5.6-sol"),
-            expected_gates: vec![Gate::FlippedOnExhaustion, Gate::UsageFailoverPinned],
-        },
-        Case {
-            model_changes: true,
-            expected_model: Some("opus[1m]"),
-            expected_gates: vec![Gate::FlippedOnExhaustion],
-        },
-    ];
-
-    for case in cases {
-        let mut config = Config::default();
-        config.policy.usage_failover_changes_model = case.model_changes;
-
-        let decision = decide(
-            scored(Verdict::Codex, Confidence::High, 0, false),
-            usage(99.0, 0.0),
-            &config,
-        );
-
-        assert_eq!(decision.provider, Provider::Claude);
-        assert_eq!(decision.model.as_deref(), case.expected_model);
-        assert_eq!(decision.effort, None);
-        assert_eq!(decision.gates, case.expected_gates);
-    }
+    assert_eq!(to_codex.gates, vec![Gate::FlippedOnExhaustion]);
 }
 
 #[test]
