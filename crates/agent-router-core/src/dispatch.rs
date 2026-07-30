@@ -31,13 +31,16 @@ pub fn dispatch(decision: &crate::decide::Decision, request: &Request) -> Result
         BackendKind::Codex => {
             let prompt = codex_prompt(request.task, request.read_only);
             // The daemon route, exactly as the viewer spawns it: no daemon lifecycle of our own,
-            // and no exec fallback. NOTE: reasoning effort cannot be carried here -
-            // `thread_start_request` takes only cwd and model, so the decision's `xhigh` is
-            // recorded in the log but not transmitted.
+            // and no exec fallback.
             let backend = agent_viewer_core::codex::CodexBackend::new(
                 agent_viewer_core::default_codex_home(),
             );
-            let spawned = backend.spawn(request.dir, &prompt, decision.model.as_deref())?;
+            let spawned = backend.spawn(
+                request.dir,
+                &prompt,
+                decision.model.as_deref(),
+                decision.effort.as_deref(),
+            )?;
             Ok(Dispatch {
                 job_id: spawned.session_id,
                 job_name: name,
@@ -51,7 +54,12 @@ pub fn dispatch(decision: &crate::decide::Decision, request: &Request) -> Result
             // task ran twice in the same directory, since it is visible on the first poll and
             // the new one is not.
             let dispatched_at = agent_viewer_core::spawn::now_ms();
-            backend.spawn(request.dir, request.task, decision.model.as_deref())?;
+            backend.spawn(
+                request.dir,
+                request.task,
+                decision.model.as_deref(),
+                decision.effort.as_deref(),
+            )?;
             let job_id = resolve_claude_short_id(&mut backend, &name, request.dir, dispatched_at);
             Ok(Dispatch {
                 job_id,
@@ -60,7 +68,12 @@ pub fn dispatch(decision: &crate::decide::Decision, request: &Request) -> Result
         }
         BackendKind::Opencode => {
             let backend = agent_viewer_core::opencode::OpencodeBackend::new();
-            let spawned = backend.spawn(request.dir, request.task, decision.model.as_deref())?;
+            let spawned = backend.spawn(
+                request.dir,
+                request.task,
+                decision.model.as_deref(),
+                decision.effort.as_deref(),
+            )?;
             Ok(Dispatch {
                 job_id: spawned.session_id,
                 job_name: name,
