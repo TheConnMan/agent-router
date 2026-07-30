@@ -36,6 +36,28 @@ pub enum Confidence {
     Low,
 }
 
+/// How much reasoning the task needs. Orthogonal to the verdict: either provider can take a
+/// trivial task. This is what scales the model and the effort the job runs at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Complexity {
+    Trivial,
+    /// The default: what an unscored, an old, or an unparseable answer reads as.
+    #[default]
+    Standard,
+    Hard,
+}
+
+impl Complexity {
+    pub fn tag(self) -> &'static str {
+        match self {
+            Complexity::Trivial => "trivial",
+            Complexity::Standard => "standard",
+            Complexity::Hard => "hard",
+        }
+    }
+}
+
 /// One scored task. The two arrays are the rubric's six criteria each, in the rubric's order.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Classification {
@@ -44,6 +66,9 @@ pub struct Classification {
     pub missing_connector: bool,
     pub verdict: Verdict,
     pub confidence: Confidence,
+    /// Absent from an older log row or an answer that omitted it, which both read as standard.
+    #[serde(default)]
+    pub complexity: Complexity,
     pub rationale: String,
     /// True when this is the fallback rather than a real score. Not part of the model's JSON.
     #[serde(default)]
@@ -64,6 +89,7 @@ impl Classification {
             missing_connector: false,
             verdict,
             confidence: Confidence::Low,
+            complexity: Complexity::Standard,
             rationale: format!("classifier failed ({why}), defaulting to {provider_name}"),
             classifier_failed: true,
         }
@@ -145,6 +171,8 @@ Score each of the twelve criteria literally, as written. Do not invent signals: 
 
 Judge the task as stated, at the level of detail it is stated. When the task says the commands, metrics, baselines, or acceptance criteria are specified, take that as given and score criteria 1 to 3 as held; a summary that does not inline them is NOT requirements still being discovered. Signal 5 needs all four of strategy, implementation, evaluation, and remediation, not evaluation alone. Signal 2 needs the task to actually call for several agents exchanging findings.
 
+Separately, and independently of the verdict, judge how much reasoning the task needs. complexity is "trivial" when it is conversational, one step, mechanical, or a single file with an obvious answer; "standard" for a normal well scoped implementation or investigation; "hard" when it spans several files or is subtle enough to need heavy reasoning or design judgment. Complexity is orthogonal to the provider: a trivial task can belong to either provider, and so can a hard one. Never let complexity change the verdict, and never let the verdict change complexity.
+
 The connector inventory is authoritative: Codex on this box can reach {inventory}. Set missing_connector true ONLY when the task must reach a named system absent from that list. Never set it because you cannot see a connector yourself.
 
 TASK
@@ -153,8 +181,8 @@ TASK
 >>>
 
 Reply with exactly this JSON object, filled in:
-{{"codex_ready":[b,b,b,b,b,b],"claude_signals":[b,b,b,b,b,b],"missing_connector":false,"verdict":"codex","confidence":"high","rationale":"one sentence"}}
-codex_ready and claude_signals are exactly six booleans each, in the order listed above. verdict is "codex" or "claude". confidence is "high", "medium", or "low"."#
+{{"codex_ready":[b,b,b,b,b,b],"claude_signals":[b,b,b,b,b,b],"missing_connector":false,"verdict":"codex","confidence":"high","complexity":"standard","rationale":"one sentence"}}
+codex_ready and claude_signals are exactly six booleans each, in the order listed above. verdict is "codex" or "claude". confidence is "high", "medium", or "low". complexity is "trivial", "standard", or "hard"."#
     )
 }
 
@@ -294,6 +322,36 @@ mod tests {
         assert!(parse_classifier_output("not json at all").is_none());
     }
 
+    /// Complexity is what scales the model and the effort, so each value must survive the parse,
+    /// and an answer that omits the field must read as standard rather than failing the whole
+    /// classification.
+    #[test]
+    fn complexity_parses_and_an_omitted_one_reads_as_standard() {
+        for (answer, want) in [
+            ("trivial", Complexity::Trivial),
+            ("standard", Complexity::Standard),
+            ("hard", Complexity::Hard),
+        ] {
+            let text = GOOD.replace(
+                "\"missing_connector\":false",
+                &format!("\"missing_connector\":false,\"complexity\":\"{answer}\""),
+            );
+            let got = parse_classifier_output(&envelope(&text)).expect("parses");
+            assert_eq!(got.complexity, want);
+            assert_eq!(got.verdict, Verdict::Codex, "complexity is not the verdict");
+        }
+
+        assert!(!GOOD.contains("complexity"), "the fixture omits the field");
+        let omitted = parse_classifier_output(&envelope(GOOD)).expect("parses");
+        assert_eq!(omitted.complexity, Complexity::Standard);
+
+        let bogus = GOOD.replace(
+            "\"missing_connector\":false",
+            "\"missing_connector\":false,\"complexity\":\"epic\"",
+        );
+        assert!(parse_classifier_output(&envelope(&bogus)).is_none());
+    }
+
     #[test]
     fn an_array_of_the_wrong_length_is_rejected_rather_than_padded() {
         let short = GOOD.replace("[true,true,true,true,true,true]", "[true,true,true]");
@@ -345,6 +403,13 @@ mod tests {
         ));
         assert!(prompt.contains("Codex on this box can reach local shell, airtable"));
         assert!(prompt.contains("do a thing"));
+        // The complexity rubric and its independence from the verdict, which is what stops a
+        // trivial conversational task from being scored hard just because it routed to codex.
+        assert!(prompt.contains("conversational, one step, mechanical, or a single file"));
+        assert!(prompt.contains("a normal well scoped implementation or investigation"));
+        assert!(prompt.contains("Complexity is orthogonal to the provider"));
+        assert!(prompt.contains("\"complexity\":\"standard\""));
+        assert!(prompt.contains("complexity is \"trivial\", \"standard\", or \"hard\""));
     }
 
     /// The startup-stripping flags are the reason the classifier fits its timeout at all, so they

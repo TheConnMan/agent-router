@@ -57,7 +57,7 @@ pub fn run(request: &Request, config: &Config) -> Result<Outcome> {
     }
     let usage = UsageSnapshot::read();
     let decision = match request.provider {
-        Some(provider) => decide_explicit(provider, request.model.clone(), usage),
+        Some(provider) => decide_explicit(provider, request.model.clone(), usage, config),
         None => decide(classify(request.task, config), usage, config),
     };
     let requested = request

@@ -27,9 +27,9 @@ pub fn dispatch(
     cwd: &Path,
     task: &str,
     model: Option<&str>,
-    _effort: Option<&str>,
+    effort: Option<&str>,
 ) -> Result<Dispatch> {
-    dispatch_with_binary(Path::new("claude"), cwd, task, model, ID_TIMEOUT)
+    dispatch_with_binary(Path::new("claude"), cwd, task, model, effort, ID_TIMEOUT)
 }
 
 pub fn dispatch_with_binary(
@@ -37,6 +37,7 @@ pub fn dispatch_with_binary(
     cwd: &Path,
     task: &str,
     model: Option<&str>,
+    effort: Option<&str>,
     timeout: Duration,
 ) -> Result<Dispatch> {
     let name = truncated_title(task);
@@ -46,10 +47,11 @@ pub fn dispatch_with_binary(
         .current_dir(cwd)
         .arg("--bg")
         .arg("--model")
-        .arg(model.unwrap_or(DEFAULT_MODEL))
-        .arg("--name")
-        .arg(&name)
-        .arg(task);
+        .arg(model.unwrap_or(DEFAULT_MODEL));
+    if let Some(effort) = effort {
+        command.arg("--effort").arg(effort);
+    }
+    command.arg("--name").arg(&name).arg(task);
     spawn_detached(command, &router_log_path("claude"))?;
 
     let job_id = resolve_short_id(binary, &name, cwd, dispatched_at, timeout);

@@ -311,6 +311,9 @@ fn outcome_json(outcome: &Outcome) -> serde_json::Value {
 fn print_outcome(outcome: &Outcome) {
     let decision = &outcome.decision;
     let mut line = decision.provider.name().to_string();
+    if let Some(classification) = &decision.classification {
+        line.push_str(&format!(" complexity {}", classification.complexity.tag()));
+    }
     if let Some(model) = &decision.model {
         line.push_str(&format!(" model {model}"));
     }
@@ -371,10 +374,11 @@ fn log(limit: usize, json: bool) -> agent_router_core::Result<()> {
     for row in &rows {
         println!(
             "#{id} {provider}{dry} codex_ready {ready}/6 claude_signals {signals}/6 \
-             {confidence} gates[{gates}] codex {codex:.0}% claude {claude:.0}% {job}",
+             {confidence} {complexity} gates[{gates}] codex {codex:.0}% claude {claude:.0}% {job}",
             id = row.id,
             provider = row.provider,
             dry = if row.dry_run { " (dry run)" } else { "" },
+            complexity = row.complexity.as_deref().unwrap_or("-"),
             ready = row
                 .codex_ready_count
                 .map(|count| count.to_string())
@@ -410,6 +414,7 @@ fn row_json(row: &Row) -> serde_json::Value {
         "effort": row.effort,
         "verdict": row.verdict,
         "confidence": row.confidence,
+        "complexity": row.complexity,
         "codex_ready_count": row.codex_ready_count,
         "claude_signal_count": row.claude_signal_count,
         "missing_connector": row.missing_connector,

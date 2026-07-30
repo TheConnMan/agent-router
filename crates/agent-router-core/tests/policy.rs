@@ -1,6 +1,7 @@
+use agent_router_core::classify::Complexity;
 use agent_router_core::classify::{Classification, Confidence, Verdict};
 use agent_router_core::config::{Config, DefaultProvider};
-use agent_router_core::decide::{CLAUDE_MODEL, CODEX_EFFORT, Gate, decide, decide_explicit};
+use agent_router_core::decide::{Gate, decide, decide_explicit};
 use agent_router_core::{Headroom, Provider, UsageSnapshot};
 use std::path::Path;
 
@@ -33,6 +34,7 @@ fn scored(
         missing_connector,
         verdict,
         confidence,
+        complexity: Complexity::Standard,
         rationale: "fixture".to_string(),
         classifier_failed: false,
     }
@@ -194,8 +196,8 @@ fn configured_claude_default_controls_a_failed_classifier_decision() {
     );
 
     assert_eq!(decision.provider, Provider::Claude);
-    assert_eq!(decision.model.as_deref(), Some(CLAUDE_MODEL));
-    assert_eq!(decision.effort, None);
+    assert_eq!(decision.model.as_deref(), Some("opus[1m]"));
+    assert_eq!(decision.effort.as_deref(), Some("high"));
     assert_eq!(decision.gates, vec![Gate::ClassifierFailed]);
 }
 
@@ -232,8 +234,8 @@ fn failed_classifier_remains_eligible_for_weekly_routing() {
     );
 
     assert_eq!(decision.provider, Provider::Claude);
-    assert_eq!(decision.model, None);
-    assert_eq!(decision.effort.as_deref(), Some(CODEX_EFFORT));
+    assert_eq!(decision.model.as_deref(), Some("gpt-5.6-terra"));
+    assert_eq!(decision.effort.as_deref(), Some("medium"));
     assert_eq!(
         decision.gates,
         vec![
@@ -254,8 +256,8 @@ fn capability_pins_force_claude_and_skip_weekly_routing() {
     );
     assert_eq!(missing_connector.provider, Provider::Claude);
     assert_eq!(missing_connector.gates, vec![Gate::MissingConnector]);
-    assert_eq!(missing_connector.model.as_deref(), Some(CLAUDE_MODEL));
-    assert_eq!(missing_connector.effort, None);
+    assert_eq!(missing_connector.model.as_deref(), Some("opus[1m]"));
+    assert_eq!(missing_connector.effort.as_deref(), Some("high"));
 
     let claude_signals = decide(
         scored(Verdict::Codex, Confidence::High, 2, false),
@@ -264,8 +266,8 @@ fn capability_pins_force_claude_and_skip_weekly_routing() {
     );
     assert_eq!(claude_signals.provider, Provider::Claude);
     assert_eq!(claude_signals.gates, vec![Gate::ClaudeSignals]);
-    assert_eq!(claude_signals.model.as_deref(), Some(CLAUDE_MODEL));
-    assert_eq!(claude_signals.effort, None);
+    assert_eq!(claude_signals.model.as_deref(), Some("opus[1m]"));
+    assert_eq!(claude_signals.effort.as_deref(), Some("high"));
 }
 
 #[test]
@@ -280,8 +282,8 @@ fn disabled_weekly_routing_blocks_both_flip_directions() {
     );
     assert_eq!(codex.provider, Provider::Codex);
     assert_eq!(codex.gates, vec![Gate::WeeklyRoutingDisabled]);
-    assert_eq!(codex.model, None);
-    assert_eq!(codex.effort.as_deref(), Some(CODEX_EFFORT));
+    assert_eq!(codex.model.as_deref(), Some("gpt-5.6-terra"));
+    assert_eq!(codex.effort.as_deref(), Some("medium"));
 
     let claude = decide(
         scored(Verdict::Claude, Confidence::High, 0, false),
@@ -290,8 +292,8 @@ fn disabled_weekly_routing_blocks_both_flip_directions() {
     );
     assert_eq!(claude.provider, Provider::Claude);
     assert_eq!(claude.gates, vec![Gate::WeeklyRoutingDisabled]);
-    assert_eq!(claude.model.as_deref(), Some(CLAUDE_MODEL));
-    assert_eq!(claude.effort, None);
+    assert_eq!(claude.model.as_deref(), Some("opus[1m]"));
+    assert_eq!(claude.effort.as_deref(), Some("high"));
 }
 
 #[test]
@@ -304,8 +306,8 @@ fn weekly_failover_pins_both_outputs_in_both_directions_by_default() {
         &config,
     );
     assert_eq!(to_claude.provider, Provider::Claude);
-    assert_eq!(to_claude.model, None);
-    assert_eq!(to_claude.effort.as_deref(), Some(CODEX_EFFORT));
+    assert_eq!(to_claude.model.as_deref(), Some("gpt-5.6-terra"));
+    assert_eq!(to_claude.effort.as_deref(), Some("medium"));
     assert_eq!(
         to_claude.gates,
         vec![Gate::FlippedOnExhaustion, Gate::UsageFailoverPinned]
@@ -317,8 +319,8 @@ fn weekly_failover_pins_both_outputs_in_both_directions_by_default() {
         &config,
     );
     assert_eq!(to_codex.provider, Provider::Codex);
-    assert_eq!(to_codex.model.as_deref(), Some(CLAUDE_MODEL));
-    assert_eq!(to_codex.effort, None);
+    assert_eq!(to_codex.model.as_deref(), Some("opus[1m]"));
+    assert_eq!(to_codex.effort.as_deref(), Some("high"));
     assert_eq!(
         to_codex.gates,
         vec![Gate::FlippedOnExhaustion, Gate::UsageFailoverPinned]
@@ -339,29 +341,29 @@ fn model_and_effort_failover_flags_are_independent() {
         Case {
             model_changes: false,
             effort_changes: false,
-            expected_model: None,
-            expected_effort: Some(CODEX_EFFORT),
+            expected_model: Some("gpt-5.6-terra"),
+            expected_effort: Some("medium"),
             pinned: true,
         },
         Case {
             model_changes: true,
             effort_changes: false,
-            expected_model: Some(CLAUDE_MODEL),
-            expected_effort: Some(CODEX_EFFORT),
+            expected_model: Some("opus[1m]"),
+            expected_effort: Some("medium"),
             pinned: true,
         },
         Case {
             model_changes: false,
             effort_changes: true,
-            expected_model: None,
-            expected_effort: None,
+            expected_model: Some("gpt-5.6-terra"),
+            expected_effort: Some("high"),
             pinned: true,
         },
         Case {
             model_changes: true,
             effort_changes: true,
-            expected_model: Some(CLAUDE_MODEL),
-            expected_effort: None,
+            expected_model: Some("opus[1m]"),
+            expected_effort: Some("high"),
             pinned: false,
         },
     ];
@@ -413,21 +415,27 @@ fn both_providers_over_ceiling_keep_the_selected_provider() {
 fn explicit_provider_decisions_remain_outside_policy_routing() {
     let snapshot = usage(99.0, 99.0);
 
-    let codex = decide_explicit(Provider::Codex, None, snapshot);
+    let config = Config::default();
+    let codex = decide_explicit(Provider::Codex, None, snapshot, &config);
     assert_eq!(codex.provider, Provider::Codex);
-    assert_eq!(codex.model, None);
-    assert_eq!(codex.effort.as_deref(), Some(CODEX_EFFORT));
+    assert_eq!(codex.model.as_deref(), Some("gpt-5.6-terra"));
+    assert_eq!(codex.effort.as_deref(), Some("medium"));
     assert_eq!(codex.gates, vec![Gate::ExplicitProvider]);
     assert!(codex.classification.is_none());
 
-    let claude = decide_explicit(Provider::Claude, Some("sonnet".to_string()), snapshot);
+    let claude = decide_explicit(
+        Provider::Claude,
+        Some("sonnet".to_string()),
+        snapshot,
+        &config,
+    );
     assert_eq!(claude.provider, Provider::Claude);
     assert_eq!(claude.model.as_deref(), Some("sonnet"));
-    assert_eq!(claude.effort, None);
+    assert_eq!(claude.effort.as_deref(), Some("high"));
     assert_eq!(claude.gates, vec![Gate::ExplicitProvider]);
     assert!(claude.classification.is_none());
 
-    let opencode = decide_explicit(Provider::Opencode, None, snapshot);
+    let opencode = decide_explicit(Provider::Opencode, None, snapshot, &config);
     assert_eq!(opencode.provider, Provider::Opencode);
     assert_eq!(opencode.model, None);
     assert_eq!(opencode.effort, None);

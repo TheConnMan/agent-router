@@ -1,14 +1,13 @@
 //! The decision engine: hard gates first, then headroom modulation. Pure given its inputs.
 
-use crate::classify::{Classification, Confidence};
+use crate::classify::{Classification, Complexity, Confidence};
 use crate::config::{Config, DefaultProvider};
 use crate::provider::Provider;
 use crate::usage::UsageSnapshot;
 
-/// Claude bg jobs are pinned to opus[1m] by house policy, never chosen per task.
-pub const CLAUDE_MODEL: &str = "opus[1m]";
-/// Codex jobs leave the model to codex and run at the highest reasoning effort.
-pub const CODEX_EFFORT: &str = "xhigh";
+/// The complexity an unscored task runs at: an explicitly named provider skips classification, so
+/// there is no judgement to scale from.
+const UNSCORED_COMPLEXITY: Complexity = Complexity::Standard;
 
 /// Everything that fired on the way to a provider, in the order it fired. These are the tuning
 /// signal in the decision log, so each one names a specific rule rather than a generic reason.
@@ -98,8 +97,9 @@ pub fn decide(classification: Classification, usage: UsageSnapshot, config: &Con
     }
 
     let pre_usage_provider = provider;
-    let mut model = model_for(pre_usage_provider);
-    let mut effort = effort_for(pre_usage_provider);
+    let complexity = classification.complexity;
+    let mut model = model_for(pre_usage_provider, complexity, config);
+    let mut effort = effort_for(pre_usage_provider, complexity, config);
     let both_over_ceiling = usage.claude.weekly_pct >= config.hard_ceiling_pct
         && usage.codex.weekly_pct >= config.hard_ceiling_pct;
 
@@ -133,11 +133,13 @@ pub fn decide(classification: Classification, usage: UsageSnapshot, config: &Con
     }
 
     if provider != pre_usage_provider {
+        // The task did not get simpler by moving, so the new provider's tiers are read at the
+        // same complexity rather than the old provider's model or effort being carried across.
         if config.policy.usage_failover_changes_model {
-            model = model_for(provider);
+            model = model_for(provider, complexity, config);
         }
         if config.policy.usage_failover_changes_effort {
-            effort = effort_for(provider);
+            effort = effort_for(provider, complexity, config);
         }
         if !config.policy.usage_failover_changes_model
             || !config.policy.usage_failover_changes_effort
@@ -169,11 +171,12 @@ pub fn decide_explicit(
     provider: Provider,
     model: Option<String>,
     usage: UsageSnapshot,
+    config: &Config,
 ) -> Decision {
     Decision {
         provider,
-        model: model.or_else(|| model_for(provider)),
-        effort: effort_for(provider),
+        model: model.or_else(|| model_for(provider, UNSCORED_COMPLEXITY, config)),
+        effort: effort_for(provider, UNSCORED_COMPLEXITY, config),
         classification: None,
         gates: vec![Gate::ExplicitProvider],
         usage,
@@ -181,19 +184,22 @@ pub fn decide_explicit(
     }
 }
 
-/// PURE: the model policy. Claude bg jobs are always opus[1m]; codex and opencode resolve their
-/// own defaults.
-fn model_for(provider: Provider) -> Option<String> {
+/// PURE: the model the job runs at, scaled by how much reasoning the task needs. Opencode has no
+/// tiers in the MVP, so it resolves its own default.
+fn model_for(provider: Provider, complexity: Complexity, config: &Config) -> Option<String> {
     match provider {
-        Provider::Claude => Some(CLAUDE_MODEL.to_string()),
-        Provider::Codex | Provider::Opencode => None,
+        Provider::Codex => Some(config.models.codex.pick(complexity).to_string()),
+        Provider::Claude => Some(config.models.claude.pick(complexity).to_string()),
+        Provider::Opencode => None,
     }
 }
 
-fn effort_for(provider: Provider) -> Option<String> {
+/// PURE: the reasoning effort, from the same complexity as the model.
+fn effort_for(provider: Provider, complexity: Complexity, config: &Config) -> Option<String> {
     match provider {
-        Provider::Codex => Some(CODEX_EFFORT.to_string()),
-        Provider::Claude | Provider::Opencode => None,
+        Provider::Codex => Some(config.effort.codex.pick(complexity).to_string()),
+        Provider::Claude => Some(config.effort.claude.pick(complexity).to_string()),
+        Provider::Opencode => None,
     }
 }
 
@@ -280,6 +286,7 @@ mod tests {
             missing_connector,
             verdict,
             confidence,
+            complexity: Complexity::Standard,
             rationale: "fixture".to_string(),
             classifier_failed: false,
         }
@@ -486,33 +493,137 @@ mod tests {
         );
         assert_eq!(decision.provider, Provider::Codex);
         assert_eq!(decision.gate_tags(), vec!["classifier_failed"]);
-        assert_eq!(decision.model, None);
-        assert_eq!(decision.effort.as_deref(), Some(CODEX_EFFORT));
+        // A fallback carries no complexity of its own, so it runs at the standard tier.
+        assert_eq!(decision.model.as_deref(), Some("gpt-5.6-terra"));
+        assert_eq!(decision.effort.as_deref(), Some("medium"));
+    }
+
+    /// The scoring fixture at a named complexity, with nothing else that could move the provider.
+    fn at(verdict: Verdict, complexity: Complexity) -> Classification {
+        Classification {
+            complexity,
+            ..scored(verdict, Confidence::High, 0, false)
+        }
+    }
+
+    /// The whole point of the feature: both outputs come from the complexity, for both providers.
+    /// Twelve cells, six per provider.
+    #[test]
+    fn the_model_and_effort_matrix_over_complexity_and_provider() {
+        let config = Config::default();
+        let cases = [
+            (Verdict::Codex, Complexity::Trivial, "gpt-5.6-luna", "low"),
+            (
+                Verdict::Codex,
+                Complexity::Standard,
+                "gpt-5.6-terra",
+                "medium",
+            ),
+            (Verdict::Codex, Complexity::Hard, "gpt-5.6-sol", "xhigh"),
+            (Verdict::Claude, Complexity::Trivial, "sonnet", "low"),
+            (Verdict::Claude, Complexity::Standard, "opus[1m]", "high"),
+            (Verdict::Claude, Complexity::Hard, "opus[1m]", "xhigh"),
+        ];
+        for (verdict, complexity, model, effort) in cases {
+            let decision = decide(at(verdict, complexity), usage(10.0, 10.0), &config);
+            assert_eq!(decision.provider, verdict.provider());
+            assert_eq!(
+                decision.model.as_deref(),
+                Some(model),
+                "model for {verdict:?} at {complexity:?}"
+            );
+            assert_eq!(
+                decision.effort.as_deref(),
+                Some(effort),
+                "effort for {verdict:?} at {complexity:?}"
+            );
+        }
+    }
+
+    /// A usage flip re-derives both outputs from the NEW provider's tiers at the SAME complexity,
+    /// rather than carrying the old provider's model or effort across the flip.
+    #[test]
+    fn a_usage_failover_rederives_the_new_providers_tier_at_the_same_complexity() {
+        let mut config = Config::default();
+        config.policy.usage_failover_changes_model = true;
+        config.policy.usage_failover_changes_effort = true;
+
+        // Codex verdict, codex exhausted: lands on claude's trivial tier, not codex's.
+        let to_claude = decide(
+            at(Verdict::Codex, Complexity::Trivial),
+            usage(99.0, 0.0),
+            &config,
+        );
+        assert_eq!(to_claude.provider, Provider::Claude);
+        assert_eq!(to_claude.model.as_deref(), Some("sonnet"));
+        assert_eq!(to_claude.effort.as_deref(), Some("low"));
+        assert_eq!(to_claude.gates, vec![Gate::FlippedOnExhaustion]);
+
+        // The other direction at a different complexity: claude verdict, claude exhausted.
+        let to_codex = decide(
+            at(Verdict::Claude, Complexity::Hard),
+            usage(0.0, 99.0),
+            &config,
+        );
+        assert_eq!(to_codex.provider, Provider::Codex);
+        assert_eq!(to_codex.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(to_codex.effort.as_deref(), Some("xhigh"));
+    }
+
+    /// With the failover flags off, both outputs stay with the pre-flip provider's tier, which is
+    /// what `usage_failover_pinned` reports.
+    #[test]
+    fn a_pinned_usage_failover_keeps_the_prior_providers_tier() {
+        let config = Config::default();
+        let decision = decide(
+            at(Verdict::Codex, Complexity::Trivial),
+            usage(99.0, 0.0),
+            &config,
+        );
+        assert_eq!(decision.provider, Provider::Claude);
+        assert_eq!(decision.model.as_deref(), Some("gpt-5.6-luna"));
+        assert_eq!(decision.effort.as_deref(), Some("low"));
+        assert!(decision.gates.contains(&Gate::UsageFailoverPinned));
     }
 
     #[test]
-    fn model_and_effort_follow_the_provider_not_the_task() {
-        let config = Config::default();
+    fn configured_tiers_override_the_built_in_defaults() {
+        let mut config = Config::default();
+        config.models.codex.trivial = "gpt-5.6-custom".to_string();
+        config.effort.claude.hard = "max".to_string();
+
         let codex = decide(
-            scored(Verdict::Codex, Confidence::High, 0, false),
+            at(Verdict::Codex, Complexity::Trivial),
             usage(10.0, 10.0),
             &config,
         );
-        assert_eq!(codex.model, None, "codex resolves its own model");
-        assert_eq!(codex.effort.as_deref(), Some("xhigh"));
+        assert_eq!(codex.model.as_deref(), Some("gpt-5.6-custom"));
 
         let claude = decide(
-            scored(Verdict::Claude, Confidence::High, 0, false),
+            at(Verdict::Claude, Complexity::Hard),
             usage(10.0, 10.0),
             &config,
         );
+        assert_eq!(claude.effort.as_deref(), Some("max"));
+    }
+
+    /// An unscored task has no complexity to read, so it runs at the standard tier.
+    #[test]
+    fn an_explicit_provider_runs_at_the_standard_tier() {
+        let config = Config::default();
+        let codex = decide_explicit(Provider::Codex, None, usage(0.0, 0.0), &config);
+        assert_eq!(codex.model.as_deref(), Some("gpt-5.6-terra"));
+        assert_eq!(codex.effort.as_deref(), Some("medium"));
+
+        let claude = decide_explicit(Provider::Claude, None, usage(0.0, 0.0), &config);
         assert_eq!(claude.model.as_deref(), Some("opus[1m]"));
-        assert_eq!(claude.effort, None);
+        assert_eq!(claude.effort.as_deref(), Some("high"));
     }
 
     #[test]
     fn an_explicit_provider_skips_classification_but_keeps_the_usage_snapshot() {
-        let decision = decide_explicit(Provider::Opencode, None, usage(71.0, 50.0));
+        let config = Config::default();
+        let decision = decide_explicit(Provider::Opencode, None, usage(71.0, 50.0), &config);
         assert_eq!(decision.provider, Provider::Opencode);
         assert!(decision.classification.is_none());
         assert_eq!(decision.gate_tags(), vec!["explicit_provider"]);
@@ -525,6 +636,7 @@ mod tests {
             Provider::Claude,
             Some("sonnet".to_string()),
             usage(0.0, 0.0),
+            &config,
         );
         assert_eq!(pinned.model.as_deref(), Some("sonnet"));
     }

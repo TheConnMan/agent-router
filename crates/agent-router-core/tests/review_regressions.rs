@@ -1,4 +1,4 @@
-use agent_router_core::classify::{Classification, Confidence, Verdict};
+use agent_router_core::classify::{Classification, Complexity, Confidence, Verdict};
 use agent_router_core::config::Config;
 use agent_router_core::decide::{Gate, decide};
 use agent_router_core::parity::{Status, check};
@@ -25,6 +25,7 @@ fn scored(verdict: Verdict, confidence: Confidence) -> Classification {
         missing_connector: false,
         verdict,
         confidence,
+        complexity: Complexity::Standard,
         rationale: "fixture".to_string(),
         classifier_failed: false,
     }

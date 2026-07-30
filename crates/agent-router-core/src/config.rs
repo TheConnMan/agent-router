@@ -1,6 +1,7 @@
 //! `~/.config/agent-router/config.toml`: the routing ceilings and the connector inventory the
 //! classifier scores gate 5 against. Written with defaults on first run.
 
+use crate::classify::Complexity;
 use crate::error::Result;
 use crate::runtime::home_dir;
 use std::path::{Path, PathBuf};
@@ -35,6 +36,136 @@ impl Default for Policy {
             weekly_routing: true,
             usage_failover_changes_model: false,
             usage_failover_changes_effort: false,
+        }
+    }
+}
+
+/// The per-provider model and effort tiers, one value per task complexity. Each table is
+/// optional in the file and each key within it is optional, so an omitted section is exactly the
+/// defaults below.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Models {
+    pub codex: CodexModels,
+    pub claude: ClaudeModels,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Effort {
+    pub codex: CodexEffort,
+    pub claude: ClaudeEffort,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct CodexModels {
+    pub trivial: String,
+    pub standard: String,
+    pub hard: String,
+}
+
+impl Default for CodexModels {
+    fn default() -> CodexModels {
+        CodexModels {
+            trivial: "gpt-5.6-luna".to_string(),
+            standard: "gpt-5.6-terra".to_string(),
+            hard: "gpt-5.6-sol".to_string(),
+        }
+    }
+}
+
+impl CodexModels {
+    pub fn pick(&self, complexity: Complexity) -> &str {
+        match complexity {
+            Complexity::Trivial => &self.trivial,
+            Complexity::Standard => &self.standard,
+            Complexity::Hard => &self.hard,
+        }
+    }
+}
+
+/// Claude bg jobs never run on fable by house policy, so the hard tier is opus, not a tier above.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct ClaudeModels {
+    pub trivial: String,
+    pub standard: String,
+    pub hard: String,
+}
+
+impl Default for ClaudeModels {
+    fn default() -> ClaudeModels {
+        ClaudeModels {
+            trivial: "sonnet".to_string(),
+            standard: "opus[1m]".to_string(),
+            hard: "opus[1m]".to_string(),
+        }
+    }
+}
+
+impl ClaudeModels {
+    pub fn pick(&self, complexity: Complexity) -> &str {
+        match complexity {
+            Complexity::Trivial => &self.trivial,
+            Complexity::Standard => &self.standard,
+            Complexity::Hard => &self.hard,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct CodexEffort {
+    pub trivial: String,
+    pub standard: String,
+    pub hard: String,
+}
+
+impl Default for CodexEffort {
+    fn default() -> CodexEffort {
+        CodexEffort {
+            trivial: "low".to_string(),
+            standard: "medium".to_string(),
+            hard: "xhigh".to_string(),
+        }
+    }
+}
+
+impl CodexEffort {
+    pub fn pick(&self, complexity: Complexity) -> &str {
+        match complexity {
+            Complexity::Trivial => &self.trivial,
+            Complexity::Standard => &self.standard,
+            Complexity::Hard => &self.hard,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct ClaudeEffort {
+    pub trivial: String,
+    pub standard: String,
+    pub hard: String,
+}
+
+impl Default for ClaudeEffort {
+    fn default() -> ClaudeEffort {
+        ClaudeEffort {
+            trivial: "low".to_string(),
+            standard: "high".to_string(),
+            hard: "xhigh".to_string(),
+        }
+    }
+}
+
+impl ClaudeEffort {
+    pub fn pick(&self, complexity: Complexity) -> &str {
+        match complexity {
+            Complexity::Trivial => &self.trivial,
+            Complexity::Standard => &self.standard,
+            Complexity::Hard => &self.hard,
         }
     }
 }
@@ -107,6 +238,9 @@ pub struct Config {
     /// absent here is what forces a task to Claude.
     pub connectors: Vec<String>,
     pub policy: Policy,
+    /// What each provider runs at per task complexity.
+    pub models: Models,
+    pub effort: Effort,
     pub parity: ParityConfig,
 }
 
@@ -123,6 +257,8 @@ impl Default for Config {
                 "airtable".to_string(),
             ],
             policy: Policy::default(),
+            models: Models::default(),
+            effort: Effort::default(),
             parity: ParityConfig::default(),
         }
     }
@@ -190,6 +326,57 @@ mod tests {
             Config::default().headroom_flip_gap
         );
         assert_eq!(config.connectors, Config::default().connectors);
+    }
+
+    /// The tiers are the routing policy an operator tunes, so an absent file section is the
+    /// documented default and a partial one overrides only the key it names.
+    #[test]
+    fn tier_tables_default_when_absent_and_override_one_key_at_a_time() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+
+        let defaults = Config::default();
+        assert_eq!(
+            defaults.models.codex.pick(Complexity::Trivial),
+            "gpt-5.6-luna"
+        );
+        assert_eq!(
+            defaults.models.codex.pick(Complexity::Standard),
+            "gpt-5.6-terra"
+        );
+        assert_eq!(defaults.models.codex.pick(Complexity::Hard), "gpt-5.6-sol");
+        assert_eq!(defaults.models.claude.pick(Complexity::Trivial), "sonnet");
+        assert_eq!(
+            defaults.models.claude.pick(Complexity::Standard),
+            "opus[1m]"
+        );
+        assert_eq!(defaults.models.claude.pick(Complexity::Hard), "opus[1m]");
+        assert_eq!(defaults.effort.codex.pick(Complexity::Trivial), "low");
+        assert_eq!(defaults.effort.codex.pick(Complexity::Standard), "medium");
+        assert_eq!(defaults.effort.codex.pick(Complexity::Hard), "xhigh");
+        assert_eq!(defaults.effort.claude.pick(Complexity::Trivial), "low");
+        assert_eq!(defaults.effort.claude.pick(Complexity::Standard), "high");
+        assert_eq!(defaults.effort.claude.pick(Complexity::Hard), "xhigh");
+
+        // No models or effort section at all.
+        std::fs::write(&path, "hard_ceiling_pct = 90.0\n").expect("write");
+        let absent = Config::load_from(&path).expect("loads");
+        assert_eq!(absent.models, defaults.models);
+        assert_eq!(absent.effort, defaults.effort);
+
+        std::fs::write(
+            &path,
+            "[models.codex]\ntrivial = \"gpt-5.6-tiny\"\n\n[effort.claude]\nhard = \"max\"\n",
+        )
+        .expect("write");
+        let partial = Config::load_from(&path).expect("loads");
+        assert_eq!(partial.models.codex.trivial, "gpt-5.6-tiny");
+        assert_eq!(partial.models.codex.standard, "gpt-5.6-terra");
+        assert_eq!(partial.models.codex.hard, "gpt-5.6-sol");
+        assert_eq!(partial.effort.claude.hard, "max");
+        assert_eq!(partial.effort.claude.trivial, "low");
+        assert_eq!(partial.effort.codex, defaults.effort.codex);
+        assert_eq!(partial.models.claude, defaults.models.claude);
     }
 
     #[test]
