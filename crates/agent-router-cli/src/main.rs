@@ -35,6 +35,14 @@ enum Command {
         /// Decide and log without dispatching.
         #[arg(long)]
         dry_run: bool,
+        /// MCP config file for the claude job, repeatable. Rejected for other providers.
+        #[arg(long = "mcp-config")]
+        mcp_configs: Vec<PathBuf>,
+        /// Use only the --mcp-config files, dropping every inherited MCP server. This also strips
+        /// the claude.ai connectors, which no --mcp-config can restore, so a job routed to claude
+        /// for a connector can lose the very connector it was routed for.
+        #[arg(long)]
+        strict_mcp_config: bool,
         #[arg(long)]
         json: bool,
     },
@@ -121,8 +129,20 @@ fn run(cli: Cli) -> agent_router_core::Result<()> {
             model,
             name,
             dry_run,
+            mcp_configs,
+            strict_mcp_config,
             json,
-        } => route(task, dir, provider, model, name, dry_run, json),
+        } => route(
+            task,
+            dir,
+            provider,
+            model,
+            name,
+            dry_run,
+            &mcp_configs,
+            strict_mcp_config,
+            json,
+        ),
         Command::Usage { json } => usage(json),
         Command::Log { limit, json } => log(limit, json),
         Command::Parity { .. } => unreachable!("parity has a command specific exit path"),
@@ -269,6 +289,8 @@ fn route(
     model: Option<String>,
     name: Option<String>,
     dry_run: bool,
+    mcp_configs: &[PathBuf],
+    strict_mcp_config: bool,
     json: bool,
 ) -> agent_router_core::Result<()> {
     let dir = match dir {
@@ -283,6 +305,8 @@ fn route(
         model,
         name,
         dry_run,
+        mcp_configs,
+        strict_mcp_config,
     };
     let outcome = agent_router_core::run::run(&request, &config)?;
     if json {
