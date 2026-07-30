@@ -2,6 +2,9 @@
 name = "agent-router-core"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "Routing machinery for agent-router: usage readers, classifier, decision engine, and dispatch"
+repository = "https://github.com/TheConnMan/agent-router"
 
 [dependencies]
 base64 = "0.22.1"

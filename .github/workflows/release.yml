@@ -1,0 +1,85 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - x86_64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # rusqlite is built with its bundled SQLite, so the musl target needs a musl C toolchain.
+      - name: Install musl build tools
+        if: endsWith(matrix.target, '-musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Build
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin agent-router
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          staging="agent-router-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "dist/$staging"
+          cp "target/${{ matrix.target }}/release/agent-router" "dist/$staging/"
+          cp README.md LICENSE "dist/$staging/"
+          tar -C dist -czf "dist/$staging.tar.gz" "$staging"
+          (cd dist && sha256sum "$staging.tar.gz" > "$staging.tar.gz.sha256")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          ls -l dist
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --title "$GITHUB_REF_NAME" \
+              --generate-notes \
+              dist/*
+          fi
