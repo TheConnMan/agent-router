@@ -128,7 +128,14 @@ agent-router run "Fix the failing test" --dir ~/git/other-project
 | `--model <NAME>` | tier table | Model override. Requires an explicit `--provider`. Pairing it with `--provider auto` is rejected: the router exits nonzero naming both flags rather than dropping the override, because the auto path chooses its own model from the tier table. |
 | `--name <NAME>` | first 40 characters of the task | Name for the dispatched job. It reaches the `claude --bg --name` argv verbatim and is recorded as `job_name` in the decision log for every provider, so callers that reconcile inflight jobs by exact name depend on it. |
 | `--dry-run` | off | Decide and log, dispatch nothing. |
+| `--mcp-config <PATH>` | none | MCP config file for the dispatched Claude job. Repeatable. Rejected for any other provider. |
+| `--strict-mcp-config` | off | Use only the `--mcp-config` files and drop every inherited MCP server. See the warning below before using it. |
 | `--json` | off | Emit the full decision, including gates, classification, and usage. |
+
+`--strict-mcp-config` also strips the claude.ai connectors, and no `--mcp-config` file can restore
+them. That interacts badly with routing: a task sent to Claude precisely because Codex was missing
+a connector can lose the very connector it was routed for. Pass it only when the job genuinely
+needs nothing beyond the files given.
 
 ### `usage`
 
