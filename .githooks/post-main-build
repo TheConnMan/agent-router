@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$(git branch --show-current)" != "main" ]]; then
+    exit 0
+fi
+
+~/.cargo/bin/cargo build --release --workspace &&
+    cp target/release/agent-router ~/.local/bin/agent-router
