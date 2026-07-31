@@ -219,6 +219,16 @@ See [docs/configuration.md](docs/configuration.md) for the full reference.
 
 ## Development
 
+To refresh the installed binary after merges and commits on `main`, enable the repository hook
+path once:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+The hook runs `~/.cargo/bin/cargo build --release --workspace` and copies the resulting binary to
+`~/.local/bin/agent-router`. It skips commits on other branches.
+
 ```bash
 cargo test --workspace --locked
 cargo fmt --all -- --check
