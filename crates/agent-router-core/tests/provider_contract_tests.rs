@@ -2,8 +2,9 @@
 use agent_router_core::decide::decide_explicit;
 use agent_router_core::dispatch::claude::dispatch_with_binary;
 use agent_router_core::dispatch::codex::{
-    CodexRpc, SpawnAttempt, parse_thread_id, spawn_on_initialized_rpc, thread_set_name_request,
-    thread_start_request, turn_start_request,
+    CodexRpc, SpawnAttempt, parse_first_turn_status, parse_thread_id, parse_thread_status,
+    spawn_on_initialized_rpc, thread_read_request, thread_set_name_request, thread_start_request,
+    turn_start_request,
 };
 #[cfg(target_os = "linux")]
 use agent_router_core::dispatch::dispatch as dispatch_decision;
@@ -149,6 +150,87 @@ fn codex_thread_identity_rejects_malformed_errors_and_other_response_ids() {
         None
     );
     assert_eq!(parse_thread_id("not json", 2), None);
+}
+
+/// Reconciliation reads a thread through `thread/read`, whose params are exactly `threadId` and
+/// `includeTurns`. The flag is the whole design: without it the reply carries no turn record, every
+/// codex row falls through to the thread status fallback, and a job that provably finished reports
+/// as unknown. It is also the easiest thing in this file to lose in a refactor.
+#[test]
+fn the_codex_thread_read_request_pins_the_app_server_method_and_params() {
+    let read: Value =
+        serde_json::from_str(&thread_read_request(2, "thread exact")).expect("thread read request");
+
+    assert_eq!(read["jsonrpc"], "2.0");
+    assert_eq!(read["id"], 2);
+    assert_eq!(read["method"], "thread/read");
+    assert_eq!(read["params"]["threadId"], "thread exact");
+    assert_eq!(
+        read["params"]["includeTurns"],
+        json!(true),
+        "without the turn history the reply proves nothing about the routed turn"
+    );
+    assert_eq!(
+        read["params"].as_object().expect("params object").len(),
+        2,
+        "params must carry exactly threadId and includeTurns, nothing extra"
+    );
+}
+
+/// Both readers over one reply, with the guards `parse_thread_id` already applies. A reply to
+/// someone else's request and a reply carrying a JSON RPC error are not observations.
+///
+/// Observed on a real `thread/read` with `includeTurns` true: the turn array is nested inside
+/// `thread`, and `result` carries the single key `thread`. The vendor schema agrees, listing
+/// `thread` as the only property of `ThreadReadResponse`.
+#[test]
+fn a_thread_read_reply_yields_its_first_turn_status_and_its_thread_status() {
+    let reply = json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "result": {
+            "thread": {
+                "id": "thread exact",
+                "status": {"type": "notLoaded"},
+                "turns": [{"status": "completed"}, {"status": "failed"}],
+            },
+        }
+    })
+    .to_string();
+
+    assert_eq!(
+        parse_first_turn_status(&reply, 2).as_deref(),
+        Some("completed"),
+        "turn index 0 is the routed job, and the later turn is a human continuation"
+    );
+    assert_eq!(
+        parse_thread_status(&reply, 2).as_deref(),
+        Some("notLoaded"),
+        "the thread status is still readable, as the fallback for a reply with no turns"
+    );
+
+    assert_eq!(parse_first_turn_status(&reply, 9), None);
+    assert_eq!(parse_thread_status(&reply, 9), None);
+
+    let errored = r#"{"jsonrpc":"2.0","id":2,"error":{"code":-1,"message":"failed"}}"#;
+    assert_eq!(parse_first_turn_status(errored, 2), None);
+    assert_eq!(parse_thread_status(errored, 2), None);
+
+    let turnless = json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "result": {"thread": {"id": "thread exact", "status": {"type": "idle"}, "turns": []}}
+    })
+    .to_string();
+    assert_eq!(
+        parse_first_turn_status(&turnless, 2),
+        None,
+        "an empty turn array is no turn record, not an empty status"
+    );
+    assert_eq!(parse_thread_status(&turnless, 2).as_deref(), Some("idle"));
+
+    assert_eq!(parse_first_turn_status("not json", 2), None);
+    assert_eq!(parse_thread_status("not json", 2), None);
 }
 
 #[derive(Default)]
