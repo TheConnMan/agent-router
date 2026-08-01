@@ -1,14 +1,20 @@
-//! The decision engine: hard gates first, then weekly headroom modulation, then Claude's five hour
-//! window pacing a stream of jobs away from Claude. Pure given its inputs.
+//! The decision engine: the capability pin first, then the hard ceiling, then a rare run rate
+//! override, then Claude's five hour window pacing a stream of jobs away from Claude. Pure given
+//! its inputs, the deciding instant included.
 
-use crate::classify::{Classification, Complexity, Confidence};
+use crate::classify::{Classification, Complexity};
 use crate::config::{Config, DefaultProvider};
 use crate::provider::Provider;
-use crate::usage::UsageSnapshot;
+use crate::usage::{Headroom, UsageSnapshot};
 
 /// The complexity an unscored task runs at: an explicitly named provider skips classification, so
 /// there is no judgement to scale from, and unscored work errs toward capability.
 const UNSCORED_COMPLEXITY: Complexity = Complexity::High;
+
+/// The weekly window, in seconds. 10080 minutes, the same window `usage.rs` identifies a weekly
+/// rate limit by. Reset epochs are recorded in SECONDS on both providers, so a distance to a reset
+/// is directly comparable to this.
+const WEEKLY_WINDOW_SECS: f64 = 604_800.0;
 
 /// Everything that fired on the way to a provider, in the order it fired. These are the tuning
 /// signal in the decision log, so each one names a specific rule rather than a generic reason.
@@ -21,16 +27,22 @@ pub enum Gate {
     ClassifierFailed,
     /// A required connector is missing: an automatic Claude decision regardless of shape.
     MissingConnector,
-    /// Two or more Claude signals held.
-    ClaudeSignals,
-    /// A confident verdict was flipped because its provider is exhausted and the other is not.
+    /// The task needs several agents exchanging findings mid-run, which Codex cannot do: an
+    /// automatic Claude decision regardless of usage.
+    Orchestration,
+    /// The provider the task was on is at the hard ceiling and the other is not, so it moved.
     FlippedOnExhaustion,
-    /// A borderline verdict was flipped by the weekly-headroom gap.
-    HeadroomTiebreak,
-    /// Both providers are at or over the hard ceiling; the verdict provider was used anyway.
+    /// Both providers are at or over the hard ceiling; the default provider was used anyway.
     OverCeiling,
     /// Weekly usage routing is disabled by policy.
     WeeklyRoutingDisabled,
+    /// The provider the task was on is burning through its weekly window far enough ahead of the
+    /// other that the task moved. Rare by construction: see `pace_flip_gap`.
+    PaceFlip,
+    /// A weekly reset epoch was never read, so there is no elapsed fraction to measure a run rate
+    /// against and the override was skipped. Recorded rather than inferred, because a missing epoch
+    /// and a window that resets at this instant are not the same input.
+    PaceUnavailable,
     /// Claude's five hour window is near exhausted and Codex has weekly room, so the task was paced
     /// away from Claude. Never fires for Codex: only Claude has a five hour window that constrains a
     /// stream of jobs on this box.
@@ -43,11 +55,12 @@ impl Gate {
             Gate::ExplicitProvider => "explicit_provider",
             Gate::ClassifierFailed => "classifier_failed",
             Gate::MissingConnector => "missing_connector",
-            Gate::ClaudeSignals => "claude_signals",
+            Gate::Orchestration => "orchestration",
             Gate::FlippedOnExhaustion => "flipped_on_exhaustion",
-            Gate::HeadroomTiebreak => "headroom_tiebreak",
             Gate::OverCeiling => "over_ceiling",
             Gate::WeeklyRoutingDisabled => "weekly_routing_disabled",
+            Gate::PaceFlip => "pace_flip",
+            Gate::PaceUnavailable => "pace_unavailable",
             Gate::FiveHourPacing => "five_hour_pacing",
         }
     }
@@ -82,6 +95,13 @@ pub struct Decision {
     pub classification: Option<Classification>,
     pub gates: Vec<Gate>,
     pub usage: UsageSnapshot,
+    /// How far ahead of its own weekly window each provider was burning at the deciding instant,
+    /// in points. Positive is hot. None when that provider's reset was never read, and therefore
+    /// when the override could not run: the log records the number the rule saw, so the next
+    /// tuning pass reads why a task moved rather than only that it did. Always None on the
+    /// explicit path, which ran no usage rule to measure.
+    pub claude_pace_delta: Option<f64>,
+    pub codex_pace_delta: Option<f64>,
     pub rationale: String,
 }
 
@@ -91,16 +111,36 @@ impl Decision {
     }
 }
 
-/// PURE: the routing decision for a scored task.
-pub fn decide(classification: Classification, usage: UsageSnapshot, config: &Config) -> Decision {
+/// PURE: the routing decision for a scored task, at the instant `now_epoch_secs`.
+///
+/// The instant is a parameter rather than a clock read, because the run rate rules below are a
+/// function of how much of each weekly window has elapsed. Passing it in is what makes a decision
+/// replayable: the backtest replays each recorded row at the instant it was actually decided.
+///
+/// The rules, in the order they run, and each in the order it must run:
+///
+/// 1. The capability pin. A task Codex cannot do is not a cheaper job when routed there, it is a
+///    failed one, so a pin bypasses every usage rule below including the ceiling.
+/// 2. The hard ceiling, before the override. Being out of weekly budget is a capacity fact, and a
+///    run rate can read a provider with two points left as running cold (95 percent used against
+///    99 percent elapsed is a negative delta), so an override allowed to run first would route
+///    into an exhausted provider.
+/// 3. The run rate override, which is deliberately rare. See `pace_flip_gap`.
+/// 4. Claude's five hour pacing, last, on whichever provider the task landed on.
+pub fn decide(
+    classification: Classification,
+    usage: UsageSnapshot,
+    now_epoch_secs: i64,
+    config: &Config,
+) -> Decision {
     let mut gates = Vec::new();
     let mut capability_pin = false;
     if classification.missing_connector {
         gates.push(Gate::MissingConnector);
         capability_pin = true;
     }
-    if classification.claude_signal_count() >= 2 {
-        gates.push(Gate::ClaudeSignals);
+    if classification.orchestration {
+        gates.push(Gate::Orchestration);
         capability_pin = true;
     }
 
@@ -111,50 +151,52 @@ pub fn decide(classification: Classification, usage: UsageSnapshot, config: &Con
     if capability_pin {
         provider = Provider::Claude;
     } else if classification.classifier_failed {
+        // Not a pin: a task nobody could score keeps the configured default and stays eligible for
+        // every usage rule, so it still lands on the provider with room.
         gates.push(Gate::ClassifierFailed);
-    } else {
-        provider = classification.verdict.provider();
     }
 
     let pre_usage_provider = provider;
     let complexity = classification.complexity;
     let mut model = model_for(pre_usage_provider, complexity, config);
-    let both_over_ceiling = usage.claude.weekly_pct >= config.hard_ceiling_pct
-        && usage.codex.weekly_pct >= config.hard_ceiling_pct;
+    let claude_pace_delta = pace_delta(&usage.claude, now_epoch_secs);
+    let codex_pace_delta = pace_delta(&usage.codex, now_epoch_secs);
 
     if !capability_pin {
         if !config.policy.weekly_routing {
             gates.push(Gate::WeeklyRoutingDisabled);
         } else {
-            if !both_over_ceiling {
-                let other = other_provider(provider);
-                let used = weekly_used(&usage, provider);
-                let other_used = weekly_used(&usage, other);
-                let confidence = if classification.classifier_failed {
-                    Confidence::High
-                } else {
-                    classification.confidence
-                };
-                match confidence {
-                    Confidence::High => {
-                        if used >= config.hard_ceiling_pct && other_used < config.hard_ceiling_pct {
-                            provider = other;
-                            gates.push(Gate::FlippedOnExhaustion);
-                        }
-                    }
-                    Confidence::Medium | Confidence::Low => {
-                        if used - other_used > config.headroom_flip_gap {
-                            provider = other;
-                            gates.push(Gate::HeadroomTiebreak);
-                        }
-                    }
+            let other = other_provider(provider);
+            let eligible = |candidate| weekly_used(&usage, candidate) < config.hard_ceiling_pct;
+            match (eligible(provider), eligible(other)) {
+                (false, false) => {
+                    // The router routes; refusing work over a ceiling is bonus drain's job. The
+                    // override is not consulted, because there is no provider to move to.
+                    gates.push(Gate::OverCeiling);
+                }
+                (false, true) => {
+                    provider = other;
+                    gates.push(Gate::FlippedOnExhaustion);
+                }
+                // Exactly the current provider eligible: the task stays whatever run rate says,
+                // since the only provider it could move to is out of weekly budget.
+                (true, false) => {}
+                (true, true) => {
+                    pace_override(
+                        &mut provider,
+                        &mut gates,
+                        other,
+                        claude_pace_delta,
+                        codex_pace_delta,
+                        config,
+                    );
                 }
             }
 
-            // Pacing runs after the weekly rules, on the provider they landed on, and reads only
-            // Claude's five hour window: Codex's own is never a routing input. A confident verdict
-            // is paced too, because an exhausted five hour window is a capacity fact rather than a
-            // preference, and a Claude dispatch into one stalls.
+            // Pacing runs after the rules above, on the provider they landed on, and reads only
+            // Claude's five hour window: Codex's own is never a routing input. It applies however
+            // the task got to Claude, because an exhausted five hour window is a capacity fact
+            // rather than a preference, and a Claude dispatch into one stalls.
             if provider == Provider::Claude
                 && usage.claude.five_hour_pct >= config.claude_five_hour_pacing_pct
                 && usage.codex.weekly_pct < config.hard_ceiling_pct
@@ -173,11 +215,6 @@ pub fn decide(classification: Classification, usage: UsageSnapshot, config: &Con
         model = model_for(provider, complexity, config);
     }
 
-    if both_over_ceiling {
-        // The router routes; refusing work over a ceiling is bonus drain's job, not this one.
-        gates.push(Gate::OverCeiling);
-    }
-
     let rationale = rationale(&classification, provider, &gates, &usage);
     Decision {
         provider,
@@ -186,8 +223,67 @@ pub fn decide(classification: Classification, usage: UsageSnapshot, config: &Con
         classification: Some(classification),
         gates,
         usage,
+        claude_pace_delta,
+        codex_pace_delta,
         rationale,
     }
+}
+
+/// PURE: the run rate override. Moves the task to `other` when the provider it is on is burning
+/// far enough further ahead of its own weekly window, and does nothing otherwise.
+///
+/// The dead zone is wide because this box runs two Claude 20x Max plans against one Codex 5x plan,
+/// an allowance mismatch of about 8x. Identical work therefore shows up as several times the
+/// percentage on Codex, and over the recorded decisions Codex sat 43 to 58 points over pace all
+/// week purely from that. A threshold inside that band is not an override at all: at 25 points it
+/// moved 27 of 39 real dispatches, 25 of them onto the provider with LESS absolute allowance left.
+/// So the gap has to clear the chronic band, and what is left is the genuine blowout.
+///
+/// Strictly greater, so a gap exactly on the threshold holds. Symmetric, because the rule is about
+/// the provider the task is on and not about Codex; that it only ever fires toward Claude on this
+/// box is a property of how the box is provisioned today, not of the rule.
+fn pace_override(
+    provider: &mut Provider,
+    gates: &mut Vec<Gate>,
+    other: Provider,
+    claude_pace_delta: Option<f64>,
+    codex_pace_delta: Option<f64>,
+    config: &Config,
+) {
+    let (Some(claude), Some(codex)) = (claude_pace_delta, codex_pace_delta) else {
+        // An unread reset has no elapsed fraction to measure against. Treating the missing epoch
+        // as an ordinary one reads the window as fully elapsed, which turns an unknown provider
+        // into an apparently idle one and routes on a number nobody measured.
+        gates.push(Gate::PaceUnavailable);
+        return;
+    };
+    let delta = |candidate| match candidate {
+        Provider::Codex => codex,
+        Provider::Claude | Provider::Opencode => claude,
+    };
+    if delta(*provider) - delta(other) > config.pace_flip_gap {
+        *provider = other;
+        gates.push(Gate::PaceFlip);
+    }
+}
+
+/// PURE: how far ahead of its own weekly window a provider is burning, in points. Positive is hot:
+/// 80 percent spent with half the window gone is 30 points over pace.
+///
+/// Each provider is measured against its OWN reset, because the two weekly windows start and end
+/// at different instants and one provider's reset says nothing about the other's progress.
+///
+/// None when the reset epoch is 0, which `usage.rs` documents as "not known" rather than as a
+/// window resetting at the epoch. The expected burn is clamped, because a reset outside the window
+/// (a stale rollout, a clock skew) would otherwise read as more than a full window elapsed or less
+/// than none, and either produces a delta larger than the scale it is measured on.
+fn pace_delta(headroom: &Headroom, now_epoch_secs: i64) -> Option<f64> {
+    if headroom.weekly_reset_epoch == 0 {
+        return None;
+    }
+    let remaining = (headroom.weekly_reset_epoch - now_epoch_secs) as f64;
+    let expected_pct = (100.0 * (1.0 - remaining / WEEKLY_WINDOW_SECS)).clamp(0.0, 100.0);
+    Some(headroom.weekly_pct - expected_pct)
 }
 
 /// PURE: the decision for a caller-named provider. No classification runs, but the usage
@@ -205,6 +301,10 @@ pub fn decide_explicit(
         classification: None,
         gates: vec![Gate::ExplicitProvider],
         usage,
+        // No usage rule ran, so no run rate was measured. Recording one anyway would put a number
+        // in the log that nothing consulted, which the next backtest would read as a rule firing.
+        claude_pace_delta: None,
+        codex_pace_delta: None,
         rationale: format!("{} requested explicitly", provider.name()),
     }
 }
@@ -258,12 +358,14 @@ fn rationale(
         )
     };
     format!(
-        "{}: {}{tags} (codex_ready {}/6, claude_signals {}/6, {:?} confidence; codex weekly {:.0}%, claude weekly {:.0}%, claude 5h {:.0}%)",
+        "{}: {}{tags} (orchestration {}; codex weekly {:.0}%, claude weekly {:.0}%, claude 5h {:.0}%)",
         provider.name(),
         classification.rationale,
-        classification.codex_ready_count(),
-        classification.claude_signal_count(),
-        classification.confidence,
+        if classification.orchestration {
+            "yes"
+        } else {
+            "no"
+        },
         usage.codex.weekly_pct,
         usage.claude.weekly_pct,
         usage.claude.five_hour_pct,
@@ -273,9 +375,10 @@ fn rationale(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::classify::Verdict;
     use crate::usage::Headroom;
 
+    /// The rules the engine routes by live in `tests/pace_routing.rs`, against the public API.
+    /// What is left here is the explicit path, which no rule touches, and the rationale string.
     fn usage(codex_weekly: f64, claude_weekly: f64) -> UsageSnapshot {
         UsageSnapshot {
             codex: Headroom {
@@ -287,343 +390,6 @@ mod tests {
                 ..Headroom::full()
             },
         }
-    }
-
-    fn scored(
-        verdict: Verdict,
-        confidence: Confidence,
-        claude_signals: usize,
-        missing_connector: bool,
-    ) -> Classification {
-        let mut signals = [false; 6];
-        for slot in signals.iter_mut().take(claude_signals) {
-            *slot = true;
-        }
-        Classification {
-            codex_ready: [true; 6],
-            claude_signals: signals,
-            missing_connector,
-            verdict,
-            confidence,
-            complexity: Complexity::High,
-            rationale: "fixture".to_string(),
-            classifier_failed: false,
-        }
-    }
-
-    /// One row of the decision matrix: what the classifier said, what both weekly numbers
-    /// were, and where the engine must land.
-    struct Case {
-        label: &'static str,
-        verdict: Verdict,
-        confidence: Confidence,
-        claude_signals: usize,
-        missing_connector: bool,
-        codex_weekly: f64,
-        claude_weekly: f64,
-        want_provider: Provider,
-        want_gates: Vec<Gate>,
-    }
-
-    #[test]
-    fn the_classification_matrix_over_headroom_combinations() {
-        let config = Config::default();
-        let cases = vec![
-            Case {
-                label: "a confident codex verdict with room on both sides is untouched",
-                verdict: Verdict::Codex,
-                confidence: Confidence::High,
-                claude_signals: 0,
-                missing_connector: false,
-                codex_weekly: 60.0,
-                claude_weekly: 10.0,
-                want_provider: Provider::Codex,
-                want_gates: vec![],
-            },
-            Case {
-                label: "even a huge headroom gap does not move a confident verdict",
-                verdict: Verdict::Codex,
-                confidence: Confidence::High,
-                claude_signals: 0,
-                missing_connector: false,
-                codex_weekly: 90.0,
-                claude_weekly: 5.0,
-                want_provider: Provider::Codex,
-                want_gates: vec![],
-            },
-            Case {
-                label: "exhausted verdict provider with room on the other flips",
-                verdict: Verdict::Codex,
-                confidence: Confidence::High,
-                claude_signals: 0,
-                missing_connector: false,
-                codex_weekly: 97.0,
-                claude_weekly: 40.0,
-                want_provider: Provider::Claude,
-                want_gates: vec![Gate::FlippedOnExhaustion],
-            },
-            Case {
-                label: "the exhaustion flip works in the other direction too",
-                verdict: Verdict::Claude,
-                confidence: Confidence::High,
-                claude_signals: 0,
-                missing_connector: false,
-                codex_weekly: 40.0,
-                claude_weekly: 99.0,
-                want_provider: Provider::Codex,
-                want_gates: vec![Gate::FlippedOnExhaustion],
-            },
-            Case {
-                label: "a borderline verdict wins a small gap",
-                verdict: Verdict::Codex,
-                confidence: Confidence::Medium,
-                claude_signals: 0,
-                missing_connector: false,
-                codex_weekly: 50.0,
-                claude_weekly: 30.0,
-                want_provider: Provider::Codex,
-                want_gates: vec![],
-            },
-            Case {
-                label: "a gap exactly at the flip threshold stays with the verdict",
-                verdict: Verdict::Codex,
-                confidence: Confidence::Medium,
-                claude_signals: 0,
-                missing_connector: false,
-                codex_weekly: 55.0,
-                claude_weekly: 30.0,
-                want_provider: Provider::Codex,
-                want_gates: vec![],
-            },
-            Case {
-                label: "a gap past the threshold flips a borderline verdict",
-                verdict: Verdict::Codex,
-                confidence: Confidence::Low,
-                claude_signals: 0,
-                missing_connector: false,
-                codex_weekly: 80.0,
-                claude_weekly: 30.0,
-                want_provider: Provider::Claude,
-                want_gates: vec![Gate::HeadroomTiebreak],
-            },
-            Case {
-                label: "two claude signals force claude even with claude exhausted",
-                verdict: Verdict::Codex,
-                confidence: Confidence::High,
-                claude_signals: 2,
-                missing_connector: false,
-                codex_weekly: 0.0,
-                claude_weekly: 99.0,
-                want_provider: Provider::Claude,
-                want_gates: vec![Gate::ClaudeSignals],
-            },
-            Case {
-                label: "a missing connector forces claude regardless of shape",
-                verdict: Verdict::Codex,
-                confidence: Confidence::High,
-                claude_signals: 0,
-                missing_connector: true,
-                codex_weekly: 10.0,
-                claude_weekly: 95.0,
-                want_provider: Provider::Claude,
-                want_gates: vec![Gate::MissingConnector],
-            },
-            Case {
-                label: "both over the ceiling dispatches to the verdict provider anyway",
-                verdict: Verdict::Codex,
-                confidence: Confidence::High,
-                claude_signals: 0,
-                missing_connector: false,
-                codex_weekly: 98.0,
-                claude_weekly: 99.0,
-                want_provider: Provider::Codex,
-                want_gates: vec![Gate::OverCeiling],
-            },
-            Case {
-                label: "both over the ceiling on a borderline verdict with a small gap",
-                verdict: Verdict::Claude,
-                confidence: Confidence::Low,
-                claude_signals: 0,
-                missing_connector: false,
-                codex_weekly: 98.0,
-                claude_weekly: 99.0,
-                want_provider: Provider::Claude,
-                want_gates: vec![Gate::OverCeiling],
-            },
-        ];
-        for case in cases {
-            let classification = scored(
-                case.verdict,
-                case.confidence,
-                case.claude_signals,
-                case.missing_connector,
-            );
-            let decision = decide(
-                classification,
-                usage(case.codex_weekly, case.claude_weekly),
-                &config,
-            );
-            assert_eq!(
-                decision.provider, case.want_provider,
-                "provider for {}",
-                case.label
-            );
-            assert_eq!(decision.gates, case.want_gates, "gates for {}", case.label);
-        }
-    }
-
-    /// The mutation target: the exhaustion flip compares weekly used against the ceiling with
-    /// `>=`, and this case sits exactly ON the ceiling. Turning that `>=` into `>` (or dropping
-    /// the `other_used < ceiling` guard, which this case's 40% satisfies) makes it fail.
-    #[test]
-    fn a_confident_verdict_flips_when_its_provider_sits_exactly_on_the_ceiling() {
-        let config = Config::default();
-        let decision = decide(
-            scored(Verdict::Codex, Confidence::High, 0, false),
-            usage(config.hard_ceiling_pct, 40.0),
-            &config,
-        );
-        assert_eq!(decision.provider, Provider::Claude);
-        assert!(decision.gates.contains(&Gate::FlippedOnExhaustion));
-    }
-
-    #[test]
-    fn an_exhausted_verdict_provider_does_not_flip_when_the_other_is_exhausted_too() {
-        let config = Config::default();
-        let decision = decide(
-            scored(Verdict::Codex, Confidence::High, 0, false),
-            usage(98.0, 97.5),
-            &config,
-        );
-        assert_eq!(decision.provider, Provider::Codex);
-        assert!(!decision.gates.contains(&Gate::FlippedOnExhaustion));
-        assert!(decision.gates.contains(&Gate::OverCeiling));
-    }
-
-    #[test]
-    fn a_failed_classifier_retains_the_configured_codex_default() {
-        let config = Config::default();
-        let decision = decide(
-            Classification::fallback("timed out after 30s", DefaultProvider::Codex),
-            // Claude exhaustion cannot move the configured Codex fallback.
-            usage(0.0, 99.0),
-            &config,
-        );
-        assert_eq!(decision.provider, Provider::Codex);
-        assert_eq!(decision.gate_tags(), vec!["classifier_failed"]);
-        // A fallback carries no complexity of its own, so it runs at the high tier.
-        assert_eq!(decision.model.as_deref(), Some("gpt-5.6-sol"));
-        assert_eq!(decision.effort, None);
-    }
-
-    /// The scoring fixture at a named complexity, with nothing else that could move the provider.
-    fn at(verdict: Verdict, complexity: Complexity) -> Classification {
-        Classification {
-            complexity,
-            ..scored(verdict, Confidence::High, 0, false)
-        }
-    }
-
-    /// The whole point of the feature: the model comes from the complexity, for both providers.
-    /// Eight cells, four per provider. Effort is never decided, so every cell leaves it None and
-    /// the backend resolves its own.
-    #[test]
-    fn the_model_matrix_over_complexity_and_provider() {
-        let config = Config::default();
-        let cases = [
-            (Verdict::Codex, Complexity::Low, "gpt-5.6-luna"),
-            (Verdict::Codex, Complexity::Medium, "gpt-5.6-terra"),
-            (Verdict::Codex, Complexity::High, "gpt-5.6-sol"),
-            (Verdict::Codex, Complexity::Ultra, "gpt-5.6-sol"),
-            (Verdict::Claude, Complexity::Low, "sonnet"),
-            (Verdict::Claude, Complexity::Medium, "opus[1m]"),
-            (Verdict::Claude, Complexity::High, "opus[1m]"),
-            (Verdict::Claude, Complexity::Ultra, "fable"),
-        ];
-        for (verdict, complexity, model) in cases {
-            let decision = decide(at(verdict, complexity), usage(10.0, 10.0), &config);
-            assert_eq!(decision.provider, verdict.provider());
-            assert_eq!(
-                decision.model.as_deref(),
-                Some(model),
-                "model for {verdict:?} at {complexity:?}"
-            );
-            assert_eq!(
-                decision.effort, None,
-                "effort must stay with the model default for {verdict:?} at {complexity:?}"
-            );
-        }
-    }
-
-    /// A usage flip re-derives the model from the NEW provider's tiers at the SAME complexity,
-    /// rather than carrying the old provider's model across the flip.
-    #[test]
-    fn a_usage_failover_rederives_the_new_providers_tier_at_the_same_complexity() {
-        let config = Config::default();
-
-        // Codex verdict, codex exhausted: lands on claude's low tier, not codex's.
-        let to_claude = decide(
-            at(Verdict::Codex, Complexity::Low),
-            usage(99.0, 0.0),
-            &config,
-        );
-        assert_eq!(to_claude.provider, Provider::Claude);
-        assert_eq!(to_claude.model.as_deref(), Some("sonnet"));
-        assert_eq!(to_claude.gates, vec![Gate::FlippedOnExhaustion]);
-
-        // The other direction at the top tier: claude ultra is fable, codex ultra is sol.
-        let to_codex = decide(
-            at(Verdict::Claude, Complexity::Ultra),
-            usage(0.0, 99.0),
-            &config,
-        );
-        assert_eq!(to_codex.provider, Provider::Codex);
-        assert_eq!(to_codex.model.as_deref(), Some("gpt-5.6-sol"));
-    }
-
-    /// The regression this fix exists for: a flipped job must never be dispatched with the model
-    /// of the provider it just left, because no model name is valid on both backends.
-    #[test]
-    fn a_flipped_job_never_carries_the_other_providers_model() {
-        let config = Config::default();
-        let to_claude = decide(
-            at(Verdict::Codex, Complexity::Low),
-            usage(99.0, 0.0),
-            &config,
-        );
-        assert_eq!(to_claude.provider, Provider::Claude);
-        assert_eq!(to_claude.model.as_deref(), Some("sonnet"));
-        assert_eq!(to_claude.gates, vec![Gate::FlippedOnExhaustion]);
-
-        let to_codex = decide(
-            at(Verdict::Claude, Complexity::Low),
-            usage(0.0, 99.0),
-            &config,
-        );
-        assert_eq!(to_codex.provider, Provider::Codex);
-        assert_eq!(to_codex.model.as_deref(), Some("gpt-5.6-luna"));
-        assert_eq!(to_codex.gates, vec![Gate::FlippedOnExhaustion]);
-    }
-
-    #[test]
-    fn configured_tiers_override_the_built_in_defaults() {
-        let mut config = Config::default();
-        config.models.codex.low = "gpt-5.6-custom".to_string();
-        config.models.claude.ultra = "opus[1m]".to_string();
-
-        let codex = decide(
-            at(Verdict::Codex, Complexity::Low),
-            usage(10.0, 10.0),
-            &config,
-        );
-        assert_eq!(codex.model.as_deref(), Some("gpt-5.6-custom"));
-
-        let claude = decide(
-            at(Verdict::Claude, Complexity::Ultra),
-            usage(10.0, 10.0),
-            &config,
-        );
-        assert_eq!(claude.model.as_deref(), Some("opus[1m]"));
     }
 
     /// An unscored task has no complexity to read, so it runs at the high tier.
@@ -649,6 +415,9 @@ mod tests {
         assert_eq!(decision.usage.codex.weekly_pct, 71.0);
         assert_eq!(decision.usage.claude.weekly_pct, 50.0);
         assert_eq!(decision.model, None);
+        // No usage rule ran on this path, so there is no run rate to record.
+        assert_eq!(decision.claude_pace_delta, None);
+        assert_eq!(decision.codex_pace_delta, None);
 
         // An explicitly requested model overrides the per-provider default.
         let pinned = decide_explicit(
@@ -660,12 +429,21 @@ mod tests {
         assert_eq!(pinned.model.as_deref(), Some("sonnet"));
     }
 
+    /// The rationale is the one line the CLI prints and the viewer shows, so it names the provider,
+    /// every gate that fired, and the numbers those gates were decided on.
     #[test]
     fn the_rationale_names_the_provider_the_gates_and_both_weekly_numbers() {
         let config = Config::default();
         let decision = decide(
-            scored(Verdict::Codex, Confidence::High, 0, true),
+            Classification {
+                orchestration: false,
+                missing_connector: true,
+                complexity: Complexity::High,
+                rationale: "fixture".to_string(),
+                classifier_failed: false,
+            },
             usage(71.0, 50.0),
+            1_785_400_000,
             &config,
         );
         assert!(

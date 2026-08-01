@@ -91,7 +91,14 @@ pub fn run(request: &Request, config: &Config) -> Result<Outcome> {
     let usage = UsageSnapshot::read();
     let decision = match request.provider {
         Some(provider) => decide_explicit(provider, request.model.clone(), usage, config),
-        None => decide(classify(request.task, config), usage, config),
+        // `decide` is pure and takes the instant it decides at, so the clock is read here, on the
+        // impure side, and after the usage snapshot the run rate rules measure against it.
+        None => decide(
+            classify(request.task, config),
+            usage,
+            crate::usage::now_epoch(),
+            config,
+        ),
     };
     let requested = request
         .provider
