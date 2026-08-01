@@ -14,12 +14,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::SystemTime;
 
-/// The gates that move a task off the provider its verdict named, as the router defines them.
+/// The gates that move a task off the provider it started on, as the router defines them.
 /// Restated here rather than imported so the reconciliation below is an independent count rather
-/// than the implementation agreeing with itself.
-const FLIP_GATES: [&str; 3] = [
+/// than the implementation agreeing with itself. `headroom_tiebreak` is retired but still counted,
+/// because rows carrying it remain in the log.
+const FLIP_GATES: [&str; 4] = [
     "flipped_on_exhaustion",
     "headroom_tiebreak",
+    "pace_flip",
     "five_hour_pacing",
 ];
 
@@ -84,11 +86,8 @@ fn shell_quote(value: &str) -> String {
 /// The envelope shape of `claude -p --output-format json`, carrying one classification answer.
 fn envelope(complexity: &str) -> String {
     let answer = json!({
-        "codex_ready": [true, true, true, true, true, true],
-        "claude_signals": [false, false, false, false, false, false],
+        "orchestration": false,
         "missing_connector": false,
-        "verdict": "codex",
-        "confidence": "high",
         "complexity": complexity,
         "rationale": "stats fixture",
     })
@@ -126,7 +125,7 @@ fn write_fake_claude(bin: &Path) {
     fs::set_permissions(&binary, permissions).expect("make fake executable");
 }
 
-/// One rollout whose weekly window is past the hard ceiling, so a codex verdict read against it
+/// One rollout whose weekly window is past the hard ceiling, so a codex route read against it
 /// fires a weekly gate rather than routing untouched.
 fn write_exhausted_rollout(sessions: &Path) {
     let resets_at = SystemTime::now()

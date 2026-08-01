@@ -3,40 +3,12 @@
 //! retains the configured default and stays eligible for weekly routing.
 
 use crate::config::{Classifier, ClassifierEngine, Config, DefaultProvider};
-use crate::provider::Provider;
 use crate::runtime::home_dir;
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// Which provider the rubric points at.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Verdict {
-    Codex,
-    Claude,
-}
-
-impl Verdict {
-    pub const fn provider(self) -> Provider {
-        match self {
-            Verdict::Codex => Provider::Codex,
-            Verdict::Claude => Provider::Claude,
-        }
-    }
-}
-
-/// How sure the classifier is. Confident verdicts survive headroom; borderline ones are
-/// decided by it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Confidence {
-    High,
-    Medium,
-    Low,
-}
-
-/// How much reasoning the task needs. Orthogonal to the verdict: either provider can take a
+/// How much reasoning the task needs. Orthogonal to the provider: either provider can take a
 /// simple task. This picks the model the job runs on, and nothing else: the reasoning effort is
 /// left to the backend to resolve, because the model is the better toggle. See `Decision::effort`
 /// for what each backend then resolves it to.
@@ -65,14 +37,22 @@ impl Complexity {
     }
 }
 
-/// One scored task. The two arrays are the rubric's six criteria each, in the rubric's order.
+/// One scored task: the two capability pins, plus how much reasoning it needs.
+///
+/// Three scored fields and no verdict, because the rubric's other ten criteria never changed an
+/// outcome. Measured over the 108 recorded decisions, the retired `claude_signals >= 2` pin fired
+/// 45 times and every one of those rows already carried a claude verdict, so it decided nothing;
+/// the provider is now decided by capability and usage alone.
+///
+/// Neither pin carries a serde default, deliberately. An answer in the retired fourteen field
+/// shape must fail the parse rather than read as "no orchestration": a defaulted pin would route
+/// silently on a field the model never scored.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Classification {
-    pub codex_ready: [bool; 6],
-    pub claude_signals: [bool; 6],
+    /// Several agents must exchange findings with each other partway through the run. The one
+    /// task shape Codex cannot do at all, and so the only shape that pins to Claude.
+    pub orchestration: bool,
     pub missing_connector: bool,
-    pub verdict: Verdict,
-    pub confidence: Confidence,
     /// Absent from an older log row or an answer that omitted it, which both read as high.
     #[serde(default)]
     pub complexity: Complexity,
@@ -84,30 +64,19 @@ pub struct Classification {
 
 impl Classification {
     /// The classification used when the classifier could not answer. The configured default
-    /// remains eligible for weekly routing, so failure does not invent a capability signal.
+    /// remains eligible for every usage rule, so failure does not invent a capability pin.
     pub fn fallback(why: &str, default_provider: DefaultProvider) -> Classification {
-        let (verdict, provider_name) = match default_provider {
-            DefaultProvider::Codex => (Verdict::Codex, "codex"),
-            DefaultProvider::Claude => (Verdict::Claude, "claude"),
+        let provider_name = match default_provider {
+            DefaultProvider::Codex => "codex",
+            DefaultProvider::Claude => "claude",
         };
         Classification {
-            codex_ready: [false; 6],
-            claude_signals: [false; 6],
+            orchestration: false,
             missing_connector: false,
-            verdict,
-            confidence: Confidence::Low,
             complexity: Complexity::High,
             rationale: format!("classifier failed ({why}), defaulting to {provider_name}"),
             classifier_failed: true,
         }
-    }
-
-    pub fn codex_ready_count(&self) -> usize {
-        self.codex_ready.iter().filter(|held| **held).count()
-    }
-
-    pub fn claude_signal_count(&self) -> usize {
-        self.claude_signals.iter().filter(|held| **held).count()
     }
 }
 
@@ -241,28 +210,37 @@ fn run_from_home(cmd: &mut Command) {
     }
 }
 
-/// PURE: the classifier prompt. The rubric is verbatim from the routing plan; the connector
-/// inventory is the config's, because gate 5 is scored against exactly that list.
+/// PURE: the classifier prompt. Three scored fields, each judged on its own evidence; the
+/// connector inventory is the config's, because `missing_connector` is scored against exactly
+/// that list.
+///
+/// Most of the wording here is a brake rather than a rubric, and the reason is measured. Under the
+/// retired twelve criterion rubric the orchestration signal NEVER fired below four total signals
+/// lit, across all 108 recorded decisions: the model was halo scoring the whole array off an
+/// overall impression of difficulty rather than judging each criterion, so orchestration read as
+/// "this task feels hard" instead of "these agents must talk to each other". That was harmless
+/// while it was one of twelve signals feeding a verdict. It is not harmless now that orchestration
+/// is the ONLY route to Claude, so the halo has to be attacked directly: the prompt names the
+/// specific things orchestration must not be inferred from, and says the test out loud twice.
+///
+/// The degenerate input paragraph is the second measured failure. An empty prompt, a greeting, or
+/// an unintelligible fragment gives the model nothing to score, and under the old rubric those
+/// answered claude, because "I cannot tell what this is" reads as "requirements still being
+/// discovered". Unscoreable input has to land on the default provider, not on the pin.
 pub fn classifier_prompt(task: &str, connectors: &[String]) -> String {
     let inventory = connectors.join(", ");
     format!(
         r#"You are a routing classifier. Score ONE task against a fixed rubric. Output ONE JSON object and NOTHING else: no prose, no reasoning, no code fence, no commentary before or after.
 
-The anchor question: Could a capable engineer enter fresh, read the prompt and repository, run the specified checks, and finish without joining the preceding conversation? If yes, choose Codex.
+Score three fields, each on its own evidence. There is no overall verdict and no total to balance, so no field may be inferred from another or from an overall impression of the task. Judge each one literally, as written, and answer false when the task does not say so.
 
-Codex ready when all or nearly all hold: (1) outcome explicit, (2) source of truth in files/commands/live systems, (3) verification mechanical, (4) one coherent boundary, (5) Codex has every required connector, (6) can stop without further strategic judgment.
+orchestration: several agents must exchange findings with each other partway through the run, so that what one agent finds changes what another does next. That is the entire test. Judge it independently: orchestration is never inferred from how difficult the task is, how large its scope is, how many files, directories or repositories it touches, whether it only reads or also writes, how important it is, or how long it will run. One agent working alone is not orchestration, however hard the work. A task that merely mentions agents, subagents, or a team without needing findings passed between them mid-run is not orchestration. Planning, reviewing, investigating, and debugging are not orchestration by themselves. When in any doubt, answer false.
 
-Claude when two or more hold: (1) requirements still being discovered, (2) dependent agents must exchange findings mid-run, (3) accumulated conversation is part of the source of truth, (4) discoveries likely reshape the plan, (5) work combines strategy + implementation + evaluation + remediation, (6) live changes need repeated risk judgment.
-
-Hard gates, applied before any scoring: a missing connector is an automatic Claude decision regardless of shape. Durable rule as tiebreaker: Codex executes contracts, Claude manages evolving programs. Difficulty alone never routes to Claude.
-
-Score each of the twelve criteria literally, as written. Do not invent signals: needing skill, care, or interpretation is not a Claude signal, and neither is being read-only, large, multi-repo, or long-running.
-
-Judge the task as stated, at the level of detail it is stated. When the task says the commands, metrics, baselines, or acceptance criteria are specified, take that as given and score criteria 1 to 3 as held; a summary that does not inline them is NOT requirements still being discovered. Signal 5 needs all four of strategy, implementation, evaluation, and remediation, not evaluation alone. Signal 2 needs the task to actually call for several agents exchanging findings.
-
-Separately, and independently of the verdict, judge how much reasoning the task needs. complexity is "low" when it is conversational, one step, mechanical, or a single file with an obvious answer; "medium" for a normal well scoped implementation or investigation; "high" when it spans several files or is subtle enough to need heavy reasoning or design judgment; "ultra" only for the rare hardest work, where a wrong call is expensive and hard to reverse: architecture or plan review, a root cause hunt that has already defeated ordinary debugging, or a design decision that sets a direction. Ultra is not "large" or "long running", and it is not "important to the user": when torn between high and ultra, answer high. Complexity is orthogonal to the provider: a low task can belong to either provider, and so can an ultra one. Never let complexity change the verdict, and never let the verdict change complexity.
+Degenerate input scores false on both booleans: an empty task, a greeting, a single word, or a fragment nobody could act on gives you nothing to score, and nothing to score is not orchestration. Score such a task complexity "low" and say in the rationale that there was nothing to score.
 
 The connector inventory is authoritative: Codex on this box can reach {inventory}. Set missing_connector true ONLY when the task must reach a named system absent from that list. Never set it because you cannot see a connector yourself.
+
+Separately, and independently of both booleans, judge how much reasoning the task needs. complexity is "low" when it is conversational, one step, mechanical, or a single file with an obvious answer; "medium" for a normal well scoped implementation or investigation; "high" when it spans several files or is subtle enough to need heavy reasoning or design judgment; "ultra" only for the rare hardest work, where a wrong call is expensive and hard to reverse: architecture or plan review, a root cause hunt that has already defeated ordinary debugging, or a design decision that sets a direction. Ultra is not "large" or "long running", and it is not "important to the user": when torn between high and ultra, answer high. Complexity is orthogonal to the provider: a low task can run on either provider, and so can an ultra one. Never let complexity change orchestration or missing_connector, and never let either of them change complexity.
 
 TASK
 <<<
@@ -270,8 +248,8 @@ TASK
 >>>
 
 Reply with exactly this JSON object, filled in:
-{{"codex_ready":[b,b,b,b,b,b],"claude_signals":[b,b,b,b,b,b],"missing_connector":false,"verdict":"codex","confidence":"high","complexity":"medium","rationale":"one sentence"}}
-codex_ready and claude_signals are exactly six booleans each, in the order listed above. verdict is "codex" or "claude". confidence is "high", "medium", or "low". complexity is "low", "medium", "high", or "ultra"."#
+{{"orchestration":false,"missing_connector":false,"complexity":"medium","rationale":"one sentence"}}
+orchestration and missing_connector are booleans. complexity is "low", "medium", "high", or "ultra". rationale is one sentence."#
     )
 }
 
@@ -420,18 +398,13 @@ mod tests {
         parse_classifier_output(stdout, ClassifierEngine::Codex)
     }
 
-    const GOOD: &str = r#"{"codex_ready":[true,true,true,true,true,true],
-        "claude_signals":[false,false,false,false,false,false],
-        "missing_connector":false,"verdict":"codex","confidence":"high",
+    const GOOD: &str = r#"{"orchestration":false,"missing_connector":false,
         "rationale":"explicit outcome, mechanical verification"}"#;
 
     #[test]
     fn a_well_formed_answer_parses_out_of_the_cli_envelope() {
         let got = parse_claude(&envelope(GOOD)).expect("parses");
-        assert_eq!(got.verdict, Verdict::Codex);
-        assert_eq!(got.confidence, Confidence::High);
-        assert_eq!(got.codex_ready_count(), 6);
-        assert_eq!(got.claude_signal_count(), 0);
+        assert!(!got.orchestration);
         assert!(!got.missing_connector);
         assert!(!got.classifier_failed);
     }
@@ -440,21 +413,24 @@ mod tests {
     fn a_fenced_or_prefaced_answer_still_parses() {
         let fenced = format!("Here is the scoring:\n```json\n{GOOD}\n```\n");
         let got = parse_claude(&envelope(&fenced)).expect("parses");
-        assert_eq!(got.verdict, Verdict::Codex);
+        assert!(!got.orchestration);
     }
 
+    /// Both pins come through independently, so an answer that lit one cannot be read as having
+    /// lit the other.
     #[test]
-    fn claude_signals_and_missing_connector_come_through_in_rubric_order() {
-        let text = r#"{"codex_ready":[true,false,false,true,false,false],
-            "claude_signals":[true,false,true,false,true,false],
-            "missing_connector":true,"verdict":"claude","confidence":"medium",
-            "rationale":"needs n8n"}"#;
-        let got = parse_claude(&envelope(text)).expect("parses");
-        assert_eq!(got.claude_signals, [true, false, true, false, true, false]);
-        assert_eq!(got.codex_ready, [true, false, false, true, false, false]);
-        assert_eq!(got.claude_signal_count(), 3);
-        assert!(got.missing_connector);
-        assert_eq!(got.verdict, Verdict::Claude);
+    fn both_capability_pins_come_through_independently() {
+        for (orchestration, missing_connector) in
+            [(true, false), (false, true), (true, true), (false, false)]
+        {
+            let text = format!(
+                r#"{{"orchestration":{orchestration},"missing_connector":{missing_connector},
+                "complexity":"high","rationale":"needs n8n"}}"#
+            );
+            let got = parse_claude(&envelope(&text)).expect("parses");
+            assert_eq!(got.orchestration, orchestration);
+            assert_eq!(got.missing_connector, missing_connector);
+        }
     }
 
     #[test]
@@ -462,10 +438,10 @@ mod tests {
         // Prose with no object, an object missing required fields, a bogus enum value, and an
         // envelope with no result field at all.
         assert!(parse_claude(&envelope("I cannot score this task.")).is_none());
-        assert!(parse_claude(&envelope(r#"{"verdict":"codex"}"#)).is_none());
+        assert!(parse_claude(&envelope(r#"{"orchestration":true}"#)).is_none());
         assert!(
             parse_claude(&envelope(
-                &GOOD.replace("\"confidence\":\"high\"", "\"confidence\":\"certain\"")
+                &GOOD.replace("\"orchestration\":false", "\"orchestration\":\"maybe\"")
             ))
             .is_none()
         );
@@ -489,7 +465,7 @@ mod tests {
             );
             let got = parse_claude(&envelope(&text)).expect("parses");
             assert_eq!(got.complexity, want);
-            assert_eq!(got.verdict, Verdict::Codex, "complexity is not the verdict");
+            assert!(!got.orchestration, "complexity is not a capability pin");
         }
 
         assert!(!GOOD.contains("complexity"), "the fixture omits the field");
@@ -501,12 +477,6 @@ mod tests {
             "\"missing_connector\":false,\"complexity\":\"epic\"",
         );
         assert!(parse_claude(&envelope(&bogus)).is_none());
-    }
-
-    #[test]
-    fn an_array_of_the_wrong_length_is_rejected_rather_than_padded() {
-        let short = GOOD.replace("[true,true,true,true,true,true]", "[true,true,true]");
-        assert!(parse_claude(&envelope(&short)).is_none());
     }
 
     #[test]
@@ -522,49 +492,80 @@ mod tests {
         );
     }
 
+    /// A failure is not a capability pin: it scores no orchestration and no missing connector, so
+    /// the configured default stands and every usage rule still applies to it.
     #[test]
-    fn the_fallback_is_low_confidence_claude_and_says_why() {
+    fn the_fallback_pins_nothing_and_says_why() {
         let got = Classification::fallback("timed out after 30s", DefaultProvider::Claude);
-        assert_eq!(got.verdict, Verdict::Claude);
-        assert_eq!(got.confidence, Confidence::Low);
+        assert!(!got.orchestration);
+        assert!(!got.missing_connector);
         assert_eq!(got.complexity, Complexity::High);
         assert!(got.classifier_failed);
         assert!(got.rationale.contains("timed out after 30s"));
+        assert!(got.rationale.contains("defaulting to claude"));
     }
 
+    /// The prompt is the whole classifier, so the instructions that are there for a measured
+    /// reason are pinned rather than left to survive the next edit by luck.
     #[test]
-    fn the_prompt_carries_the_rubric_verbatim_and_the_configured_inventory() {
+    fn the_prompt_carries_the_rubric_and_the_configured_inventory() {
         let prompt = classifier_prompt(
             "do a thing",
             &["local shell".to_string(), "airtable".to_string()],
         );
+        // Orchestration is the only route to Claude, and its definition is the whole of it.
         assert!(prompt.contains(
-            "Could a capable engineer enter fresh, read the prompt and repository, run the \
-             specified checks, and finish without joining the preceding conversation?"
+            "several agents must exchange findings with each other partway through the run"
         ));
-        assert!(prompt.contains("(6) can stop without further strategic judgment"));
-        assert!(prompt.contains("(6) live changes need repeated risk judgment"));
-        assert!(prompt.contains("a missing connector is an automatic Claude decision"));
-        assert!(prompt.contains("Difficulty alone never routes to Claude"));
-        // The anti-drift instructions are load-bearing: without them haiku reads a task summary
-        // that does not inline its metrics as "requirements still being discovered" and routes a
-        // bounded evaluation to claude.
-        assert!(prompt.contains("Judge the task as stated, at the level of detail it is stated."));
+        // The anti-halo instructions. Under the old rubric the orchestration signal never once
+        // fired below four signals lit, which is the model scoring an impression of difficulty
+        // rather than this criterion, so each thing it must NOT be inferred from is named.
+        assert!(prompt.contains("Judge it independently"));
         assert!(prompt.contains(
-            "Signal 5 needs all four of strategy, implementation, evaluation, and remediation"
+            "orchestration is never inferred from how difficult the task is, how large its scope \
+             is, how many files, directories or repositories it touches, whether it only reads or \
+             also writes, how important it is, or how long it will run"
         ));
+        assert!(prompt.contains("One agent working alone is not orchestration"));
+        assert!(prompt.contains("When in any doubt, answer false."));
+        // Degenerate input has nothing to score, and nothing to score used to read as claude.
+        assert!(prompt.contains(
+            "an empty task, a greeting, a single word, or a fragment nobody could act on"
+        ));
+        // The connector inventory, scored against exactly the configured list.
         assert!(prompt.contains("Codex on this box can reach local shell, airtable"));
+        assert!(prompt.contains(
+            "Set missing_connector true ONLY when the task must reach a named system absent from \
+             that list"
+        ));
         assert!(prompt.contains("do a thing"));
-        // The complexity rubric and its independence from the verdict, which is what stops a
-        // trivial conversational task from being scored hard just because it routed to codex.
+        // The complexity rubric and its independence from both pins, which is what stops a
+        // trivial conversational task from being scored hard because it looks like Claude work.
         assert!(prompt.contains("conversational, one step, mechanical, or a single file"));
         assert!(prompt.contains("a normal well scoped implementation or investigation"));
         assert!(prompt.contains("Complexity is orthogonal to the provider"));
+        assert!(prompt.contains(
+            "Never let complexity change orchestration or missing_connector, and never let either \
+             of them change complexity."
+        ));
         // Ultra is the only tier that reaches fable, so the brake on over-assigning it is
         // load-bearing rather than decorative.
         assert!(prompt.contains("when torn between high and ultra, answer high"));
-        assert!(prompt.contains("\"complexity\":\"medium\""));
+        // The answer shape, which is what the parser accepts and nothing wider.
+        assert!(prompt.contains(
+            "{\"orchestration\":false,\"missing_connector\":false,\"complexity\":\"medium\",\
+             \"rationale\":\"one sentence\"}"
+        ));
         assert!(prompt.contains("complexity is \"low\", \"medium\", \"high\", or \"ultra\""));
+        // No field of the retired fourteen field shape may still be asked for. Matched as a JSON
+        // key, because the prose deliberately says the word "verdict" to tell the model there
+        // is not one.
+        for retired in ["codex_ready", "claude_signals", "verdict", "confidence"] {
+            assert!(
+                !prompt.contains(&format!("\"{retired}\"")),
+                "the prompt still asks for the retired field {retired}"
+            );
+        }
     }
 
     fn args_of(cmd: &Command) -> Vec<String> {
@@ -715,15 +716,11 @@ mod tests {
     fn a_codex_answer_parses_out_of_the_jsonl_event_stream() {
         let got = parse_codex(&stream(GOOD)).expect("parses");
         assert_eq!(got, parse_claude(&envelope(GOOD)).expect("parses"));
-        assert_eq!(got.verdict, Verdict::Codex);
-        assert_eq!(got.confidence, Confidence::High);
+        assert!(!got.orchestration);
         assert!(!got.classifier_failed);
 
         let fenced = format!("Here is the scoring:\n```json\n{GOOD}\n```\n");
-        assert_eq!(
-            parse_codex(&stream(&fenced)).expect("parses").verdict,
-            Verdict::Codex
-        );
+        assert!(!parse_codex(&stream(&fenced)).expect("parses").orchestration);
     }
 
     /// A turn can emit several messages; the verdict is the last one, not a preamble.
@@ -735,10 +732,7 @@ mod tests {
         })
         .to_string();
         let stdout = format!("{preamble}\n{}", stream(GOOD));
-        assert_eq!(
-            parse_codex(&stdout).expect("parses").verdict,
-            Verdict::Codex
-        );
+        assert!(!parse_codex(&stdout).expect("parses").orchestration);
     }
 
     /// Reasoning and command items ride the same stream, and a failed turn emits no agent message
