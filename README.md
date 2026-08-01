@@ -299,6 +299,28 @@ never ran a usage rule and never ran the classifier. The dry run share is denomi
 row instead, since any row can be a dry run. Each rate carries its numerator and denominator so it
 can be checked by hand, and a rate with no denominator reads `-` rather than a percentage.
 
+Then the feedback breakdowns: a bad rate and a failure rate, each broken down by gate tag, by
+provider, and by complexity tier. The bad rate is the rows a human marked `bad` with
+`agent-router log --mark`; the failure rate is the rows `agent-router status` settled to `failed`,
+plus the rows whose dispatch itself errored. A row carrying several gate tags counts under each of
+them, since a gate breakdown is per gate by definition, unlike the flip rate, where one route that
+moved counts once however many gates fired on it.
+
+Both denominators are deliberately narrower than the row count, and that is what makes the numbers
+worth trusting. A bad rate counts only the rows a human actually judged, because an unmarked row is
+absence of evidence rather than evidence of a good route, and counting it as good would drive every
+bad rate toward zero as the log grows. A failure rate counts only the rows whose fate is settled
+(`completed`, `failed`, or a dispatch error), because a row still reading `dispatched`, `running`,
+or `unknown` has not been shown to have succeeded, and counting it as one reports a perfect record
+over jobs nobody has heard back about. A dry run never enters a failure denominator at all, since it
+dispatched nothing that could succeed or fail, though it does enter a bad rate, because it still has
+a route a human can judge.
+
+Every breakdown carries the full key set of the distribution it breaks down, so a key nobody has
+judged reads `0 of 0` with a null share instead of vanishing from the report. That is also why a
+zero and a null are different answers here: `0 of 4` is four judged routes with nothing wrong,
+`0 of 0` is nothing to say yet.
+
 `--limit` defaults to 200, which is the same window as `agent-router log --json --limit 200`, so
 every number here reconciles by hand against the rows that command prints.
 

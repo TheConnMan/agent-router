@@ -163,6 +163,13 @@ pub struct StatsRow {
     /// The gate tags that fired, comma joined. Empty when none did.
     pub gates: String,
     pub dry_run: bool,
+    /// The human judgement on the route. None means nobody has judged this row, which is why a bad
+    /// rate is denominated on the marked rows alone.
+    pub mark: Option<String>,
+    /// What became of the job: the dispatch time value until `status` has read a backend for this
+    /// row, and the reconciled state afterwards. It is the state, so a failure rate reads it
+    /// directly rather than a second column.
+    pub outcome: String,
 }
 
 const SCHEMA: &str = "\
@@ -220,7 +227,8 @@ claude_usage_stale, codex_usage_stale, orchestration, claude_pace_delta, codex_p
 reconciled_at_ms, mark, note, effective_effort";
 
 /// The narrower list the stats reader needs, so a report never pays for columns it drops.
-const STATS_COLUMNS: &str = "created_at_ms, requested, provider, complexity, gates, dry_run";
+const STATS_COLUMNS: &str =
+    "created_at_ms, requested, provider, complexity, gates, dry_run, mark, outcome";
 
 /// The narrower list the reconciler needs.
 const STATUS_COLUMNS: &str = "id, created_at_ms, provider, job_id, job_name, outcome";
@@ -345,6 +353,8 @@ impl DecisionLog {
                 complexity: row.get(3)?,
                 gates: row.get(4)?,
                 dry_run: row.get(5)?,
+                mark: row.get(6)?,
+                outcome: row.get(7)?,
             })
         };
         let rows = match since_ms {

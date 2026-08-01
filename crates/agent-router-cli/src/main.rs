@@ -738,7 +738,23 @@ fn stats_json(stats: &Stats) -> serde_json::Value {
         "flip_rate": rate_json(&stats.flip_rate),
         "classifier_failure_rate": rate_json(&stats.classifier_failure_rate),
         "dry_run_share": rate_json(&stats.dry_run_share),
+        "bad_rate_by_gate": rate_map_json(&stats.bad_rate_by_gate),
+        "bad_rate_by_provider": rate_map_json(&stats.bad_rate_by_provider),
+        "bad_rate_by_complexity": rate_map_json(&stats.bad_rate_by_complexity),
+        "failure_rate_by_gate": rate_map_json(&stats.failure_rate_by_gate),
+        "failure_rate_by_provider": rate_map_json(&stats.failure_rate_by_provider),
+        "failure_rate_by_complexity": rate_map_json(&stats.failure_rate_by_complexity),
     })
+}
+
+/// One breakdown as an object keyed the same way the distribution it breaks down is keyed, so the
+/// two reconcile key by key.
+fn rate_map_json(rates: &BTreeMap<String, Rate>) -> serde_json::Value {
+    rates
+        .iter()
+        .map(|(key, rate)| (key.clone(), rate_json(rate)))
+        .collect::<serde_json::Map<String, serde_json::Value>>()
+        .into()
 }
 
 /// Both counts travel with the share, so a reader can check the rate rather than trust it. The
@@ -765,6 +781,15 @@ fn print_stats(stats: &Stats) {
     print_rate("flip rate", &stats.flip_rate);
     print_rate("classifier failure rate", &stats.classifier_failure_rate);
     print_rate("dry run share", &stats.dry_run_share);
+    print_rate_map("bad rate by gate", &stats.bad_rate_by_gate);
+    print_rate_map("bad rate by provider", &stats.bad_rate_by_provider);
+    print_rate_map("bad rate by complexity", &stats.bad_rate_by_complexity);
+    print_rate_map("failure rate by gate", &stats.failure_rate_by_gate);
+    print_rate_map("failure rate by provider", &stats.failure_rate_by_provider);
+    print_rate_map(
+        "failure rate by complexity",
+        &stats.failure_rate_by_complexity,
+    );
 }
 
 fn print_counts(label: &str, counts: &BTreeMap<String, usize>) {
@@ -792,6 +817,32 @@ fn print_rate(label: &str, rate: &Rate) {
         ),
         None => println!("{label}: - (0 of 0)"),
     }
+}
+
+/// One breakdown, key by key, with the same dash a rate with no denominator gets on its own line: a
+/// key nobody has judged yet is present and unanswered rather than absent or invented.
+fn print_rate_map(label: &str, rates: &BTreeMap<String, Rate>) {
+    if rates.is_empty() {
+        println!("{label}: -");
+        return;
+    }
+    let rendered = rates
+        .iter()
+        .map(|(name, rate)| {
+            let name = escape_terminal_controls(name);
+            match rate.share() {
+                Some(share) => format!(
+                    "{name} {:.1}% ({} of {})",
+                    share * 100.0,
+                    rate.numerator,
+                    rate.denominator
+                ),
+                None => format!("{name} - (0 of 0)"),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!("{label}: {rendered}");
 }
 
 fn stamp(created_at_ms: Option<i64>) -> String {
