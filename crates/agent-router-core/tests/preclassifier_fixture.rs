@@ -19,6 +19,14 @@
 //!
 //! These assertions exist so the evidence cannot silently rot: a truncated, relabelled, or one
 //! sided fixture would otherwise still parse and still produce a confident looking evaluation.
+//!
+//! What is actually enforced here is the exact composition of the fixture, not merely that it is
+//! non empty: the total case count, the split by verdict, the split by missing_connector, and the
+//! split by origin are each pinned to the measured value. Relabelling a single case, dropping a
+//! single case, or appending a new one fails this test. That strictness is deliberate, because the
+//! measured numbers recorded in `preclassifier_gate_eval.rs` describe this exact set of cases and
+//! stop being true of any other one. Alongside the counts, the structural checks require every
+//! log_id to be positive and unique and every task text to be non empty.
 
 use serde::Deserialize;
 
@@ -37,10 +45,10 @@ struct Case {
 fn preclassifier_fixture_is_a_usable_evidence_set() {
     let cases: Vec<Case> = serde_json::from_str(FIXTURE).expect("parse preclassifier fixture");
 
-    assert!(
-        cases.len() >= 40,
-        "fixture must carry at least 40 cases, found {}",
-        cases.len()
+    assert_eq!(
+        cases.len(),
+        98,
+        "fixture composition changed: total case count, so the evaluation must be run again"
     );
 
     let mut seen = std::collections::HashSet::new();
@@ -65,14 +73,26 @@ fn preclassifier_fixture_is_a_usable_evidence_set() {
         cases.len(),
         "every verdict must be claude or codex"
     );
-    assert!(claude > 0, "fixture must contain a claude verdict");
-    assert!(codex > 0, "fixture must contain a codex verdict");
+    assert_eq!(
+        claude, 57,
+        "fixture composition changed: claude verdict count, so the evaluation must be run again"
+    );
+    assert_eq!(
+        codex, 41,
+        "fixture composition changed: codex verdict count, so the evaluation must be run again"
+    );
 
     let missing = cases.iter().filter(|c| c.missing_connector).count();
-    assert!(missing > 0, "fixture must contain a missing connector case");
-    assert!(
-        missing < cases.len(),
-        "fixture must contain a present connector case"
+    let present = cases.len() - missing;
+    assert_eq!(
+        missing, 13,
+        "fixture composition changed: missing_connector true count, so the evaluation must be run \
+         again"
+    );
+    assert_eq!(
+        present, 85,
+        "fixture composition changed: missing_connector false count, so the evaluation must be \
+         run again"
     );
 
     let observed = cases
@@ -88,15 +108,21 @@ fn preclassifier_fixture_is_a_usable_evidence_set() {
         cases.len(),
         "every origin must be observed_traffic or authored_probe"
     );
-    assert!(observed > 0, "fixture must contain observed traffic");
-    assert!(authored > 0, "fixture must contain authored probes");
+    assert_eq!(
+        observed, 79,
+        "fixture composition changed: observed_traffic count, so the evaluation must be run again"
+    );
+    assert_eq!(
+        authored, 19,
+        "fixture composition changed: authored_probe count, so the evaluation must be run again"
+    );
 
     println!("preclassifier fixture composition");
     println!("  total: {}", cases.len());
     println!("  verdict claude: {claude}");
     println!("  verdict codex: {codex}");
     println!("  missing_connector true: {missing}");
-    println!("  missing_connector false: {}", cases.len() - missing);
+    println!("  missing_connector false: {present}");
     println!("  origin observed_traffic: {observed}");
     println!("  origin authored_probe: {authored}");
 }
