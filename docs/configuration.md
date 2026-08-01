@@ -47,13 +47,14 @@ as predating versioning, so do not delete the key to "reset" anything.
 | version | migration |
 | --- | --- |
 | 1 | `classifier_timeout_secs` of `30`, the old generated default, becomes `60`. Any other value is left alone. |
+| 2 | `headroom_flip_gap` is gone and `pace_flip_gap` replaces it. Nothing is carried across: the two keys threshold different comparisons, so a number tuned for the old one means nothing under the new one. The rewrite drops the stale key from the file. |
 
 ## Defaults in full
 
 ```toml
-config_version = 1
+config_version = 2
 hard_ceiling_pct = 97.0
-headroom_flip_gap = 25.0
+pace_flip_gap = 70.0
 claude_five_hour_pacing_pct = 90.0
 classifier_timeout_secs = 60
 connectors = [
@@ -95,18 +96,39 @@ exceptions = []
 
 Default `97.0`. Weekly percent used at or above which a provider counts as exhausted.
 
-This is the threshold that lets a confident verdict be overridden. A confident verdict flips only
-when its own provider is at or over this ceiling and the other provider is not. When both providers
-are at or over it, no flip happens at all: the verdict provider is used anyway and the decision is
-tagged `over_ceiling`, because at that point there is no better destination to move to.
+A provider at or over this ceiling is ineligible. Exactly one ineligible sends the task to the
+other and tags the decision `flipped_on_exhaustion`. Both ineligible keeps the default provider and
+tags it `over_ceiling`, because at that point there is no better destination to move to.
 
-### `headroom_flip_gap`
+Eligibility is judged before the run rate override, not after, and that order is load bearing. A
+provider with two points of weekly allowance left reads as running COLD on run rate whenever its
+window is nearly elapsed (95 percent used against 99 percent elapsed is a negative pace), so an
+override allowed to run first would route into a provider that is out of budget.
 
-Default `25.0`. How many points of weekly headroom advantage flip a borderline verdict.
+### `pace_flip_gap`
 
-Only borderline (medium or low confidence) verdicts are subject to this. If the other provider has
-at least this many more points of weekly headroom remaining, the task moves there and the decision
-is tagged `headroom_tiebreak`. Raising it makes routing respect the rubric more and usage less.
+Default `70.0`. How many points a provider must be burning ahead of the other, each measured
+against its own weekly window, before a task moves off it.
+
+Each provider's run rate is `weekly_pct` minus its expected burn, where the expected burn is how
+much of its own weekly window has elapsed. Positive is hot: 80 percent spent with half the window
+gone is 30 points over pace. The two providers reset at different instants, so each is measured
+against its own reset and never the other's. When either reset is unknown the override is skipped
+entirely and the decision is tagged `pace_unavailable`; when it fires, the decision is tagged
+`pace_flip`. The comparison is strictly greater, so a gap exactly on the threshold holds.
+
+The default is measured rather than chosen, and it is deliberately wide enough to be rare. This box
+runs two Claude 20x Max plans against one Codex 5x plan, so identical work shows as several times
+the percentage on the smaller allowance, and over the recorded decisions Codex sat 43 to 58 points
+over pace all week from that alone. That band is a plan size artifact, not a signal, so the dead
+zone has to clear it. At a gap of 25 the override moved 27 of 39 real dispatches, 25 of them onto
+the provider with LESS absolute allowance left, which is the opposite of what it is for. At 70 it
+moves 2. Lower it and routing follows the percentages; raise it past about 80 and the rule never
+fires at all, which makes it dead config rather than a conservative setting.
+
+There is no `headroom_flip_gap` alias. The key it named thresholded a comparison of raw weekly
+percentages, which is exactly the reading that misrouted, so a file still carrying it is ignored
+rather than honoured.
 
 ### `claude_five_hour_pacing_pct`
 
@@ -114,16 +136,16 @@ Default `90.0`. Claude 5 hour percent used at or above which a task is paced awa
 
 This runs after the weekly rules, on the provider they landed on. A task still bound for Claude
 moves to Codex when Claude's 5 hour percent reaches this threshold, and the decision is tagged
-`five_hour_pacing`. Unlike `headroom_flip_gap`, it applies to confident verdicts too: a near
-exhausted 5 hour window stalls a Claude dispatch rather than merely making it more expensive.
+`five_hour_pacing`. It applies however the task reached Claude, the run rate override included: a
+near exhausted 5 hour window stalls a Claude dispatch rather than merely making it more expensive.
 
 Codex having room is judged by `hard_ceiling_pct`, the same threshold the exhaustion flip uses,
 rather than by a second key that could drift away from it. Codex sitting exactly on that ceiling has
 no room, so no pacing happens: moving the job would relocate the stall rather than avoid it.
 
 A capability pin overrides this entirely. A task that needs a connector Codex cannot reach, or that
-carries two or more Claude signals, stays on Claude however exhausted its 5 hour window is, because
-a paced job that cannot reach its connector is a failed job rather than a cheaper one.
+needs several agents exchanging findings mid-run, stays on Claude however exhausted its 5 hour
+window is, because a paced job that cannot do the work is a failed job rather than a cheaper one.
 
 Setting `weekly_routing = false` disables pacing along with every other usage driven rule. An
 operator who turned weekly routing off asked to route purely on task shape, and a usage driven flip
@@ -163,20 +185,21 @@ there.
 
 ### `default_provider`
 
-Default `"codex"`. Either `"codex"` or `"claude"`. The provider in force when the classifier cannot
-answer, and the starting point before the verdict is applied.
+Default `"codex"`. Either `"codex"` or `"claude"`. The provider every task starts on, and the one
+that stands when no usage rule moves it.
 
 The router was built so this is a one word edit. Nothing in the decision engine assumes Codex is
 the default; setting `"claude"` makes Claude the default destination and Codex the exception
-without any routing logic change.
+without any routing logic change. The run rate override is symmetric and measured from whichever
+provider the task is currently on, so it works in both directions unchanged.
 
 ### `weekly_routing`
 
-Default `true`. Whether weekly usage is allowed to modulate the verdict at all.
+Default `true`. Whether usage is allowed to move a task off the default provider at all.
 
 Set to `false` to route purely on task shape. Decisions are then tagged `weekly_routing_disabled`,
-and neither the exhaustion flip nor the headroom tiebreak can fire. Capability hard gates still
-apply, because those are not usage decisions.
+and neither the exhaustion flip, the run rate override, nor the 5 hour pacing rule can fire.
+Capability pins still apply, because those are not usage decisions.
 
 ## `[classifier]`
 
@@ -209,7 +232,7 @@ every automatically routed task and its only job is to emit one JSON object.
 ## `[models.codex]` and `[models.claude]`
 
 One model per complexity tier, per provider. The classifier scores complexity independently of the
-verdict, and the resulting tier picks the model the job is spawned with.
+capability pins, and the resulting tier picks the model the job is spawned with.
 
 | Tier | When the rubric assigns it |
 | --- | --- |
@@ -225,8 +248,8 @@ the backend to resolve. Forcing an effort on top of a model choice was tried and
 both tables read the same complexity value, so the second one carried no signal the first did not
 and only multiplied the cost of a misscored task.
 
-Complexity never changes the verdict and the verdict never changes complexity. A low complexity
-task can belong to either provider, and so can an ultra one.
+Complexity never changes which provider a task routes to, and the provider never changes
+complexity. A low complexity task can run on either provider, and so can an ultra one.
 
 The Codex defaults point `high` and `ultra` at the same model because `sol` is the top of the Codex
 catalogue. The Claude defaults reserve `fable` for `ultra` alone, which is why the rubric is written

@@ -8,8 +8,9 @@ use std::path::{Path, PathBuf};
 
 /// Weekly percent at which a provider counts as exhausted.
 const DEFAULT_HARD_CEILING_PCT: f64 = 97.0;
-/// Weekly-headroom gap (in points) that flips a borderline classification.
-const DEFAULT_HEADROOM_FLIP_GAP: f64 = 25.0;
+/// Run rate gap (in points of window) that moves a task off the provider it is on. Measured, not
+/// chosen: see the field's own doc comment.
+const DEFAULT_PACE_FLIP_GAP: f64 = 70.0;
 /// Claude five hour percent used at or above which a task is paced away from Claude.
 const DEFAULT_CLAUDE_FIVE_HOUR_PACING_PCT: f64 = 90.0;
 /// Ceiling on the classifier call. Headroom over the measured worst case rather than a target:
@@ -21,7 +22,7 @@ const PRE_MIGRATION_CLASSIFIER_TIMEOUT_SECS: u64 = 30;
 
 /// The migration level a config file written by this build carries. Raise this, and add a step to
 /// `migrate`, whenever a stale generated value has to be corrected in place.
-const CURRENT_CONFIG_VERSION: u32 = 1;
+const CURRENT_CONFIG_VERSION: u32 = 2;
 
 /// The level a file that predates versioning reads as. This is deliberately NOT
 /// `CURRENT_CONFIG_VERSION`: an absent key has to be distinguishable from a stamped one, or every
@@ -244,8 +245,19 @@ pub struct Config {
     pub config_version: u32,
     /// Weekly percent used at or above which a provider is treated as exhausted.
     pub hard_ceiling_pct: f64,
-    /// How many points of weekly-headroom advantage flip a borderline verdict.
-    pub headroom_flip_gap: f64,
+    /// How many points a provider must be burning ahead of the other, each measured against its
+    /// own weekly window, before a task moves off it. Strictly greater: a gap exactly here holds.
+    ///
+    /// The default of 70 is measured rather than chosen. This box runs two Claude 20x Max plans
+    /// against one Codex 5x plan, so identical work shows as several times the percentage on
+    /// Codex, and over the recorded decisions Codex sat 43 to 58 points over pace all week from
+    /// that alone. The dead zone has to clear that band or the override becomes the routing rule:
+    /// at 25 points it moved 27 of 39 real dispatches, 25 of them onto the emptier provider.
+    ///
+    /// There is no `headroom_flip_gap` alias. The rule it named compared raw weekly percentages,
+    /// which is exactly the reading that misrouted, so a file still carrying the old key must be
+    /// ignored rather than honoured.
+    pub pace_flip_gap: f64,
     /// Claude five hour percent used at or above which a task is paced away from Claude, provided
     /// Codex has weekly room. Codex's own five hour number never influences routing. Declared here
     /// rather than below `policy`, because a scalar after a table typed field makes
@@ -270,7 +282,7 @@ impl Default for Config {
         Config {
             config_version: CURRENT_CONFIG_VERSION,
             hard_ceiling_pct: DEFAULT_HARD_CEILING_PCT,
-            headroom_flip_gap: DEFAULT_HEADROOM_FLIP_GAP,
+            pace_flip_gap: DEFAULT_PACE_FLIP_GAP,
             claude_five_hour_pacing_pct: DEFAULT_CLAUDE_FIVE_HOUR_PACING_PCT,
             classifier_timeout_secs: DEFAULT_CLASSIFIER_TIMEOUT_SECS,
             connectors: vec![
@@ -341,6 +353,11 @@ impl Config {
         {
             self.classifier_timeout_secs = DEFAULT_CLASSIFIER_TIMEOUT_SECS;
         }
+        // v2: `headroom_flip_gap` became `pace_flip_gap`, and the rule behind it changed from a
+        // raw percentage comparison to a run rate one. There is nothing to carry across: a number
+        // tuned for the old comparison means nothing under the new one, so the old key is simply
+        // no longer read and the rewrite below is what drops it from the file. Leaving it on disk
+        // would be a config that names a key the router ignores.
         self.config_version = CURRENT_CONFIG_VERSION;
         true
     }
@@ -393,7 +410,7 @@ mod tests {
         // the router behaves as 60 is a config that lies about what is running.
         let text = std::fs::read_to_string(&path).expect("re-read");
         assert!(text.contains("classifier_timeout_secs = 60"), "{text}");
-        assert!(text.contains("config_version = 1"), "{text}");
+        assert!(text.contains("config_version = 2"), "{text}");
     }
 
     /// A value the operator chose is not the tool's to correct, even while the same file is being
@@ -457,10 +474,7 @@ mod tests {
         std::fs::write(&path, "hard_ceiling_pct = 90.0\n").expect("write");
         let config = Config::load_from(&path).expect("loads");
         assert_eq!(config.hard_ceiling_pct, 90.0);
-        assert_eq!(
-            config.headroom_flip_gap,
-            Config::default().headroom_flip_gap
-        );
+        assert_eq!(config.pace_flip_gap, Config::default().pace_flip_gap);
         assert_eq!(config.connectors, Config::default().connectors);
     }
 
@@ -552,6 +566,83 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "[classifier]\nengine = \"opencode\"\n").expect("write");
         assert!(Config::load_from(&path).is_err());
+    }
+
+    fn load_config(text: &str, path: &Path) -> Result<Config> {
+        std::fs::write(path, text).expect("write config fixture");
+        Config::load_from(path)
+    }
+
+    /// A provider name that is not one of the two the policy can default to is an error rather
+    /// than a silent fall back, for the same reason an unknown classifier engine is.
+    #[test]
+    fn an_invalid_policy_provider_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        assert!(load_config("[policy]\ndefault_provider = \"opencode\"\n", &path).is_err());
+    }
+
+    /// A parity exception silences a real difference, so an incomplete one is a difference nobody
+    /// is looking at. Each way of writing one badly must be rejected rather than half-applied.
+    #[test]
+    fn incomplete_or_invalid_parity_exceptions_are_rejected() {
+        let fixtures = [
+            ("missing path", "[[parity.exceptions]]\nreason = \"why\"\n"),
+            (
+                "empty path",
+                "[[parity.exceptions]]\npath = \"\"\nreason = \"why\"\n",
+            ),
+            (
+                "missing reason",
+                "[[parity.exceptions]]\npath = \"project\"\n",
+            ),
+            (
+                "blank reason",
+                "[[parity.exceptions]]\npath = \"project\"\nreason = \"   \"\n",
+            ),
+            (
+                "unknown kind",
+                "[[parity.exceptions]]\npath = \"project\"\nreason = \"why\"\nkind = \"other\"\n",
+            ),
+        ];
+        for (label, text) in fixtures {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("config.toml");
+            assert!(
+                load_config(text, &path).is_err(),
+                "{label} must be rejected"
+            );
+        }
+    }
+
+    /// The pacing threshold is one scalar key with its own default, so an operator can lower it
+    /// without restating every other ceiling. Writing the defaults and reading them back also
+    /// proves the key is declared above `policy`: a scalar after a table typed field makes the
+    /// TOML serializer fail when the default file is written on first run.
+    #[test]
+    fn the_pacing_threshold_defaults_when_absent_and_overrides_on_its_own() {
+        assert_eq!(Config::default().claude_five_hour_pacing_pct, 90.0);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let written_path = dir.path().join("written/config.toml");
+        let created = Config::load_from(&written_path).expect("create the default config");
+        assert_eq!(created.claude_five_hour_pacing_pct, 90.0);
+        let document: toml::Value = toml::from_str(
+            &std::fs::read_to_string(&written_path).expect("read the written config"),
+        )
+        .expect("parse the written config");
+        assert_eq!(
+            document["claude_five_hour_pacing_pct"].as_float(),
+            Some(90.0)
+        );
+
+        let path = dir.path().join("partial.toml");
+        let config = load_config("claude_five_hour_pacing_pct = 55.0\n", &path)
+            .expect("load the partial config");
+        assert_eq!(config.claude_five_hour_pacing_pct, 55.0);
+        assert_eq!(config.hard_ceiling_pct, Config::default().hard_ceiling_pct);
+        assert_eq!(config.pace_flip_gap, Config::default().pace_flip_gap);
+        assert!(config.policy.weekly_routing);
     }
 
     #[test]
