@@ -53,8 +53,16 @@ pub struct Decision {
     pub provider: Provider,
     /// The model to spawn with. None means the backend resolves its own default.
     pub model: Option<String>,
-    /// The reasoning effort to force. Always None: the model tier is the toggle, so every job
-    /// runs at its own model's default effort. Dispatch still honours a value if one is set.
+    /// The reasoning effort to force. Always None: the model tier is the toggle, so the router
+    /// decides no effort at all and each backend resolves its own. That resolution is not the
+    /// same on both. Claude runs at the model's own default, because nothing else sets one. Codex
+    /// runs at whatever `~/.codex/config.toml` resolves, because dispatch goes through
+    /// `codex app-server daemon`, which loads user config; only when that file names no
+    /// `model_reasoning_effort` does a codex job fall through to the model's catalogue default.
+    /// So the effort a codex job runs at is neither decided nor recorded here.
+    ///
+    /// Dispatch still honours a value if one is set, on codex (`turn/start` `effort`) and on
+    /// claude (`--effort`). Opencode discards it.
     pub effort: Option<String>,
     /// None when the caller named a provider and no classification ran.
     pub classification: Option<Classification>,
@@ -174,8 +182,9 @@ pub fn decide_explicit(
 }
 
 /// PURE: the model the job runs on, scaled by how much reasoning the task needs. This is the only
-/// tier lever: no reasoning effort is decided at all, so each model runs at its own default.
-/// Opencode has no tiers in the MVP, so it resolves its own default.
+/// tier lever: no reasoning effort is decided at all, so each backend resolves its own. See the
+/// `effort` field on `Decision` for what each one resolves it to, which is not the model default
+/// on codex. Opencode has no tiers in the MVP, so it resolves its own default.
 fn model_for(provider: Provider, complexity: Complexity, config: &Config) -> Option<String> {
     match provider {
         Provider::Codex => Some(config.models.codex.pick(complexity).to_string()),
@@ -488,7 +497,7 @@ mod tests {
 
     /// The whole point of the feature: the model comes from the complexity, for both providers.
     /// Eight cells, four per provider. Effort is never decided, so every cell leaves it None and
-    /// the model runs at its own default.
+    /// the backend resolves its own.
     #[test]
     fn the_model_matrix_over_complexity_and_provider() {
         let config = Config::default();

@@ -934,7 +934,7 @@ fn codex_decision_effort_reaches_turn_start_at_the_dispatch_boundary() {
     assert_eq!(requests[3]["method"], "turn/start");
     assert!(
         requests[3]["params"].get("effort").is_none(),
-        "the router must leave the model's own default effort in place"
+        "the router must force no effort, leaving the daemon to resolve its own"
     );
     assert_eq!(requests[1]["params"]["model"], "gpt-5.6-sol");
     // The task reaches Codex verbatim. The router prepends nothing: an execution-mode preamble
