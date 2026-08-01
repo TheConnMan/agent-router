@@ -88,8 +88,10 @@ pub struct Stats {
     pub classifier_failure_rate: Rate,
     /// Rows that dispatched nothing, over every row considered.
     pub dry_run_share: Rate,
-    /// Gate tag to the rows carrying it that a human marked `bad`, over the rows carrying it that a
-    /// human marked at all. A row carrying several tags counts under each of them.
+    /// Gate tag to the rows carrying it that a human marked `bad` or `rerouted`, over the rows
+    /// carrying it that a human marked at all. `good` is the only mark left out of the numerator,
+    /// because the other two both say the route was wrong. A row carrying several tags counts under
+    /// each of them.
     pub bad_rate_by_gate: BTreeMap<String, Rate>,
     /// Provider to the same rate, over the marked rows that landed there.
     pub bad_rate_by_provider: BTreeMap<String, Rate>,
@@ -222,13 +224,21 @@ fn count(rates: &mut BTreeMap<String, Rate>, key: &str, hit: Option<bool>) {
     }
 }
 
-/// PURE: whether a human judged this row bad, or None when nobody judged it at all.
+/// PURE: whether a human judged this row's route wrong, or None when nobody judged it at all.
+///
+/// `bad` and `rerouted` both count, and `good` is the only mark that does not. Both of the first
+/// two record that routing the task to that provider was the wrong call; `rerouted` additionally
+/// records that the human had to move the job off it. Counting `rerouted` as not wrong put it in
+/// the denominator and never in the numerator, so every rerouted decision made routing look better
+/// and the bad rate understated routing errors the more rerouting was recorded.
 ///
 /// An unmarked row is absence of evidence, not evidence of a good route, so it stays out of the
 /// denominator. Counting it as good would drive every bad rate toward zero as the log grows, which
 /// is exactly as the log becomes worth reading.
 fn marked_bad(row: &StatsRow) -> Option<bool> {
-    row.mark.as_deref().map(|mark| mark == Mark::Bad.tag())
+    row.mark
+        .as_deref()
+        .map(|mark| mark == Mark::Bad.tag() || mark == Mark::Rerouted.tag())
 }
 
 /// PURE: whether this row settled as a failure, or None when its fate is not settled.

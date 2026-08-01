@@ -7,8 +7,10 @@
 
 use agent_router_core::config::Config;
 use agent_router_core::decide::decide_explicit;
+use agent_router_core::error::Error;
 use agent_router_core::log::{DecisionLog, Entry};
 use agent_router_core::provider::Provider;
+use agent_router_core::run::{Dispatch, recorded_fields};
 use agent_router_core::usage::UsageSnapshot;
 use std::path::Path;
 
@@ -40,7 +42,7 @@ fn entry<'a>(
 /// the same write path, one row carrying the value the backend reported and two carrying nothing
 /// because their backends report nothing.
 #[test]
-fn a_codex_row_records_the_observed_effort_while_claude_and_opencode_rows_stay_null() {
+fn a_row_written_with_an_effort_reads_it_back_and_rows_written_without_one_stay_null() {
     let directory = tempfile::tempdir().expect("tempdir");
     let log = DecisionLog::open_at(&directory.path().join("router.db")).expect("opens");
 
@@ -105,6 +107,63 @@ fn a_decided_effort_and_an_observed_effort_are_two_independent_columns() {
         Some("high"),
         "the effort the backend reported it will run at"
     );
+}
+
+/// The seam between the dispatch and the row: the parsing of the backend's reply is covered at the
+/// RPC level and the column is covered above, but neither notices if the value stops being carried
+/// across. A dispatch reporting an effort has to reach the log still carrying it.
+#[test]
+fn a_dispatch_reporting_an_effort_carries_it_into_the_row_it_is_logged_as() {
+    let dispatched: agent_router_core::Result<Dispatch> = Ok(Dispatch {
+        job_id: Some("thread abc123".to_string()),
+        job_name: "Bonus: abc 123".to_string(),
+        effective_effort: Some("high".to_string()),
+    });
+
+    let (job_id, job_name, effective_effort, outcome) = recorded_fields(&dispatched);
+    assert_eq!(job_id.as_deref(), Some("thread abc123"));
+    assert_eq!(job_name.as_deref(), Some("Bonus: abc 123"));
+    assert_eq!(
+        effective_effort.as_deref(),
+        Some("high"),
+        "the backend reported an effort and the fields the row is written from have to carry it"
+    );
+    assert_eq!(outcome, "dispatched");
+
+    let directory = tempfile::tempdir().expect("tempdir");
+    let log = DecisionLog::open_at(&directory.path().join("router.db")).expect("opens");
+    let codex = decision(Provider::Codex);
+    log.record(&entry(
+        "dispatched to codex",
+        "codex",
+        &codex,
+        effective_effort.as_deref(),
+    ))
+    .expect("records the row");
+
+    let rows = log.recent(1).expect("reads the row back");
+    assert_eq!(
+        rows[0].effective_effort.as_deref(),
+        Some("high"),
+        "the effort the dispatch reported has to survive all the way into the column"
+    );
+}
+
+/// A dispatch that failed produced no job and observed no effort, so its row carries no identity
+/// and no effort, and the outcome carries the backend's own message rather than a generic one.
+#[test]
+fn a_failed_dispatch_records_no_identity_no_effort_and_the_backend_message() {
+    let dispatched: agent_router_core::Result<Dispatch> =
+        Err(Error::Command("app-server refused the thread".to_string()));
+
+    let (job_id, job_name, effective_effort, outcome) = recorded_fields(&dispatched);
+    assert_eq!(job_id, None);
+    assert_eq!(job_name, None);
+    assert_eq!(
+        effective_effort, None,
+        "nothing dispatched, so no backend reported an effort"
+    );
+    assert_eq!(outcome, "error: app-server refused the thread");
 }
 
 /// The current `decisions` table definition, read back out of a database the log itself created,
