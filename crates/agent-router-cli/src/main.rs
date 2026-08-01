@@ -593,7 +593,7 @@ fn print_counts(label: &str, counts: &BTreeMap<String, usize>) {
     }
     let rendered = counts
         .iter()
-        .map(|(name, count)| format!("{name} {count}"))
+        .map(|(name, count)| format!("{} {count}", escape_terminal_controls(name)))
         .collect::<Vec<_>>()
         .join(", ");
     println!("{label}: {rendered}");

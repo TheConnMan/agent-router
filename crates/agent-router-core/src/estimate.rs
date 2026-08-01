@@ -72,7 +72,12 @@ pub fn median(values: &[f64]) -> Option<f64> {
 pub fn project(log: &DecisionLog, decision: &Decision) -> Result<Estimate> {
     let provider = decision.provider.name();
     let model = decision.model.clone();
-    let series = log.weekly_series(provider, model.as_deref(), SERIES_LIMIT)?;
+    // A provider the router names no model for keeps no weekly series of its own to sample, so the
+    // estimate is short of data rather than taken over another key's rows.
+    let series = match model.as_deref() {
+        Some(model) => log.weekly_series(provider, model, SERIES_LIMIT)?,
+        None => Vec::new(),
+    };
     let observed = draws(&series);
     let samples = observed.len();
     let weekly_pct = if samples >= MIN_SAMPLES {

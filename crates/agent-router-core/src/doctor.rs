@@ -7,6 +7,7 @@
 //! moment it is used, so nothing silently routes on a wrong number because of it.
 
 use crate::config::{Config, default_config_path};
+use crate::error::Error;
 use crate::log::DecisionLog;
 use crate::runtime::home_dir;
 use crate::usage::UsageSnapshot;
@@ -47,14 +48,16 @@ impl Report {
 /// check, and the two lines it prints cannot disagree about the same read.
 pub fn run() -> Report {
     let usage = UsageSnapshot::read();
+    let claude_installed = on_path("claude").is_some();
+    let codex_installed = on_path("codex").is_some();
     Report {
         checks: vec![
             required_binary("claude_on_path", "claude"),
             claude_credentials(),
-            usage_source("claude_usage", usage.claude.stale),
+            usage_source("claude_usage", usage.claude.stale, claude_installed),
             optional_binary("codex_on_path", "codex"),
             codex_app_server(),
-            usage_source("codex_rate_limits", usage.codex.stale),
+            usage_source("codex_rate_limits", usage.codex.stale, codex_installed),
             optional_binary("opencode_on_path", "opencode"),
             config_parses(),
             log_writable(),
@@ -125,13 +128,23 @@ fn claude_credentials() -> Check {
 /// A fail open read reports the same two zeroes as a provider that has genuinely consumed nothing,
 /// and those zeroes win every headroom tiebreak, so the router keeps routing on a number nobody
 /// can trust. That is the failure this check exists to name.
-fn usage_source(name: &'static str, stale: bool) -> Check {
+///
+/// It is only a failure when the provider is installed. With no binary on PATH there is nothing to
+/// sign in to and nothing that read could have said, and the binary check one line earlier already
+/// reports its absence as a warning, so failing here would make a box that does not use the
+/// provider exit nonzero forever over a provider it never routes to.
+fn usage_source(name: &'static str, stale: bool, installed: bool) -> Check {
     if stale {
-        fail(
-            name,
-            "fail-open, so the provider reads as completely unused whatever it has spent"
-                .to_string(),
-        )
+        let detail = "fail-open, so the provider reads as completely unused whatever it has spent"
+            .to_string();
+        if installed {
+            fail(name, detail)
+        } else {
+            warn(
+                name,
+                format!("{detail}, and no binary on PATH to read a real number from"),
+            )
+        }
     } else {
         pass(
             name,
@@ -140,18 +153,19 @@ fn usage_source(name: &'static str, stale: bool) -> Check {
     }
 }
 
-/// Every Codex dispatch goes through the app-server daemon, so this takes the same path a dispatch
-/// takes, minus the thread it would start. A daemon that does not answer errors at dispatch time.
+/// Every Codex dispatch goes through the app-server daemon, so this reports whether one answers.
+/// It only observes: dispatch starts a daemon when none is running, and a diagnostic command must
+/// not create the state it is diagnosing, so this asks and reports the answer. A daemon that does
+/// not answer errors at dispatch time, which is why an absent one is a warning.
 fn codex_app_server() -> Check {
     let name = "codex_app_server";
-    match crate::dispatch::codex::app_server_status() {
-        Ok(()) => pass(name, "the app-server daemon answers".to_string()),
-        Err(error) => warn(
+    match crate::dispatch::codex::probe_daemon() {
+        Some(_) => pass(name, "the app-server daemon answers".to_string()),
+        None => warn(
             name,
-            format!(
-                "the app-server daemon does not answer: {}",
-                one_line(&error)
-            ),
+            "no app-server daemon answers, and doctor does not start one; the next Codex \
+             dispatch will start it"
+                .to_string(),
         ),
     }
 }
@@ -199,14 +213,44 @@ fn log_writable() -> Check {
     };
     match log.probe_writable() {
         Ok(()) => pass(name, format!("{} takes a write", path.display())),
-        Err(error) => fail(
-            name,
-            format!(
-                "{} opens but cannot be written: {}",
-                path.display(),
-                one_line(&error)
+        Err(error) => match write_probe_health(&error) {
+            Health::Warn => warn(
+                name,
+                format!(
+                    "{} is held by another writer, so the probe timed out rather than proving \
+                     anything: {}",
+                    path.display(),
+                    one_line(&error)
+                ),
             ),
-        ),
+            _ => fail(
+                name,
+                format!(
+                    "{} opens but cannot be written: {}",
+                    path.display(),
+                    one_line(&error)
+                ),
+            ),
+        },
+    }
+}
+
+/// PURE: how a failed write probe is reported.
+///
+/// A busy database is contention, not unwritability. Several agents write this log at once, the
+/// probe takes the same RESERVED lock a dispatch takes, and the connection's busy timeout is short
+/// enough that a concurrent writer holding the lock past it returns `SQLITE_BUSY`. The next
+/// dispatch takes that lock on its own and nothing has been lost, so the severity rule's Fail (the
+/// router could not run at all) does not apply. Every other error is a genuine readonly or
+/// permission fault, which it does apply to.
+pub fn write_probe_health(error: &Error) -> Health {
+    match error {
+        Error::Sqlite(rusqlite::Error::SqliteFailure(code, _))
+            if code.code == rusqlite::ErrorCode::DatabaseBusy =>
+        {
+            Health::Warn
+        }
+        _ => Health::Fail,
     }
 }
 

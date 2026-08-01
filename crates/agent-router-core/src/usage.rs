@@ -8,6 +8,13 @@
 //! Numerically a fail open read and a genuinely idle provider are the same two zeroes, so the flag
 //! is the only thing that separates them. `agent-router doctor` reports it as `live` or
 //! `fail-open`, and the decision log records it per provider on every row.
+//!
+//! The flag reads freshness but means provenance, and there is one path where the two diverge:
+//! `claude_headroom`'s last resort reads the shared cache regardless of its age, and a cache that
+//! parses carries `stale = false` however old it is. So an expired but parseable cache, read
+//! because the API was unreachable, is reported `live` rather than fail open. That is deliberate:
+//! the numbers came from a real reading of the provider rather than from a default, which is the
+//! distinction routing acts on, and `usage.sh` reports the same cache the same way.
 
 use crate::runtime::{default_codex_home, home_dir};
 use std::path::{Path, PathBuf};

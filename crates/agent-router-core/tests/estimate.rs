@@ -148,20 +148,19 @@ fn weekly_series_excludes_dry_runs_and_other_models() {
     );
 
     assert_eq!(
-        log.weekly_series("codex", Some(MODEL), 50).expect("reads"),
+        log.weekly_series("codex", MODEL, 50).expect("reads"),
         vec![10.0, 30.0, 45.0],
         "oldest first, dry runs and other tiers dropped"
     );
     // The claude row carries both providers' percentages, so a query reading the wrong column
     // would answer with 77.0 here.
     assert_eq!(
-        log.weekly_series("claude", Some("opus[1m]"), 50)
-            .expect("reads"),
+        log.weekly_series("claude", "opus[1m]", 50).expect("reads"),
         vec![55.0],
         "each provider's series is read from its own weekly column"
     );
     assert!(
-        log.weekly_series("codex", Some("a model no row ran on"), 50)
+        log.weekly_series("codex", "a model no row ran on", 50)
             .expect("reads")
             .is_empty(),
         "an unseen tier has no series rather than the provider's whole history"

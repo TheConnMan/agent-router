@@ -199,7 +199,7 @@ pass log_writable        /home/you/.local/state/agent-router/router.db takes a w
 | `claude_credentials` | `~/.claude/.credentials.json` exists, parses, and carries `/claudeAiOauth/accessToken`. Without it the usage reader has nothing to authenticate with. |
 | `claude_usage` | Whether the Claude usage read was live or fell open. |
 | `codex_on_path` | An executable `codex` on `PATH`. |
-| `codex_app_server` | The app-server daemon answers, which is the transport every Codex dispatch goes through. |
+| `codex_app_server` | Whether the app-server daemon answers, which is the transport every Codex dispatch goes through. Observed only: doctor does not start a daemon, so an absent one is reported rather than created. |
 | `codex_rate_limits` | Whether the Codex usage read was live or fell open. |
 | `opencode_on_path` | An executable `opencode` on `PATH`. |
 | `config_parses` | The config file parses, read directly so a diagnostic never creates the file it was asked to report on. An absent file is a pass: the router runs on the same defaults. |
@@ -210,7 +210,10 @@ trust, or could not run at all: a missing classifier, unreadable credentials, a 
 a default rather than a reading, a config file that does not parse, a log that cannot take a row.
 **Warn** means a degraded path that fails loudly at the moment it is used, so nothing routes wrongly
 because of it: a missing `codex` or `opencode` binary, or a daemon that does not answer, all error
-at dispatch time rather than quietly changing where work lands.
+at dispatch time rather than quietly changing where work lands. A fail open usage read is a warning
+rather than a failure when that provider's binary is not on PATH, because a box that never routes
+there has nothing to sign in to. A log another writer holds the lock on is a warning too: that is
+contention, and the next dispatch takes the lock on its own.
 
 Exit code is `0` when every check is pass or warn, `1` when any check fails. A missing `opencode` is
 never a failure: it is a provider the router can route to on request, not one it needs, so

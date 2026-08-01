@@ -15,7 +15,7 @@ const OUTPUT_GRACE: Duration = Duration::from_millis(250);
 const HANDSHAKE_URL: &str = "ws://localhost/rpc";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Daemon {
+pub(crate) struct Daemon {
     socket_path: PathBuf,
 }
 
@@ -195,16 +195,11 @@ fn daemon_command(action: &str) -> Command {
     command
 }
 
-fn probe_daemon() -> Option<Daemon> {
+/// IMPURE: the running app-server daemon, or None when none answers. This only asks, so a caller
+/// that must not create the state it is reporting on (doctor) uses it rather than `ensure_daemon`.
+pub(crate) fn probe_daemon() -> Option<Daemon> {
     let stdout = run_reporting_failure(daemon_command("version"), PROBE_TIMEOUT).ok()?;
     parse_daemon_version(&stdout)
-}
-
-/// IMPURE: start the app-server daemon if it is not already running, and report whether it answers.
-/// The daemon is what every Codex dispatch goes through, so this is the same path a dispatch takes,
-/// minus the thread it would start.
-pub fn app_server_status() -> std::result::Result<(), String> {
-    ensure_daemon().map(|_| ())
 }
 
 fn ensure_daemon() -> std::result::Result<Daemon, String> {

@@ -8,6 +8,7 @@
 
 use agent_router_core::config::Config;
 use agent_router_core::decide::decide_explicit;
+use agent_router_core::doctor::{self, Health};
 use agent_router_core::log::{DecisionLog, Entry};
 use agent_router_core::provider::Provider;
 use agent_router_core::usage::{
@@ -202,6 +203,69 @@ fn an_older_database_gains_the_stale_columns_and_reads_them_back_as_unknown() {
 
     // The migration is idempotent: opening again must not try to add either column twice.
     DecisionLog::open_at(&path).expect("reopens");
+}
+
+/// Several agents write this log at once, so the probe losing a race for the write lock is an
+/// ordinary event on this box. Contention is not unwritability: the lock is released and the next
+/// dispatch takes it, so reporting it as a failed check would exit doctor 1 over nothing. The test
+/// below it holds the other half: a genuinely readonly database is what Fail is reserved for, so
+/// neither answer can be given to both cases.
+#[test]
+fn a_busy_log_is_contention_rather_than_an_unwritable_one() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("state/router.db");
+    let log = DecisionLog::open_at(&path).expect("creates the log");
+
+    // A second connection holding the RESERVED lock for longer than the probe's busy timeout,
+    // which is what a concurrent `record()` on this box looks like.
+    let holder = rusqlite::Connection::open(&path).expect("second connection");
+    holder
+        .execute_batch("BEGIN IMMEDIATE; CREATE TABLE another_writer_is_here (id INTEGER);")
+        .expect("take the write lock");
+
+    let busy = log
+        .probe_writable()
+        .expect_err("a held write lock must stop the probe from writing");
+    assert_eq!(
+        doctor::write_probe_health(&busy),
+        Health::Warn,
+        "a database another agent is writing was reported as unwritable: {busy}"
+    );
+    holder.execute_batch("ROLLBACK;").expect("release the lock");
+
+    assert!(
+        log.probe_writable().is_ok(),
+        "the probe fails once the lock is released, so the fixture proved nothing about busy"
+    );
+}
+
+/// The other half of the severity split: a database the owner cannot write is the case doctor
+/// exits nonzero for, and no retry or later dispatch will fix it.
+#[cfg(unix)]
+#[test]
+fn a_read_only_log_is_a_failure_rather_than_contention() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().expect("tempdir");
+    if !writes_can_be_denied_by_mode(directory.path()) {
+        eprintln!("skipped: this user is not denied writes by the permission bits");
+        return;
+    }
+
+    let path = directory.path().join("state/router.db");
+    DecisionLog::open_at(&path).expect("creates the log");
+    let mut permissions = std::fs::metadata(&path).expect("metadata").permissions();
+    permissions.set_mode(0o444);
+    std::fs::set_permissions(&path, permissions).expect("make the database read only");
+
+    let log = DecisionLog::open_at(&path).expect("open() succeeds on a read only database");
+    let error = log
+        .probe_writable()
+        .expect_err("a read only database cannot take the probe write");
+    assert_eq!(
+        doctor::write_probe_health(&error),
+        Health::Fail,
+        "a log that will never take a row was reported as passing contention: {error}"
+    );
 }
 
 /// Root ignores the permission bits, so a mode based read only fixture proves nothing there.

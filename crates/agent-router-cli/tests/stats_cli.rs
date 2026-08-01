@@ -5,18 +5,41 @@
 //! which is the idiom `run_json_tests.rs` already uses.
 #![cfg(unix)]
 
+use agent_router_core::stats::Stats;
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::SystemTime;
 
-/// The gates that move a task off the provider its verdict named, as the router defines them at
-/// the end of stream 1. Restated here rather than imported so the reconciliation below is an
-/// independent count rather than the implementation agreeing with itself.
-const FLIP_GATES: [&str; 2] = ["flipped_on_exhaustion", "headroom_tiebreak"];
+/// The gates that move a task off the provider its verdict named, as the router defines them.
+/// Restated here rather than imported so the reconciliation below is an independent count rather
+/// than the implementation agreeing with itself.
+const FLIP_GATES: [&str; 3] = [
+    "flipped_on_exhaustion",
+    "headroom_tiebreak",
+    "five_hour_pacing",
+];
+
+/// Every metric `stats --json` is contracted to publish. The CLI writes that object field by
+/// field, so a metric added to the report and not surfaced there is otherwise invisible: it
+/// compiles, it lints, and every assertion below still passes. `expected_metrics` binds this list
+/// to the report's own fields, and the test asserts the whole key set rather than the presence of
+/// the keys this file happens to read, so neither half can drift alone.
+const METRICS: [&str; 10] = [
+    "rows_considered",
+    "oldest_created_at_ms",
+    "newest_created_at_ms",
+    "routes",
+    "gates",
+    "complexity",
+    "auto_routes",
+    "flip_rate",
+    "classifier_failure_rate",
+    "dry_run_share",
+];
 
 /// The codex rollout directory each invocation scans. Idle is empty, so codex reads as fail open
 /// with nothing consumed; exhausted carries a weekly number past the hard ceiling.
@@ -248,6 +271,34 @@ fn object_counts(stats: &Value, key: &str) -> BTreeMap<String, usize> {
         .collect()
 }
 
+/// The key set `stats --json` must print, derived by destructuring the report exhaustively. The
+/// pattern carries no `..`, so a field added to `Stats` stops this file from compiling until the
+/// metric is named here, and the assertion in the test then requires the CLI to print it too.
+fn expected_metrics() -> BTreeSet<String> {
+    let Stats {
+        rows_considered: _,
+        oldest_created_at_ms: _,
+        newest_created_at_ms: _,
+        routes: _,
+        gates: _,
+        complexity: _,
+        auto_routes: _,
+        flip_rate: _,
+        classifier_failure_rate: _,
+        dry_run_share: _,
+    } = Stats::default();
+    METRICS.iter().map(|key| key.to_string()).collect()
+}
+
+fn top_level_keys(stats: &Value) -> BTreeSet<String> {
+    stats
+        .as_object()
+        .expect("stats --json must print an object")
+        .keys()
+        .cloned()
+        .collect()
+}
+
 /// The acceptance criterion, executed rather than checked by hand: every number `stats --json`
 /// reports is recomputed here from the rows `log --json --limit 200` prints over the same window,
 /// so the two commands must be summarizing the same decisions.
@@ -268,6 +319,14 @@ fn stats_json_reconciles_with_the_log_json_it_summarises() {
         .expect("log --json prints an array")
         .clone();
     let stats = fixture.json(&["stats", "--json"]);
+
+    // Equality, not containment: a metric the report gained and the CLI never wrote would satisfy
+    // every other assertion in this file, so completeness is the only thing that catches it.
+    assert_eq!(
+        top_level_keys(&stats),
+        expected_metrics(),
+        "stats --json must publish every metric and nothing else"
+    );
 
     // The fixture chose this shape, so a silent change in what it produced is a failure rather
     // than a quietly weaker reconciliation: a report of all zeros would otherwise agree with a log
