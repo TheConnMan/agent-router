@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 const DEFAULT_HARD_CEILING_PCT: f64 = 97.0;
 /// Weekly-headroom gap (in points) that flips a borderline classification.
 const DEFAULT_HEADROOM_FLIP_GAP: f64 = 25.0;
+/// Claude five hour percent used at or above which a task is paced away from Claude.
+const DEFAULT_CLAUDE_FIVE_HOUR_PACING_PCT: f64 = 90.0;
 /// Ceiling on the classifier call. Headroom over the measured worst case rather than a target:
 /// the fast path is 3.4-7.0s, so this only has to be generous enough that a slow tail falls back
 /// far less often than it did at 30s, where 6 of 18 measured calls lost the deadline.
@@ -244,6 +246,11 @@ pub struct Config {
     pub hard_ceiling_pct: f64,
     /// How many points of weekly-headroom advantage flip a borderline verdict.
     pub headroom_flip_gap: f64,
+    /// Claude five hour percent used at or above which a task is paced away from Claude, provided
+    /// Codex has weekly room. Codex's own five hour number never influences routing. Declared here
+    /// rather than below `policy`, because a scalar after a table typed field makes
+    /// `toml::to_string_pretty` fail when the default file is written on first run.
+    pub claude_five_hour_pacing_pct: f64,
     /// How long the classifier call may take before it counts as failed.
     pub classifier_timeout_secs: u64,
     /// What Codex can actually reach on this box. Human-maintained: gate 5 of the rubric
@@ -264,6 +271,7 @@ impl Default for Config {
             config_version: CURRENT_CONFIG_VERSION,
             hard_ceiling_pct: DEFAULT_HARD_CEILING_PCT,
             headroom_flip_gap: DEFAULT_HEADROOM_FLIP_GAP,
+            claude_five_hour_pacing_pct: DEFAULT_CLAUDE_FIVE_HOUR_PACING_PCT,
             classifier_timeout_secs: DEFAULT_CLASSIFIER_TIMEOUT_SECS,
             connectors: vec![
                 "local shell".to_string(),

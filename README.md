@@ -29,9 +29,13 @@ log: row 87 in /home/you/.local/state/agent-router/router.db
    force and the decision is tagged `classifier_failed`.
 2. **Apply hard gates.** A missing connector or two or more Claude signals pins the task to Claude
    regardless of usage. These are capability decisions, so headroom never overrides them.
-3. **Modulate on weekly headroom.** A confident verdict is flipped only when its provider is at or
-   over the hard ceiling and the other is not. A borderline verdict is flipped when the other
-   provider has a large enough weekly headroom advantage.
+3. **Modulate on weekly headroom, then pace on Claude's 5 hour window.** A confident verdict is
+   flipped only when its provider is at or over the hard ceiling and the other is not. A borderline
+   verdict is flipped when the other provider has a large enough weekly headroom advantage. After
+   those rules settle, a task still bound for Claude moves to Codex when Claude's 5 hour percent is
+   at or above `claude_five_hour_pacing_pct` and Codex is under the hard ceiling, tagged
+   `five_hour_pacing`. Pacing applies to confident verdicts too, because an exhausted 5 hour window
+   stalls the job rather than merely costing more, and it never overrides a capability pin.
 4. **Pick the model from complexity.** The complexity tier selects the model from the per provider
    tier table. Reasoning effort is deliberately not decided: the router forces none and each
    backend resolves its own. See [docs/configuration.md](docs/configuration.md#modelscodex-and-modelsclaude)
@@ -93,7 +97,11 @@ work.
 Usage reading fails open by design. A missing credential file, an unreachable API, or an
 unparseable payload all read as full headroom, because a usage read must never be the thing that
 blocks a dispatch. The consequence is worth knowing: if Claude credentials cannot be read, Claude
-looks completely unused and will win every headroom tiebreak.
+looks completely unused and will win every headroom tiebreak. A fail open read and a genuinely idle
+provider report the same numbers, so the router records which one it got rather than leaving it to
+be inferred: `agent-router doctor` reports every read as `live` or `fail-open` and exits nonzero on a
+fail open one, `agent-router usage` names the same source per provider, and every decision row
+records `claude_usage_stale` and `codex_usage_stale`. Routing itself is unchanged by the marker.
 
 Usage comes from:
 
@@ -129,10 +137,18 @@ agent-router run "Fix the failing test" --dir ~/git/other-project
 | `--provider <NAME>` | `auto` | `auto` classifies. `codex`, `claude`, or `opencode` skips classification. |
 | `--model <NAME>` | tier table | Model override. Requires an explicit `--provider`. Pairing it with `--provider auto` is rejected: the router exits nonzero naming both flags rather than dropping the override, because the auto path chooses its own model from the tier table. |
 | `--name <NAME>` | first 40 characters of the task | Name for the dispatched job. It reaches the `claude --bg --name` argv verbatim, names the Codex thread, and is recorded as `job_name` in the decision log for every provider, so callers that reconcile inflight jobs by exact name depend on it. An empty or whitespace only name is rejected. |
-| `--dry-run` | off | Decide and log, dispatch nothing. |
+| `--dry-run` | off | Decide and log, dispatch nothing, and project the weekly draw the job is likely to cost on the provider it landed on. |
 | `--mcp-config <PATH>` | none | MCP config file for the dispatched Claude job. Repeatable. Rejected for any other provider, and the check runs after routing, so pairing it with `--provider auto` fails whenever classification lands on a provider other than Claude. |
 | `--strict-mcp-config` | off | Use only the `--mcp-config` files and drop every inherited MCP server. See the warning below before using it. |
 | `--json` | off | Emit the full decision, including gates, classification, and usage. |
+
+The projection is an upper bound, not the job's own cost. It is the median gap between this
+provider's weekly percentage at consecutive decisions on the same model, so it also carries
+everything else that consumed the same weekly quota over those intervals: your interactive
+sessions, jobs on other models, and anything dispatched without going through the router. It is
+the honest figure the decision log can support, and it is the right one for asking whether a job
+fits in what is left. Fewer than three comparable jobs in the log prints an explicit insufficient
+data line instead of a number.
 
 `--strict-mcp-config` also strips the claude.ai connectors, and no `--mcp-config` file can restore
 them. That interacts badly with routing: a task sent to Claude precisely because Codex was missing
@@ -145,13 +161,66 @@ Weekly and 5 hour headroom for both providers.
 
 ```bash
 $ agent-router usage
-provider  5h      weekly  weekly reset
-claude     12.4%   58.1%  in 41h07m
-codex       3.0%   22.7%  in 96h12m
+provider  5h      weekly  source     weekly reset
+claude     12.4%   58.1%  live       in 41h07m
+codex       0.0%    0.0%  fail-open  -
 ```
 
-Routing uses the weekly window only. The 5 hour window is reported because it matters for pacing a
-stream of jobs, not for placing a single one.
+`source` is where the numbers came from: `live` for a parsed payload, `fail-open` for a read that
+found nothing and defaulted to full headroom. Those two zeroes above are the fail open default, not
+a measurement, and they are exactly what a genuinely idle provider also reports, so the source
+column is the only thing on the line that separates them.
+
+The weekly window is what places a single job: it decides which provider has room for the task in
+front of the router. Claude's 5 hour window is what paces a stream of them, moving work away from
+Claude once its 5 hour percent reaches `claude_five_hour_pacing_pct` and Codex still has weekly
+room. Codex's own 5 hour number is reported here for the operator and never influences routing.
+
+### `doctor`
+
+Preflight the environment the router routes from, one line per check.
+
+```bash
+$ agent-router doctor
+pass claude_on_path      claude at /home/you/.local/bin/claude
+fail claude_credentials  /home/you/.claude/.credentials.json has no /claudeAiOauth/accessToken
+fail claude_usage        fail-open, so the provider reads as completely unused whatever it has spent
+pass codex_on_path       codex at /home/you/.local/bin/codex
+pass codex_app_server    the app-server daemon answers
+pass codex_rate_limits   live, read from the provider's own source
+warn opencode_on_path    no executable opencode on PATH, so any dispatch to it will error
+pass config_parses       absent, defaults apply (/home/you/.config/agent-router/config.toml)
+pass log_writable        /home/you/.local/state/agent-router/router.db takes a write
+```
+
+| Check | What it covers |
+| --- | --- |
+| `claude_on_path` | An executable `claude` on `PATH`. The classifier runs on every auto route, so this is exercised even when every task ends up on Codex. |
+| `claude_credentials` | `~/.claude/.credentials.json` exists, parses, and carries `/claudeAiOauth/accessToken`. Without it the usage reader has nothing to authenticate with. |
+| `claude_usage` | Whether the Claude usage read was live or fell open. |
+| `codex_on_path` | An executable `codex` on `PATH`. |
+| `codex_app_server` | Whether the app-server daemon answers, which is the transport every Codex dispatch goes through. Observed only: doctor does not start a daemon, so an absent one is reported rather than created. |
+| `codex_rate_limits` | Whether the Codex usage read was live or fell open. |
+| `opencode_on_path` | An executable `opencode` on `PATH`. |
+| `config_parses` | The config file parses, read directly so a diagnostic never creates the file it was asked to report on. An absent file is a pass: the router runs on the same defaults. |
+| `log_writable` | The decision log opens and takes an actual write. Opening alone proves nothing, because the schema batch is all `IF NOT EXISTS` and can succeed on a database the next dispatch cannot write to. |
+
+One rule decides the severity. **Fail** means the router would keep running on inputs it cannot
+trust, or could not run at all: a missing classifier, unreadable credentials, a usage number that is
+a default rather than a reading, a config file that does not parse, a log that cannot take a row.
+**Warn** means a degraded path that fails loudly at the moment it is used, so nothing routes wrongly
+because of it: a missing `codex` or `opencode` binary, or a daemon that does not answer, all error
+at dispatch time rather than quietly changing where work lands. A fail open usage read is a warning
+rather than a failure when that provider's binary is not on PATH, because a box that never routes
+there has nothing to sign in to. A log another writer holds the lock on is a warning too: that is
+contention, and the next dispatch takes the lock on its own.
+
+Exit code is `0` when every check is pass or warn, `1` when any check fails. A missing `opencode` is
+never a failure: it is a provider the router can route to on request, not one it needs, so
+installing it or not never moves the exit code.
+
+Both usage checks come from a single usage read, so doctor asks each provider once and its two
+lines cannot disagree about the same read.
 
 ### `log`
 
@@ -168,6 +237,36 @@ $ agent-router log --limit 3
 `--json` emits every recorded column, including the full task text, the rationale, and the
 dispatch outcome. The log is the tuning surface: each gate tag names a specific rule that fired, so
 routing behaviour can be audited against outcomes rather than recalled.
+
+### `stats`
+
+Aggregate metrics over recent routing decisions, so the heuristic can be tuned against what it
+actually did rather than against what it feels like it did.
+
+```bash
+# The default window: the 200 newest decisions.
+agent-router stats
+
+# Narrow the window by age as well. Accepts h, d, and w.
+agent-router stats --since 7d
+
+# Machine readable.
+agent-router stats --json
+```
+
+Reported over the window: the rows considered and their oldest and newest timestamps, the count per
+provider, the count per gate tag, the complexity distribution (with a row that was never scored
+counted as `unscored`), the number of auto routes, and three rates. The flip rate is the auto routed
+rows carrying a provider moving gate (`flipped_on_exhaustion`, `headroom_tiebreak`, or
+`five_hour_pacing`) over all auto routes. A row carrying more than one of them counts once, because
+the route moved once. The classifier failure rate is the auto routed rows carrying `classifier_failed` over the
+same denominator. Both are denominated on auto routes only, because a row that named its provider
+never had a verdict to flip and never ran the classifier. The dry run share is denominated on every
+row instead, since any row can be a dry run. Each rate carries its numerator and denominator so it
+can be checked by hand, and a rate with no denominator reads `-` rather than a percentage.
+
+`--limit` defaults to 200, which is the same window as `agent-router log --json --limit 200`, so
+every number here reconciles by hand against the rows that command prints.
 
 ### `parity`
 
@@ -191,12 +290,22 @@ kinds are `missing_in_codex`, `missing_in_claude`, `command_differs`, `args_diff
 `env_keys_differ`, and `standalone_claude_md` (a `CLAUDE.md` with no `AGENTS.md` beside it, which
 Codex cannot consume).
 
+The ambient configuration every project inherits is compared too, as its own entry: `~/.claude.json`
+against `~/.codex/config.toml`. It is reported first in the human output and as a top level `global`
+object beside `projects` in `--json`, and it carries only the MCP server difference kinds, since
+`standalone_claude_md` has no counterpart in those two files. Its differences never appear under a
+project, so a global gap is never blamed on one. An absent file means no servers declared on that
+side; a present file that does not parse is a scan error naming the file and its position, never its
+contents. The same exception mechanism covers it: record an exception whose `path` is your home
+directory, which is the root a global difference is reported under.
+
 Each project resolves to one of three statuses. `aligned` means no differences. `intentional`
 means every difference is covered by a recorded exception in the config. `drift` means at least one
-difference is not.
+difference is not. The global entry carries its own status on the same rule.
 
-Exit codes make this usable as a gate: `0` for aligned or intentional, `1` for drift, `2` for a
-configuration or scan error.
+Exit codes make this usable as a gate and are unchanged by the global scope: `0` for aligned or
+intentional, `1` for drift, `2` for a configuration or scan error. An uncovered global difference is
+drift on its own, with no project difference anywhere in the scan.
 
 ## Configuration
 

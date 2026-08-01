@@ -553,3 +553,387 @@ fn environment_values_are_excluded_from_human_and_json_differences() {
         );
     }
 }
+
+/// One server name paired with the kind reported for it, so a difference set can be compared
+/// without spelling the tuple out at every call site.
+type ServerKind<'a> = (&'a str, &'a str);
+
+fn write_global_claude(home: &Path, contents: &str) {
+    write_file(&home.join(".claude.json"), contents);
+}
+
+fn write_global_codex(home: &Path, contents: &str) {
+    write_file(&home.join(".codex/config.toml"), contents);
+}
+
+/// The two absolute paths the global entry names, derived from the canonical home so a symlinked
+/// temp directory does not make the assertion disagree with the report.
+fn global_paths(home: &Path) -> (String, String) {
+    let home = PathBuf::from(canonical(home));
+    (
+        home.join(".claude.json").to_string_lossy().into_owned(),
+        home.join(".codex/config.toml")
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+fn global_entry(report: &Value) -> &Value {
+    report
+        .get("global")
+        .unwrap_or_else(|| panic!("parity JSON lacks a global entry: {report}"))
+}
+
+fn difference_kinds(entry: &Value) -> Vec<ServerKind<'_>> {
+    entry
+        .get("differences")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("entry lacks a differences array: {entry}"))
+        .iter()
+        .map(|difference| {
+            (
+                difference["server"].as_str().unwrap_or("(no server)"),
+                difference["kind"].as_str().unwrap_or("(no kind)"),
+            )
+        })
+        .collect()
+}
+
+fn project_entry<'a>(report: &'a Value, root: &str) -> &'a Value {
+    report["projects"]
+        .as_array()
+        .unwrap_or_else(|| panic!("parity JSON lacks a projects array: {report}"))
+        .iter()
+        .find(|project| project["root"].as_str() == Some(root))
+        .unwrap_or_else(|| panic!("no project entry for {root}: {report}"))
+}
+
+/// The global entry names both files and carries its own status. The key names asserted here are
+/// the contract the human and JSON renderings are read through: `claude_path`, `codex_path`,
+/// `status`, and `differences`.
+#[test]
+fn parity_json_includes_a_global_entry() {
+    let tree = TempTree::new("global_entry");
+    let home = tree.path().join("home");
+    let project = tree.path().join("project");
+    fs::create_dir_all(&home).expect("create home");
+    write_empty_parity_config(&home);
+    write_global_claude(
+        &home,
+        r#"{
+  "mcpServers": {
+    "shared": {
+      "command": "runner",
+      "args": ["serve"]
+    }
+  }
+}
+"#,
+    );
+    write_global_codex(
+        &home,
+        r#"[mcp_servers.shared]
+command = "runner"
+args = ["serve"]
+"#,
+    );
+    write_aligned_project(&project);
+
+    let output = run_parity(&home, tree.path(), &[&project], true);
+
+    assert_exit(&output, 0);
+    let report = parse_json(&output);
+    let global = global_entry(&report);
+    let (claude_path, codex_path) = global_paths(&home);
+    assert_eq!(
+        global["claude_path"].as_str(),
+        Some(claude_path.as_str()),
+        "{}",
+        diagnostic(&output)
+    );
+    assert_eq!(
+        global["codex_path"].as_str(),
+        Some(codex_path.as_str()),
+        "{}",
+        diagnostic(&output)
+    );
+    assert_eq!(
+        global["status"].as_str(),
+        Some("aligned"),
+        "{}",
+        diagnostic(&output)
+    );
+    assert_eq!(difference_kinds(global), Vec::new());
+}
+
+/// The global comparison can move the exit code with no project difference anywhere in the scan,
+/// which is the whole point of folding both vectors into the report status.
+#[test]
+fn a_global_only_difference_is_drift_and_exits_one() {
+    let tree = TempTree::new("global_only_drift");
+    let home = tree.path().join("home");
+    let project = tree.path().join("project");
+    fs::create_dir_all(&home).expect("create home");
+    write_empty_parity_config(&home);
+    write_global_claude(
+        &home,
+        r#"{"mcpServers":{"global_claude_only":{"command":"runner"}}}"#,
+    );
+    write_aligned_project(&project);
+
+    let output = run_parity(&home, tree.path(), &[&project], true);
+
+    assert_exit(&output, 1);
+    let report = parse_json(&output);
+    assert_eq!(
+        report["status"].as_str(),
+        Some("drift"),
+        "{}",
+        diagnostic(&output)
+    );
+    assert_eq!(
+        difference_kinds(global_entry(&report)),
+        vec![("global_claude_only", "missing_in_codex")]
+    );
+    for project_entry in report["projects"]
+        .as_array()
+        .expect("parity JSON lacks a projects array")
+    {
+        assert_eq!(
+            difference_kinds(project_entry),
+            Vec::new(),
+            "a global difference was attributed to a project\n{}",
+            diagnostic(&output)
+        );
+    }
+}
+
+/// An operator excepts a global difference by recording the home directory as the exception path,
+/// because that is the root a global difference is reported under.
+#[test]
+fn a_global_difference_covered_by_a_home_scoped_exception_exits_zero() {
+    let tree = TempTree::new("global_intentional");
+    let home = tree.path().join("home");
+    let project = tree.path().join("project");
+    let reason = "the global claude server is deliberately not mirrored into codex";
+    fs::create_dir_all(&home).expect("create home");
+    write_global_claude(
+        &home,
+        r#"{"mcpServers":{"global_claude_only":{"command":"runner"}}}"#,
+    );
+    write_intentional_exception(
+        &home,
+        &home,
+        "global_claude_only",
+        "missing_in_codex",
+        reason,
+    );
+    write_aligned_project(&project);
+
+    let human = run_parity(&home, tree.path(), &[&project], false);
+    let json = run_parity(&home, tree.path(), &[&project], true);
+
+    assert_exit(&human, 0);
+    assert_exit(&json, 0);
+    let report = parse_json(&json);
+    let global = global_entry(&report);
+    assert_eq!(
+        report["status"].as_str(),
+        Some("intentional"),
+        "{}",
+        diagnostic(&json)
+    );
+    assert_eq!(
+        global["status"].as_str(),
+        Some("intentional"),
+        "{}",
+        diagnostic(&json)
+    );
+    assert_eq!(
+        global["differences"][0]["intentional_reason"].as_str(),
+        Some(reason),
+        "{}",
+        diagnostic(&json)
+    );
+    assert!(stdout(&human).contains(reason), "{}", diagnostic(&human));
+}
+
+#[test]
+fn an_unparseable_global_claude_json_is_a_scan_error_with_exit_two() {
+    let tree = TempTree::new("global_malformed_claude");
+    let home = tree.path().join("home");
+    let project = tree.path().join("project");
+    fs::create_dir_all(&home).expect("create home");
+    write_empty_parity_config(&home);
+    write_global_claude(&home, "{");
+    write_aligned_project(&project);
+
+    let output = run_parity(&home, tree.path(), &[&project], false);
+
+    assert_exit(&output, 2);
+    let error = diagnostic(&output);
+    let (claude_path, _) = global_paths(&home);
+    assert!(
+        error.contains(&claude_path),
+        "scan error lacks the offending global file\n{error}"
+    );
+}
+
+#[test]
+fn an_unparseable_global_codex_config_is_a_scan_error_with_exit_two() {
+    let tree = TempTree::new("global_malformed_codex");
+    let home = tree.path().join("home");
+    let project = tree.path().join("project");
+    fs::create_dir_all(&home).expect("create home");
+    write_empty_parity_config(&home);
+    write_global_codex(&home, "[mcp_servers.broken\ncommand = \"runner\"\n");
+    write_aligned_project(&project);
+
+    let output = run_parity(&home, tree.path(), &[&project], false);
+
+    assert_exit(&output, 2);
+    let error = diagnostic(&output);
+    let (_, codex_path) = global_paths(&home);
+    assert!(
+        error.contains(&codex_path),
+        "scan error lacks the offending global file\n{error}"
+    );
+}
+
+/// `~/.claude.json` carries real MCP credentials, so the global projection must expose environment
+/// keys and never environment values, exactly as the project scoped projection already does.
+#[test]
+fn global_environment_values_are_excluded_from_human_and_json_output() {
+    let tree = TempTree::new("global_secret_exclusion");
+    let home = tree.path().join("home");
+    let project = tree.path().join("project");
+    let claude_value = "GLOBAL_CLAUDE_SECRET_SENTINEL_2718";
+    let codex_value = "GLOBAL_CODEX_SECRET_SENTINEL_3141";
+    fs::create_dir_all(&home).expect("create home");
+    write_empty_parity_config(&home);
+    write_global_claude(
+        &home,
+        &format!(
+            r#"{{
+  "mcpServers": {{
+    "private": {{
+      "command": "claude-runner",
+      "args": ["serve"],
+      "env": {{
+        "CREDENTIAL": "{claude_value}"
+      }}
+    }}
+  }}
+}}
+"#
+        ),
+    );
+    write_global_codex(
+        &home,
+        &format!(
+            r#"[mcp_servers.private]
+command = "codex-runner"
+args = ["serve"]
+env = {{ CREDENTIAL = "{codex_value}" }}
+"#
+        ),
+    );
+    write_aligned_project(&project);
+
+    let human = run_parity(&home, tree.path(), &[&project], false);
+    let json = run_parity(&home, tree.path(), &[&project], true);
+
+    assert_exit(&human, 1);
+    assert_exit(&json, 1);
+    for output in [&human, &json] {
+        let report = diagnostic(output);
+        assert!(
+            report.contains("CREDENTIAL"),
+            "safe environment key is missing from the rendered global projection\n{report}"
+        );
+        assert!(
+            !report.contains(claude_value),
+            "global Claude environment value leaked\n{report}"
+        );
+        assert!(
+            !report.contains(codex_value),
+            "global Codex environment value leaked\n{report}"
+        );
+    }
+}
+
+/// `.codex/config.toml` is one of the discovery markers, so a scan rooted at or above `$HOME` makes
+/// `$HOME` itself a project candidate whose root equals the global entry's root. This pins the
+/// accepted consequence rather than asserting machinery that separates them: the two stay distinct
+/// entries because they live in separate vectors and compare different Claude side files, and one
+/// home scoped exception covers both because `push_difference` matches on root.
+#[test]
+fn home_as_a_project_candidate_and_the_global_entry_are_reported_separately() {
+    let tree = TempTree::new("global_home_overlap");
+    let home = tree.path().join("home");
+    let reason = "the home directory is deliberately asymmetric";
+    fs::create_dir_all(&home).expect("create home");
+    write_global_claude(
+        &home,
+        r#"{"mcpServers":{"global_only":{"command":"runner"}}}"#,
+    );
+    write_global_codex(&home, "[mcp_servers.codex_global]\ncommand = \"runner\"\n");
+    write_empty_parity_config(&home);
+
+    let drift = run_parity(&home, tree.path(), &[&home], true);
+
+    assert_exit(&drift, 1);
+    let report = parse_json(&drift);
+    let home_path = canonical(&home);
+    let mut global_kinds = difference_kinds(global_entry(&report));
+    global_kinds.sort_unstable();
+    assert_eq!(
+        global_kinds,
+        vec![
+            ("codex_global", "missing_in_claude"),
+            ("global_only", "missing_in_codex"),
+        ],
+        "{}",
+        diagnostic(&drift)
+    );
+    assert_eq!(
+        difference_kinds(project_entry(&report, &home_path)),
+        vec![("codex_global", "missing_in_claude")],
+        "the home project entry compares .mcp.json, not .claude.json\n{}",
+        diagnostic(&drift)
+    );
+
+    write_router_config(
+        &home,
+        &format!(
+            "[parity]\nroots = []\n\n\
+             [[parity.exceptions]]\n\
+             path = {}\n\
+             reason = {reason:?}\n",
+            toml_path(&home)
+        ),
+    );
+
+    let excepted = run_parity(&home, tree.path(), &[&home], true);
+
+    assert_exit(&excepted, 0);
+    let report = parse_json(&excepted);
+    assert_eq!(
+        report["status"].as_str(),
+        Some("intentional"),
+        "{}",
+        diagnostic(&excepted)
+    );
+    assert_eq!(
+        global_entry(&report)["status"].as_str(),
+        Some("intentional"),
+        "one home scoped exception must cover the global entry\n{}",
+        diagnostic(&excepted)
+    );
+    assert_eq!(
+        project_entry(&report, &home_path)["status"].as_str(),
+        Some("intentional"),
+        "the same exception must cover the home directory as a project\n{}",
+        diagnostic(&excepted)
+    );
+}
