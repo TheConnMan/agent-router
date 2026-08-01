@@ -42,6 +42,15 @@ fn canonical(path: &Path) -> PathBuf {
     path.canonicalize().expect("canonical fixture path")
 }
 
+/// A home directory holding neither `.claude.json` nor `.codex/config.toml`, injected into `check`
+/// so the global comparison contributes nothing and these regression assertions read exactly what
+/// they read before the global scope existed.
+fn empty_home(parent: &Path) -> PathBuf {
+    let home = parent.join("empty_home");
+    std::fs::create_dir_all(&home).expect("create empty home");
+    home
+}
+
 #[test]
 fn both_providers_over_ceiling_prevent_small_gap_flips_in_both_directions() {
     let config = Config {
@@ -75,7 +84,8 @@ fn malformed_codex_toml_errors_do_not_expose_secrets_or_source_lines() {
         &format!("[mcp_servers.server]\n{source_line}\n"),
     );
 
-    let error = check(&[project], &Config::default()).expect_err("malformed TOML must fail");
+    let error = check(&[project], &Config::default(), &empty_home(fixture.path()))
+        .expect_err("malformed TOML must fail");
 
     for rendered in [format!("{error}"), format!("{error:?}")] {
         assert!(
@@ -126,7 +136,7 @@ fn codex_symlinks_cannot_escape_the_scanned_project() {
             .expect("link codex config");
         }
 
-        let error = check(&[project], &Config::default())
+        let error = check(&[project], &Config::default(), &empty_home(fixture.path()))
             .expect_err("a project escaping codex link must be rejected");
 
         for rendered in [format!("{error}"), format!("{error:?}")] {
@@ -155,7 +165,12 @@ fn aligned_discovered_projects_remain_in_the_report_snapshot() {
         "[mcp_servers.shared]\ncommand = \"runner\"\n",
     );
 
-    let report = check(&[fixture.path().to_path_buf()], &Config::default()).expect("scan succeeds");
+    let report = check(
+        &[fixture.path().to_path_buf()],
+        &Config::default(),
+        &empty_home(fixture.path()),
+    )
+    .expect("scan succeeds");
     let snapshot = serde_json::to_value(&report).expect("serialize report");
 
     assert_eq!(report.status(), Status::Aligned);

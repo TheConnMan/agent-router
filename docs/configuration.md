@@ -308,6 +308,13 @@ reason = "Codex intentionally runs the read-only Airtable profile"
 `.mcp.json` or `.codex/config.toml` rather than a parent of it. As with `roots`, `~` is not
 expanded here.
 
+A difference in the global comparison of `~/.claude.json` against `~/.codex/config.toml` is excepted
+the same way, by setting `path` to your home directory, because that is the root a global difference
+is reported under. Such an exception also covers the home directory when it is itself scanned as a
+project, which happens whenever a scan is rooted at or above it, since `.codex/config.toml` is one of
+the discovery markers. The two stay separate entries in the report; one exception simply reaches
+both.
+
 Valid `kind` values are `missing_in_codex`, `missing_in_claude`, `command_differs`, `args_differ`,
 `env_keys_differ`, and `standalone_claude_md`.
 

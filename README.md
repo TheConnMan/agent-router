@@ -287,12 +287,22 @@ kinds are `missing_in_codex`, `missing_in_claude`, `command_differs`, `args_diff
 `env_keys_differ`, and `standalone_claude_md` (a `CLAUDE.md` with no `AGENTS.md` beside it, which
 Codex cannot consume).
 
+The ambient configuration every project inherits is compared too, as its own entry: `~/.claude.json`
+against `~/.codex/config.toml`. It is reported first in the human output and as a top level `global`
+object beside `projects` in `--json`, and it carries only the MCP server difference kinds, since
+`standalone_claude_md` has no counterpart in those two files. Its differences never appear under a
+project, so a global gap is never blamed on one. An absent file means no servers declared on that
+side; a present file that does not parse is a scan error naming the file and its position, never its
+contents. The same exception mechanism covers it: record an exception whose `path` is your home
+directory, which is the root a global difference is reported under.
+
 Each project resolves to one of three statuses. `aligned` means no differences. `intentional`
 means every difference is covered by a recorded exception in the config. `drift` means at least one
-difference is not.
+difference is not. The global entry carries its own status on the same rule.
 
-Exit codes make this usable as a gate: `0` for aligned or intentional, `1` for drift, `2` for a
-configuration or scan error.
+Exit codes make this usable as a gate and are unchanged by the global scope: `0` for aligned or
+intentional, `1` for drift, `2` for a configuration or scan error. An uncovered global difference is
+drift on its own, with no project difference anywhere in the scan.
 
 ## Configuration
 

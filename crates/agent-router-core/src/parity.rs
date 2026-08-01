@@ -1,4 +1,6 @@
-//! Project scoped comparison of Claude and Codex declarations.
+//! Project and global scoped comparison of Claude and Codex declarations. The project scope walks
+//! each scan root for candidate directories; the global scope compares the two ambient files every
+//! project inherits, `~/.claude.json` and `~/.codex/config.toml`, and is reported as its own entry.
 
 use crate::Config;
 use crate::config::{ParityException, ParityKind};
@@ -36,10 +38,21 @@ pub struct Difference {
     pub intentional_reason: Option<String>,
 }
 
+/// The global comparison, distinct from the per project entries. Its differences live in their own
+/// vector so a global difference can never be attributed to a project, and each one is rooted at the
+/// canonicalized home directory so a home scoped exception covers it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct GlobalReport {
+    pub claude_path: PathBuf,
+    pub codex_path: PathBuf,
+    pub differences: Vec<Difference>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ParityReport {
     pub projects: Vec<PathBuf>,
     pub differences: Vec<Difference>,
+    pub global: GlobalReport,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -51,14 +64,17 @@ pub enum Status {
 }
 
 impl ParityReport {
+    /// Both scopes fold into one status, which is what keeps the exit code contract intact: an
+    /// uncovered global difference is drift exactly as an uncovered project difference is.
     pub fn status(&self) -> Status {
-        if self.differences.is_empty() {
+        let differences = || {
+            self.differences
+                .iter()
+                .chain(self.global.differences.iter())
+        };
+        if differences().next().is_none() {
             Status::Aligned
-        } else if self
-            .differences
-            .iter()
-            .all(|difference| difference.intentional_reason.is_some())
-        {
+        } else if differences().all(|difference| difference.intentional_reason.is_some()) {
             Status::Intentional
         } else {
             Status::Drift
@@ -149,7 +165,10 @@ struct ResolvedException<'a> {
     exception: &'a ParityException,
 }
 
-pub fn check(roots: &[PathBuf], config: &Config) -> Result<ParityReport> {
+/// `home` is injected rather than read from the process environment: the global comparison exists to
+/// detect divergence between the two ambient files, so resolving them from the environment would
+/// make every caller, including the test suite, depend on the machine it runs on.
+pub fn check(roots: &[PathBuf], config: &Config, home: &Path) -> Result<ParityReport> {
     let cwd = std::env::current_dir()?;
     let roots = canonical_roots(roots, config, &cwd)?;
     let exceptions = resolve_exceptions(&config.parity.exceptions, &cwd)?;
@@ -164,9 +183,30 @@ pub fn check(roots: &[PathBuf], config: &Config) -> Result<ParityReport> {
     for candidate in &projects {
         compare_candidate(candidate, &exceptions, &mut differences)?;
     }
+    let global = compare_global(home, &exceptions)?;
 
     Ok(ParityReport {
         projects,
+        differences,
+        global,
+    })
+}
+
+/// The ambient pair, rooted at the canonicalized home so an exception written against a symlinked
+/// home still matches. Only the MCP server kinds apply: `standalone_claude_md` has no global
+/// counterpart in these two files.
+fn compare_global(home: &Path, exceptions: &[ResolvedException<'_>]) -> Result<GlobalReport> {
+    let root = crate::runtime::canonicalize_dir(home);
+    let claude_path = root.join(".claude.json");
+    let codex_path = root.join(".codex/config.toml");
+    let claude = read_claude_servers_at(&claude_path)?;
+    let codex = read_global_codex_servers(&codex_path)?;
+
+    let mut differences = Vec::new();
+    compare_servers(&root, exceptions, &claude, &codex, &mut differences);
+    Ok(GlobalReport {
+        claude_path,
+        codex_path,
         differences,
     })
 }
@@ -269,70 +309,7 @@ fn compare_candidate(
 ) -> Result<()> {
     let claude = read_claude_servers(candidate)?;
     let codex = read_codex_servers(candidate)?;
-    let server_names = claude
-        .keys()
-        .chain(codex.keys())
-        .cloned()
-        .collect::<BTreeSet<_>>();
-
-    for server in server_names {
-        match (claude.get(&server), codex.get(&server)) {
-            (Some(claude), None) => push_difference(
-                differences,
-                exceptions,
-                candidate,
-                Some(server),
-                ParityKind::MissingInCodex,
-                Some(claude.clone()),
-                None,
-            ),
-            (None, Some(codex)) => push_difference(
-                differences,
-                exceptions,
-                candidate,
-                Some(server),
-                ParityKind::MissingInClaude,
-                None,
-                Some(codex.clone()),
-            ),
-            (Some(claude), Some(codex)) => {
-                if claude.command != codex.command {
-                    push_difference(
-                        differences,
-                        exceptions,
-                        candidate,
-                        Some(server.clone()),
-                        ParityKind::CommandDiffers,
-                        Some(claude.clone()),
-                        Some(codex.clone()),
-                    );
-                }
-                if claude.args != codex.args {
-                    push_difference(
-                        differences,
-                        exceptions,
-                        candidate,
-                        Some(server.clone()),
-                        ParityKind::ArgsDiffer,
-                        Some(claude.clone()),
-                        Some(codex.clone()),
-                    );
-                }
-                if claude.env_keys != codex.env_keys {
-                    push_difference(
-                        differences,
-                        exceptions,
-                        candidate,
-                        Some(server),
-                        ParityKind::EnvKeysDiffer,
-                        Some(claude.clone()),
-                        Some(codex.clone()),
-                    );
-                }
-            }
-            (None, None) => {}
-        }
-    }
+    compare_servers(candidate, exceptions, &claude, &codex, differences);
 
     if candidate.join("CLAUDE.md").exists() && !candidate.join("AGENTS.md").exists() {
         push_difference(
@@ -346,6 +323,81 @@ fn compare_candidate(
         );
     }
     Ok(())
+}
+
+/// Classify one pair of declared server sets under `root`. Both scopes call this, so the project and
+/// global entries cannot drift on what counts as a difference.
+fn compare_servers(
+    root: &Path,
+    exceptions: &[ResolvedException<'_>],
+    claude: &BTreeMap<String, ServerProjection>,
+    codex: &BTreeMap<String, ServerProjection>,
+    differences: &mut Vec<Difference>,
+) {
+    let server_names = claude
+        .keys()
+        .chain(codex.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+
+    for server in server_names {
+        match (claude.get(&server), codex.get(&server)) {
+            (Some(claude), None) => push_difference(
+                differences,
+                exceptions,
+                root,
+                Some(server),
+                ParityKind::MissingInCodex,
+                Some(claude.clone()),
+                None,
+            ),
+            (None, Some(codex)) => push_difference(
+                differences,
+                exceptions,
+                root,
+                Some(server),
+                ParityKind::MissingInClaude,
+                None,
+                Some(codex.clone()),
+            ),
+            (Some(claude), Some(codex)) => {
+                if claude.command != codex.command {
+                    push_difference(
+                        differences,
+                        exceptions,
+                        root,
+                        Some(server.clone()),
+                        ParityKind::CommandDiffers,
+                        Some(claude.clone()),
+                        Some(codex.clone()),
+                    );
+                }
+                if claude.args != codex.args {
+                    push_difference(
+                        differences,
+                        exceptions,
+                        root,
+                        Some(server.clone()),
+                        ParityKind::ArgsDiffer,
+                        Some(claude.clone()),
+                        Some(codex.clone()),
+                    );
+                }
+                if claude.env_keys != codex.env_keys {
+                    push_difference(
+                        differences,
+                        exceptions,
+                        root,
+                        Some(server),
+                        ParityKind::EnvKeysDiffer,
+                        Some(claude.clone()),
+                        Some(codex.clone()),
+                    );
+                }
+            }
+            (None, None) => {}
+        }
+    }
 }
 
 fn push_difference(
@@ -384,20 +436,48 @@ fn push_difference(
 }
 
 fn read_claude_servers(candidate: &Path) -> Result<BTreeMap<String, ServerProjection>> {
-    let path = candidate.join(".mcp.json");
+    read_claude_servers_at(&candidate.join(".mcp.json"))
+}
+
+/// One Claude JSON document, whether it is a project `.mcp.json` or the global `~/.claude.json`. An
+/// absent file means no declared servers; a present one that does not parse is an error naming only
+/// the file and its position, because the document can carry MCP server credentials.
+fn read_claude_servers_at(path: &Path) -> Result<BTreeMap<String, ServerProjection>> {
     if !path.exists() {
         return Ok(BTreeMap::new());
     }
 
-    let file = File::open(&path)?;
+    let file = File::open(path)?;
     let document: ClaudeDocument = serde_json::from_reader(BufReader::new(file))
-        .map_err(|error| sanitized_json_error(&path, &error))?;
+        .map_err(|error| sanitized_json_error(path, &error))?;
     Ok(document
         .mcp_servers
         .into_iter()
         .map(|(name, server)| {
             let mut effective = EffectiveServer::default();
             effective.apply(server);
+            (name, effective.into_projection())
+        })
+        .collect())
+}
+
+/// The global Codex file, which is one fixed path rather than a layered project tree, so none of the
+/// directory walking or path identity validation the project reader performs applies to it.
+fn read_global_codex_servers(path: &Path) -> Result<BTreeMap<String, ServerProjection>> {
+    if !path.exists() {
+        return Ok(BTreeMap::new());
+    }
+
+    let mut text = String::new();
+    BufReader::new(File::open(path)?).read_to_string(&mut text)?;
+    let document: CodexDocument =
+        toml::from_str(&text).map_err(|error| sanitized_toml_error(path, &text, &error))?;
+    Ok(document
+        .mcp_servers
+        .into_iter()
+        .map(|(name, layer)| {
+            let mut effective = EffectiveServer::default();
+            effective.apply(layer);
             (name, effective.into_projection())
         })
         .collect())
