@@ -308,13 +308,19 @@ impl Config {
     }
 
     /// PURE-ish: bring a file written by an older build up to `CURRENT_CONFIG_VERSION`, returning
-    /// whether it now needs rewriting. Every step here corrects a value THIS TOOL generated, never
-    /// one the operator chose, which is the line that keeps this compatible with the file's stated
+    /// whether it now needs rewriting. A step may only touch a value still equal to the default
+    /// this tool used to generate, which is what keeps this compatible with the file's stated
     /// contract that the operator's config is authoritative.
     ///
-    /// The version stamp is what makes that true over time. Migrating on the value alone would
-    /// re-apply on every load, so an operator who set the old default back deliberately would have
-    /// it overwritten again and again with no way to win.
+    /// KNOWN LIMIT, on an unstamped file only: "still equal to the old generated default" cannot
+    /// distinguish a value the operator deliberately typed from the one the tool wrote, so a v1
+    /// migration will move a hand-pinned 30. That is accepted rather than solved, because there is
+    /// no evidence in the file to solve it with: the cost is one value, once, in the direction of
+    /// more headroom, and it is documented in `docs/configuration.md`.
+    ///
+    /// After the stamp the ambiguity is gone, and that is why steps are keyed on the version and
+    /// not on the value. Migrating on the value alone would re-apply on every load, so an operator
+    /// who set the old default back deliberately would have it overwritten every time, forever.
     fn migrate(&mut self) -> bool {
         if self.config_version >= CURRENT_CONFIG_VERSION {
             return false;
