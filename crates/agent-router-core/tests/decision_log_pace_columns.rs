@@ -57,6 +57,7 @@ fn record(log: &DecisionLog, decision: &Decision) {
         job_id: Some("thread-abc"),
         job_name: None,
         outcome: "dispatched",
+        effective_effort: None,
     })
     .expect("records the decision");
 }

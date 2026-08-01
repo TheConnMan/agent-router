@@ -40,7 +40,8 @@ log: row 87 in /home/you/.local/state/agent-router/router.db
    merely costing more.
 4. **Pick the model from complexity.** The complexity tier selects the model from the per provider
    tier table. Reasoning effort is deliberately not decided: the router forces none and each
-   backend resolves its own. See [docs/configuration.md](docs/configuration.md#modelscodex-and-modelsclaude)
+   backend resolves its own, and the log records that resolution wherever the backend reports one.
+   See [docs/configuration.md](docs/configuration.md#modelscodex-and-modelsclaude)
    for what that actually means per backend, because it is not the model default on Codex.
 5. **Dispatch and log.** The job is spawned detached, its backend job id is resolved, and the whole
    decision lands in a SQLite decision log.
@@ -230,11 +231,21 @@ Recent routing decisions, newest first.
 
 ```bash
 $ agent-router log --limit 3
-#87 codex orchestration no medium pace claude -12 codex +6 gates[] codex 23% claude 58% 019c3f2a
+#87 codex orchestration no medium pace claude -12 codex +6 gates[] codex 23% claude 58% 019c3f2a dispatched
      Port usage.sh to Rust with the same fail-open semantics
-#86 claude orchestration yes high pace claude -12 codex +6 gates[orchestration] codex 23% claude 58% Fix the ...
+#86 claude orchestration yes high pace claude -12 codex +6 gates[orchestration] codex 23% claude 58% 019c3f19 dispatched mark bad note routed to codex, needed connectors
      Fix the flaky parity test and work out why it only fails in CI
+
+# Judge a decision: was routing it there the right call.
+agent-router log --mark 87 bad --note "routed to codex, needed connectors"
 ```
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--limit <N>` | `10` | Newest rows to print. |
+| `--mark <ROW_ID> <MARK>` | none | Record the human judgement on one row: `good`, `bad`, or `rerouted`. Any other value is rejected and exits nonzero naming the accepted three. An unknown `ROW_ID` also exits nonzero, without writing anything. Short circuits: it prints one confirmation line instead of the listing. |
+| `--note <TEXT>` | none | Free text alongside `--mark`. Requires `--mark`; a note with no mark is rejected. An empty or whitespace only note is rejected rather than stored. |
+| `--json` | off | Emit the full decision, including gates, classification, and usage. Rejected alongside `--mark`, which prints a confirmation line rather than a listing. |
 
 `--json` emits every recorded column, including the full task text, the rationale, and the
 dispatch outcome. It also still prints the scores the classifier no longer produces
@@ -242,6 +253,23 @@ dispatch outcome. It also still prints the scores the classifier no longer produ
 them and this is the only way to read one back through the tool; they are null on every row
 written since. The log is the tuning surface: each gate tag names a specific rule that fired, so
 routing behaviour can be audited against outcomes rather than recalled.
+
+Two of those columns are about reasoning effort and they are not the same fact. `effort` is what the
+router decided, which is nothing, because the model tier is the toggle. `effective_effort` is what
+the backend reported the job will actually run at, and it is recorded only where a backend genuinely
+says: Codex reports its resolved effort on the `thread/start` reply, so a Codex row carries it, and
+it moves when your `~/.codex/config.toml` moves. Claude exposes no effective effort anywhere and
+OpenCode discards effort entirely, so both stay null rather than being filled in from the model, the
+decision, or a config file. Null also covers a dry run, which dispatched nothing, and a row written
+before the column existed. In every case null means nobody observed an effort, which is not the same
+as a job running at no effort. See
+[docs/configuration.md](docs/configuration.md#what-reasoning-effort-a-dispatched-job-actually-runs-at).
+
+Marking a row is the human half of the loop: `status` can only say whether a job ran, never whether
+routing it to that provider was the right call, and the mark is what makes the log tunable against
+outcomes rather than intuition. Marking a row again replaces the earlier judgement outright. Because
+the mark and the note are written together as one annotation, re marking without a note clears any
+note stored from an earlier mark on that row.
 
 ### `stats`
 
@@ -271,8 +299,84 @@ never ran a usage rule and never ran the classifier. The dry run share is denomi
 row instead, since any row can be a dry run. Each rate carries its numerator and denominator so it
 can be checked by hand, and a rate with no denominator reads `-` rather than a percentage.
 
+Then the feedback breakdowns: a bad rate and a failure rate, each broken down by gate tag, by
+provider, and by complexity tier. The bad rate is the rows a human marked `bad` or `rerouted` with
+`agent-router log --mark`, over the rows carrying any of the three marks: `good` is the only mark
+outside the numerator, because `bad` and `rerouted` both say the route was the wrong call and
+`rerouted` says in addition that the job had to be moved off it. The failure rate is the rows
+`agent-router status` settled to `failed`, plus the rows whose dispatch itself errored. A row
+carrying several gate tags counts under each of them, since a gate breakdown is per gate by
+definition, unlike the flip rate, where one route that moved counts once however many gates fired
+on it.
+
+Both denominators are deliberately narrower than the row count, and that is what makes the numbers
+worth trusting. A bad rate counts only the rows a human actually judged, because an unmarked row is
+absence of evidence rather than evidence of a good route, and counting it as good would drive every
+bad rate toward zero as the log grows. A failure rate counts only the rows whose fate is settled
+(`completed`, `failed`, or a dispatch error), because a row still reading `dispatched`, `running`,
+or `unknown` has not been shown to have succeeded, and counting it as one reports a perfect record
+over jobs nobody has heard back about. A dry run never enters a failure denominator at all, since it
+dispatched nothing that could succeed or fail, though it does enter a bad rate, because it still has
+a route a human can judge.
+
+Every breakdown carries the full key set of the distribution it breaks down, so a key nobody has
+judged reads `0 of 0` with a null share instead of vanishing from the report. That is also why a
+zero and a null are different answers here: `0 of 4` is four judged routes with nothing wrong,
+`0 of 0` is nothing to say yet.
+
 `--limit` defaults to 200, which is the same window as `agent-router log --json --limit 200`, so
 every number here reconciles by hand against the rows that command prints.
+
+### `status`
+
+Reconcile logged decisions against the backends that actually ran them, and write a terminal state
+back into the decision log's `outcome` column.
+
+```bash
+$ agent-router status --limit 3
+rows considered: 3
+window: 1737330000000 to 1737336000000
+#88 codex completed turn completed job 019c3f2c
+#87 claude running working job 019c3f2a
+#86 claude unknown absent job 019c2f11 no trace
+```
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--limit <N>` | `20` | Newest matching rows to reconcile. Smaller than the `stats` default on purpose: every row here costs a live backend call, where a `stats` window is pure SQL. |
+| `--since <WINDOW>` | none | Also drop rows older than a lookback window, for example `24h`, `7d`, or `2w`. Same parser as `stats --since`. |
+| `--json` | off | Emit the reconciliation as structured JSON instead of one line per row. |
+
+Only rows that actually dispatched are ever touched: the predicate is `dry_run = 0 AND job_id IS
+NOT NULL`. A `--dry-run` row and a row whose dispatch itself failed (which carries no job id, and
+whose `outcome` already holds the backend's own error text) are both left alone.
+
+Claude jobs resolve through `claude agents --json --all`. That list is a bounded recent window, so
+a job missing from it reports `unknown`, never `completed`: absence is equally consistent with
+completed, crashed on startup, or never started, and the router refuses to guess which. A claude
+job reporting `stopped` also reports `unknown` rather than `failed`, because an operator stopping a
+healthy job is not a routing failure.
+
+Codex jobs resolve through the app-server `thread/read` call with `includeTurns` set, and the state
+comes from the first turn record, since the router starts exactly one turn per thread. Turn history
+is read from disk, so a codex job still resolves even when the daemon has not loaded the thread.
+
+Every row settles into one of four states written to `outcome`: `running`, `completed`, `failed`,
+or `unknown`. `unknown` never overwrites an already proven `completed` or `failed`: once a job is
+proven finished, a later run that can no longer see the backend leaves that fact alone, which is
+what makes rerunning `status` safe.
+
+Claude rows also carry a `traced` flag: whether a session transcript exists on disk for that job.
+It is evidence only and never changes the state, so a traced but unresolvable job still reports
+`unknown`. It exists to tell "ran and we lost track of it" apart from "vanished without a trace".
+
+`--json` emits `rows_considered`, `oldest_created_at_ms`, and `newest_created_at_ms` at the top
+level, plus a `rows` array where each row carries `id`, `provider`, `job_id`, `observation`,
+`state`, and `traced`.
+
+`status` owns its own exit code the way `doctor` does: `0` when nothing in the window is known to
+have failed, `1` when something is, `2` when the command could not run at all. An `unknown` never
+moves it, since an absence of information is not a finding.
 
 ### `parity`
 

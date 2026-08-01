@@ -271,6 +271,78 @@ fn a_supplied_name_reaches_the_spawned_job_and_the_decision_log_verbatim() {
     assert_eq!(rows[0]["job_name"], name);
 }
 
+/// Claude's CLI exposes no effective reasoning effort anywhere: it accepts `--effort`, prints a
+/// warning on a value it does not know, and exits 0 having run at its own default. So the router
+/// observes nothing and the column stays null, permanently.
+///
+/// This is the test that has to fail if someone later fills the claude column in from the decided
+/// effort, from the model, or from a config default. It asserts key presence as well as null,
+/// because a missing key and a null value are the same read otherwise, and the missing key is what
+/// an absent feature looks like. The codex control that proves a non null value can be recorded at
+/// all is `a_codex_row_records_the_observed_effort_while_claude_and_opencode_rows_stay_null` in the
+/// core suite.
+#[cfg(unix)]
+#[test]
+fn a_claude_dispatch_records_no_effective_effort() {
+    let fixture = CliFixture::new();
+    let output = fixture.run(true);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("router json");
+
+    let dispatch = value["dispatch"].as_object().expect("dispatch object");
+    assert!(
+        dispatch.contains_key("effective_effort"),
+        "the dispatch reports no effective effort at all, so null is unreadable from absent: \
+         {dispatch:?}"
+    );
+    assert_eq!(
+        dispatch["effective_effort"],
+        Value::Null,
+        "claude reported no effort, so the router must record none"
+    );
+    // Both of the values an inference would most plausibly be built from, sitting in the same
+    // payload as the null the router is required to report.
+    assert_eq!(value["model"], "opus[1m]");
+    assert_eq!(value["effort"], Value::Null);
+
+    let logged = fixture
+        .router()
+        .arg("log")
+        .arg("--limit")
+        .arg("1")
+        .arg("--json")
+        .output()
+        .expect("read decision log");
+    assert!(
+        logged.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&logged.stderr)
+    );
+    let rows: Value = serde_json::from_slice(&logged.stdout).expect("log json");
+    let row = rows[0].as_object().expect("log row object");
+
+    assert_eq!(row["provider"], "claude");
+    assert!(
+        row.contains_key("effort") && row.contains_key("effective_effort"),
+        "the log reports the decided effort and the observed effort as separate readable keys: \
+         {row:?}"
+    );
+    assert_eq!(
+        row["effort"],
+        Value::Null,
+        "the router decided no effort, which is what this column has always recorded"
+    );
+    assert_eq!(
+        row["effective_effort"],
+        Value::Null,
+        "and claude never said what it ran at, so nothing may be written here"
+    );
+}
+
 /// The auto path picks its model from the complexity tiers, so a `--model` alongside it can only be
 /// silently dropped. That has to be loud.
 #[cfg(unix)]
