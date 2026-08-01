@@ -1,7 +1,9 @@
 use agent_router_core::log::{DecisionLog, Row};
 use agent_router_core::parity::{Difference, ParityReport, ServerProjection, Status};
 use agent_router_core::run::{Outcome, Request};
+use agent_router_core::stats::{Rate, Stats, Window};
 use clap::{Parser, Subcommand};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -55,6 +57,16 @@ enum Command {
     Log {
         #[arg(long, default_value_t = 10)]
         limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Aggregate metrics over recent routing decisions.
+    Stats {
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+        /// Also drop rows older than a lookback window, for example 24h, 7d, or 2w.
+        #[arg(long)]
+        since: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -145,6 +157,7 @@ fn run(cli: Cli) -> agent_router_core::Result<()> {
         ),
         Command::Usage { json } => usage(json),
         Command::Log { limit, json } => log(limit, json),
+        Command::Stats { limit, since, json } => stats(limit, since, json),
         Command::Parity { .. } => unreachable!("parity has a command specific exit path"),
     }
 }
@@ -426,6 +439,99 @@ fn log(limit: usize, json: bool) -> agent_router_core::Result<()> {
         println!("     {}", first_line(&row.task));
     }
     Ok(())
+}
+
+fn stats(limit: usize, since: Option<String>, json: bool) -> agent_router_core::Result<()> {
+    let since_ms = match &since {
+        Some(window) => {
+            let lookback = agent_router_core::stats::parse_since(window)?;
+            Some(agent_router_core::runtime::now_ms() - lookback)
+        }
+        None => None,
+    };
+    let log = DecisionLog::open()?;
+    let stats = agent_router_core::stats::collect(&log, Window { limit, since_ms })?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&stats_json(&stats))?);
+        return Ok(());
+    }
+    print_stats(&stats);
+    Ok(())
+}
+
+fn stats_json(stats: &Stats) -> serde_json::Value {
+    serde_json::json!({
+        "rows_considered": stats.rows_considered,
+        "oldest_created_at_ms": stats.oldest_created_at_ms,
+        "newest_created_at_ms": stats.newest_created_at_ms,
+        "routes": stats.routes,
+        "gates": stats.gates,
+        "complexity": stats.complexity,
+        "auto_routes": stats.auto_routes,
+        "flip_rate": rate_json(&stats.flip_rate),
+        "classifier_failure_rate": rate_json(&stats.classifier_failure_rate),
+        "dry_run_share": rate_json(&stats.dry_run_share),
+    })
+}
+
+/// Both counts travel with the share, so a reader can check the rate rather than trust it. The
+/// share is null when there was nothing to divide by.
+fn rate_json(rate: &Rate) -> serde_json::Value {
+    serde_json::json!({
+        "numerator": rate.numerator,
+        "denominator": rate.denominator,
+        "share": rate.share(),
+    })
+}
+
+fn print_stats(stats: &Stats) {
+    println!("rows considered: {}", stats.rows_considered);
+    println!(
+        "window: {} to {}",
+        stamp(stats.oldest_created_at_ms),
+        stamp(stats.newest_created_at_ms)
+    );
+    println!("auto routes: {}", stats.auto_routes);
+    print_counts("routes", &stats.routes);
+    print_counts("gates", &stats.gates);
+    print_counts("complexity", &stats.complexity);
+    print_rate("flip rate", &stats.flip_rate);
+    print_rate("classifier failure rate", &stats.classifier_failure_rate);
+    print_rate("dry run share", &stats.dry_run_share);
+}
+
+fn print_counts(label: &str, counts: &BTreeMap<String, usize>) {
+    if counts.is_empty() {
+        println!("{label}: -");
+        return;
+    }
+    let rendered = counts
+        .iter()
+        .map(|(name, count)| format!("{name} {count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!("{label}: {rendered}");
+}
+
+/// A rate with no denominator prints as "-": any percentage on the screen would be invented, and a
+/// zero over zero share renders as NaN.
+fn print_rate(label: &str, rate: &Rate) {
+    match rate.share() {
+        Some(share) => println!(
+            "{label}: {:.1}% ({} of {})",
+            share * 100.0,
+            rate.numerator,
+            rate.denominator
+        ),
+        None => println!("{label}: - (0 of 0)"),
+    }
+}
+
+fn stamp(created_at_ms: Option<i64>) -> String {
+    match created_at_ms {
+        Some(ms) => ms.to_string(),
+        None => "-".to_string(),
+    }
 }
 
 fn row_json(row: &Row) -> serde_json::Value {

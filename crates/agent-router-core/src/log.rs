@@ -54,6 +54,20 @@ pub struct Row {
     pub rationale: String,
 }
 
+/// One row as the stats reader needs it: the columns a metric is derived from, nothing else.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatsRow {
+    pub created_at_ms: i64,
+    /// "auto" or the provider the caller named.
+    pub requested: String,
+    pub provider: String,
+    /// None for a row written before complexity scaling, and for an explicit provider.
+    pub complexity: Option<String>,
+    /// The gate tags that fired, comma joined. Empty when none did.
+    pub gates: String,
+    pub dry_run: bool,
+}
+
 const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS decisions (
     id                  INTEGER PRIMARY KEY,
@@ -94,6 +108,9 @@ const SELECT_COLUMNS: &str = "\
 id, created_at_ms, task, dir, requested, provider, model, effort, verdict, confidence, \
 codex_ready_count, claude_signal_count, missing_connector, gates, claude_weekly_pct, \
 codex_weekly_pct, dry_run, job_id, job_name, outcome, rationale, complexity";
+
+/// The narrower list the stats reader needs, so a report never pays for columns it drops.
+const STATS_COLUMNS: &str = "created_at_ms, requested, provider, complexity, gates, dry_run";
 
 pub struct DecisionLog {
     conn: Connection,
@@ -169,6 +186,40 @@ impl DecisionLog {
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// IMPURE: the `limit` newest rows the stats reader needs, newest first. `since_ms` is an
+    /// inclusive floor on `created_at_ms`: it filters first, then the limit caps what is left.
+    pub fn stats_rows(&self, limit: usize, since_ms: Option<i64>) -> Result<Vec<StatsRow>> {
+        let read = |row: &rusqlite::Row| {
+            Ok(StatsRow {
+                created_at_ms: row.get(0)?,
+                requested: row.get(1)?,
+                provider: row.get(2)?,
+                complexity: row.get(3)?,
+                gates: row.get(4)?,
+                dry_run: row.get(5)?,
+            })
+        };
+        let rows = match since_ms {
+            Some(floor) => {
+                let sql = format!(
+                    "SELECT {STATS_COLUMNS} FROM decisions WHERE created_at_ms >= ?1 \
+                     ORDER BY id DESC LIMIT ?2"
+                );
+                let mut statement = self.conn.prepare(&sql)?;
+                let rows = statement.query_map([floor, limit as i64], read)?;
+                rows.collect::<rusqlite::Result<Vec<StatsRow>>>()?
+            }
+            None => {
+                let sql =
+                    format!("SELECT {STATS_COLUMNS} FROM decisions ORDER BY id DESC LIMIT ?1");
+                let mut statement = self.conn.prepare(&sql)?;
+                let rows = statement.query_map([limit as i64], read)?;
+                rows.collect::<rusqlite::Result<Vec<StatsRow>>>()?
+            }
+        };
+        Ok(rows)
     }
 
     /// The `limit` newest decisions, newest first.

@@ -169,6 +169,35 @@ $ agent-router log --limit 3
 dispatch outcome. The log is the tuning surface: each gate tag names a specific rule that fired, so
 routing behaviour can be audited against outcomes rather than recalled.
 
+### `stats`
+
+Aggregate metrics over recent routing decisions, so the heuristic can be tuned against what it
+actually did rather than against what it feels like it did.
+
+```bash
+# The default window: the 200 newest decisions.
+agent-router stats
+
+# Narrow the window by age as well. Accepts h, d, and w.
+agent-router stats --since 7d
+
+# Machine readable.
+agent-router stats --json
+```
+
+Reported over the window: the rows considered and their oldest and newest timestamps, the count per
+provider, the count per gate tag, the complexity distribution (with a row that was never scored
+counted as `unscored`), the number of auto routes, and three rates. The flip rate is the auto routed
+rows carrying a provider moving gate (`flipped_on_exhaustion` or `headroom_tiebreak`) over all auto
+routes. The classifier failure rate is the auto routed rows carrying `classifier_failed` over the
+same denominator. Both are denominated on auto routes only, because a row that named its provider
+never had a verdict to flip and never ran the classifier. The dry run share is denominated on every
+row instead, since any row can be a dry run. Each rate carries its numerator and denominator so it
+can be checked by hand, and a rate with no denominator reads `-` rather than a percentage.
+
+`--limit` defaults to 200, which is the same window as `agent-router log --json --limit 200`, so
+every number here reconciles by hand against the rows that command prints.
+
 ### `parity`
 
 Compare project scoped Claude and Codex declarations, so either provider can take over a project

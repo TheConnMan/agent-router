@@ -11,6 +11,7 @@ pub mod parity;
 pub mod provider;
 pub mod run;
 pub mod runtime;
+pub mod stats;
 pub mod usage;
 
 pub use classify::{Classification, Confidence, Verdict};
