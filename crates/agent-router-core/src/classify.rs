@@ -135,23 +135,35 @@ pub fn classifier_command(prompt: &str, classifier: &Classifier) -> Command {
     }
 }
 
-/// PURE builder: the claude classifier invocation. Every flag here is about the CLI's own startup
-/// cost, which dominated this call and is the whole reason the 30s timeout is viable.
+/// PURE builder: the claude classifier invocation. Two separate costs are stripped here: the
+/// CLI's own startup, and the model's thinking tokens. Either one alone loses the deadline.
 ///
 /// Measured on this box 2026-07-30: plain `claude -p --model haiku --output-format json` spent
 /// ~14s before it even issued the API request (hooks, plugin sync, auto-memory, CLAUDE.md
 /// discovery) and took 29-38s wall, so it lost a 30s deadline about half the time.
 /// `CLAUDE_SUBPROCESS=1` plus `--safe-mode` (all customizations off: CLAUDE.md, skills, plugins,
-/// hooks, MCP servers, commands, agents) took time-to-request to ~27ms and the whole call to
-/// 12-16s. `--bare` would do the same but is unusable here: it never reads OAuth or the keychain,
-/// so it answers "Not logged in". This is the same posture the compound-learning hooks use for
-/// their own haiku calls.
+/// hooks, MCP servers, commands, agents) took time-to-request to ~27ms. `--bare` would do the same
+/// but is unusable here: it never reads OAuth or the keychain, so it answers "Not logged in". This
+/// is the same posture the compound-learning hooks use for their own haiku calls.
+///
+/// `MAX_THINKING_TOKENS=0` is the larger win and was found later. With startup already at ~30ms,
+/// wall time is entirely API time, and API time is close to linear in OUTPUT tokens at ~90 tok/s.
+/// Scoring emits one ~100-token JSON object, but haiku was generating 1104-4154 tokens per call
+/// because extended thinking is on by default, and every one of those tokens is discarded before
+/// `parse_classification` ever sees the object. Re-measured 2026-08-01 over the nine tasks that had
+/// actually timed out in the decision log, two runs each: 12.5-48.6s (mean 26.7s, 6 of 18 past 30s)
+/// with thinking on, against 3.4-7.0s (mean 4.5s, 0 of 18 past 30s) and 97-127 output tokens with
+/// it off. Codex on the same nine was 6.3-12.4s, so the fast claude path beats it by about half.
+///
+/// Input is ~22k tokens regardless (Claude Code's own system prompt, cached); that is not the
+/// lever, and no prompt-shortening here would have mattered.
 ///
 /// `--safe-mode` also makes the scoring hermetic, which matters independently of speed: the
 /// verdict must not shift because a project's CLAUDE.md or a skill happened to load.
 pub fn claude_classifier_command(prompt: &str, model: &str) -> Command {
     let mut cmd = Command::new("claude");
     cmd.env("CLAUDE_SUBPROCESS", "1")
+        .env("MAX_THINKING_TOKENS", "0")
         .arg("-p")
         .arg("--model")
         .arg(model)
@@ -561,6 +573,13 @@ mod tests {
             .collect()
     }
 
+    fn env_of(cmd: &Command, key: &str) -> Option<String> {
+        cmd.get_envs()
+            .find(|(name, _)| *name == std::ffi::OsStr::new(key))
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_string_lossy().into_owned())
+    }
+
     /// The startup-stripping flags are the reason the classifier fits its timeout at all, so they
     /// are pinned: losing one silently doubles the call and every task starts falling back to
     /// claude with `classifier_failed`.
@@ -585,12 +604,12 @@ mod tests {
 
         // `--safe-mode` disables hooks, but the env var is what keeps a hook-driven harness from
         // treating this as a fresh interactive session.
-        let subprocess = cmd
-            .get_envs()
-            .find(|(key, _)| *key == std::ffi::OsStr::new("CLAUDE_SUBPROCESS"))
-            .and_then(|(_, value)| value)
-            .map(|value| value.to_string_lossy().into_owned());
-        assert_eq!(subprocess.as_deref(), Some("1"));
+        assert_eq!(env_of(&cmd, "CLAUDE_SUBPROCESS").as_deref(), Some("1"));
+
+        // Thinking tokens dominate the call: they are 10x the answer and are thrown away. Losing
+        // this var takes the mean from ~4.5s back to ~27s and past the deadline on a third of
+        // tasks, silently, because the call still succeeds when it fits.
+        assert_eq!(env_of(&cmd, "MAX_THINKING_TOKENS").as_deref(), Some("0"));
     }
 
     /// Same contract on the codex side: these flags are what make the call fast and hermetic, and

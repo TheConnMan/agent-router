@@ -20,12 +20,41 @@ Two rules govern the whole file:
   commands fail rather than silently substituting defaults. Routing jobs against ceilings and a
   connector inventory the operator never wrote would be worse than refusing to run.
 
+## `config_version` and in-place migrations
+
+Because the file is generated rather than hand-authored, a value this tool once wrote can go stale
+in every existing install while the default constant in the source moves on. `config_version` is
+the marker that lets those be corrected exactly once.
+
+On load, a file stamped below the current version is migrated and rewritten in place, then stamped.
+A migration only ever touches a value still equal to the default this tool used to generate;
+anything else is left alone.
+
+**On a file with no stamp, that test is a guess, and it can guess wrong.** A `30` you typed
+yourself is indistinguishable from the `30` the tool generated, so a v1 migration will move it. It
+is a one-time, one-value cost, and it errs toward more headroom rather than less, but it is real:
+if you had deliberately pinned the old default before upgrading, re-pin it after.
+
+After that first stamp the ambiguity is gone for good. A migration runs once per file, so setting a
+migrated value back is permanent, and nothing will move it again. That is the whole reason migrations
+are keyed on the stamp and not on the value: a value-keyed migration would re-apply on every single
+load, and restoring the old default would be impossible rather than merely inconvenient.
+
+Two consequences worth knowing. The rewrite serializes the whole config, so hand-added comments in
+the file are lost the one time a migration runs. And a file with no `config_version` key is treated
+as predating versioning, so do not delete the key to "reset" anything.
+
+| version | migration |
+| --- | --- |
+| 1 | `classifier_timeout_secs` of `30`, the old generated default, becomes `60`. Any other value is left alone. |
+
 ## Defaults in full
 
 ```toml
+config_version = 1
 hard_ceiling_pct = 97.0
 headroom_flip_gap = 25.0
-classifier_timeout_secs = 30
+classifier_timeout_secs = 60
 connectors = [
     "local shell",
     "git",
@@ -80,12 +109,14 @@ is tagged `headroom_tiebreak`. Raising it makes routing respect the rubric more 
 
 ### `classifier_timeout_secs`
 
-Default `30`. How long the classifier call may take before it counts as failed.
+Default `60`. How long the classifier call may take before it counts as failed.
 
-A failed classifier is not fatal. The configured `default_provider` stays in force, complexity
-reads as `high`, and the decision is tagged `classifier_failed`. The default is viable only because
-the classifier invocation strips CLI startup cost; see the note in `classify.rs` for the measured
-numbers behind that.
+A failed classifier is not fatal, but it is not cheap either: the configured `default_provider`
+stays in force, complexity reads as `high`, and the decision is tagged `classifier_failed`, so a
+timeout can pick both the wrong provider and the top model tier. The measured call is 3.4-7.0s, so
+this default is headroom for a slow tail rather than a target. It is viable only because the
+classifier invocation strips both CLI startup cost and the model's thinking tokens; see the note in
+`classify.rs` for the measured numbers behind that.
 
 ### `connectors`
 
