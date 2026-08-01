@@ -97,7 +97,11 @@ work.
 Usage reading fails open by design. A missing credential file, an unreachable API, or an
 unparseable payload all read as full headroom, because a usage read must never be the thing that
 blocks a dispatch. The consequence is worth knowing: if Claude credentials cannot be read, Claude
-looks completely unused and will win every headroom tiebreak.
+looks completely unused and will win every headroom tiebreak. A fail open read and a genuinely idle
+provider report the same numbers, so the router records which one it got rather than leaving it to
+be inferred: `agent-router doctor` reports every read as `live` or `fail-open` and exits nonzero on a
+fail open one, `agent-router usage` names the same source per provider, and every decision row
+records `claude_usage_stale` and `codex_usage_stale`. Routing itself is unchanged by the marker.
 
 Usage comes from:
 
@@ -157,15 +161,63 @@ Weekly and 5 hour headroom for both providers.
 
 ```bash
 $ agent-router usage
-provider  5h      weekly  weekly reset
-claude     12.4%   58.1%  in 41h07m
-codex       3.0%   22.7%  in 96h12m
+provider  5h      weekly  source     weekly reset
+claude     12.4%   58.1%  live       in 41h07m
+codex       0.0%    0.0%  fail-open  -
 ```
+
+`source` is where the numbers came from: `live` for a parsed payload, `fail-open` for a read that
+found nothing and defaulted to full headroom. Those two zeroes above are the fail open default, not
+a measurement, and they are exactly what a genuinely idle provider also reports, so the source
+column is the only thing on the line that separates them.
 
 The weekly window is what places a single job: it decides which provider has room for the task in
 front of the router. Claude's 5 hour window is what paces a stream of them, moving work away from
 Claude once its 5 hour percent reaches `claude_five_hour_pacing_pct` and Codex still has weekly
 room. Codex's own 5 hour number is reported here for the operator and never influences routing.
+
+### `doctor`
+
+Preflight the environment the router routes from, one line per check.
+
+```bash
+$ agent-router doctor
+pass claude_on_path      claude at /home/you/.local/bin/claude
+fail claude_credentials  /home/you/.claude/.credentials.json has no /claudeAiOauth/accessToken
+fail claude_usage        fail-open, so the provider reads as completely unused whatever it has spent
+pass codex_on_path       codex at /home/you/.local/bin/codex
+pass codex_app_server    the app-server daemon answers
+pass codex_rate_limits   live, read from the provider's own source
+warn opencode_on_path    no executable opencode on PATH, so any dispatch to it will error
+pass config_parses       absent, defaults apply (/home/you/.config/agent-router/config.toml)
+pass log_writable        /home/you/.local/state/agent-router/router.db takes a write
+```
+
+| Check | What it covers |
+| --- | --- |
+| `claude_on_path` | An executable `claude` on `PATH`. The classifier runs on every auto route, so this is exercised even when every task ends up on Codex. |
+| `claude_credentials` | `~/.claude/.credentials.json` exists, parses, and carries `/claudeAiOauth/accessToken`. Without it the usage reader has nothing to authenticate with. |
+| `claude_usage` | Whether the Claude usage read was live or fell open. |
+| `codex_on_path` | An executable `codex` on `PATH`. |
+| `codex_app_server` | The app-server daemon answers, which is the transport every Codex dispatch goes through. |
+| `codex_rate_limits` | Whether the Codex usage read was live or fell open. |
+| `opencode_on_path` | An executable `opencode` on `PATH`. |
+| `config_parses` | The config file parses, read directly so a diagnostic never creates the file it was asked to report on. An absent file is a pass: the router runs on the same defaults. |
+| `log_writable` | The decision log opens and takes an actual write. Opening alone proves nothing, because the schema batch is all `IF NOT EXISTS` and can succeed on a database the next dispatch cannot write to. |
+
+One rule decides the severity. **Fail** means the router would keep running on inputs it cannot
+trust, or could not run at all: a missing classifier, unreadable credentials, a usage number that is
+a default rather than a reading, a config file that does not parse, a log that cannot take a row.
+**Warn** means a degraded path that fails loudly at the moment it is used, so nothing routes wrongly
+because of it: a missing `codex` or `opencode` binary, or a daemon that does not answer, all error
+at dispatch time rather than quietly changing where work lands.
+
+Exit code is `0` when every check is pass or warn, `1` when any check fails. A missing `opencode` is
+never a failure: it is a provider the router can route to on request, not one it needs, so
+installing it or not never moves the exit code.
+
+Both usage checks come from a single usage read, so doctor asks each provider once and its two
+lines cannot disagree about the same read.
 
 ### `log`
 

@@ -52,6 +52,11 @@ pub struct Row {
     pub job_name: Option<String>,
     pub outcome: String,
     pub rationale: String,
+    /// Whether the Claude usage numbers on this row came from a fail open read rather than a live
+    /// one. None for a row written before the marker, which is not the same as a live read.
+    pub claude_usage_stale: Option<bool>,
+    /// The same for Codex.
+    pub codex_usage_stale: Option<bool>,
 }
 
 /// One row as the stats reader needs it: the columns a metric is derived from, nothing else.
@@ -96,6 +101,8 @@ CREATE TABLE IF NOT EXISTS decisions (
     codex_five_hour_reset  INTEGER NOT NULL,
     codex_weekly_pct       REAL NOT NULL,
     codex_weekly_reset     INTEGER NOT NULL,
+    claude_usage_stale     INTEGER,
+    codex_usage_stale      INTEGER,
     dry_run             INTEGER NOT NULL,
     job_id              TEXT,
     job_name            TEXT,
@@ -107,7 +114,8 @@ CREATE INDEX IF NOT EXISTS decisions_created_at ON decisions(created_at_ms);
 const SELECT_COLUMNS: &str = "\
 id, created_at_ms, task, dir, requested, provider, model, effort, verdict, confidence, \
 codex_ready_count, claude_signal_count, missing_connector, gates, claude_weekly_pct, \
-codex_weekly_pct, dry_run, job_id, job_name, outcome, rationale, complexity";
+codex_weekly_pct, dry_run, job_id, job_name, outcome, rationale, complexity, \
+claude_usage_stale, codex_usage_stale";
 
 /// The narrower list the stats reader needs, so a report never pays for columns it drops.
 const STATS_COLUMNS: &str = "created_at_ms, requested, provider, complexity, gates, dry_run";
@@ -135,6 +143,30 @@ impl DecisionLog {
         Ok(DecisionLog { conn })
     }
 
+    /// IMPURE: prove the log can actually be written.
+    ///
+    /// `open()` alone does not prove it: its schema batch is entirely `CREATE ... IF NOT EXISTS`,
+    /// so against a database whose objects all already exist it satisfies every statement without
+    /// ever taking a write lock, and returns `Ok` on a database the next `record()` fails on.
+    ///
+    /// A lock only probe does not prove it either, which is why this writes. Measured against a
+    /// 0o444 database file: `CREATE TABLE IF NOT EXISTS` succeeds, `BEGIN IMMEDIATE` succeeds, and
+    /// only an actual write raises "attempt to write a readonly database". So the probe creates a
+    /// throwaway table inside a transaction and rolls it back, which is a genuine write against a
+    /// database that leaves behind no table, no row, and no schema change.
+    pub fn probe_writable(&self) -> Result<()> {
+        let probe = self.conn.execute_batch(
+            "BEGIN IMMEDIATE; CREATE TABLE agent_router_write_probe (id INTEGER); ROLLBACK;",
+        );
+        if probe.is_err() {
+            // The batch stops at the failing statement, so the transaction it opened is still
+            // open on this connection and has to be closed before the connection is reused.
+            let _ = self.conn.execute_batch("ROLLBACK;");
+        }
+        probe?;
+        Ok(())
+    }
+
     /// Append one decision. Returns its row id.
     pub fn record(&self, entry: &Entry) -> Result<i64> {
         let decision = entry.decision;
@@ -148,10 +180,10 @@ impl DecisionLog {
                 claude_five_hour_pct, claude_five_hour_reset, claude_weekly_pct,
                 claude_weekly_reset, codex_five_hour_pct, codex_five_hour_reset,
                 codex_weekly_pct, codex_weekly_reset, dry_run, job_id, job_name, outcome,
-                complexity
+                complexity, claude_usage_stale, codex_usage_stale
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29
+                ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31
             )",
             rusqlite::params![
                 now_ms(),
@@ -183,6 +215,8 @@ impl DecisionLog {
                 entry.job_name,
                 entry.outcome,
                 classification.map(|c| c.complexity.tag()),
+                usage.claude.stale,
+                usage.codex.stale,
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -295,6 +329,8 @@ impl DecisionLog {
                     outcome: row.get(19)?,
                     rationale: row.get(20)?,
                     complexity: row.get(21)?,
+                    claude_usage_stale: row.get(22)?,
+                    codex_usage_stale: row.get(23)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<Row>>>()?;
@@ -302,14 +338,28 @@ impl DecisionLog {
     }
 }
 
-/// IMPURE: bring a database written before complexity scaling up to the current schema. Guarded
-/// on the column being absent, because `ALTER TABLE ADD COLUMN` is an error when it is not.
+/// Every column added to `decisions` after the first shipped schema, with its declared type. Each
+/// one is nullable, so the fresh schema and the migration below produce the same table shape and a
+/// row written before the column reads back as "this row does not know".
+const MISSING_COLUMNS: [(&str, &str); 3] = [
+    ("complexity", "TEXT"),
+    ("claude_usage_stale", "INTEGER"),
+    ("codex_usage_stale", "INTEGER"),
+];
+
+/// IMPURE: bring a database written before any of those columns up to the current schema. Guarded
+/// on each column being absent, because `ALTER TABLE ADD COLUMN` is an error when it is not.
 fn add_missing_columns(conn: &Connection) -> Result<()> {
-    let present: bool = conn
-        .prepare("SELECT 1 FROM pragma_table_info('decisions') WHERE name = 'complexity'")?
-        .exists([])?;
-    if !present {
-        conn.execute("ALTER TABLE decisions ADD COLUMN complexity TEXT", [])?;
+    for (name, declared_type) in MISSING_COLUMNS {
+        let present: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('decisions') WHERE name = ?1")?
+            .exists([name])?;
+        if !present {
+            conn.execute(
+                &format!("ALTER TABLE decisions ADD COLUMN {name} {declared_type}"),
+                [],
+            )?;
+        }
     }
     Ok(())
 }
@@ -375,6 +425,7 @@ mod tests {
                 five_hour_reset_epoch: 1_785_375_600,
                 weekly_pct: 50.0,
                 weekly_reset_epoch: 1_785_589_200,
+                stale: false,
             },
             codex: Headroom {
                 weekly_pct: 71.0,

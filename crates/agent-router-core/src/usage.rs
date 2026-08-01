@@ -3,6 +3,11 @@
 //!
 //! Both readers FAIL OPEN: any missing file, network failure, or unparseable payload reads as
 //! full headroom, because a usage read must never be the thing that blocks a dispatch.
+//!
+//! Every fail open value carries `stale = true`, and only a parsed payload carries `stale = false`.
+//! Numerically a fail open read and a genuinely idle provider are the same two zeroes, so the flag
+//! is the only thing that separates them. `agent-router doctor` reports it as `live` or
+//! `fail-open`, and the decision log records it per provider on every row.
 
 use crate::runtime::{default_codex_home, home_dir};
 use std::path::{Path, PathBuf};
@@ -29,16 +34,23 @@ pub struct Headroom {
     pub five_hour_reset_epoch: i64,
     pub weekly_pct: f64,
     pub weekly_reset_epoch: i64,
+    /// True when this is the fail open default rather than a live read. A fail open read is
+    /// indistinguishable from a genuinely idle provider by its numbers alone, and an idle looking
+    /// provider wins every headroom tiebreak, so the distinction is recorded rather than inferred.
+    pub stale: bool,
 }
 
 impl Headroom {
-    /// The fail-open value: nothing consumed, no known resets.
+    /// The fail-open value: nothing consumed, no known resets. `stale` is what makes this
+    /// distinguishable from a live read of a provider that has genuinely consumed nothing, which
+    /// reports the same numbers.
     pub const fn full() -> Headroom {
         Headroom {
             five_hour_pct: 0.0,
             five_hour_reset_epoch: 0,
             weekly_pct: 0.0,
             weekly_reset_epoch: 0,
+            stale: true,
         }
     }
 
@@ -118,6 +130,7 @@ pub fn parse_claude_usage(body: &str) -> Option<Headroom> {
         five_hour_reset_epoch: five_hour.and_then(resets_at_epoch).unwrap_or(0),
         weekly_pct: utilization(seven_day).unwrap_or(0.0),
         weekly_reset_epoch: resets_at_epoch(seven_day).unwrap_or(0),
+        stale: false,
     })
 }
 
@@ -248,6 +261,7 @@ pub fn parse_codex_rate_limits(line: &str, now: i64) -> Option<Headroom> {
         five_hour_reset_epoch,
         weekly_pct,
         weekly_reset_epoch,
+        stale: false,
     })
 }
 

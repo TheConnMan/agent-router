@@ -200,6 +200,13 @@ fn probe_daemon() -> Option<Daemon> {
     parse_daemon_version(&stdout)
 }
 
+/// IMPURE: start the app-server daemon if it is not already running, and report whether it answers.
+/// The daemon is what every Codex dispatch goes through, so this is the same path a dispatch takes,
+/// minus the thread it would start.
+pub fn app_server_status() -> std::result::Result<(), String> {
+    ensure_daemon().map(|_| ())
+}
+
 fn ensure_daemon() -> std::result::Result<Daemon, String> {
     if let Some(daemon) = probe_daemon() {
         return Ok(daemon);
