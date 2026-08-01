@@ -1,5 +1,5 @@
 //! Aggregate metrics over a window of decision log rows: what routed where, which gates fired,
-//! and how often a verdict was overridden.
+//! and how often a route was moved off the provider it started on.
 //!
 //! The fold happens in Rust over the rows one query returned, not in SQL aggregates. The `gates`
 //! column is a comma joined string, so a SQL `LIKE '%tag%'` count reads a tag that is a prefix of
@@ -10,11 +10,16 @@ use crate::error::{Error, Result};
 use crate::log::{DecisionLog, StatsRow};
 use std::collections::BTreeMap;
 
-/// The gates that move a task off the provider its verdict named. Any new provider moving gate
-/// belongs here, or the flip rate silently under reports the moment it starts firing.
-const FLIP_GATES: [&str; 3] = [
+/// The gates that move a task off the provider it started on. Any new provider moving gate belongs
+/// here, or the flip rate silently under reports the moment it starts firing.
+///
+/// `headroom_tiebreak` is retired and no decision made since carries it, but it stays in this list
+/// because 45 rows already in the log do, and a report over a window that reaches back into them
+/// must count the routes that really did move.
+const FLIP_GATES: [&str; 4] = [
     "flipped_on_exhaustion",
     "headroom_tiebreak",
+    "pace_flip",
     "five_hour_pacing",
 ];
 
@@ -71,7 +76,7 @@ pub struct Stats {
     /// Complexity tier to its count, with unscored rows counted as `unscored`.
     pub complexity: BTreeMap<String, usize>,
     pub auto_routes: usize,
-    /// Rows whose route moved off the provider the verdict named, over auto routes.
+    /// Rows whose route moved off the provider it started on, over auto routes.
     pub flip_rate: Rate,
     /// Rows whose classifier could not answer, over auto routes.
     pub classifier_failure_rate: Rate,
@@ -108,7 +113,7 @@ pub fn summarize(rows: &[StatsRow]) -> Stats {
             dry_runs += 1;
         }
 
-        // An explicitly routed row never had a verdict to flip and never ran the classifier, so it
+        // An explicitly routed row never ran a usage rule and never ran the classifier, so it
         // belongs in neither of those denominators.
         if row.requested == AUTO {
             auto_routes += 1;
