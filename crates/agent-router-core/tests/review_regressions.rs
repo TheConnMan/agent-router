@@ -1,35 +1,9 @@
-use agent_router_core::classify::{Classification, Complexity, Confidence, Verdict};
+//! Regressions found in review, over the parity scanner. The routing regression this file also
+//! carried is now in `pace_routing.rs`, where the whole ceiling rule lives.
+
 use agent_router_core::config::Config;
-use agent_router_core::decide::{Gate, decide};
 use agent_router_core::parity::{Status, check};
-use agent_router_core::{Headroom, Provider, UsageSnapshot};
 use std::path::{Path, PathBuf};
-
-fn usage(codex_weekly: f64, claude_weekly: f64) -> UsageSnapshot {
-    UsageSnapshot {
-        codex: Headroom {
-            weekly_pct: codex_weekly,
-            ..Headroom::full()
-        },
-        claude: Headroom {
-            weekly_pct: claude_weekly,
-            ..Headroom::full()
-        },
-    }
-}
-
-fn scored(verdict: Verdict, confidence: Confidence) -> Classification {
-    Classification {
-        codex_ready: [true; 6],
-        claude_signals: [false; 6],
-        missing_connector: false,
-        verdict,
-        confidence,
-        complexity: Complexity::High,
-        rationale: "fixture".to_string(),
-        classifier_failed: false,
-    }
-}
 
 fn write(path: &Path, contents: &str) {
     if let Some(parent) = path.parent() {
@@ -49,28 +23,6 @@ fn empty_home(parent: &Path) -> PathBuf {
     let home = parent.join("empty_home");
     std::fs::create_dir_all(&home).expect("create empty home");
     home
-}
-
-#[test]
-fn both_providers_over_ceiling_prevent_small_gap_flips_in_both_directions() {
-    let config = Config {
-        headroom_flip_gap: 0.5,
-        ..Config::default()
-    };
-
-    for (verdict, expected, codex_weekly, claude_weekly) in [
-        (Verdict::Codex, Provider::Codex, 99.0, 98.0),
-        (Verdict::Claude, Provider::Claude, 98.0, 99.0),
-    ] {
-        let decision = decide(
-            scored(verdict, Confidence::Medium),
-            usage(codex_weekly, claude_weekly),
-            &config,
-        );
-
-        assert_eq!(decision.provider, expected);
-        assert_eq!(decision.gates, vec![Gate::OverCeiling]);
-    }
 }
 
 #[test]

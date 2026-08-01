@@ -43,13 +43,24 @@ pub struct Row {
     /// The reasoning effort the router decided, which nothing currently sets. Not the effort the
     /// job ran at: that is `effective_effort` below.
     pub effort: Option<String>,
+    /// The four scores the classifier no longer produces. Kept on the read model because the rows
+    /// already in the database carry them and are the corpus every backtest replays; None on
+    /// every row written since, and on an explicit provider.
     pub verdict: Option<String>,
     pub confidence: Option<String>,
-    /// None for a row written before complexity scaling, and for an explicit provider.
-    pub complexity: Option<String>,
     pub codex_ready_count: Option<i64>,
     pub claude_signal_count: Option<i64>,
+    /// None for a row written before complexity scaling, and for an explicit provider.
+    pub complexity: Option<String>,
+    /// The capability pin the classifier does still produce. None on a row written before it, and
+    /// on an explicit provider.
+    pub orchestration: Option<bool>,
     pub missing_connector: Option<bool>,
+    /// How far ahead of its own weekly window each provider was burning when this decision was
+    /// made, in points. None on a row written before the override, on an explicit provider, and on
+    /// a row whose reset was never read.
+    pub claude_pace_delta: Option<f64>,
+    pub codex_pace_delta: Option<f64>,
     pub gates: String,
     pub claude_weekly_pct: f64,
     pub codex_weekly_pct: f64,
@@ -171,7 +182,10 @@ CREATE TABLE IF NOT EXISTS decisions (
     codex_ready_count   INTEGER,
     claude_signals      TEXT,
     claude_signal_count INTEGER,
+    orchestration       INTEGER,
     missing_connector   INTEGER,
+    claude_pace_delta   REAL,
+    codex_pace_delta    REAL,
     gates               TEXT    NOT NULL,
     rationale           TEXT    NOT NULL,
     claude_five_hour_pct   REAL NOT NULL,
@@ -196,11 +210,14 @@ CREATE TABLE IF NOT EXISTS decisions (
 CREATE INDEX IF NOT EXISTS decisions_created_at ON decisions(created_at_ms);
 ";
 
+/// The retired score columns are still selected, because the rows written under them are the
+/// corpus and reading them back through the tool is the only way to see one.
 const SELECT_COLUMNS: &str = "\
 id, created_at_ms, task, dir, requested, provider, model, effort, verdict, confidence, \
 codex_ready_count, claude_signal_count, missing_connector, gates, claude_weekly_pct, \
 codex_weekly_pct, dry_run, job_id, job_name, outcome, rationale, complexity, \
-claude_usage_stale, codex_usage_stale, reconciled_at_ms, mark, note, effective_effort";
+claude_usage_stale, codex_usage_stale, orchestration, claude_pace_delta, codex_pace_delta, \
+reconciled_at_ms, mark, note, effective_effort";
 
 /// The narrower list the stats reader needs, so a report never pays for columns it drops.
 const STATS_COLUMNS: &str = "created_at_ms, requested, provider, complexity, gates, dry_run";
@@ -266,18 +283,21 @@ impl DecisionLog {
         let decision = entry.decision;
         let classification = decision.classification.as_ref();
         let usage = &decision.usage;
+        // The retired score columns are not in this list on purpose. They stay in the table so the
+        // recorded corpus keeps its scores, but writing a placeholder into them would make a new
+        // row indistinguishable from an old one that genuinely scored zero.
         self.conn.execute(
             "INSERT INTO decisions (
-                created_at_ms, task, dir, requested, provider, model, effort, verdict,
-                confidence, codex_ready, codex_ready_count, claude_signals,
-                claude_signal_count, missing_connector, gates, rationale,
+                created_at_ms, task, dir, requested, provider, model, effort,
+                orchestration, missing_connector, gates, rationale,
                 claude_five_hour_pct, claude_five_hour_reset, claude_weekly_pct,
                 claude_weekly_reset, codex_five_hour_pct, codex_five_hour_reset,
                 codex_weekly_pct, codex_weekly_reset, dry_run, job_id, job_name, outcome,
-                complexity, claude_usage_stale, codex_usage_stale, effective_effort
+                complexity, claude_usage_stale, codex_usage_stale,
+                claude_pace_delta, codex_pace_delta, effective_effort
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32
+                ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29
             )",
             rusqlite::params![
                 now_ms(),
@@ -287,12 +307,7 @@ impl DecisionLog {
                 decision.provider.name(),
                 decision.model,
                 decision.effort,
-                classification.map(|c| format!("{:?}", c.verdict).to_lowercase()),
-                classification.map(|c| format!("{:?}", c.confidence).to_lowercase()),
-                classification.map(|c| bits(&c.codex_ready)),
-                classification.map(|c| c.codex_ready_count() as i64),
-                classification.map(|c| bits(&c.claude_signals)),
-                classification.map(|c| c.claude_signal_count() as i64),
+                classification.map(|c| c.orchestration),
                 classification.map(|c| c.missing_connector),
                 decision.gate_tags().join(","),
                 decision.rationale,
@@ -311,6 +326,8 @@ impl DecisionLog {
                 classification.map(|c| c.complexity.tag()),
                 usage.claude.stale,
                 usage.codex.stale,
+                decision.claude_pace_delta,
+                decision.codex_pace_delta,
                 entry.effective_effort,
             ],
         )?;
@@ -489,10 +506,13 @@ impl DecisionLog {
                     complexity: row.get(21)?,
                     claude_usage_stale: row.get(22)?,
                     codex_usage_stale: row.get(23)?,
-                    reconciled_at_ms: row.get(24)?,
-                    mark: row.get(25)?,
-                    note: row.get(26)?,
-                    effective_effort: row.get(27)?,
+                    orchestration: row.get(24)?,
+                    claude_pace_delta: row.get(25)?,
+                    codex_pace_delta: row.get(26)?,
+                    reconciled_at_ms: row.get(27)?,
+                    mark: row.get(28)?,
+                    note: row.get(29)?,
+                    effective_effort: row.get(30)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<Row>>>()?;
@@ -507,10 +527,13 @@ impl DecisionLog {
 /// Same columns, different physical order: `SCHEMA` places these mid table while `ALTER TABLE ADD
 /// COLUMN` can only append them, so a fresh and a migrated database disagree on every ordinal and
 /// every read must name the columns it wants rather than `SELECT *` or a `pragma_table_info` index.
-const MISSING_COLUMNS: [(&str, &str); 7] = [
+const MISSING_COLUMNS: [(&str, &str); 10] = [
     ("complexity", "TEXT"),
     ("claude_usage_stale", "INTEGER"),
     ("codex_usage_stale", "INTEGER"),
+    ("orchestration", "INTEGER"),
+    ("claude_pace_delta", "REAL"),
+    ("codex_pace_delta", "REAL"),
     ("reconciled_at_ms", "INTEGER"),
     ("mark", "TEXT"),
     ("note", "TEXT"),
@@ -563,28 +586,23 @@ fn restrict_to_owner(_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// PURE: the six rubric booleans as "101010", the compact shape a human reads in a sqlite dump.
-fn bits(flags: &[bool; 6]) -> String {
-    flags
-        .iter()
-        .map(|held| if *held { '1' } else { '0' })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::classify::{Classification, Complexity, Confidence, Verdict};
+    use crate::classify::{Classification, Complexity};
     use crate::config::Config;
     use crate::usage::{Headroom, UsageSnapshot};
 
+    /// The instant the fixture decision is made at, chosen to sit before both recorded resets so
+    /// each provider's weekly window is genuinely part elapsed. The percentages below then put the
+    /// two providers within the dead zone of each other, so this fixture records a decision no
+    /// rule moved: what is under test here is the round trip, not the routing.
+    const NOW: i64 = 1_785_400_000;
+
     fn decision() -> Decision {
         let classification = Classification {
-            codex_ready: [true, true, true, true, true, false],
-            claude_signals: [false, true, false, false, false, false],
+            orchestration: false,
             missing_connector: false,
-            verdict: Verdict::Codex,
-            confidence: Confidence::High,
             complexity: Complexity::Ultra,
             rationale: "bounded contract".to_string(),
             classifier_failed: false,
@@ -593,7 +611,7 @@ mod tests {
             claude: Headroom {
                 five_hour_pct: 11.0,
                 five_hour_reset_epoch: 1_785_375_600,
-                weekly_pct: 50.0,
+                weekly_pct: 60.0,
                 weekly_reset_epoch: 1_785_589_200,
                 stale: false,
             },
@@ -603,11 +621,11 @@ mod tests {
                 ..Headroom::full()
             },
         };
-        crate::decide::decide(classification, usage, &Config::default())
+        crate::decide::decide(classification, usage, NOW, &Config::default())
     }
 
     #[test]
-    fn a_recorded_decision_reads_back_with_its_rubric_scores_and_usage_snapshot() {
+    fn a_recorded_decision_reads_back_with_its_scores_and_usage_snapshot() {
         let dir = tempfile::tempdir().expect("tempdir");
         let log = DecisionLog::open_at(&dir.path().join("state/router.db")).expect("opens");
         let decision = decision();
@@ -631,14 +649,14 @@ mod tests {
         let row = &rows[0];
         assert_eq!(row.task, "audit the airtable records");
         assert_eq!(row.provider, "codex");
-        assert_eq!(row.verdict.as_deref(), Some("codex"));
-        assert_eq!(row.confidence.as_deref(), Some("high"));
         assert_eq!(row.complexity.as_deref(), Some("ultra"));
-        assert_eq!(row.codex_ready_count, Some(5));
-        assert_eq!(row.claude_signal_count, Some(1));
+        assert_eq!(row.orchestration, Some(false));
         assert_eq!(row.missing_connector, Some(false));
-        assert_eq!(row.claude_weekly_pct, 50.0);
+        assert_eq!(row.claude_weekly_pct, 60.0);
         assert_eq!(row.codex_weekly_pct, 71.0);
+        // Both resets were read, so both run rates travel with the row.
+        assert!(row.claude_pace_delta.is_some());
+        assert!(row.codex_pace_delta.is_some());
         assert_eq!(row.job_id.as_deref(), Some("thread-abc"));
         assert_eq!(row.outcome, "dispatched");
         assert!(!row.dry_run);
@@ -647,7 +665,7 @@ mod tests {
     }
 
     #[test]
-    fn the_raw_row_keeps_both_rubric_arrays_and_every_usage_field() {
+    fn the_raw_row_keeps_every_usage_field() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("router.db");
         let log = DecisionLog::open_at(&path).expect("opens");
@@ -665,30 +683,13 @@ mod tests {
         })
         .expect("records");
         let conn = rusqlite::Connection::open(&path).expect("reopen");
-        let (codex_ready, claude_signals, gates, five_hour, weekly_reset): (
-            String,
-            String,
-            String,
-            f64,
-            i64,
-        ) = conn
+        let (gates, five_hour, weekly_reset): (String, f64, i64) = conn
             .query_row(
-                "SELECT codex_ready, claude_signals, gates, claude_five_hour_pct, \
-                 codex_weekly_reset FROM decisions",
+                "SELECT gates, claude_five_hour_pct, codex_weekly_reset FROM decisions",
                 [],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                },
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .expect("query");
-        assert_eq!(codex_ready, "111110");
-        assert_eq!(claude_signals, "010000");
         assert_eq!(gates, "");
         assert_eq!(five_hour, 11.0);
         assert_eq!(weekly_reset, 1_785_908_348);
@@ -718,9 +719,11 @@ mod tests {
         .expect("records");
         let row = &log.recent(1).expect("reads")[0];
         assert_eq!(row.provider, "opencode");
-        assert_eq!(row.verdict, None);
-        assert_eq!(row.confidence, None);
-        assert_eq!(row.codex_ready_count, None);
+        assert_eq!(row.orchestration, None);
+        assert_eq!(row.missing_connector, None);
+        assert_eq!(row.complexity, None);
+        assert_eq!(row.claude_pace_delta, None);
+        assert_eq!(row.codex_pace_delta, None);
         assert_eq!(row.gates, "explicit_provider");
     }
 

@@ -639,22 +639,17 @@ fn log(
     }
     for row in &rows {
         println!(
-            "#{id} {provider}{dry} codex_ready {ready}/6 claude_signals {signals}/6 \
-             {confidence} {complexity} gates[{gates}] codex {codex:.0}% claude {claude:.0}% {job} \
+            "#{id} {provider}{dry} orchestration {orchestration} {complexity} \
+             pace claude {claude_pace} codex {codex_pace} \
+             gates[{gates}] codex {codex:.0}% claude {claude:.0}% {job} \
              {outcome}{judgement}",
             id = row.id,
             provider = row.provider,
             dry = if row.dry_run { " (dry run)" } else { "" },
             complexity = row.complexity.as_deref().unwrap_or("-"),
-            ready = row
-                .codex_ready_count
-                .map(|count| count.to_string())
-                .unwrap_or_else(|| "-".to_string()),
-            signals = row
-                .claude_signal_count
-                .map(|count| count.to_string())
-                .unwrap_or_else(|| "-".to_string()),
-            confidence = row.confidence.as_deref().unwrap_or("-"),
+            orchestration = flag(row.orchestration),
+            claude_pace = pace(row.claude_pace_delta),
+            codex_pace = pace(row.codex_pace_delta),
             gates = row.gates,
             codex = row.codex_weekly_pct,
             claude = row.claude_weekly_pct,
@@ -822,9 +817,15 @@ fn row_json(row: &Row) -> serde_json::Value {
         "verdict": row.verdict,
         "confidence": row.confidence,
         "complexity": row.complexity,
+        // Null on every row written since the classifier stopped scoring them. Still printed
+        // because the rows recorded under them are the corpus every backtest replays, and this is
+        // the only way to read one back through the tool.
         "codex_ready_count": row.codex_ready_count,
         "claude_signal_count": row.claude_signal_count,
+        "orchestration": row.orchestration,
         "missing_connector": row.missing_connector,
+        "claude_pace_delta": row.claude_pace_delta,
+        "codex_pace_delta": row.codex_pace_delta,
         "gates": row.gates,
         "claude_weekly_pct": row.claude_weekly_pct,
         "codex_weekly_pct": row.codex_weekly_pct,
@@ -842,6 +843,25 @@ fn row_json(row: &Row) -> serde_json::Value {
         "mark": row.mark,
         "note": row.note,
     })
+}
+
+/// A recorded boolean, or "-" when the row does not know. An older row scored no orchestration and
+/// an explicit route was never scored at all, and neither is the same as a scored false.
+fn flag(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "-",
+    }
+}
+
+/// A recorded run rate, signed so hot and cold read at a glance, or "-" when the reset behind it
+/// was never read and the override could not run.
+fn pace(delta: Option<f64>) -> String {
+    match delta {
+        Some(delta) => format!("{delta:+.0}"),
+        None => "-".to_string(),
+    }
 }
 
 /// The first line of a task, capped, so one log row stays one line.
