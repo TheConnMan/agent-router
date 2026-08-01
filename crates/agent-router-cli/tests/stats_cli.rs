@@ -30,7 +30,7 @@ const FLIP_GATES: [&str; 4] = [
 /// compiles, it lints, and every assertion below still passes. `expected_metrics` binds this list
 /// to the report's own fields, and the test asserts the whole key set rather than the presence of
 /// the keys this file happens to read, so neither half can drift alone.
-const METRICS: [&str; 10] = [
+const METRICS: [&str; 16] = [
     "rows_considered",
     "oldest_created_at_ms",
     "newest_created_at_ms",
@@ -41,6 +41,25 @@ const METRICS: [&str; 10] = [
     "flip_rate",
     "classifier_failure_rate",
     "dry_run_share",
+    "bad_rate_by_gate",
+    "bad_rate_by_provider",
+    "bad_rate_by_complexity",
+    "failure_rate_by_gate",
+    "failure_rate_by_provider",
+    "failure_rate_by_complexity",
+];
+
+/// The six breakdowns commit 4 publishes, in the two families they belong to. Every one of them is
+/// a map from a key to a rate carrying its own numerator and denominator.
+const BAD_RATES: [&str; 3] = [
+    "bad_rate_by_gate",
+    "bad_rate_by_provider",
+    "bad_rate_by_complexity",
+];
+const FAILURE_RATES: [&str; 3] = [
+    "failure_rate_by_gate",
+    "failure_rate_by_provider",
+    "failure_rate_by_complexity",
 ];
 
 /// The codex rollout directory each invocation scans. Idle is empty, so codex reads as fail open
@@ -221,6 +240,21 @@ impl StatsFixture {
             .output()
             .expect("run the router")
     }
+
+    /// One human judgement on one row, through the same `log --mark` path an operator uses, so the
+    /// value under test reached the column the way a real one does.
+    fn mark(&self, id: i64, mark: &str) {
+        let output = self
+            .router(IDLE)
+            .args(["log", "--mark", &id.to_string(), mark])
+            .output()
+            .expect("run the router");
+        assert!(
+            output.status.success(),
+            "marking #{id} {mark} failed, stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 fn text(row: &Value, key: &str) -> String {
@@ -270,6 +304,37 @@ fn object_counts(stats: &Value, key: &str) -> BTreeMap<String, usize> {
         .collect()
 }
 
+/// One published breakdown, as key to numerator and denominator. The share is deliberately not
+/// read here: the two counts are what a reader checks by hand, and the share is checked against
+/// them separately.
+fn rate_map(stats: &Value, key: &str) -> BTreeMap<String, (u64, u64)> {
+    stats[key]
+        .as_object()
+        .unwrap_or_else(|| panic!("stats --json must carry a {key} object"))
+        .iter()
+        .map(|(name, rate)| {
+            let counts = (
+                rate["numerator"]
+                    .as_u64()
+                    .unwrap_or_else(|| panic!("{key}.{name} must carry a numerator")),
+                rate["denominator"]
+                    .as_u64()
+                    .unwrap_or_else(|| panic!("{key}.{name} must carry a denominator")),
+            );
+            (name.clone(), counts)
+        })
+        .collect()
+}
+
+/// The id the log gave the row that logged this task.
+fn row_id(rows: &[Value], task: &str) -> i64 {
+    rows.iter()
+        .find(|row| text(row, "task") == task)
+        .unwrap_or_else(|| panic!("no logged row for {task:?}"))["id"]
+        .as_i64()
+        .expect("a log row must carry an id")
+}
+
 /// The key set `stats --json` must print, derived by destructuring the report exhaustively. The
 /// pattern carries no `..`, so a field added to `Stats` stops this file from compiling until the
 /// metric is named here, and the assertion in the test then requires the CLI to print it too.
@@ -285,6 +350,12 @@ fn expected_metrics() -> BTreeSet<String> {
         flip_rate: _,
         classifier_failure_rate: _,
         dry_run_share: _,
+        bad_rate_by_gate: _,
+        bad_rate_by_provider: _,
+        bad_rate_by_complexity: _,
+        failure_rate_by_gate: _,
+        failure_rate_by_provider: _,
+        failure_rate_by_complexity: _,
     } = Stats::default();
     METRICS.iter().map(|key| key.to_string()).collect()
 }
@@ -418,6 +489,176 @@ fn stats_json_reconciles_with_the_log_json_it_summarises() {
     );
 }
 
+/// Commit 4's acceptance criterion through the real binary: the bad rates `stats --json` publishes
+/// reconcile against the rows `log --json` prints, over a window this fixture marked itself with
+/// `log --mark`.
+///
+/// Six rows are logged and four are judged: the explicit claude route `bad`, the explicit opencode
+/// route `good`, the unclassifiable route `bad`, and the low complexity route `good`. The medium
+/// and ultra routes are left unmarked on purpose, because an unjudged row is the case the whole
+/// denominator rule exists for.
+#[test]
+fn stats_json_emits_a_bad_rate_by_gate_that_reconciles_against_the_marked_rows() {
+    let fixture = StatsFixture::new();
+    fixture.dry_run(SCORED_LOW, None, IDLE);
+    fixture.dry_run(SCORED_ULTRA, None, IDLE);
+    fixture.dry_run(SCORED_MEDIUM, None, IDLE);
+    fixture.dry_run(CLASSIFIER_FAILS, None, IDLE);
+    fixture.dry_run("explicitly on claude", Some("claude"), IDLE);
+    fixture.dry_run("explicitly on opencode", Some("opencode"), IDLE);
+
+    let logged: Vec<Value> = fixture
+        .json(&["log", "--json", "--limit", "200"])
+        .as_array()
+        .expect("log --json prints an array")
+        .clone();
+    assert_eq!(logged.len(), 6, "the fixture must have recorded six rows");
+
+    fixture.mark(row_id(&logged, "explicitly on claude"), "bad");
+    fixture.mark(row_id(&logged, "explicitly on opencode"), "good");
+    fixture.mark(row_id(&logged, CLASSIFIER_FAILS), "bad");
+    fixture.mark(row_id(&logged, SCORED_LOW), "good");
+
+    let rows: Vec<Value> = fixture
+        .json(&["log", "--json", "--limit", "200"])
+        .as_array()
+        .expect("log --json prints an array")
+        .clone();
+    let stats = fixture.json(&["stats", "--json"]);
+
+    assert_eq!(
+        top_level_keys(&stats),
+        expected_metrics(),
+        "stats --json must publish every metric and nothing else"
+    );
+
+    // Four marks landed and two of them are bad, so a report reading anything else is summarizing
+    // a different log than the one `log --json` just printed.
+    let marked = rows.iter().filter(|row| !row["mark"].is_null()).count();
+    let bad = rows.iter().filter(|row| row["mark"] == "bad").count();
+    assert_eq!((bad, marked), (2, 4));
+
+    // The counts a reader can check by hand. Two rows named their provider, so both carry
+    // `explicit_provider` and both are judged, one bad: 1 of 2. One row could not be classified,
+    // it is judged bad, and no other row carries that tag: 1 of 1. Complexity is the classifier's
+    // own answer, so the two explicit rows are unscored and the unclassifiable one reads high.
+    let by_gate = rate_map(&stats, "bad_rate_by_gate");
+    assert_eq!(by_gate.get("explicit_provider").copied(), Some((1, 2)));
+    assert_eq!(by_gate.get("classifier_failed").copied(), Some((1, 1)));
+    let by_complexity = rate_map(&stats, "bad_rate_by_complexity");
+    assert_eq!(by_complexity.get("unscored").copied(), Some((1, 2)));
+    assert_eq!(by_complexity.get("high").copied(), Some((1, 1)));
+    assert_eq!(by_complexity.get("low").copied(), Some((0, 1)));
+    // The ultra and medium rows are the only ones at their tier and neither is judged, so neither
+    // tier has a bad rate at all. Counting an unjudged row as good would report 0 of 1 here.
+    assert_eq!(by_complexity.get("ultra").copied(), Some((0, 0)));
+    assert_eq!(by_complexity.get("medium").copied(), Some((0, 0)));
+    assert_eq!(
+        stats["bad_rate_by_complexity"]["ultra"]["share"],
+        Value::Null
+    );
+    assert_eq!(stats["bad_rate_by_gate"]["explicit_provider"]["share"], 0.5);
+    // Only an explicit route reaches opencode, and that one is judged good.
+    assert_eq!(
+        rate_map(&stats, "bad_rate_by_provider")
+            .get("opencode")
+            .copied(),
+        Some((0, 1))
+    );
+
+    // The whole of every bad rate, recomputed from the rows the log printed rather than read back
+    // out of the report. Which provider each auto row landed on depends on this box's own usage
+    // numbers, so the provider map is reconciled rather than pinned.
+    let mut want_gate: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+    let mut want_provider: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+    let mut want_complexity: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+    for row in &rows {
+        let judged = !row["mark"].is_null();
+        let is_bad = row["mark"] == "bad";
+        let count = |into: &mut BTreeMap<String, (u64, u64)>, key: String| {
+            let counts = into.entry(key).or_insert((0, 0));
+            if judged {
+                counts.1 += 1;
+                if is_bad {
+                    counts.0 += 1;
+                }
+            }
+        };
+        for tag in gate_tags(row) {
+            count(&mut want_gate, tag);
+        }
+        count(&mut want_provider, text(row, "provider"));
+        count(&mut want_complexity, complexity_tag(row));
+    }
+    assert_eq!(by_gate, want_gate);
+    assert_eq!(rate_map(&stats, "bad_rate_by_provider"), want_provider);
+    assert_eq!(by_complexity, want_complexity);
+
+    // Every key of every breakdown is a key of the distribution it breaks down, so a rate nobody
+    // has judged is visible as a null share rather than as a missing key.
+    for metric in BAD_RATES.iter().chain(&FAILURE_RATES) {
+        let distribution = match *metric {
+            name if name.ends_with("_by_gate") => "gates",
+            name if name.ends_with("_by_provider") => "routes",
+            _ => "complexity",
+        };
+        assert_eq!(
+            rate_map(&stats, metric).keys().collect::<Vec<_>>(),
+            object_counts(&stats, distribution)
+                .keys()
+                .collect::<Vec<_>>(),
+            "{metric} must cover every key of {distribution}"
+        );
+    }
+
+    // Every row here is a dry run, so nothing dispatched and nothing could be reconciled. A
+    // failure rate over rows that never ran is the reading this pins out.
+    for metric in FAILURE_RATES {
+        for (key, (numerator, denominator)) in rate_map(&stats, metric) {
+            assert_eq!(
+                (numerator, denominator),
+                (0, 0),
+                "{metric}.{key} counted a dry run"
+            );
+            assert_eq!(stats[metric][&key]["share"], Value::Null, "{metric}.{key}");
+        }
+    }
+}
+
+/// A rate nobody has judged has no percentage to print. Every row here named its provider and every
+/// one is a dry run, so the only rate in the report with a denominator at all is the dry run share:
+/// one percentage on the screen, and a dash everywhere else. Any other percentage was invented, and
+/// a zero over zero rendered as a number is how NaN reaches a terminal.
+#[test]
+fn the_human_report_prints_a_dash_for_a_rate_nobody_has_judged() {
+    let fixture = StatsFixture::new();
+    fixture.dry_run("explicitly on claude", Some("claude"), IDLE);
+    fixture.dry_run("a second explicit claude route", Some("claude"), IDLE);
+    fixture.dry_run("explicitly on opencode", Some("opencode"), IDLE);
+
+    let output = fixture.stats();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+
+    assert!(
+        stdout.contains("explicit_provider"),
+        "the gate distribution must be shown: {stdout}"
+    );
+    assert_eq!(
+        stdout.matches('%').count(),
+        1,
+        "only the dry run share has a denominator: {stdout}"
+    );
+    assert!(
+        !stdout.to_lowercase().contains("nan"),
+        "a rate with no denominator rendered a NaN: {stdout}"
+    );
+}
+
 #[test]
 fn stats_on_an_empty_database_exits_zero_and_reports_no_rows() {
     let fixture = StatsFixture::new();
@@ -452,5 +693,14 @@ fn stats_on_an_empty_database_exits_zero_and_reports_no_rows() {
     for rate in ["flip_rate", "classifier_failure_rate", "dry_run_share"] {
         assert_eq!(stats[rate]["numerator"], 0, "{rate} numerator");
         assert_eq!(stats[rate]["denominator"], 0, "{rate} denominator");
+    }
+    // A window with no rows has no keys to break down, so each of the six maps is an empty object
+    // rather than a missing key or a null.
+    for metric in BAD_RATES.iter().chain(&FAILURE_RATES) {
+        assert_eq!(
+            rate_map(&stats, metric),
+            BTreeMap::new(),
+            "{metric} over an empty window"
+        );
     }
 }
