@@ -12,7 +12,11 @@ use std::collections::BTreeMap;
 
 /// The gates that move a task off the provider its verdict named. Any new provider moving gate
 /// belongs here, or the flip rate silently under reports the moment it starts firing.
-const FLIP_GATES: [&str; 2] = ["flipped_on_exhaustion", "headroom_tiebreak"];
+const FLIP_GATES: [&str; 3] = [
+    "flipped_on_exhaustion",
+    "headroom_tiebreak",
+    "five_hour_pacing",
+];
 
 /// The gate a row carries when the classifier could not answer and the default provider was used.
 const CLASSIFIER_FAILED: &str = "classifier_failed";

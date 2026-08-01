@@ -280,15 +280,17 @@ fn rates_are_denominated_on_auto_routes_only() {
 }
 
 /// The flip rate counts routes that moved, not tags that fired. A row carrying two provider moving
-/// gates is one flipped route: the task moved once. Stream 2's pacing gate makes that double fire
-/// reachable, so it is pinned before it can happen. Dropping either tag from the numerator's gate
-/// list fails this.
+/// gates is one flipped route: the task moved once. `five_hour_pacing` moves a task off the
+/// provider its verdict named exactly as the other two do, so a paced route is a flipped route;
+/// leaving it out of the numerator shrinks the measured flip rate the moment the rule starts
+/// firing. Eight flip tags fire across these six rows and five routes moved, so dropping any tag
+/// from the numerator's gate list fails this, and so does counting tags instead of rows.
 #[test]
 fn every_provider_moving_gate_counts_toward_the_flip_rate() {
     let rows = vec![
-        row(4_000, "auto", "codex", Some("high"), "over_ceiling", false),
+        row(6_000, "auto", "codex", Some("high"), "over_ceiling", false),
         row(
-            3_000,
+            5_000,
             "auto",
             "codex",
             Some("high"),
@@ -296,7 +298,7 @@ fn every_provider_moving_gate_counts_toward_the_flip_rate() {
             false,
         ),
         row(
-            2_000,
+            4_000,
             "auto",
             "claude",
             Some("high"),
@@ -304,11 +306,29 @@ fn every_provider_moving_gate_counts_toward_the_flip_rate() {
             false,
         ),
         row(
-            1_000,
+            3_000,
             "auto",
             "claude",
             Some("high"),
             "flipped_on_exhaustion",
+            false,
+        ),
+        row(
+            2_000,
+            "auto",
+            "codex",
+            Some("high"),
+            "five_hour_pacing",
+            false,
+        ),
+        // The reachable double fire the engine produces: a headroom tiebreak to claude that the
+        // pacing rule sends straight back to codex. One route, two provider moving tags.
+        row(
+            1_000,
+            "auto",
+            "codex",
+            Some("high"),
+            "headroom_tiebreak,five_hour_pacing",
             false,
         ),
     ];
@@ -317,13 +337,14 @@ fn every_provider_moving_gate_counts_toward_the_flip_rate() {
 
     assert_eq!(
         (stats.flip_rate.numerator, stats.flip_rate.denominator),
-        (3, 4)
+        (5, 6)
     );
     assert_eq!(
         stats.gates,
         counts(&[
+            ("five_hour_pacing", 2),
             ("flipped_on_exhaustion", 2),
-            ("headroom_tiebreak", 2),
+            ("headroom_tiebreak", 3),
             ("over_ceiling", 1),
         ])
     );
