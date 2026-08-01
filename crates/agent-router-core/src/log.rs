@@ -3,7 +3,7 @@
 //! answer to "why did this route here".
 
 use crate::decide::Decision;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::runtime::{home_dir, now_ms};
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
@@ -62,6 +62,59 @@ pub struct Row {
     /// When the last reading that actually landed was taken. None means never reconciled, which is
     /// not the same as reconciled and found unknown.
     pub reconciled_at_ms: Option<i64>,
+    /// The human judgement on the route. None means nobody has judged this row, which is not the
+    /// same as judging it good.
+    pub mark: Option<String>,
+    /// What the human said alongside the mark. None means nothing was said.
+    pub note: Option<String>,
+}
+
+/// The human judgement on one routing decision: whether sending the task there was the right call.
+///
+/// Deliberately a separate column from `outcome`, which says only whether the job ran. A completed
+/// job can still be a bad route, and a failed job can be the right route that hit an unrelated
+/// fault, so no backend can produce this value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mark {
+    Good,
+    Bad,
+    Rerouted,
+}
+
+impl Mark {
+    pub const fn tag(self) -> &'static str {
+        match self {
+            Mark::Good => "good",
+            Mark::Bad => "bad",
+            Mark::Rerouted => "rerouted",
+        }
+    }
+}
+
+/// PURE: the mark a `--mark` value names.
+///
+/// The column is TEXT and SQLite enforces nothing about what lands in it, so this is deliberately
+/// the only way a value reaches it: a second write path added later is the regression to guard
+/// against.
+pub fn parse_mark(value: &str) -> Result<Mark> {
+    match value {
+        "good" => Ok(Mark::Good),
+        "bad" => Ok(Mark::Bad),
+        "rerouted" => Ok(Mark::Rerouted),
+        other => Err(Error::Command(format!(
+            "unknown mark {other:?}: expected good, bad, or rerouted"
+        ))),
+    }
+}
+
+/// PURE: the log row a `--mark` value names. The CLI takes the id as a string so the rejection names
+/// the value the caller actually passed rather than reporting clap's own parse failure.
+pub fn parse_row_id(value: &str) -> Result<i64> {
+    value.parse().map_err(|_| {
+        Error::Command(format!(
+            "unknown row id {value:?}: expected the id of a decision log row"
+        ))
+    })
 }
 
 /// One row as the reconciler needs it: the columns it matches a backend on, nothing else.
@@ -124,6 +177,8 @@ CREATE TABLE IF NOT EXISTS decisions (
     job_id              TEXT,
     job_name            TEXT,
     reconciled_at_ms    INTEGER,
+    mark                TEXT,
+    note                TEXT,
     outcome             TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS decisions_created_at ON decisions(created_at_ms);
@@ -133,7 +188,7 @@ const SELECT_COLUMNS: &str = "\
 id, created_at_ms, task, dir, requested, provider, model, effort, verdict, confidence, \
 codex_ready_count, claude_signal_count, missing_connector, gates, claude_weekly_pct, \
 codex_weekly_pct, dry_run, job_id, job_name, outcome, rationale, complexity, \
-claude_usage_stale, codex_usage_stale, reconciled_at_ms";
+claude_usage_stale, codex_usage_stale, reconciled_at_ms, mark, note";
 
 /// The narrower list the stats reader needs, so a report never pays for columns it drops.
 const STATS_COLUMNS: &str = "created_at_ms, requested, provider, complexity, gates, dry_run";
@@ -335,6 +390,35 @@ impl DecisionLog {
         Ok(())
     }
 
+    /// IMPURE: record the human judgement on one row, replacing any earlier one.
+    ///
+    /// Both columns are written every time, including the note when there is none. A mark with no
+    /// note landing after a mark that had one would otherwise leave the old note attached to a new
+    /// judgement, which is a sentence no human said.
+    ///
+    /// A zero row update is an error rather than a quiet success: a bare UPDATE that matched
+    /// nothing exits 0 and reports a judgement as recorded when nothing was recorded at all.
+    pub fn mark(&self, id: i64, mark: Mark, note: Option<&str>) -> Result<()> {
+        // An empty or whitespace only note is Some, so it would land in the column and read as a
+        // note nobody wrote. A loud error is correct, exactly as it is for an empty --name, since a
+        // caller passing a note believes it recorded one.
+        if let Some(note) = note
+            && note.trim().is_empty()
+        {
+            return Err(Error::Command(
+                "--note must not be empty or whitespace only".to_string(),
+            ));
+        }
+        let changed = self.conn.execute(
+            "UPDATE decisions SET mark = ?1, note = ?2 WHERE id = ?3",
+            rusqlite::params![mark.tag(), note, id],
+        )?;
+        if changed == 0 {
+            return Err(Error::Command(format!("no decision log row with id {id}")));
+        }
+        Ok(())
+    }
+
     /// IMPURE: this provider's own weekly percent at each dispatched decision on this exact model,
     /// oldest first. Dry runs are excluded: they drew nothing, so a step across one is not a draw.
     ///
@@ -393,6 +477,8 @@ impl DecisionLog {
                     claude_usage_stale: row.get(22)?,
                     codex_usage_stale: row.get(23)?,
                     reconciled_at_ms: row.get(24)?,
+                    mark: row.get(25)?,
+                    note: row.get(26)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<Row>>>()?;
@@ -407,11 +493,13 @@ impl DecisionLog {
 /// Same columns, different physical order: `SCHEMA` places these mid table while `ALTER TABLE ADD
 /// COLUMN` can only append them, so a fresh and a migrated database disagree on every ordinal and
 /// every read must name the columns it wants rather than `SELECT *` or a `pragma_table_info` index.
-const MISSING_COLUMNS: [(&str, &str); 4] = [
+const MISSING_COLUMNS: [(&str, &str); 6] = [
     ("complexity", "TEXT"),
     ("claude_usage_stale", "INTEGER"),
     ("codex_usage_stale", "INTEGER"),
     ("reconciled_at_ms", "INTEGER"),
+    ("mark", "TEXT"),
+    ("note", "TEXT"),
 ];
 
 /// IMPURE: bring a database written before any of those columns up to the current schema. Guarded
@@ -740,6 +828,105 @@ mod tests {
 
         // The migration is idempotent: opening again must not try to add the column twice.
         DecisionLog::open_at(&path).expect("reopens");
+    }
+
+    /// A database written before the human judgement gains both columns on open, keeps its rows,
+    /// and reads them back as unjudged rather than failing the SELECT.
+    #[test]
+    fn an_older_database_gains_the_mark_columns_and_keeps_its_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("router.db");
+        let older = SCHEMA
+            .replace("    mark                TEXT,\n", "")
+            .replace("    note                TEXT,\n", "");
+        assert!(!older.contains("mark"), "the older schema fixture");
+        assert!(!older.contains("note"), "the older schema fixture");
+        {
+            let conn = rusqlite::Connection::open(&path).expect("create older database");
+            conn.execute_batch(&older).expect("older schema");
+            conn.execute(
+                "INSERT INTO decisions (
+                    created_at_ms, task, dir, requested, provider, gates, rationale,
+                    claude_five_hour_pct, claude_five_hour_reset, claude_weekly_pct,
+                    claude_weekly_reset, codex_five_hour_pct, codex_five_hour_reset,
+                    codex_weekly_pct, codex_weekly_reset, dry_run, job_id, outcome
+                ) VALUES (1, 'older row', '/tmp', 'auto', 'codex', '', 'why', 0, 0, 0, 0, 0, 0, \
+                 0, 0, 0, 'c0ffee42', 'dispatched')",
+                [],
+            )
+            .expect("older row");
+        }
+
+        let log = DecisionLog::open_at(&path).expect("migrates on open");
+        let rows = log.recent(10).expect("reads the older row back");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].task, "older row");
+        assert_eq!(rows[0].mark, None);
+        assert_eq!(rows[0].note, None);
+
+        // The judgement is written to the migrated database, whose appended columns sit at
+        // different ordinals here than the same columns do in a fresh one.
+        log.mark(rows[0].id, Mark::Bad, Some("needed connectors"))
+            .expect("marks the older row");
+        let marked = &log.recent(10).expect("reads back")[0];
+        assert_eq!(marked.mark.as_deref(), Some("bad"));
+        assert_eq!(marked.note.as_deref(), Some("needed connectors"));
+        assert_eq!(marked.outcome, "dispatched");
+
+        // The migration is idempotent: opening again must not try to add the columns twice.
+        DecisionLog::open_at(&path).expect("reopens");
+    }
+
+    /// The accepted set is a closed enum of three and this parse is its only entry point, so every
+    /// accepted value round trips through `tag()` and anything else is refused by name with the
+    /// accepted values in the message.
+    #[test]
+    fn an_unknown_mark_is_rejected_by_name() {
+        for mark in [Mark::Good, Mark::Bad, Mark::Rerouted] {
+            assert_eq!(parse_mark(mark.tag()).expect("round trips"), mark);
+        }
+        assert_eq!(parse_mark("good").expect("good"), Mark::Good);
+        assert_eq!(parse_mark("bad").expect("bad"), Mark::Bad);
+        assert_eq!(parse_mark("rerouted").expect("rerouted"), Mark::Rerouted);
+
+        let rejection = parse_mark("great")
+            .expect_err("great is not a mark")
+            .to_string();
+        assert!(rejection.contains("great"), "{rejection}");
+        for accepted in ["good", "bad", "rerouted"] {
+            assert!(rejection.contains(accepted), "{rejection}");
+        }
+    }
+
+    /// An empty note is Some, so nothing but this check keeps it out of the column, and a caller
+    /// passing one believes it recorded a judgement.
+    #[test]
+    fn an_empty_note_is_rejected_rather_than_stored() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = DecisionLog::open_at(&dir.path().join("router.db")).expect("opens");
+        let decision = decision();
+        let id = log
+            .record(&Entry {
+                task: "t",
+                dir: Path::new("/tmp"),
+                requested: "auto",
+                decision: &decision,
+                dry_run: false,
+                job_id: Some("thread-abc"),
+                job_name: None,
+                outcome: "dispatched",
+            })
+            .expect("records");
+
+        log.mark(id, Mark::Good, Some("   "))
+            .expect_err("a whitespace only note");
+
+        let row = &log.recent(1).expect("reads")[0];
+        assert_eq!(
+            row.mark, None,
+            "the rejected note carried a mark in with it"
+        );
+        assert_eq!(row.note, None);
     }
 
     /// The predicate the whole in place update rests on: a dry run and a dispatch error are outside
