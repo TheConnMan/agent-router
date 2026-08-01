@@ -27,12 +27,18 @@ in every existing install while the default constant in the source moves on. `co
 the marker that lets those be corrected exactly once.
 
 On load, a file stamped below the current version is migrated and rewritten in place, then stamped.
-A migration may only correct a value **this tool generated**; a value you chose is never touched.
-The version stamp is what makes that promise hold over time: keying a migration off the value alone
-would re-apply it on every load, so restoring the old value deliberately would be impossible.
+A migration only ever touches a value still equal to the default this tool used to generate;
+anything else is left alone.
 
-Practically, that means you can always win. If a migration moves a setting and you want it back,
-set it back: the file is already stamped, so nothing will move it again.
+**On a file with no stamp, that test is a guess, and it can guess wrong.** A `30` you typed
+yourself is indistinguishable from the `30` the tool generated, so a v1 migration will move it. It
+is a one-time, one-value cost, and it errs toward more headroom rather than less, but it is real:
+if you had deliberately pinned the old default before upgrading, re-pin it after.
+
+After that first stamp the ambiguity is gone for good. A migration runs once per file, so setting a
+migrated value back is permanent, and nothing will move it again. That is the whole reason migrations
+are keyed on the stamp and not on the value: a value-keyed migration would re-apply on every single
+load, and restoring the old default would be impossible rather than merely inconvenient.
 
 Two consequences worth knowing. The rewrite serializes the whole config, so hand-added comments in
 the file are lost the one time a migration runs. And a file with no `config_version` key is treated
