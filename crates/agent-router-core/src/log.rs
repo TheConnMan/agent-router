@@ -242,14 +242,15 @@ impl DecisionLog {
                      ORDER BY id DESC LIMIT ?2"
                 );
                 let mut statement = self.conn.prepare(&sql)?;
-                let rows = statement.query_map([floor, limit as i64], read)?;
+                let rows =
+                    statement.query_map([floor, i64::try_from(limit).unwrap_or(i64::MAX)], read)?;
                 rows.collect::<rusqlite::Result<Vec<StatsRow>>>()?
             }
             None => {
                 let sql =
                     format!("SELECT {STATS_COLUMNS} FROM decisions ORDER BY id DESC LIMIT ?1");
                 let mut statement = self.conn.prepare(&sql)?;
-                let rows = statement.query_map([limit as i64], read)?;
+                let rows = statement.query_map([i64::try_from(limit).unwrap_or(i64::MAX)], read)?;
                 rows.collect::<rusqlite::Result<Vec<StatsRow>>>()?
             }
         };
@@ -263,40 +264,22 @@ impl DecisionLog {
     /// chronological order. Ordering ascending before the limit would instead take the OLDEST rows
     /// and quietly answer about ancient history as the log grows, while the steps between rows are
     /// only meaningful read oldest first.
-    pub fn weekly_series(
-        &self,
-        provider: &str,
-        model: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<f64>> {
+    pub fn weekly_series(&self, provider: &str, model: &str, limit: usize) -> Result<Vec<f64>> {
         let Some(column) = weekly_column(provider) else {
             return Ok(Vec::new());
         };
-        let read = |row: &rusqlite::Row| row.get(0);
-        let series = match model {
-            Some(model) => {
-                let sql = format!(
-                    "SELECT {column} FROM (SELECT id, {column} FROM decisions \
-                     WHERE provider = ?1 AND model = ?2 AND dry_run = 0 \
-                     ORDER BY id DESC LIMIT ?3) ORDER BY id ASC"
-                );
-                let mut statement = self.conn.prepare(&sql)?;
-                statement
-                    .query_map(rusqlite::params![provider, model, limit as i64], read)?
-                    .collect::<rusqlite::Result<Vec<f64>>>()?
-            }
-            None => {
-                let sql = format!(
-                    "SELECT {column} FROM (SELECT id, {column} FROM decisions \
-                     WHERE provider = ?1 AND model IS NULL AND dry_run = 0 \
-                     ORDER BY id DESC LIMIT ?2) ORDER BY id ASC"
-                );
-                let mut statement = self.conn.prepare(&sql)?;
-                statement
-                    .query_map(rusqlite::params![provider, limit as i64], read)?
-                    .collect::<rusqlite::Result<Vec<f64>>>()?
-            }
-        };
+        let sql = format!(
+            "SELECT {column} FROM (SELECT id, {column} FROM decisions \
+             WHERE provider = ?1 AND model = ?2 AND dry_run = 0 \
+             ORDER BY id DESC LIMIT ?3) ORDER BY id ASC"
+        );
+        let mut statement = self.conn.prepare(&sql)?;
+        let series = statement
+            .query_map(
+                rusqlite::params![provider, model, i64::try_from(limit).unwrap_or(i64::MAX)],
+                |row: &rusqlite::Row| row.get(0),
+            )?
+            .collect::<rusqlite::Result<Vec<f64>>>()?;
         Ok(series)
     }
 
@@ -305,7 +288,7 @@ impl DecisionLog {
         let sql = format!("SELECT {SELECT_COLUMNS} FROM decisions ORDER BY id DESC LIMIT ?1");
         let mut statement = self.conn.prepare(&sql)?;
         let rows = statement
-            .query_map([limit as i64], |row| {
+            .query_map([i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
                 Ok(Row {
                     id: row.get(0)?,
                     created_at_ms: row.get(1)?,
@@ -341,6 +324,10 @@ impl DecisionLog {
 /// Every column added to `decisions` after the first shipped schema, with its declared type. Each
 /// one is nullable, so the fresh schema and the migration below produce the same table shape and a
 /// row written before the column reads back as "this row does not know".
+///
+/// Same columns, different physical order: `SCHEMA` places these mid table while `ALTER TABLE ADD
+/// COLUMN` can only append them, so a fresh and a migrated database disagree on every ordinal and
+/// every read must name the columns it wants rather than `SELECT *` or a `pragma_table_info` index.
 const MISSING_COLUMNS: [(&str, &str); 3] = [
     ("complexity", "TEXT"),
     ("claude_usage_stale", "INTEGER"),
