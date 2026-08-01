@@ -27,8 +27,17 @@ pub trait CodexRpc {
 
 #[derive(Debug)]
 pub enum SpawnAttempt {
-    Started(String),
-    TurnFailed { thread_id: String, error: Error },
+    Started {
+        thread_id: String,
+        /// The effort the daemon reported the thread resolved to, straight off the `thread/start`
+        /// reply. None when that reply said nothing, which means the router does not know rather
+        /// than that the job runs at no effort.
+        effective_effort: Option<String>,
+    },
+    TurnFailed {
+        thread_id: String,
+        error: Error,
+    },
     NotCreated(Error),
 }
 
@@ -126,6 +135,17 @@ pub fn parse_thread_status(line: &str, expected_id: i64) -> Option<String> {
     read_field(line, expected_id, "/result/thread/status/type")
 }
 
+/// PURE: the reasoning effort the daemon resolved this thread to, off the `thread/start` reply.
+///
+/// A SIBLING of `thread` at the result root, not a member of it, which is why the pointer stops at
+/// `/result/reasoningEffort`. It rides the reply the spawn already reads for the thread id, so
+/// observing it costs no extra call. None when the reply does not carry it: that is the router not
+/// knowing, and nothing here may substitute the decided effort, the model, or a config value for an
+/// answer the daemon did not give.
+pub fn parse_reasoning_effort(line: &str, expected_id: i64) -> Option<String> {
+    read_field(line, expected_id, "/result/reasoningEffort")
+}
+
 /// PURE: one string out of a reply that is genuinely an answer to this request. A reply to someone
 /// else's request and a reply carrying a JSON RPC error are not observations.
 fn read_field(line: &str, expected_id: i64, pointer: &str) -> Option<String> {
@@ -212,10 +232,16 @@ pub fn spawn_on_initialized_rpc(
             "app-server thread/start returned no thread id: {thread_response}"
         )));
     };
+    // Read off the reply already in hand rather than asking again: the daemon loads the operator's
+    // own config, so this is the resolved effort the turn will actually run at.
+    let effective_effort = parse_reasoning_effort(&thread_response, 2);
     // The thread is already running, so a rejected name must not cost the caller its identity.
     let _ = rpc.request(3, &thread_set_name_request(3, &thread_id, name));
     match rpc.request(4, &turn_start_request(4, &thread_id, task, effort)) {
-        Ok(_) => SpawnAttempt::Started(thread_id),
+        Ok(_) => SpawnAttempt::Started {
+            thread_id,
+            effective_effort,
+        },
         Err(error) => SpawnAttempt::TurnFailed { thread_id, error },
     }
 }
@@ -232,9 +258,13 @@ pub fn dispatch(
         let daemon = ensure_daemon().map_err(Error::Command)?;
         let mut client = Client::connect(&daemon)?;
         match spawn_on_initialized_rpc(&mut client, cwd, task, name, model, effort) {
-            SpawnAttempt::Started(thread_id) => Ok(Dispatch {
+            SpawnAttempt::Started {
+                thread_id,
+                effective_effort,
+            } => Ok(Dispatch {
                 job_id: Some(thread_id),
                 job_name: name.to_string(),
+                effective_effort,
             }),
             SpawnAttempt::TurnFailed { thread_id, error } => Err(Error::Command(format!(
                 "app-server started thread {thread_id} but its first turn failed: {error}"

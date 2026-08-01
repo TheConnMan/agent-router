@@ -24,6 +24,10 @@ pub struct Entry<'a> {
     pub job_name: Option<&'a str>,
     /// "dispatched", "dry-run", or "error: ...".
     pub outcome: &'a str,
+    /// What the backend reported this job will actually run its reasoning at, which is a different
+    /// fact from the effort the router decided. None where the backend says nothing, which is every
+    /// claude and opencode dispatch and every dry run.
+    pub effective_effort: Option<&'a str>,
 }
 
 /// One row read back, flattened for display.
@@ -36,6 +40,8 @@ pub struct Row {
     pub requested: String,
     pub provider: String,
     pub model: Option<String>,
+    /// The reasoning effort the router decided, which nothing currently sets. Not the effort the
+    /// job ran at: that is `effective_effort` below.
     pub effort: Option<String>,
     pub verdict: Option<String>,
     pub confidence: Option<String>,
@@ -67,6 +73,11 @@ pub struct Row {
     pub mark: Option<String>,
     /// What the human said alongside the mark. None means nothing was said.
     pub note: Option<String>,
+    /// The reasoning effort the backend reported this job will run at, as against `effort` above,
+    /// which is what the router decided. None means nobody observed one: the backend exposes none
+    /// (claude, opencode), nothing was dispatched (a dry run), or the row predates the column. None
+    /// of those is the same as a job running at no effort.
+    pub effective_effort: Option<String>,
 }
 
 /// The human judgement on one routing decision: whether sending the task there was the right call.
@@ -179,6 +190,7 @@ CREATE TABLE IF NOT EXISTS decisions (
     reconciled_at_ms    INTEGER,
     mark                TEXT,
     note                TEXT,
+    effective_effort    TEXT,
     outcome             TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS decisions_created_at ON decisions(created_at_ms);
@@ -188,7 +200,7 @@ const SELECT_COLUMNS: &str = "\
 id, created_at_ms, task, dir, requested, provider, model, effort, verdict, confidence, \
 codex_ready_count, claude_signal_count, missing_connector, gates, claude_weekly_pct, \
 codex_weekly_pct, dry_run, job_id, job_name, outcome, rationale, complexity, \
-claude_usage_stale, codex_usage_stale, reconciled_at_ms, mark, note";
+claude_usage_stale, codex_usage_stale, reconciled_at_ms, mark, note, effective_effort";
 
 /// The narrower list the stats reader needs, so a report never pays for columns it drops.
 const STATS_COLUMNS: &str = "created_at_ms, requested, provider, complexity, gates, dry_run";
@@ -262,10 +274,10 @@ impl DecisionLog {
                 claude_five_hour_pct, claude_five_hour_reset, claude_weekly_pct,
                 claude_weekly_reset, codex_five_hour_pct, codex_five_hour_reset,
                 codex_weekly_pct, codex_weekly_reset, dry_run, job_id, job_name, outcome,
-                complexity, claude_usage_stale, codex_usage_stale
+                complexity, claude_usage_stale, codex_usage_stale, effective_effort
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31
+                ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32
             )",
             rusqlite::params![
                 now_ms(),
@@ -299,6 +311,7 @@ impl DecisionLog {
                 classification.map(|c| c.complexity.tag()),
                 usage.claude.stale,
                 usage.codex.stale,
+                entry.effective_effort,
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -479,6 +492,7 @@ impl DecisionLog {
                     reconciled_at_ms: row.get(24)?,
                     mark: row.get(25)?,
                     note: row.get(26)?,
+                    effective_effort: row.get(27)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<Row>>>()?;
@@ -493,13 +507,14 @@ impl DecisionLog {
 /// Same columns, different physical order: `SCHEMA` places these mid table while `ALTER TABLE ADD
 /// COLUMN` can only append them, so a fresh and a migrated database disagree on every ordinal and
 /// every read must name the columns it wants rather than `SELECT *` or a `pragma_table_info` index.
-const MISSING_COLUMNS: [(&str, &str); 6] = [
+const MISSING_COLUMNS: [(&str, &str); 7] = [
     ("complexity", "TEXT"),
     ("claude_usage_stale", "INTEGER"),
     ("codex_usage_stale", "INTEGER"),
     ("reconciled_at_ms", "INTEGER"),
     ("mark", "TEXT"),
     ("note", "TEXT"),
+    ("effective_effort", "TEXT"),
 ];
 
 /// IMPURE: bring a database written before any of those columns up to the current schema. Guarded
@@ -606,6 +621,7 @@ mod tests {
                 job_id: Some("thread-abc"),
                 job_name: None,
                 outcome: "dispatched",
+                effective_effort: None,
             })
             .expect("records");
         assert!(id > 0);
@@ -645,6 +661,7 @@ mod tests {
             job_id: None,
             job_name: Some("t"),
             outcome: "dry-run",
+            effective_effort: None,
         })
         .expect("records");
         let conn = rusqlite::Connection::open(&path).expect("reopen");
@@ -696,6 +713,7 @@ mod tests {
             job_id: Some("session-1"),
             job_name: None,
             outcome: "dispatched",
+            effective_effort: None,
         })
         .expect("records");
         let row = &log.recent(1).expect("reads")[0];
@@ -721,6 +739,7 @@ mod tests {
                 job_id: None,
                 job_name: None,
                 outcome: "dry-run",
+                effective_effort: None,
             })
             .expect("records");
         }
@@ -915,6 +934,7 @@ mod tests {
                 job_id: Some("thread-abc"),
                 job_name: None,
                 outcome: "dispatched",
+                effective_effort: None,
             })
             .expect("records");
 
@@ -945,6 +965,7 @@ mod tests {
             job_id: None,
             job_name: None,
             outcome: "dry-run",
+            effective_effort: None,
         };
         log.record(&entry).expect("a dry run row");
         entry.dry_run = false;
@@ -977,6 +998,7 @@ mod tests {
                 job_id: None,
                 job_name: None,
                 outcome: "dry-run",
+                effective_effort: None,
             })
             .expect("records");
         }

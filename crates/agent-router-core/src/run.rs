@@ -40,6 +40,11 @@ pub struct Dispatch {
     /// The name the job is findable by, which is how a claude job with no resolved short id is
     /// still locatable.
     pub job_name: String,
+    /// The reasoning effort the backend reported the job will run at, which is a different fact
+    /// from the effort the router decided. Populated by codex alone, from the `thread/start`
+    /// reply. None for claude and opencode, permanently: neither exposes one, so there is nothing
+    /// observed to record and an inferred value here would read as an observed one.
+    pub effective_effort: Option<String>,
 }
 
 /// The whole outcome, including the decision log row id.
@@ -111,6 +116,8 @@ pub fn run(request: &Request, config: &Config) -> Result<Outcome> {
             job_id: None,
             job_name: None,
             outcome: "dry-run",
+            // A dry run dispatched nothing, so no backend said anything about an effort.
+            effective_effort: None,
         })?;
         return Ok(Outcome {
             decision,
@@ -124,13 +131,14 @@ pub fn run(request: &Request, config: &Config) -> Result<Outcome> {
     let dispatched = crate::dispatch::dispatch(&decision, request);
     // The decision is logged either way: a dispatch that failed is exactly the row worth
     // keeping, and losing it would hide the failure from the tuning data.
-    let (job_id, job_name, outcome) = match &dispatched {
+    let (job_id, job_name, effective_effort, outcome) = match &dispatched {
         Ok(dispatch) => (
             dispatch.job_id.clone(),
             Some(dispatch.job_name.clone()),
+            dispatch.effective_effort.clone(),
             "dispatched".to_string(),
         ),
-        Err(e) => (None, None, format!("error: {e}")),
+        Err(e) => (None, None, None, format!("error: {e}")),
     };
     let recorded = log.record(&Entry {
         task: request.task,
@@ -141,6 +149,7 @@ pub fn run(request: &Request, config: &Config) -> Result<Outcome> {
         job_id: job_id.as_deref(),
         job_name: job_name.as_deref(),
         outcome: &outcome,
+        effective_effort: effective_effort.as_deref(),
     });
     // The dispatch decides the result, not the logging: once a job is running, returning Err
     // because a row could not be written would hide the job identity from the caller, who would
