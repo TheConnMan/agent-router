@@ -14,6 +14,19 @@ const DEFAULT_HEADROOM_FLIP_GAP: f64 = 25.0;
 /// the fast path is 3.4-7.0s, so this only has to be generous enough that a slow tail falls back
 /// far less often than it did at 30s, where 6 of 18 measured calls lost the deadline.
 const DEFAULT_CLASSIFIER_TIMEOUT_SECS: u64 = 60;
+/// The classifier timeout this tool used to generate into new config files.
+const PRE_MIGRATION_CLASSIFIER_TIMEOUT_SECS: u64 = 30;
+
+/// The migration level a config file written by this build carries. Raise this, and add a step to
+/// `migrate`, whenever a stale generated value has to be corrected in place.
+const CURRENT_CONFIG_VERSION: u32 = 1;
+
+/// The level a file that predates versioning reads as. This is deliberately NOT
+/// `CURRENT_CONFIG_VERSION`: an absent key has to be distinguishable from a stamped one, or every
+/// file would look already-migrated and no migration could ever run.
+fn pre_versioning() -> u32 {
+    0
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -222,6 +235,11 @@ pub enum ParityKind {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Config {
+    /// Which in-place migrations have already been applied to this file. Absent means the file
+    /// predates versioning and every migration is still owed. Stamped on write, so an operator who
+    /// restores a migrated value keeps it: a migration runs once per file, never on every load.
+    #[serde(default = "pre_versioning")]
+    pub config_version: u32,
     /// Weekly percent used at or above which a provider is treated as exhausted.
     pub hard_ceiling_pct: f64,
     /// How many points of weekly-headroom advantage flip a borderline verdict.
@@ -243,6 +261,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Config {
         Config {
+            config_version: CURRENT_CONFIG_VERSION,
             hard_ceiling_pct: DEFAULT_HARD_CEILING_PCT,
             headroom_flip_gap: DEFAULT_HEADROOM_FLIP_GAP,
             classifier_timeout_secs: DEFAULT_CLASSIFIER_TIMEOUT_SECS,
@@ -266,12 +285,19 @@ impl Config {
         Config::load_from(&default_config_path())
     }
 
-    /// IMPURE: the config at `path`, created with defaults when absent. A file that exists but
-    /// does not parse is an Err: silently substituting defaults would route jobs against
-    /// ceilings and a connector list the operator never wrote.
+    /// IMPURE: the config at `path`, created with defaults when absent, and migrated in place when
+    /// it predates the current version. A file that exists but does not parse is an Err: silently
+    /// substituting defaults would route jobs against ceilings and a connector list the operator
+    /// never wrote.
     pub fn load_from(path: &Path) -> Result<Config> {
         match std::fs::read_to_string(path) {
-            Ok(text) => Ok(toml::from_str(&text)?),
+            Ok(text) => {
+                let mut config: Config = toml::from_str(&text)?;
+                if config.migrate() {
+                    config.write_to(path)?;
+                }
+                Ok(config)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let config = Config::default();
                 config.write_to(path)?;
@@ -279,6 +305,30 @@ impl Config {
             }
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// PURE-ish: bring a file written by an older build up to `CURRENT_CONFIG_VERSION`, returning
+    /// whether it now needs rewriting. Every step here corrects a value THIS TOOL generated, never
+    /// one the operator chose, which is the line that keeps this compatible with the file's stated
+    /// contract that the operator's config is authoritative.
+    ///
+    /// The version stamp is what makes that true over time. Migrating on the value alone would
+    /// re-apply on every load, so an operator who set the old default back deliberately would have
+    /// it overwritten again and again with no way to win.
+    fn migrate(&mut self) -> bool {
+        if self.config_version >= CURRENT_CONFIG_VERSION {
+            return false;
+        }
+        // v1: the classifier timeout was generated as 30s, which the measured call time then
+        // outgrew (see `classify.rs`). A file still carrying the old generated value gets the new
+        // one; anything else is a choice and is left alone.
+        if self.config_version < 1
+            && self.classifier_timeout_secs == PRE_MIGRATION_CLASSIFIER_TIMEOUT_SECS
+        {
+            self.classifier_timeout_secs = DEFAULT_CLASSIFIER_TIMEOUT_SECS;
+        }
+        self.config_version = CURRENT_CONFIG_VERSION;
+        true
     }
 
     fn write_to(&self, path: &Path) -> Result<()> {
@@ -308,6 +358,82 @@ mod tests {
         assert_eq!(created, Config::default());
         assert!(path.exists(), "the default config must be written to disk");
         assert_eq!(Config::load_from(&path).expect("re-reads"), created);
+    }
+
+    /// The whole point of the migration: a file this tool generated before the timeout changed
+    /// still says 30, and changing only the default constant would never reach it.
+    #[test]
+    fn a_pre_versioning_file_carrying_the_old_generated_timeout_is_migrated_on_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "classifier_timeout_secs = 30\n").expect("write");
+
+        let config = Config::load_from(&path).expect("loads");
+        assert_eq!(
+            config.classifier_timeout_secs,
+            DEFAULT_CLASSIFIER_TIMEOUT_SECS
+        );
+        assert_eq!(config.config_version, CURRENT_CONFIG_VERSION);
+
+        // The new value must be on disk, not merely in memory: a file that still reads 30 while
+        // the router behaves as 60 is a config that lies about what is running.
+        let text = std::fs::read_to_string(&path).expect("re-read");
+        assert!(text.contains("classifier_timeout_secs = 60"), "{text}");
+        assert!(text.contains("config_version = 1"), "{text}");
+    }
+
+    /// A value the operator chose is not the tool's to correct, even while the same file is being
+    /// migrated to the current version.
+    #[test]
+    fn migration_stamps_the_version_without_touching_a_deliberate_timeout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "classifier_timeout_secs = 45\n").expect("write");
+
+        let config = Config::load_from(&path).expect("loads");
+        assert_eq!(config.classifier_timeout_secs, 45);
+        assert_eq!(config.config_version, CURRENT_CONFIG_VERSION);
+    }
+
+    /// The regression the version stamp exists to prevent. Without it the migration keys off the
+    /// value alone, so an operator who deliberately restores 30 has it overwritten on every single
+    /// load and can never make the choice stick.
+    #[test]
+    fn a_migrated_file_never_has_its_timeout_corrected_a_second_time() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "classifier_timeout_secs = 30\n").expect("write");
+        Config::load_from(&path).expect("first load migrates");
+
+        // The operator now deliberately puts the old deadline back, on an already-stamped file.
+        let migrated = std::fs::read_to_string(&path).expect("read");
+        std::fs::write(
+            &path,
+            migrated.replace(
+                "classifier_timeout_secs = 60",
+                "classifier_timeout_secs = 30",
+            ),
+        )
+        .expect("write");
+
+        let config = Config::load_from(&path).expect("loads");
+        assert_eq!(
+            config.classifier_timeout_secs, 30,
+            "a stamped file must keep the operator's value"
+        );
+    }
+
+    /// A file this build writes is already current, so it must not be rewritten on the next load.
+    #[test]
+    fn a_freshly_created_config_is_stamped_current_and_is_not_migrated() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let created = Config::load_from(&path).expect("creates");
+        assert_eq!(created.config_version, CURRENT_CONFIG_VERSION);
+
+        let mut again = created.clone();
+        assert!(!again.migrate(), "a current file has nothing to migrate");
+        assert_eq!(again, created);
     }
 
     #[test]
