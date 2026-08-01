@@ -23,6 +23,6 @@ pub use config::{
 };
 pub use decide::{Decision, Gate};
 pub use error::{Error, Result};
-pub use parity::{Difference, ParityReport, ServerProjection, Status};
+pub use parity::{Difference, GlobalReport, ParityReport, ServerProjection, Status};
 pub use provider::Provider;
 pub use usage::{Headroom, UsageSnapshot};

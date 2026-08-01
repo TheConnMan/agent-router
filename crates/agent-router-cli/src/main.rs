@@ -1,6 +1,6 @@
 use agent_router_core::doctor::Health;
 use agent_router_core::log::{DecisionLog, Row};
-use agent_router_core::parity::{Difference, ParityReport, ServerProjection, Status};
+use agent_router_core::parity::{Difference, GlobalReport, ParityReport, ServerProjection, Status};
 use agent_router_core::run::{Outcome, Request};
 use agent_router_core::stats::{Rate, Stats, Window};
 use clap::{Parser, Subcommand};
@@ -73,7 +73,7 @@ enum Command {
     },
     /// Preflight the provider binaries, credentials, usage provenance, config, and decision log.
     Doctor,
-    /// Compare project scoped Claude and Codex declarations.
+    /// Compare the global and project scoped Claude and Codex declarations.
     Parity {
         #[arg(long = "root")]
         roots: Vec<PathBuf>,
@@ -135,11 +135,12 @@ fn parity_exit(roots: Vec<PathBuf>, json: bool) -> std::process::ExitCode {
             return std::process::ExitCode::from(2);
         }
     };
-    let report = match agent_router_core::parity::check(&roots, &config) {
+    let home = agent_router_core::runtime::home_dir();
+    let report = match agent_router_core::parity::check(&roots, &config, &home) {
         Ok(report) => report,
         Err(error) => {
             eprintln!(
-                "agent-router: parity scan error while reading .mcp.json or \
+                "agent-router: parity scan error while reading .mcp.json, .claude.json, or \
                  .codex/config.toml: {}",
                 escape_terminal_controls(&error.to_string())
             );
@@ -196,6 +197,7 @@ fn run(cli: Cli) -> agent_router_core::Result<()> {
 
 fn print_parity(report: &ParityReport) {
     println!("parity: {}", status_label(report.status()));
+    print_global(&report.global);
     for project in &report.projects {
         let differences = project_differences(report, project);
         println!(
@@ -203,22 +205,41 @@ fn print_parity(report: &ParityReport) {
             escape_terminal_controls(&project.to_string_lossy()),
             status_label(difference_status(&differences))
         );
-        for difference in differences {
-            match &difference.server {
-                Some(server) => {
-                    println!(
-                        "  {} server {}",
-                        kind_label(difference),
-                        escape_terminal_controls(server)
-                    );
-                }
-                None => println!("  {}", kind_label(difference)),
+        print_differences(&differences);
+    }
+}
+
+/// The global entry prints first, because it is the ambient configuration every project inherits.
+fn print_global(global: &GlobalReport) {
+    let differences = global.differences.iter().collect::<Vec<_>>();
+    println!("global: {}", status_label(difference_status(&differences)));
+    println!(
+        "  claude: {}",
+        escape_terminal_controls(&global.claude_path.to_string_lossy())
+    );
+    println!(
+        "  codex: {}",
+        escape_terminal_controls(&global.codex_path.to_string_lossy())
+    );
+    print_differences(&differences);
+}
+
+fn print_differences(differences: &[&Difference]) {
+    for difference in differences {
+        match &difference.server {
+            Some(server) => {
+                println!(
+                    "  {} server {}",
+                    kind_label(difference),
+                    escape_terminal_controls(server)
+                );
             }
-            print_projection("claude", difference.claude.as_ref());
-            print_projection("codex", difference.codex.as_ref());
-            if let Some(reason) = &difference.intentional_reason {
-                println!("    reason: {}", escape_terminal_controls(reason));
-            }
+            None => println!("  {}", kind_label(difference)),
+        }
+        print_projection("claude", difference.claude.as_ref());
+        print_projection("codex", difference.codex.as_ref());
+        if let Some(reason) = &difference.intentional_reason {
+            println!("    reason: {}", escape_terminal_controls(reason));
         }
     }
 }
@@ -241,31 +262,40 @@ fn parity_json(report: &ParityReport) -> serde_json::Value {
         .iter()
         .map(|project| {
             let differences = project_differences(report, project);
-            let status = difference_status(&differences);
-            let differences = differences
-                .into_iter()
-                .map(|difference| {
-                    serde_json::json!({
-                        "server": difference.server.as_deref(),
-                        "kind": difference.kind,
-                        "claude": &difference.claude,
-                        "codex": &difference.codex,
-                        "intentional_reason": difference.intentional_reason.as_deref(),
-                    })
-                })
-                .collect::<Vec<_>>();
             serde_json::json!({
                 "root": project,
-                "status": status,
-                "differences": differences,
+                "status": difference_status(&differences),
+                "differences": differences_json(&differences),
             })
         })
         .collect::<Vec<_>>();
 
+    let global_differences = report.global.differences.iter().collect::<Vec<_>>();
     serde_json::json!({
         "status": report.status(),
+        "global": serde_json::json!({
+            "claude_path": report.global.claude_path,
+            "codex_path": report.global.codex_path,
+            "status": difference_status(&global_differences),
+            "differences": differences_json(&global_differences),
+        }),
         "projects": projects,
     })
+}
+
+fn differences_json(differences: &[&Difference]) -> Vec<serde_json::Value> {
+    differences
+        .iter()
+        .map(|difference| {
+            serde_json::json!({
+                "server": difference.server.as_deref(),
+                "kind": difference.kind,
+                "claude": &difference.claude,
+                "codex": &difference.codex,
+                "intentional_reason": difference.intentional_reason.as_deref(),
+            })
+        })
+        .collect()
 }
 
 fn escaped_string_list(values: &[String]) -> String {
