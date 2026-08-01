@@ -5,6 +5,7 @@ use crate::classify::classify;
 use crate::config::Config;
 use crate::decide::{Decision, decide, decide_explicit};
 use crate::error::{Error, Result};
+use crate::estimate::Estimate;
 use crate::log::{DecisionLog, Entry};
 use crate::provider::Provider;
 use crate::usage::UsageSnapshot;
@@ -51,6 +52,9 @@ pub struct Outcome {
     /// swallowing the job identity behind an Err.
     pub log_id: Option<i64>,
     pub log_error: Option<String>,
+    /// The projected weekly draw, populated on the dry run path only. A real dispatch is not asking
+    /// what a job would cost, it is spending it, so there is nothing to project.
+    pub estimate: Option<Estimate>,
 }
 
 /// IMPURE: run one task through the router.
@@ -95,6 +99,9 @@ pub fn run(request: &Request, config: &Config) -> Result<Outcome> {
         // only scoping flags refuse here too, for the provider the decision landed on: reporting a
         // clean route would hide that the real run would have dropped them.
         crate::dispatch::reject_mcp_scoping(request, decision.provider)?;
+        // Projected before this run's own row is written, so the dry run is never a sample of
+        // itself. It dispatched nothing, so it drew nothing.
+        let estimate = crate::estimate::project(&log, &decision)?;
         let log_id = log.record(&Entry {
             task: request.task,
             dir: request.dir,
@@ -110,6 +117,7 @@ pub fn run(request: &Request, config: &Config) -> Result<Outcome> {
             dispatch: None,
             log_id: Some(log_id),
             log_error: None,
+            estimate: Some(estimate),
         });
     }
 
@@ -147,6 +155,7 @@ pub fn run(request: &Request, config: &Config) -> Result<Outcome> {
         dispatch: Some(dispatch),
         log_id,
         log_error,
+        estimate: None,
     })
 }
 

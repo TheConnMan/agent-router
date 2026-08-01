@@ -222,6 +222,50 @@ impl DecisionLog {
         Ok(rows)
     }
 
+    /// IMPURE: this provider's own weekly percent at each dispatched decision on this exact model,
+    /// oldest first. Dry runs are excluded: they drew nothing, so a step across one is not a draw.
+    ///
+    /// The inner query takes the NEWEST `limit` rows and the outer one puts them back in
+    /// chronological order. Ordering ascending before the limit would instead take the OLDEST rows
+    /// and quietly answer about ancient history as the log grows, while the steps between rows are
+    /// only meaningful read oldest first.
+    pub fn weekly_series(
+        &self,
+        provider: &str,
+        model: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<f64>> {
+        let Some(column) = weekly_column(provider) else {
+            return Ok(Vec::new());
+        };
+        let read = |row: &rusqlite::Row| row.get(0);
+        let series = match model {
+            Some(model) => {
+                let sql = format!(
+                    "SELECT {column} FROM (SELECT id, {column} FROM decisions \
+                     WHERE provider = ?1 AND model = ?2 AND dry_run = 0 \
+                     ORDER BY id DESC LIMIT ?3) ORDER BY id ASC"
+                );
+                let mut statement = self.conn.prepare(&sql)?;
+                statement
+                    .query_map(rusqlite::params![provider, model, limit as i64], read)?
+                    .collect::<rusqlite::Result<Vec<f64>>>()?
+            }
+            None => {
+                let sql = format!(
+                    "SELECT {column} FROM (SELECT id, {column} FROM decisions \
+                     WHERE provider = ?1 AND model IS NULL AND dry_run = 0 \
+                     ORDER BY id DESC LIMIT ?2) ORDER BY id ASC"
+                );
+                let mut statement = self.conn.prepare(&sql)?;
+                statement
+                    .query_map(rusqlite::params![provider, limit as i64], read)?
+                    .collect::<rusqlite::Result<Vec<f64>>>()?
+            }
+        };
+        Ok(series)
+    }
+
     /// The `limit` newest decisions, newest first.
     pub fn recent(&self, limit: usize) -> Result<Vec<Row>> {
         let sql = format!("SELECT {SELECT_COLUMNS} FROM decisions ORDER BY id DESC LIMIT ?1");
@@ -268,6 +312,18 @@ fn add_missing_columns(conn: &Connection) -> Result<()> {
         conn.execute("ALTER TABLE decisions ADD COLUMN complexity TEXT", [])?;
     }
     Ok(())
+}
+
+/// PURE: the column a provider's own weekly percentage is recorded in. None for a provider the log
+/// keeps no weekly window for, so its series reads as empty rather than as another provider's
+/// numbers. Naming the column here rather than interpolating the caller's string also keeps the
+/// only formatted identifier in these queries a fixed one.
+fn weekly_column(provider: &str) -> Option<&'static str> {
+    match provider {
+        "claude" => Some("claude_weekly_pct"),
+        "codex" => Some("codex_weekly_pct"),
+        _ => None,
+    }
 }
 
 pub fn default_db_path() -> PathBuf {

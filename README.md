@@ -133,10 +133,18 @@ agent-router run "Fix the failing test" --dir ~/git/other-project
 | `--provider <NAME>` | `auto` | `auto` classifies. `codex`, `claude`, or `opencode` skips classification. |
 | `--model <NAME>` | tier table | Model override. Requires an explicit `--provider`. Pairing it with `--provider auto` is rejected: the router exits nonzero naming both flags rather than dropping the override, because the auto path chooses its own model from the tier table. |
 | `--name <NAME>` | first 40 characters of the task | Name for the dispatched job. It reaches the `claude --bg --name` argv verbatim, names the Codex thread, and is recorded as `job_name` in the decision log for every provider, so callers that reconcile inflight jobs by exact name depend on it. An empty or whitespace only name is rejected. |
-| `--dry-run` | off | Decide and log, dispatch nothing. |
+| `--dry-run` | off | Decide and log, dispatch nothing, and project the weekly draw the job is likely to cost on the provider it landed on. |
 | `--mcp-config <PATH>` | none | MCP config file for the dispatched Claude job. Repeatable. Rejected for any other provider, and the check runs after routing, so pairing it with `--provider auto` fails whenever classification lands on a provider other than Claude. |
 | `--strict-mcp-config` | off | Use only the `--mcp-config` files and drop every inherited MCP server. See the warning below before using it. |
 | `--json` | off | Emit the full decision, including gates, classification, and usage. |
+
+The projection is an upper bound, not the job's own cost. It is the median gap between this
+provider's weekly percentage at consecutive decisions on the same model, so it also carries
+everything else that consumed the same weekly quota over those intervals: your interactive
+sessions, jobs on other models, and anything dispatched without going through the router. It is
+the honest figure the decision log can support, and it is the right one for asking whether a job
+fits in what is left. Fewer than three comparable jobs in the log prints an explicit insufficient
+data line instead of a number.
 
 `--strict-mcp-config` also strips the claude.ai connectors, and no `--mcp-config` file can restore
 them. That interacts badly with routing: a task sent to Claude precisely because Codex was missing

@@ -344,6 +344,9 @@ fn outcome_json(outcome: &Outcome) -> serde_json::Value {
         "dry_run": outcome.dispatch.is_none(),
         "log_id": outcome.log_id,
         "log_error": outcome.log_error,
+        // Emitted on both paths, as null off the dry run one, so the JSON shape does not depend on
+        // which path produced it.
+        "estimate": outcome.estimate,
     })
 }
 
@@ -368,6 +371,9 @@ fn print_outcome(outcome: &Outcome) {
     }
     println!("{line}");
     println!("why: {}", decision.rationale);
+    if let Some(estimate) = &outcome.estimate {
+        print_estimate(estimate);
+    }
     match (outcome.log_id, &outcome.log_error) {
         (Some(id), _) => println!("log: row {id} in {}", db_path()),
         // The job is running regardless, so this is a warning on stderr, not a failure.
@@ -375,6 +381,23 @@ fn print_outcome(outcome: &Outcome) {
             "log: NOT RECORDED in {}: {}",
             db_path(),
             error.as_deref().unwrap_or("unknown error")
+        ),
+    }
+}
+
+/// The projection is an upper bound, and the wording is what keeps it from being read as the job's
+/// own cost, so "up to" and the clause naming what else is inside the number are not trimmed. A
+/// short sample prints its shortfall rather than a number it cannot support.
+fn print_estimate(estimate: &agent_router_core::estimate::Estimate) {
+    match estimate.weekly_pct {
+        Some(weekly_pct) => println!(
+            "estimate: up to {weekly_pct:.1}% of the {} weekly window (median gap over {} \
+             comparable jobs, includes other usage in the same period)",
+            estimate.provider, estimate.samples
+        ),
+        None => println!(
+            "estimate: insufficient data ({} comparable jobs, {} needed)",
+            estimate.samples, estimate.needed
         ),
     }
 }
