@@ -19,6 +19,15 @@ fn default_config() -> Config {
     Config::default()
 }
 
+/// A home directory holding neither `.claude.json` nor `.codex/config.toml`. Every project scoped
+/// test wants one: the global comparison then contributes nothing, and the home is injected rather
+/// than read from the environment so these tests stay hermetic under concurrent execution.
+fn empty_home(parent: &Path) -> PathBuf {
+    let home = parent.join("empty_home");
+    std::fs::create_dir_all(&home).expect("create empty home");
+    home
+}
+
 #[test]
 fn recursive_discovery_deduplicates_candidates_from_overlapping_roots() {
     let fixture = tempfile::tempdir().expect("tempdir");
@@ -31,6 +40,7 @@ fn recursive_discovery_deduplicates_candidates_from_overlapping_roots() {
     let report = check(
         &[fixture.path().to_path_buf(), fixture.path().join("outer")],
         &default_config(),
+        &empty_home(fixture.path()),
     )
     .expect("scan succeeds");
 
@@ -72,7 +82,8 @@ env = { ROOT_KEY = "codex_secret" }
 }"#,
         );
 
-        let report = check(&[project], &default_config()).expect("scan succeeds");
+        let report = check(&[project], &default_config(), &empty_home(fixture.path()))
+            .expect("scan succeeds");
 
         assert_eq!(report.status(), Status::Aligned);
         assert!(report.differences.is_empty());
@@ -96,7 +107,12 @@ command = "parent_command"
         r#"{"mcpServers":{"parent_only":{"command":"parent_command"}}}"#,
     );
 
-    let report = check(std::slice::from_ref(&project), &default_config()).expect("scan succeeds");
+    let report = check(
+        std::slice::from_ref(&project),
+        &default_config(),
+        &empty_home(fixture.path()),
+    )
+    .expect("scan succeeds");
 
     assert_eq!(report.differences.len(), 1);
     assert_eq!(report.differences[0].root, canonical(&project));
@@ -154,7 +170,8 @@ args = ["leaf_arg", "second_arg"]
 }"#,
     );
 
-    let report = check(&[leaf], &default_config()).expect("scan succeeds");
+    let report =
+        check(&[leaf], &default_config(), &empty_home(fixture.path())).expect("scan succeeds");
 
     assert_eq!(report.status(), Status::Aligned);
     assert!(report.differences.is_empty());
@@ -218,7 +235,8 @@ env = { TOKEN_KEY = "codex_token_secret" }
     );
     write(&project.join("CLAUDE.md"), "instructions");
 
-    let report = check(&[project], &default_config()).expect("scan succeeds");
+    let report =
+        check(&[project], &default_config(), &empty_home(fixture.path())).expect("scan succeeds");
     for kind in [
         ParityKind::MissingInCodex,
         ParityKind::MissingInClaude,
@@ -391,7 +409,8 @@ TOKEN_KEY = "codex_secret"
 "#,
     );
 
-    let report = check(&[project], &default_config()).expect("scan succeeds");
+    let report =
+        check(&[project], &default_config(), &empty_home(fixture.path())).expect("scan succeeds");
     let serialized = serde_json::to_string(&report).expect("serialize report");
 
     assert_eq!(report.status(), Status::Aligned);
@@ -425,7 +444,8 @@ enabled = false
 "#,
     );
 
-    let report = check(&[project], &default_config()).expect("scan succeeds");
+    let report =
+        check(&[project], &default_config(), &empty_home(fixture.path())).expect("scan succeeds");
 
     assert_eq!(report.status(), Status::Aligned);
     assert!(report.differences.is_empty());
@@ -473,7 +493,12 @@ command = "codex_command"
         kind: Some(ParityKind::CommandDiffers),
     }];
 
-    let report = check(&[fixture.path().to_path_buf()], &config).expect("scan succeeds");
+    let report = check(
+        &[fixture.path().to_path_buf()],
+        &config,
+        &empty_home(fixture.path()),
+    )
+    .expect("scan succeeds");
     let intentional = report
         .differences
         .iter()
@@ -521,7 +546,7 @@ fn a_wholly_intentional_difference_has_intentional_status() {
         kind: Some(ParityKind::StandaloneClaudeMd),
     }];
 
-    let report = check(&[project], &config).expect("scan succeeds");
+    let report = check(&[project], &config, &empty_home(fixture.path())).expect("scan succeeds");
 
     assert_eq!(report.status(), Status::Intentional);
     assert_eq!(report.differences.len(), 1);
@@ -562,9 +587,15 @@ fn deterministic_ordering_is_independent_of_scan_root_order_and_reduces_to_worst
     let forward = check(
         &[aligned.clone(), intentional.clone(), drift.clone()],
         &config,
+        &empty_home(fixture.path()),
     )
     .expect("forward scan");
-    let reverse = check(&[drift, intentional, aligned], &config).expect("reverse scan");
+    let reverse = check(
+        &[drift, intentional, aligned],
+        &config,
+        &empty_home(fixture.path()),
+    )
+    .expect("reverse scan");
 
     assert_eq!(forward.status(), Status::Drift);
     assert_eq!(reverse.status(), Status::Drift);
@@ -615,7 +646,12 @@ fn valid_and_dangling_instruction_symlinks_follow_file_existence_semantics() {
 
     write(&agents_only.join("AGENTS.md"), "instructions");
 
-    let report = check(&[fixture.path().to_path_buf()], &default_config()).expect("scan succeeds");
+    let report = check(
+        &[fixture.path().to_path_buf()],
+        &default_config(),
+        &empty_home(fixture.path()),
+    )
+    .expect("scan succeeds");
     let standalone_roots = report
         .differences
         .iter()
@@ -642,7 +678,12 @@ fn recursive_discovery_does_not_follow_directory_symlinks() {
     );
     symlink(outside.path(), scan.path().join("linked")).expect("directory link");
 
-    let report = check(&[scan.path().to_path_buf()], &default_config()).expect("scan succeeds");
+    let report = check(
+        &[scan.path().to_path_buf()],
+        &default_config(),
+        &empty_home(outside.path()),
+    )
+    .expect("scan succeeds");
 
     assert_eq!(report.status(), Status::Aligned);
     assert!(report.differences.is_empty());
@@ -656,7 +697,12 @@ fn recursive_discovery_does_not_descend_into_vcs_metadata() {
         r#"{"mcpServers":{"hidden":{"command":"runner"}}}"#,
     );
 
-    let report = check(&[fixture.path().to_path_buf()], &default_config()).expect("scan succeeds");
+    let report = check(
+        &[fixture.path().to_path_buf()],
+        &default_config(),
+        &empty_home(fixture.path()),
+    )
+    .expect("scan succeeds");
 
     assert_eq!(report.status(), Status::Aligned);
     assert!(report.differences.is_empty());
@@ -669,7 +715,12 @@ fn malformed_present_project_files_are_scan_errors() {
         write(&fixture.path().join(relative), contents);
 
         assert!(
-            check(&[fixture.path().to_path_buf()], &default_config()).is_err(),
+            check(
+                &[fixture.path().to_path_buf()],
+                &default_config(),
+                &empty_home(fixture.path())
+            )
+            .is_err(),
             "{relative} must not be treated as an empty declaration"
         );
     }
@@ -693,7 +744,11 @@ fn unreadable_present_project_files_are_scan_errors() {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))
             .expect("remove read permission");
 
-        let result = check(&[fixture.path().to_path_buf()], &default_config());
+        let result = check(
+            &[fixture.path().to_path_buf()],
+            &default_config(),
+            &empty_home(fixture.path()),
+        );
 
         std::fs::set_permissions(&path, original).expect("restore read permission");
         assert!(
@@ -712,9 +767,103 @@ fn missing_and_nondirectory_roots_are_scan_errors() {
 
     for root in [missing, regular_file] {
         assert!(
-            check(std::slice::from_ref(&root), &default_config()).is_err(),
+            check(
+                std::slice::from_ref(&root),
+                &default_config(),
+                &empty_home(fixture.path())
+            )
+            .is_err(),
             "{} must be rejected as a scan root",
             root.display()
         );
     }
+}
+
+/// A home directory carrying the two global files, built inside the fixture and passed to `check`
+/// directly so nothing about this test depends on the process environment.
+fn global_home(parent: &Path, claude: Option<&str>, codex: Option<&str>) -> PathBuf {
+    let home = parent.join("global_home");
+    std::fs::create_dir_all(&home).expect("create global home");
+    if let Some(contents) = claude {
+        write(&home.join(".claude.json"), contents);
+    }
+    if let Some(contents) = codex {
+        write(&home.join(".codex/config.toml"), contents);
+    }
+    home
+}
+
+/// A global MCP difference is classified with the same `ParityKind` a project difference would
+/// carry, is rooted at the canonicalized home directory so the exception mechanism reaches it, and
+/// lives in its own vector so no project can ever be blamed for it.
+#[test]
+fn a_global_mcp_difference_is_kept_out_of_the_project_differences() {
+    let fixture = tempfile::tempdir().expect("tempdir");
+    let project = fixture.path().join("project");
+    let home = global_home(
+        fixture.path(),
+        Some(r#"{"mcpServers":{"global_only":{"command":"runner"}}}"#),
+        None,
+    );
+    write(
+        &project.join(".mcp.json"),
+        r#"{"mcpServers":{"project_only":{"command":"runner"}}}"#,
+    );
+
+    let report =
+        check(std::slice::from_ref(&project), &default_config(), &home).expect("scan succeeds");
+
+    assert_eq!(
+        report.global.claude_path,
+        canonical(&home).join(".claude.json")
+    );
+    assert_eq!(
+        report.global.codex_path,
+        canonical(&home).join(".codex/config.toml")
+    );
+    assert_eq!(report.global.differences.len(), 1);
+    assert_eq!(
+        report.global.differences[0].kind,
+        ParityKind::MissingInCodex
+    );
+    assert_eq!(
+        report.global.differences[0].server.as_deref(),
+        Some("global_only")
+    );
+    assert_eq!(report.global.differences[0].root, canonical(&home));
+
+    assert_eq!(report.differences.len(), 1);
+    assert_eq!(
+        report.differences[0].server.as_deref(),
+        Some("project_only")
+    );
+    assert_eq!(report.differences[0].root, canonical(&project));
+    assert_eq!(report.status(), Status::Drift);
+}
+
+/// An absent global pair contributes nothing, which is what keeps every project scoped test in this
+/// file and in `parity_cli.rs` passing unchanged once the global entry exists.
+#[test]
+fn an_absent_global_pair_contributes_no_differences() {
+    let fixture = tempfile::tempdir().expect("tempdir");
+    let project = fixture.path().join("project");
+    write(
+        &project.join(".mcp.json"),
+        r#"{"mcpServers":{"shared":{"command":"runner"}}}"#,
+    );
+    write(
+        &project.join(".codex/config.toml"),
+        "[mcp_servers.shared]\ncommand = \"runner\"\n",
+    );
+
+    let report = check(
+        std::slice::from_ref(&project),
+        &default_config(),
+        &empty_home(fixture.path()),
+    )
+    .expect("scan succeeds");
+
+    assert!(report.global.differences.is_empty());
+    assert!(report.differences.is_empty());
+    assert_eq!(report.status(), Status::Aligned);
 }

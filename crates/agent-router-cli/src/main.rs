@@ -1,7 +1,10 @@
+use agent_router_core::doctor::Health;
 use agent_router_core::log::{DecisionLog, Row};
-use agent_router_core::parity::{Difference, ParityReport, ServerProjection, Status};
+use agent_router_core::parity::{Difference, GlobalReport, ParityReport, ServerProjection, Status};
 use agent_router_core::run::{Outcome, Request};
+use agent_router_core::stats::{Rate, Stats, Window};
 use clap::{Parser, Subcommand};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -58,7 +61,19 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Compare project scoped Claude and Codex declarations.
+    /// Aggregate metrics over recent routing decisions.
+    Stats {
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+        /// Also drop rows older than a lookback window, for example 24h, 7d, or 2w.
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Preflight the provider binaries, credentials, usage provenance, config, and decision log.
+    Doctor,
+    /// Compare the global and project scoped Claude and Codex declarations.
     Parity {
         #[arg(long = "root")]
         roots: Vec<PathBuf>,
@@ -70,6 +85,7 @@ enum Command {
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     match cli.command {
+        Command::Doctor => doctor_exit(),
         Command::Parity { roots, json } => parity_exit(roots, json),
         command => match run(Cli { command }) {
             Ok(()) => std::process::ExitCode::SUCCESS,
@@ -78,6 +94,33 @@ fn main() -> std::process::ExitCode {
                 std::process::ExitCode::FAILURE
             }
         },
+    }
+}
+
+/// Doctor owns its exit code the same way parity does: a failing check is reported by exiting
+/// nonzero, not by an error, since the report itself is the output.
+fn doctor_exit() -> std::process::ExitCode {
+    let report = agent_router_core::doctor::run();
+    for check in &report.checks {
+        println!(
+            "{:<4} {:<19} {}",
+            health_label(check.health),
+            check.name,
+            escape_terminal_controls(&check.detail)
+        );
+    }
+    if report.failed() {
+        std::process::ExitCode::FAILURE
+    } else {
+        std::process::ExitCode::SUCCESS
+    }
+}
+
+fn health_label(health: Health) -> &'static str {
+    match health {
+        Health::Pass => "pass",
+        Health::Warn => "warn",
+        Health::Fail => "fail",
     }
 }
 
@@ -92,11 +135,12 @@ fn parity_exit(roots: Vec<PathBuf>, json: bool) -> std::process::ExitCode {
             return std::process::ExitCode::from(2);
         }
     };
-    let report = match agent_router_core::parity::check(&roots, &config) {
+    let home = agent_router_core::runtime::home_dir();
+    let report = match agent_router_core::parity::check(&roots, &config, &home) {
         Ok(report) => report,
         Err(error) => {
             eprintln!(
-                "agent-router: parity scan error while reading .mcp.json or \
+                "agent-router: parity scan error while reading .mcp.json, .claude.json, or \
                  .codex/config.toml: {}",
                 escape_terminal_controls(&error.to_string())
             );
@@ -145,12 +189,15 @@ fn run(cli: Cli) -> agent_router_core::Result<()> {
         ),
         Command::Usage { json } => usage(json),
         Command::Log { limit, json } => log(limit, json),
+        Command::Stats { limit, since, json } => stats(limit, since, json),
+        Command::Doctor => unreachable!("doctor has a command specific exit path"),
         Command::Parity { .. } => unreachable!("parity has a command specific exit path"),
     }
 }
 
 fn print_parity(report: &ParityReport) {
     println!("parity: {}", status_label(report.status()));
+    print_global(&report.global);
     for project in &report.projects {
         let differences = project_differences(report, project);
         println!(
@@ -158,22 +205,41 @@ fn print_parity(report: &ParityReport) {
             escape_terminal_controls(&project.to_string_lossy()),
             status_label(difference_status(&differences))
         );
-        for difference in differences {
-            match &difference.server {
-                Some(server) => {
-                    println!(
-                        "  {} server {}",
-                        kind_label(difference),
-                        escape_terminal_controls(server)
-                    );
-                }
-                None => println!("  {}", kind_label(difference)),
+        print_differences(&differences);
+    }
+}
+
+/// The global entry prints first, because it is the ambient configuration every project inherits.
+fn print_global(global: &GlobalReport) {
+    let differences = global.differences.iter().collect::<Vec<_>>();
+    println!("global: {}", status_label(difference_status(&differences)));
+    println!(
+        "  claude: {}",
+        escape_terminal_controls(&global.claude_path.to_string_lossy())
+    );
+    println!(
+        "  codex: {}",
+        escape_terminal_controls(&global.codex_path.to_string_lossy())
+    );
+    print_differences(&differences);
+}
+
+fn print_differences(differences: &[&Difference]) {
+    for difference in differences {
+        match &difference.server {
+            Some(server) => {
+                println!(
+                    "  {} server {}",
+                    kind_label(difference),
+                    escape_terminal_controls(server)
+                );
             }
-            print_projection("claude", difference.claude.as_ref());
-            print_projection("codex", difference.codex.as_ref());
-            if let Some(reason) = &difference.intentional_reason {
-                println!("    reason: {}", escape_terminal_controls(reason));
-            }
+            None => println!("  {}", kind_label(difference)),
+        }
+        print_projection("claude", difference.claude.as_ref());
+        print_projection("codex", difference.codex.as_ref());
+        if let Some(reason) = &difference.intentional_reason {
+            println!("    reason: {}", escape_terminal_controls(reason));
         }
     }
 }
@@ -196,31 +262,40 @@ fn parity_json(report: &ParityReport) -> serde_json::Value {
         .iter()
         .map(|project| {
             let differences = project_differences(report, project);
-            let status = difference_status(&differences);
-            let differences = differences
-                .into_iter()
-                .map(|difference| {
-                    serde_json::json!({
-                        "server": difference.server.as_deref(),
-                        "kind": difference.kind,
-                        "claude": &difference.claude,
-                        "codex": &difference.codex,
-                        "intentional_reason": difference.intentional_reason.as_deref(),
-                    })
-                })
-                .collect::<Vec<_>>();
             serde_json::json!({
                 "root": project,
-                "status": status,
-                "differences": differences,
+                "status": difference_status(&differences),
+                "differences": differences_json(&differences),
             })
         })
         .collect::<Vec<_>>();
 
+    let global_differences = report.global.differences.iter().collect::<Vec<_>>();
     serde_json::json!({
         "status": report.status(),
+        "global": serde_json::json!({
+            "claude_path": report.global.claude_path,
+            "codex_path": report.global.codex_path,
+            "status": difference_status(&global_differences),
+            "differences": differences_json(&global_differences),
+        }),
         "projects": projects,
     })
+}
+
+fn differences_json(differences: &[&Difference]) -> Vec<serde_json::Value> {
+    differences
+        .iter()
+        .map(|difference| {
+            serde_json::json!({
+                "server": difference.server.as_deref(),
+                "kind": difference.kind,
+                "claude": &difference.claude,
+                "codex": &difference.codex,
+                "intentional_reason": difference.intentional_reason.as_deref(),
+            })
+        })
+        .collect()
 }
 
 fn escaped_string_list(values: &[String]) -> String {
@@ -331,6 +406,9 @@ fn outcome_json(outcome: &Outcome) -> serde_json::Value {
         "dry_run": outcome.dispatch.is_none(),
         "log_id": outcome.log_id,
         "log_error": outcome.log_error,
+        // Emitted on both paths, as null off the dry run one, so the JSON shape does not depend on
+        // which path produced it.
+        "estimate": outcome.estimate,
     })
 }
 
@@ -355,6 +433,9 @@ fn print_outcome(outcome: &Outcome) {
     }
     println!("{line}");
     println!("why: {}", decision.rationale);
+    if let Some(estimate) = &outcome.estimate {
+        print_estimate(estimate);
+    }
     match (outcome.log_id, &outcome.log_error) {
         (Some(id), _) => println!("log: row {id} in {}", db_path()),
         // The job is running regardless, so this is a warning on stderr, not a failure.
@@ -362,6 +443,23 @@ fn print_outcome(outcome: &Outcome) {
             "log: NOT RECORDED in {}: {}",
             db_path(),
             error.as_deref().unwrap_or("unknown error")
+        ),
+    }
+}
+
+/// The projection is an upper bound, and the wording is what keeps it from being read as the job's
+/// own cost, so "up to" and the clause naming what else is inside the number are not trimmed. A
+/// short sample prints its shortfall rather than a number it cannot support.
+fn print_estimate(estimate: &agent_router_core::estimate::Estimate) {
+    match estimate.weekly_pct {
+        Some(weekly_pct) => println!(
+            "estimate: up to {weekly_pct:.1}% of the {} weekly window (median gap over {} \
+             comparable jobs, includes other usage in the same period)",
+            estimate.provider, estimate.samples
+        ),
+        None => println!(
+            "estimate: insufficient data ({} comparable jobs, {} needed)",
+            estimate.samples, estimate.needed
         ),
     }
 }
@@ -378,12 +476,13 @@ fn usage(json: bool) -> agent_router_core::Result<()> {
         println!("{}", serde_json::to_string_pretty(&snapshot)?);
         return Ok(());
     }
-    println!("provider  5h      weekly  weekly reset");
+    println!("provider  5h      weekly  source     weekly reset");
     for (name, headroom) in [("claude", snapshot.claude), ("codex", snapshot.codex)] {
         println!(
-            "{name:<9} {:>5.1}%  {:>5.1}%  {}",
+            "{name:<9} {:>5.1}%  {:>5.1}%  {:<9}  {}",
             headroom.five_hour_pct,
             headroom.weekly_pct,
+            usage_source_label(headroom.stale),
             reset_label(headroom.weekly_reset_epoch)
         );
     }
@@ -428,6 +527,99 @@ fn log(limit: usize, json: bool) -> agent_router_core::Result<()> {
     Ok(())
 }
 
+fn stats(limit: usize, since: Option<String>, json: bool) -> agent_router_core::Result<()> {
+    let since_ms = match &since {
+        Some(window) => {
+            let lookback = agent_router_core::stats::parse_since(window)?;
+            Some(agent_router_core::runtime::now_ms() - lookback)
+        }
+        None => None,
+    };
+    let log = DecisionLog::open()?;
+    let stats = agent_router_core::stats::collect(&log, Window { limit, since_ms })?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&stats_json(&stats))?);
+        return Ok(());
+    }
+    print_stats(&stats);
+    Ok(())
+}
+
+fn stats_json(stats: &Stats) -> serde_json::Value {
+    serde_json::json!({
+        "rows_considered": stats.rows_considered,
+        "oldest_created_at_ms": stats.oldest_created_at_ms,
+        "newest_created_at_ms": stats.newest_created_at_ms,
+        "routes": stats.routes,
+        "gates": stats.gates,
+        "complexity": stats.complexity,
+        "auto_routes": stats.auto_routes,
+        "flip_rate": rate_json(&stats.flip_rate),
+        "classifier_failure_rate": rate_json(&stats.classifier_failure_rate),
+        "dry_run_share": rate_json(&stats.dry_run_share),
+    })
+}
+
+/// Both counts travel with the share, so a reader can check the rate rather than trust it. The
+/// share is null when there was nothing to divide by.
+fn rate_json(rate: &Rate) -> serde_json::Value {
+    serde_json::json!({
+        "numerator": rate.numerator,
+        "denominator": rate.denominator,
+        "share": rate.share(),
+    })
+}
+
+fn print_stats(stats: &Stats) {
+    println!("rows considered: {}", stats.rows_considered);
+    println!(
+        "window: {} to {}",
+        stamp(stats.oldest_created_at_ms),
+        stamp(stats.newest_created_at_ms)
+    );
+    println!("auto routes: {}", stats.auto_routes);
+    print_counts("routes", &stats.routes);
+    print_counts("gates", &stats.gates);
+    print_counts("complexity", &stats.complexity);
+    print_rate("flip rate", &stats.flip_rate);
+    print_rate("classifier failure rate", &stats.classifier_failure_rate);
+    print_rate("dry run share", &stats.dry_run_share);
+}
+
+fn print_counts(label: &str, counts: &BTreeMap<String, usize>) {
+    if counts.is_empty() {
+        println!("{label}: -");
+        return;
+    }
+    let rendered = counts
+        .iter()
+        .map(|(name, count)| format!("{} {count}", escape_terminal_controls(name)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!("{label}: {rendered}");
+}
+
+/// A rate with no denominator prints as "-": any percentage on the screen would be invented, and a
+/// zero over zero share renders as NaN.
+fn print_rate(label: &str, rate: &Rate) {
+    match rate.share() {
+        Some(share) => println!(
+            "{label}: {:.1}% ({} of {})",
+            share * 100.0,
+            rate.numerator,
+            rate.denominator
+        ),
+        None => println!("{label}: - (0 of 0)"),
+    }
+}
+
+fn stamp(created_at_ms: Option<i64>) -> String {
+    match created_at_ms {
+        Some(ms) => ms.to_string(),
+        None => "-".to_string(),
+    }
+}
+
 fn row_json(row: &Row) -> serde_json::Value {
     serde_json::json!({
         "id": row.id,
@@ -452,6 +644,9 @@ fn row_json(row: &Row) -> serde_json::Value {
         "job_name": row.job_name,
         "outcome": row.outcome,
         "rationale": row.rationale,
+        // Null on a row written before the marker, which is not the same as a live read.
+        "claude_usage_stale": row.claude_usage_stale,
+        "codex_usage_stale": row.codex_usage_stale,
     })
 }
 
@@ -462,6 +657,13 @@ fn first_line(task: &str) -> String {
         return line.to_string();
     }
     format!("{}...", line.chars().take(97).collect::<String>())
+}
+
+/// Where a provider's numbers came from. Two zeroes from a fail open read and two zeroes from a
+/// provider that has consumed nothing are the same line without this, and only one of them means
+/// the router knows anything.
+fn usage_source_label(stale: bool) -> &'static str {
+    if stale { "fail-open" } else { "live" }
 }
 
 /// "in 2h13m" for a future reset, "-" when the epoch is unknown, "elapsed" once it has passed.

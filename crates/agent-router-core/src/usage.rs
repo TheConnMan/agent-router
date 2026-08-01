@@ -3,6 +3,18 @@
 //!
 //! Both readers FAIL OPEN: any missing file, network failure, or unparseable payload reads as
 //! full headroom, because a usage read must never be the thing that blocks a dispatch.
+//!
+//! Every fail open value carries `stale = true`, and only a parsed payload carries `stale = false`.
+//! Numerically a fail open read and a genuinely idle provider are the same two zeroes, so the flag
+//! is the only thing that separates them. `agent-router doctor` reports it as `live` or
+//! `fail-open`, and the decision log records it per provider on every row.
+//!
+//! The flag reads freshness but means provenance, and there is one path where the two diverge:
+//! `claude_headroom`'s last resort reads the shared cache regardless of its age, and a cache that
+//! parses carries `stale = false` however old it is. So an expired but parseable cache, read
+//! because the API was unreachable, is reported `live` rather than fail open. That is deliberate:
+//! the numbers came from a real reading of the provider rather than from a default, which is the
+//! distinction routing acts on, and `usage.sh` reports the same cache the same way.
 
 use crate::runtime::{default_codex_home, home_dir};
 use std::path::{Path, PathBuf};
@@ -29,21 +41,28 @@ pub struct Headroom {
     pub five_hour_reset_epoch: i64,
     pub weekly_pct: f64,
     pub weekly_reset_epoch: i64,
+    /// True when this is the fail open default rather than a live read. A fail open read is
+    /// indistinguishable from a genuinely idle provider by its numbers alone, and an idle looking
+    /// provider wins every headroom tiebreak, so the distinction is recorded rather than inferred.
+    pub stale: bool,
 }
 
 impl Headroom {
-    /// The fail-open value: nothing consumed, no known resets.
+    /// The fail-open value: nothing consumed, no known resets. `stale` is what makes this
+    /// distinguishable from a live read of a provider that has genuinely consumed nothing, which
+    /// reports the same numbers.
     pub const fn full() -> Headroom {
         Headroom {
             five_hour_pct: 0.0,
             five_hour_reset_epoch: 0,
             weekly_pct: 0.0,
             weekly_reset_epoch: 0,
+            stale: true,
         }
     }
 
-    /// Weekly percent still available. Routing uses weekly only: the 5h window matters for
-    /// pacing a stream of jobs, not for placing a single one.
+    /// Weekly percent still available. The weekly window is what places a single job; Claude's 5h
+    /// window is what paces a stream of them away from Claude once it is near exhausted.
     pub fn weekly_remaining(&self) -> f64 {
         100.0 - self.weekly_pct
     }
@@ -118,6 +137,7 @@ pub fn parse_claude_usage(body: &str) -> Option<Headroom> {
         five_hour_reset_epoch: five_hour.and_then(resets_at_epoch).unwrap_or(0),
         weekly_pct: utilization(seven_day).unwrap_or(0.0),
         weekly_reset_epoch: resets_at_epoch(seven_day).unwrap_or(0),
+        stale: false,
     })
 }
 
@@ -248,6 +268,7 @@ pub fn parse_codex_rate_limits(line: &str, now: i64) -> Option<Headroom> {
         five_hour_reset_epoch,
         weekly_pct,
         weekly_reset_epoch,
+        stale: false,
     })
 }
 

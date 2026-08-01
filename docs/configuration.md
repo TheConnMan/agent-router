@@ -54,6 +54,7 @@ as predating versioning, so do not delete the key to "reset" anything.
 config_version = 1
 hard_ceiling_pct = 97.0
 headroom_flip_gap = 25.0
+claude_five_hour_pacing_pct = 90.0
 classifier_timeout_secs = 60
 connectors = [
     "local shell",
@@ -106,6 +107,31 @@ Default `25.0`. How many points of weekly headroom advantage flip a borderline v
 Only borderline (medium or low confidence) verdicts are subject to this. If the other provider has
 at least this many more points of weekly headroom remaining, the task moves there and the decision
 is tagged `headroom_tiebreak`. Raising it makes routing respect the rubric more and usage less.
+
+### `claude_five_hour_pacing_pct`
+
+Default `90.0`. Claude 5 hour percent used at or above which a task is paced away from Claude.
+
+This runs after the weekly rules, on the provider they landed on. A task still bound for Claude
+moves to Codex when Claude's 5 hour percent reaches this threshold, and the decision is tagged
+`five_hour_pacing`. Unlike `headroom_flip_gap`, it applies to confident verdicts too: a near
+exhausted 5 hour window stalls a Claude dispatch rather than merely making it more expensive.
+
+Codex having room is judged by `hard_ceiling_pct`, the same threshold the exhaustion flip uses,
+rather than by a second key that could drift away from it. Codex sitting exactly on that ceiling has
+no room, so no pacing happens: moving the job would relocate the stall rather than avoid it.
+
+A capability pin overrides this entirely. A task that needs a connector Codex cannot reach, or that
+carries two or more Claude signals, stays on Claude however exhausted its 5 hour window is, because
+a paced job that cannot reach its connector is a failed job rather than a cheaper one.
+
+Setting `weekly_routing = false` disables pacing along with every other usage driven rule. An
+operator who turned weekly routing off asked to route purely on task shape, and a usage driven flip
+would contradict that, so there is no second flag to leave on by accident.
+
+Codex's own 5 hour number is deliberately ignored, in both directions: it never paces a task away
+from Codex and it never keeps one on Claude. Only Claude has a 5 hour window that constrains a
+stream of jobs on this box.
 
 ### `classifier_timeout_secs`
 
@@ -281,6 +307,13 @@ reason = "Codex intentionally runs the read-only Airtable profile"
 `path` matches one project directory exactly, not a subtree, so it names the directory holding the
 `.mcp.json` or `.codex/config.toml` rather than a parent of it. As with `roots`, `~` is not
 expanded here.
+
+A difference in the global comparison of `~/.claude.json` against `~/.codex/config.toml` is excepted
+the same way, by setting `path` to your home directory, because that is the root a global difference
+is reported under. Such an exception also covers the home directory when it is itself scanned as a
+project, which happens whenever a scan is rooted at or above it, since `.codex/config.toml` is one of
+the discovery markers. The two stay separate entries in the report; one exception simply reaches
+both.
 
 Valid `kind` values are `missing_in_codex`, `missing_in_claude`, `command_differs`, `args_differ`,
 `env_keys_differ`, and `standalone_claude_md`.
