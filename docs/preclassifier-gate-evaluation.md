@@ -16,8 +16,11 @@ idea is not re-proposed without new evidence.
 98 cases, each carrying the classifier's own recorded verdict from the decision log rather than a
 human assigned label. 79 cases are observed real traffic. 19 are task texts authored to cover both
 directions and the near miss cases, then labelled by running the live classifier over them, so each
-still has a decision log row id as provenance. Decisions whose classifier call failed and fell back
-are excluded, because a fallback carries no classifier judgment.
+still has a decision log row id as provenance. The decision log holds 113 rows in total. 9 rows
+requested as `--provider auto` are excluded because the classifier call failed and fell back, and a
+fallback carries no classifier judgment; a further 6 rows are excluded because the caller named a
+provider explicitly, so no classification ran and the verdict is null. The remaining 98 rows, all
+requested as `--provider auto` and all carrying a real classifier verdict, are the evidence set.
 
 | Split | Count |
 | --- | --- |
@@ -28,7 +31,9 @@ are excluded, because a fallback carries no classifier judgment.
 
 The fixture is `crates/agent-router-core/tests/fixtures/preclassifier_cases.json`, held to its
 composition by `tests/preclassifier_fixture.rs`. The rule and its measurement are in
-`tests/preclassifier_gate_eval.rs`.
+`tests/preclassifier_gate_eval.rs`. Those pinned assertions are a decision record, not a regression
+guard: they hold the measured numbers in place so that a later change forces this decision to be
+revisited rather than drifting silently.
 
 ## The bar
 
@@ -39,53 +44,99 @@ Fixed in advance, before measurement:
 
 ## Result
 
-| Measure | Value |
-| --- | --- |
-| Cases | 98 |
-| Fired | 20 (20.4 percent) |
-| Agreed | 13 |
-| Disagreed | 7 |
-| Agreement rate among fired | 65.0 percent |
-| Wrong pins | 7 |
-| Oracle ceiling | 13 cases (13.3 percent) |
+The two halves of the evidence behave completely differently, so the blended numbers are never
+reported on their own.
 
-The zero wrong pin bar is missed by 7. The 20 percent fire rate bar is nominally met at 20.4
-percent, but only because the 7 wrong pins are counted among the firings. The correct firings alone
-are 13, which is 13.3 percent.
+| Origin | Cases | Fired | Fire rate | Wrong pins | Oracle ceiling |
+| --- | --- | --- | --- | --- | --- |
+| Observed traffic | 79 | 5 | 6.3 percent | 0 | 5 (6.3 percent) |
+| Authored probes | 19 | 15 | 78.9 percent | 7 | 8 (42.1 percent) |
+| All cases | 98 | 20 | 20.4 percent | 7 | 13 (13.3 percent) |
 
-## Finding 1: naming a system is not the same as needing to reach it
+Agreement rate among the 20 blended firings is 65.0 percent: 13 agreed, 7 disagreed.
 
-All 7 wrong pins have the same shape. The task names an out of inventory system as a token inside
-the codebase rather than as a system to reach, so no connector is required, and the classifier sent
-every one of them to Codex. Three illustrations, by decision log id:
+The traffic grounded reason for rejection is the fire rate. On observed traffic the rule fires on
+6.3 percent of cases, nowhere near the 20 percent bar, and the observed traffic oracle ceiling is
+also 6.3 percent, so no tuning reaches the bar on the traffic the rule would actually run against.
 
-- 95: "Fix the typo in the README section that describes our n8n workflows, then run the test suite."
-- 105: "Delete the dead slack_webhook_url key from config.toml and remove the matching field from
-  the config struct."
-- 110: "Grep the repo for every mention of Snowflake and list the files that contain it, making no
-  changes."
+The blended 20.4 percent is an artifact of the authored probe set, which was deliberately dense in
+connector cases. It is not an estimate of real traffic. It also clears 20 percent by exactly one
+case: 20 of 98 is 20.4 percent, and 19 of 98 would be 19.4 percent and would miss.
 
-A text match carries no way to tell the two apart, and that distinction is exactly the judgment the
-classifier is making.
+The 7 wrong pins prove the failure mode is real and easy to hit with ordinary tasks, but all 7 are
+authored cases, so this evidence establishes that the mode exists, not how often it would occur in
+production.
 
-## Finding 2: the ceiling makes this unfixable by tuning
+## Finding 1: the ceiling makes this unfixable by tuning
 
-Only 13 of 98 cases actually carry `missing_connector` true, so no rule that never wrong pins can
-fire on more than 13.3 percent of this evidence, which is already below the 20 percent bar. The two
-bars are jointly unreachable for this family of rule, not merely unmet by this candidate. Tuning the
-vocabulary to remove the wrong pins necessarily drives the fire rate down toward that ceiling, never
-up.
+No rule keyed on the missing connector criterion can fire more often than the missing connector rate
+itself, which is 13.3 percent across all cases and 6.3 percent on observed traffic. Both are below
+the 20 percent bar, so the two bars are jointly unreachable for this family of rule, not merely
+unmet by this candidate. Tuning the vocabulary to remove wrong pins necessarily drives the fire rate
+down toward that ceiling, never up.
+
+This bound is narrow on purpose. It says nothing about rules built on other grounds: 57 of the 98
+cases carry verdict `claude`, so a rule predicting `claude` from some other signal could in
+principle fire far more often without wrong pinning. What is ruled out is keying on the absent
+connector.
+
+## Finding 2: naming a system is not the same as needing to reach it
+
+The 7 wrong pins are two distinct shapes, and only one of them is fixable.
+
+Three are tokenizer artifacts, fixable by a better tokenizer. The system name sits inside a
+snake_case identifier and matches only because the underscore is treated as a word boundary, so
+treating the underscore as a word character removes all three. By decision log id:
+
+- 105: `slack_webhook_url`, a dead config key being deleted.
+- 106: `jira_ticket_id`, a parser getting a unit test.
+- 108: `sentry_dsn`, a field getting a doc comment.
+
+Four are not fixable by tokenizing. The system is named in ordinary prose while no connector is
+needed at all:
+
+- 95: fixing a typo in a README section that describes n8n workflows.
+- 107: updating docs to state that the Notion integration was removed.
+- 109: fixing the word Stripe misspelled in three comments.
+- 110: grepping the repo for mentions of Snowflake and listing the files.
+
+This second group is what kills the approach. Distinguishing a system that must be reached from a
+system that is merely named is exactly the judgment the classifier makes, and no text matching rule
+can recover it.
+
+## Sensitivity to the matching rule
+
+The conclusion does not depend on which matching rule was chosen. Every variant fails at least one
+bar:
+
+| Matching rule | Fired | Fire rate | Wrong pins | Outcome |
+| --- | --- | --- | --- | --- |
+| Underscore as a word character | 17 | 17.3 percent | 4 | Fails both bars |
+| Underscore as a boundary (measured) | 20 | 20.4 percent | 7 | Fails the wrong pin bar |
+| Loose substring matching | 21 | 21.4 percent | 8 | Fails the wrong pin bar |
+
+## Limitations of this evidence
+
+- The 19 authored probes were written by the same evaluator who proposed the rule, and were
+  deliberately dense in connector cases. Their labels are the classifier's own recorded verdicts
+  rather than the author's judgment, which is what keeps them usable, but their prevalence is
+  chosen, not observed.
+- Within observed traffic, only 2 distinct task texts ever cause the rule to fire, so the real
+  traffic firing behavior rests on a very thin base.
+- 17 of the 26 vocabulary terms never match anything in the evidence set, and the set contains no
+  system outside that vocabulary, so the vocabulary's coverage of real systems is untested.
 
 ## Secondary observation: the rule cannot be built from existing configuration
 
 The config lists only the connectors that are available. Detecting a name that is absent therefore
 requires a second, separately maintained vocabulary of system names, which is a new config surface
-and is inherently incomplete. That cost is real, and it buys at most 13.3 percent of calls even in
-the perfect case.
+and is inherently incomplete. That cost is real, and even in the perfect case it buys at most 13.3
+percent of calls across all cases, 6.3 percent on observed traffic.
 
 ## What would justify revisiting this
 
 Two things, together:
 
-1. Evidence that the determined subset is materially larger than 13.3 percent of real traffic.
+1. Evidence from observed traffic, not authored probes, that the determined subset is materially
+   larger than the 6.3 percent measured here.
 2. A rule that distinguishes a system that must be reached from a system that is merely named.
