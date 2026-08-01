@@ -7,7 +7,8 @@
 //! `agent-router log` prints, so the two reconcile by construction.
 
 use crate::error::{Error, Result};
-use crate::log::{DecisionLog, StatsRow};
+use crate::log::{DecisionLog, Mark, StatsRow};
+use crate::status::State;
 use std::collections::BTreeMap;
 
 /// The gates that move a task off the provider it started on. Any new provider moving gate belongs
@@ -32,6 +33,11 @@ const UNSCORED: &str = "unscored";
 
 /// What the caller named when it asked the router to classify rather than pick a provider.
 const AUTO: &str = "auto";
+
+/// The prefix `run` writes into `outcome` when the dispatch itself failed. Nothing reconciles such
+/// a row, because it never produced a job, but the router watched that dispatch fail, so its fate
+/// is settled and it is a failure.
+const DISPATCH_ERROR: &str = "error: ";
 
 const HOUR_MS: i64 = 60 * 60 * 1_000;
 
@@ -82,6 +88,20 @@ pub struct Stats {
     pub classifier_failure_rate: Rate,
     /// Rows that dispatched nothing, over every row considered.
     pub dry_run_share: Rate,
+    /// Gate tag to the rows carrying it that a human marked `bad`, over the rows carrying it that a
+    /// human marked at all. A row carrying several tags counts under each of them.
+    pub bad_rate_by_gate: BTreeMap<String, Rate>,
+    /// Provider to the same rate, over the marked rows that landed there.
+    pub bad_rate_by_provider: BTreeMap<String, Rate>,
+    /// Complexity tier to the same rate, with unscored rows counted as `unscored`.
+    pub bad_rate_by_complexity: BTreeMap<String, Rate>,
+    /// Gate tag to the rows carrying it that settled as a failure, over the rows carrying it whose
+    /// fate settled at all. A dry run and a job nobody has heard back about are in neither.
+    pub failure_rate_by_gate: BTreeMap<String, Rate>,
+    /// Provider to the same rate, over the settled rows that landed there.
+    pub failure_rate_by_provider: BTreeMap<String, Rate>,
+    /// Complexity tier to the same rate, with unscored rows counted as `unscored`.
+    pub failure_rate_by_complexity: BTreeMap<String, Rate>,
 }
 
 /// PURE: fold the fetched rows into a report.
@@ -95,6 +115,12 @@ pub fn summarize(rows: &[StatsRow]) -> Stats {
     let mut flipped = 0;
     let mut classifier_failures = 0;
     let mut dry_runs = 0;
+    let mut bad_rate_by_gate: BTreeMap<String, Rate> = BTreeMap::new();
+    let mut bad_rate_by_provider: BTreeMap<String, Rate> = BTreeMap::new();
+    let mut bad_rate_by_complexity: BTreeMap<String, Rate> = BTreeMap::new();
+    let mut failure_rate_by_gate: BTreeMap<String, Rate> = BTreeMap::new();
+    let mut failure_rate_by_provider: BTreeMap<String, Rate> = BTreeMap::new();
+    let mut failure_rate_by_complexity: BTreeMap<String, Rate> = BTreeMap::new();
 
     for row in rows {
         *routes.entry(row.provider.clone()).or_insert(0) += 1;
@@ -102,11 +128,25 @@ pub fn summarize(rows: &[StatsRow]) -> Stats {
             .complexity
             .clone()
             .unwrap_or_else(|| UNSCORED.to_string());
-        *complexity.entry(tier).or_insert(0) += 1;
+        *complexity.entry(tier.clone()).or_insert(0) += 1;
 
         let tags = gate_tags(&row.gates);
         for tag in &tags {
             *gates.entry((*tag).to_string()).or_insert(0) += 1;
+        }
+
+        // Each row contributes to one provider key, one complexity key, and every gate key it
+        // carries, in both families. The entry is created whichever population the row is in, so a
+        // key nobody has judged and a key nothing has settled both stay visible as zero of zero.
+        let bad = marked_bad(row);
+        let failure = settled_as_failure(row);
+        count(&mut bad_rate_by_provider, &row.provider, bad);
+        count(&mut failure_rate_by_provider, &row.provider, failure);
+        count(&mut bad_rate_by_complexity, &tier, bad);
+        count(&mut failure_rate_by_complexity, &tier, failure);
+        for tag in &tags {
+            count(&mut bad_rate_by_gate, tag, bad);
+            count(&mut failure_rate_by_gate, tag, failure);
         }
 
         if row.dry_run {
@@ -157,7 +197,60 @@ pub fn summarize(rows: &[StatsRow]) -> Stats {
             numerator: dry_runs,
             denominator: rows.len(),
         },
+        bad_rate_by_gate,
+        bad_rate_by_provider,
+        bad_rate_by_complexity,
+        failure_rate_by_gate,
+        failure_rate_by_provider,
+        failure_rate_by_complexity,
     }
+}
+
+/// PURE: add one row's contribution to the rate under `key`.
+///
+/// The entry is created even when the row is in no population, because a key that vanishes from a
+/// breakdown reads as a key nobody routed to, where the truth is a key nobody has judged. `hit` is
+/// None for a row outside this rate's denominator entirely.
+fn count(rates: &mut BTreeMap<String, Rate>, key: &str, hit: Option<bool>) {
+    let rate = rates.entry(key.to_string()).or_default();
+    let Some(hit) = hit else {
+        return;
+    };
+    rate.denominator += 1;
+    if hit {
+        rate.numerator += 1;
+    }
+}
+
+/// PURE: whether a human judged this row bad, or None when nobody judged it at all.
+///
+/// An unmarked row is absence of evidence, not evidence of a good route, so it stays out of the
+/// denominator. Counting it as good would drive every bad rate toward zero as the log grows, which
+/// is exactly as the log becomes worth reading.
+fn marked_bad(row: &StatsRow) -> Option<bool> {
+    row.mark.as_deref().map(|mark| mark == Mark::Bad.tag())
+}
+
+/// PURE: whether this row settled as a failure, or None when its fate is not settled.
+///
+/// `dispatched` is the value written at dispatch time, `running` is a live job, and `unknown` is
+/// reconciliation reporting that it could not tell, so none of the three has been shown to have
+/// succeeded and counting any of them as one reports a perfect record over jobs nobody has heard
+/// back about. An outcome a later router invents lands here too, in neither count rather than
+/// guessed into a neighbour. A dry run is excluded on its flag rather than on its outcome, because
+/// it dispatched nothing that could succeed or fail.
+fn settled_as_failure(row: &StatsRow) -> Option<bool> {
+    if row.dry_run {
+        return None;
+    }
+    let outcome = row.outcome.as_str();
+    if outcome == State::Failed.tag() || outcome.starts_with(DISPATCH_ERROR) {
+        return Some(true);
+    }
+    if outcome == State::Completed.tag() {
+        return Some(false);
+    }
+    None
 }
 
 /// IMPURE: fetch the window and summarize it.
