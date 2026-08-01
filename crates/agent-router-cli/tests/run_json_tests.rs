@@ -169,7 +169,7 @@ fn run_json_preserves_provider_decision_and_dispatched_job_identity() {
 
     assert_eq!(value["provider"], "claude");
     assert_eq!(value["model"], "opus[1m]");
-    // The router forces no effort: each model runs at its own default.
+    // The router forces no effort: the backend resolves its own.
     assert_eq!(value["effort"], Value::Null);
     assert_eq!(value["gates"], json!(["explicit_provider"]));
     assert_eq!(value["classification"], Value::Null);
