@@ -815,7 +815,10 @@ fn row_json(row: &Row) -> serde_json::Value {
         "requested": row.requested,
         "provider": row.provider,
         "model": row.model,
+        // What the router decided, which is not what the job ran at: that is `effective_effort`,
+        // null wherever no backend reported one.
         "effort": row.effort,
+        "effective_effort": row.effective_effort,
         "verdict": row.verdict,
         "confidence": row.confidence,
         "complexity": row.complexity,

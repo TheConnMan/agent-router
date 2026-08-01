@@ -186,6 +186,9 @@ impl ManagedClient {
         Ok(Dispatch {
             job_id: Some(created.id),
             job_name: name.to_string(),
+            // Opencode is never sent an effort and reports none back, so there is nothing observed
+            // to record here.
+            effective_effort: None,
         })
     }
 
@@ -291,6 +294,9 @@ impl Credentials {
     }
 }
 
+/// The effort is accepted and discarded: opencode has no field for it on either transport. That is
+/// also why the dispatch reports no effective effort, since a value that was never sent cannot come
+/// back observed.
 pub fn dispatch(
     cwd: &Path,
     task: &str,
@@ -327,6 +333,8 @@ fn dispatch_cli(cwd: &Path, task: &str, name: &str, model: Option<&str>) -> Resu
     Ok(Dispatch {
         job_id: None,
         job_name: name.to_string(),
+        // Same as the managed path: nothing carries an effort in either direction.
+        effective_effort: None,
     })
 }
 
@@ -1192,6 +1200,10 @@ fn read_with_deadline(
     loop {
         match stream.read(buffer) {
             Ok(read) => return Ok(read),
+            // Interrupted is not a failed read: a signal landing on this thread (a reaped child,
+            // for one) aborts the syscall with nothing said about the socket, so the read is
+            // reissued rather than reported as the server having gone away.
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error)
                 if matches!(
                     error.kind(),

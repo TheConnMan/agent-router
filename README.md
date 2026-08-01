@@ -38,7 +38,8 @@ log: row 87 in /home/you/.local/state/agent-router/router.db
    stalls the job rather than merely costing more, and it never overrides a capability pin.
 4. **Pick the model from complexity.** The complexity tier selects the model from the per provider
    tier table. Reasoning effort is deliberately not decided: the router forces none and each
-   backend resolves its own. See [docs/configuration.md](docs/configuration.md#modelscodex-and-modelsclaude)
+   backend resolves its own, and the log records that resolution wherever the backend reports one.
+   See [docs/configuration.md](docs/configuration.md#modelscodex-and-modelsclaude)
    for what that actually means per backend, because it is not the model default on Codex.
 5. **Dispatch and log.** The job is spawned detached, its backend job id is resolved, and the whole
    decision lands in a SQLite decision log.
@@ -247,6 +248,17 @@ agent-router log --mark 87 bad --note "routed to codex, needed connectors"
 `--json` emits every recorded column, including the full task text, the rationale, and the
 dispatch outcome. The log is the tuning surface: each gate tag names a specific rule that fired, so
 routing behaviour can be audited against outcomes rather than recalled.
+
+Two of those columns are about reasoning effort and they are not the same fact. `effort` is what the
+router decided, which is nothing, because the model tier is the toggle. `effective_effort` is what
+the backend reported the job will actually run at, and it is recorded only where a backend genuinely
+says: Codex reports its resolved effort on the `thread/start` reply, so a Codex row carries it, and
+it moves when your `~/.codex/config.toml` moves. Claude exposes no effective effort anywhere and
+OpenCode discards effort entirely, so both stay null rather than being filled in from the model, the
+decision, or a config file. Null also covers a dry run, which dispatched nothing, and a row written
+before the column existed. In every case null means nobody observed an effort, which is not the same
+as a job running at no effort. See
+[docs/configuration.md](docs/configuration.md#what-reasoning-effort-a-dispatched-job-actually-runs-at).
 
 Marking a row is the human half of the loop: `status` can only say whether a job ran, never whether
 routing it to that provider was the right call, and the mark is what makes the log tunable against

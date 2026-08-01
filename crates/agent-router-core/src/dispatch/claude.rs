@@ -90,6 +90,10 @@ pub fn dispatch_with_binary(
     Ok(Dispatch {
         job_id,
         job_name: name.to_string(),
+        // Claude reports no effective effort anywhere: it takes `--effort`, warns on a value it
+        // does not know, and exits 0 having run at its own default. So nothing was observed, and
+        // filling this in from the decided effort or the model would record a guess as a reading.
+        effective_effort: None,
     })
 }
 

@@ -163,6 +163,7 @@ impl StatusFixture {
             job_id,
             job_name,
             outcome,
+            effective_effort: None,
         })
         .expect("seed a decision row")
     }
