@@ -37,8 +37,9 @@ pub enum Confidence {
 }
 
 /// How much reasoning the task needs. Orthogonal to the verdict: either provider can take a
-/// simple task. This picks the model the job runs on; the model's own default effort then
-/// follows from it, because the model is the better toggle.
+/// simple task. This picks the model the job runs on, and nothing else: the reasoning effort is
+/// left to the backend to resolve, because the model is the better toggle. See `Decision::effort`
+/// for what each backend then resolves it to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Complexity {
