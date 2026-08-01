@@ -20,9 +20,32 @@ Two rules govern the whole file:
   commands fail rather than silently substituting defaults. Routing jobs against ceilings and a
   connector inventory the operator never wrote would be worse than refusing to run.
 
+## `config_version` and in-place migrations
+
+Because the file is generated rather than hand-authored, a value this tool once wrote can go stale
+in every existing install while the default constant in the source moves on. `config_version` is
+the marker that lets those be corrected exactly once.
+
+On load, a file stamped below the current version is migrated and rewritten in place, then stamped.
+A migration may only correct a value **this tool generated**; a value you chose is never touched.
+The version stamp is what makes that promise hold over time: keying a migration off the value alone
+would re-apply it on every load, so restoring the old value deliberately would be impossible.
+
+Practically, that means you can always win. If a migration moves a setting and you want it back,
+set it back: the file is already stamped, so nothing will move it again.
+
+Two consequences worth knowing. The rewrite serializes the whole config, so hand-added comments in
+the file are lost the one time a migration runs. And a file with no `config_version` key is treated
+as predating versioning, so do not delete the key to "reset" anything.
+
+| version | migration |
+| --- | --- |
+| 1 | `classifier_timeout_secs` of `30`, the old generated default, becomes `60`. Any other value is left alone. |
+
 ## Defaults in full
 
 ```toml
+config_version = 1
 hard_ceiling_pct = 97.0
 headroom_flip_gap = 25.0
 classifier_timeout_secs = 60
