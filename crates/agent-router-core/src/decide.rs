@@ -1,4 +1,5 @@
-//! The decision engine: hard gates first, then headroom modulation. Pure given its inputs.
+//! The decision engine: hard gates first, then weekly headroom modulation, then Claude's five hour
+//! window pacing a stream of jobs away from Claude. Pure given its inputs.
 
 use crate::classify::{Classification, Complexity, Confidence};
 use crate::config::{Config, DefaultProvider};
@@ -30,6 +31,10 @@ pub enum Gate {
     OverCeiling,
     /// Weekly usage routing is disabled by policy.
     WeeklyRoutingDisabled,
+    /// Claude's five hour window is near exhausted and Codex has weekly room, so the task was paced
+    /// away from Claude. Never fires for Codex: only Claude has a five hour window that constrains a
+    /// stream of jobs on this box.
+    FiveHourPacing,
 }
 
 impl Gate {
@@ -43,6 +48,7 @@ impl Gate {
             Gate::HeadroomTiebreak => "headroom_tiebreak",
             Gate::OverCeiling => "over_ceiling",
             Gate::WeeklyRoutingDisabled => "weekly_routing_disabled",
+            Gate::FiveHourPacing => "five_hour_pacing",
         }
     }
 }
@@ -111,28 +117,42 @@ pub fn decide(classification: Classification, usage: UsageSnapshot, config: &Con
     if !capability_pin {
         if !config.policy.weekly_routing {
             gates.push(Gate::WeeklyRoutingDisabled);
-        } else if !both_over_ceiling {
-            let other = other_provider(provider);
-            let used = weekly_used(&usage, provider);
-            let other_used = weekly_used(&usage, other);
-            let confidence = if classification.classifier_failed {
-                Confidence::High
-            } else {
-                classification.confidence
-            };
-            match confidence {
-                Confidence::High => {
-                    if used >= config.hard_ceiling_pct && other_used < config.hard_ceiling_pct {
-                        provider = other;
-                        gates.push(Gate::FlippedOnExhaustion);
+        } else {
+            if !both_over_ceiling {
+                let other = other_provider(provider);
+                let used = weekly_used(&usage, provider);
+                let other_used = weekly_used(&usage, other);
+                let confidence = if classification.classifier_failed {
+                    Confidence::High
+                } else {
+                    classification.confidence
+                };
+                match confidence {
+                    Confidence::High => {
+                        if used >= config.hard_ceiling_pct && other_used < config.hard_ceiling_pct {
+                            provider = other;
+                            gates.push(Gate::FlippedOnExhaustion);
+                        }
+                    }
+                    Confidence::Medium | Confidence::Low => {
+                        if used - other_used > config.headroom_flip_gap {
+                            provider = other;
+                            gates.push(Gate::HeadroomTiebreak);
+                        }
                     }
                 }
-                Confidence::Medium | Confidence::Low => {
-                    if used - other_used > config.headroom_flip_gap {
-                        provider = other;
-                        gates.push(Gate::HeadroomTiebreak);
-                    }
-                }
+            }
+
+            // Pacing runs after the weekly rules, on the provider they landed on, and reads only
+            // Claude's five hour window: Codex's own is never a routing input. A confident verdict
+            // is paced too, because an exhausted five hour window is a capacity fact rather than a
+            // preference, and a Claude dispatch into one stalls.
+            if provider == Provider::Claude
+                && usage.claude.five_hour_pct >= config.claude_five_hour_pacing_pct
+                && usage.codex.weekly_pct < config.hard_ceiling_pct
+            {
+                provider = Provider::Codex;
+                gates.push(Gate::FiveHourPacing);
             }
         }
     }
@@ -230,7 +250,7 @@ fn rationale(
         )
     };
     format!(
-        "{}: {}{tags} (codex_ready {}/6, claude_signals {}/6, {:?} confidence; codex weekly {:.0}%, claude weekly {:.0}%)",
+        "{}: {}{tags} (codex_ready {}/6, claude_signals {}/6, {:?} confidence; codex weekly {:.0}%, claude weekly {:.0}%, claude 5h {:.0}%)",
         provider.name(),
         classification.rationale,
         classification.codex_ready_count(),
@@ -238,6 +258,7 @@ fn rationale(
         classification.confidence,
         usage.codex.weekly_pct,
         usage.claude.weekly_pct,
+        usage.claude.five_hour_pct,
     )
 }
 

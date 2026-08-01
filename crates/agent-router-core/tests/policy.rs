@@ -358,3 +358,258 @@ fn explicit_provider_decisions_remain_outside_policy_routing() {
     assert_eq!(opencode.gates, vec![Gate::ExplicitProvider]);
     assert!(opencode.classification.is_none());
 }
+
+/// The weekly-only fixture above cannot express a five hour number, and widening it would touch
+/// every existing case for no gain. This sibling carries both windows for both providers, so a
+/// pacing test can state Codex's five hour number as well as Claude's and prove it is ignored.
+fn usage_with_five_hour(
+    codex_weekly: f64,
+    claude_weekly: f64,
+    codex_five_hour: f64,
+    claude_five_hour: f64,
+) -> UsageSnapshot {
+    UsageSnapshot {
+        codex: Headroom {
+            weekly_pct: codex_weekly,
+            five_hour_pct: codex_five_hour,
+            ..Headroom::full()
+        },
+        claude: Headroom {
+            weekly_pct: claude_weekly,
+            five_hour_pct: claude_five_hour,
+            ..Headroom::full()
+        },
+    }
+}
+
+/// The mutation target: the pacing rule compares Claude's five hour percent against
+/// `claude_five_hour_pacing_pct` with `>=`, and this case sits exactly ON the threshold. Turning
+/// that `>=` into a `>` makes it fail, and so does restricting the rule to borderline verdicts,
+/// since this verdict is a confident one.
+#[test]
+fn a_claude_route_paces_away_when_claude_five_hour_sits_exactly_on_the_threshold() {
+    let config = Config::default();
+    let decision = decide(
+        scored(Verdict::Claude, Confidence::High, 0, false),
+        usage_with_five_hour(10.0, 10.0, 0.0, config.claude_five_hour_pacing_pct),
+        &config,
+    );
+
+    assert_eq!(decision.provider, Provider::Codex);
+    assert!(decision.gates.contains(&Gate::FiveHourPacing));
+}
+
+/// A capability pin is a statement that the task cannot run on Codex at all, so an exhausted five
+/// hour window cannot move it: a paced job that cannot reach its connector is a failed job, not a
+/// cheaper one. Both pins are covered, because they set `capability_pin` from different branches.
+#[test]
+fn a_capability_pin_survives_an_exhausted_claude_five_hour_window() {
+    let config = Config::default();
+
+    let missing_connector = decide(
+        scored(Verdict::Codex, Confidence::High, 0, true),
+        usage_with_five_hour(0.0, 0.0, 0.0, 100.0),
+        &config,
+    );
+    assert_eq!(missing_connector.provider, Provider::Claude);
+    assert_eq!(missing_connector.gates, vec![Gate::MissingConnector]);
+    assert!(!missing_connector.gates.contains(&Gate::FiveHourPacing));
+
+    let claude_signals = decide(
+        scored(Verdict::Codex, Confidence::High, 2, false),
+        usage_with_five_hour(0.0, 0.0, 0.0, 100.0),
+        &config,
+    );
+    assert_eq!(claude_signals.provider, Provider::Claude);
+    assert_eq!(claude_signals.gates, vec![Gate::ClaudeSignals]);
+    assert!(!claude_signals.gates.contains(&Gate::FiveHourPacing));
+}
+
+/// Codex having room is judged by the same `hard_ceiling_pct` the exhaustion flip uses, and the
+/// comparison is a strict `<`, so a Codex sitting exactly on the ceiling has no room. Pacing into
+/// an exhausted Codex would move the stall rather than avoid it.
+#[test]
+fn pacing_does_not_fire_when_codex_has_no_weekly_room() {
+    let config = Config::default();
+
+    let on_the_ceiling = decide(
+        scored(Verdict::Claude, Confidence::High, 0, false),
+        usage_with_five_hour(config.hard_ceiling_pct, 10.0, 0.0, 100.0),
+        &config,
+    );
+    assert_eq!(on_the_ceiling.provider, Provider::Claude);
+    assert!(on_the_ceiling.gates.is_empty());
+
+    let over_the_ceiling = decide(
+        scored(Verdict::Claude, Confidence::High, 0, false),
+        usage_with_five_hour(99.0, 10.0, 0.0, 100.0),
+        &config,
+    );
+    assert_eq!(over_the_ceiling.provider, Provider::Claude);
+    assert!(!over_the_ceiling.gates.contains(&Gate::FiveHourPacing));
+}
+
+/// An operator who set `weekly_routing = false` asked to route purely on task shape. A usage
+/// driven pacing flip contradicts that, so it sits under the same flag rather than behind a second
+/// one that could be left on by accident.
+#[test]
+fn pacing_is_off_when_weekly_routing_is_disabled() {
+    let mut config = Config::default();
+    config.policy.weekly_routing = false;
+
+    let decision = decide(
+        scored(Verdict::Claude, Confidence::High, 0, false),
+        usage_with_five_hour(0.0, 0.0, 0.0, 100.0),
+        &config,
+    );
+
+    assert_eq!(decision.provider, Provider::Claude);
+    assert_eq!(decision.gates, vec![Gate::WeeklyRoutingDisabled]);
+    assert!(!decision.gates.contains(&Gate::FiveHourPacing));
+}
+
+/// The hard constraint: only Claude has a five hour window that constrains a stream of jobs on this
+/// box, so Codex's own five hour number never influences routing. This is the test that fails if
+/// the rule is later generalized to both providers, in either direction.
+#[test]
+fn a_codex_five_hour_window_never_moves_a_task() {
+    let config = Config::default();
+
+    let codex_verdict = decide(
+        scored(Verdict::Codex, Confidence::High, 0, false),
+        usage_with_five_hour(10.0, 10.0, 100.0, 0.0),
+        &config,
+    );
+    assert_eq!(codex_verdict.provider, Provider::Codex);
+    assert!(codex_verdict.gates.is_empty());
+
+    let claude_verdict = decide(
+        scored(Verdict::Claude, Confidence::High, 0, false),
+        usage_with_five_hour(10.0, 10.0, 100.0, 0.0),
+        &config,
+    );
+    assert_eq!(claude_verdict.provider, Provider::Claude);
+    assert!(claude_verdict.gates.is_empty());
+}
+
+/// A paced job is dispatched to Codex, so its model must be read from Codex's tiers at the same
+/// complexity. The ultra case is the one that proves the re-derivation rather than a coincidence:
+/// Claude's ultra tier is `fable`, which no Codex backend can resolve.
+#[test]
+fn a_paced_job_carries_the_codex_tier_for_its_complexity() {
+    let config = Config::default();
+
+    let low = decide(
+        Classification {
+            complexity: Complexity::Low,
+            ..scored(Verdict::Claude, Confidence::High, 0, false)
+        },
+        usage_with_five_hour(10.0, 10.0, 0.0, 100.0),
+        &config,
+    );
+    assert_eq!(low.provider, Provider::Codex);
+    assert_eq!(low.model.as_deref(), Some("gpt-5.6-luna"));
+    assert_eq!(low.gates, vec![Gate::FiveHourPacing]);
+
+    let ultra = decide(
+        Classification {
+            complexity: Complexity::Ultra,
+            ..scored(Verdict::Claude, Confidence::High, 0, false)
+        },
+        usage_with_five_hour(10.0, 10.0, 0.0, 100.0),
+        &config,
+    );
+    assert_eq!(ultra.provider, Provider::Codex);
+    assert_eq!(ultra.model.as_deref(), Some("gpt-5.6-sol"));
+    assert_eq!(ultra.gates, vec![Gate::FiveHourPacing]);
+}
+
+/// The one reachable double fire, pinned in order. A borderline Codex verdict with codex weekly 50
+/// and claude weekly 20 is a gap past `headroom_flip_gap`, so the tiebreak moves it to Claude;
+/// Claude's five hour window then moves it straight back. The whole vector is asserted rather than
+/// its members, because reordering the two rules changes the final provider silently: run the
+/// pacing rule first and the tiebreak has the last word, leaving the job on Claude.
+#[test]
+fn a_headroom_tiebreak_to_claude_is_paced_straight_back_to_codex_carrying_both_tags() {
+    let config = Config::default();
+    let decision = decide(
+        scored(Verdict::Codex, Confidence::Medium, 0, false),
+        usage_with_five_hour(50.0, 20.0, 0.0, config.claude_five_hour_pacing_pct),
+        &config,
+    );
+
+    assert_eq!(decision.provider, Provider::Codex);
+    assert_eq!(
+        decision.gates,
+        vec![Gate::HeadroomTiebreak, Gate::FiveHourPacing]
+    );
+    assert_eq!(decision.model.as_deref(), Some("gpt-5.6-sol"));
+}
+
+/// The number that produced the flip travels with the tag. The five hour figure is in the rationale
+/// unconditionally rather than only when pacing fires, because a conditional field is a second code
+/// path that can disagree with the gate it is supposed to explain.
+#[test]
+fn five_hour_pacing_is_visible_in_the_rationale_and_the_gate_tags() {
+    let config = Config::default();
+
+    let paced = decide(
+        scored(Verdict::Claude, Confidence::High, 0, false),
+        usage_with_five_hour(10.0, 10.0, 0.0, 90.0),
+        &config,
+    );
+    assert!(paced.gate_tags().contains(&"five_hour_pacing"));
+    assert!(
+        paced.rationale.contains("five_hour_pacing"),
+        "{}",
+        paced.rationale
+    );
+    assert!(
+        paced.rationale.contains("claude 5h 90%"),
+        "{}",
+        paced.rationale
+    );
+
+    let untouched = decide(
+        scored(Verdict::Codex, Confidence::High, 0, false),
+        usage_with_five_hour(10.0, 10.0, 100.0, 12.0),
+        &config,
+    );
+    assert!(!untouched.gate_tags().contains(&"five_hour_pacing"));
+    assert!(
+        untouched.rationale.contains("claude 5h 12%"),
+        "{}",
+        untouched.rationale
+    );
+}
+
+/// The threshold is one scalar key with its own default, so an operator can lower it without
+/// restating every other ceiling. Writing the defaults and reading them back also proves the key is
+/// declared above `policy`: a scalar after a table makes the TOML serializer fail on first run.
+#[test]
+fn the_pacing_threshold_defaults_when_absent_and_overrides_on_its_own() {
+    assert_eq!(Config::default().claude_five_hour_pacing_pct, 90.0);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let written_path = dir.path().join("written/config.toml");
+    let created = Config::load_from(&written_path).expect("create the default config");
+    assert_eq!(created.claude_five_hour_pacing_pct, 90.0);
+    let document: toml::Value =
+        toml::from_str(&std::fs::read_to_string(&written_path).expect("read the written config"))
+            .expect("parse the written config");
+    assert_eq!(
+        document["claude_five_hour_pacing_pct"].as_float(),
+        Some(90.0)
+    );
+
+    let path = dir.path().join("partial.toml");
+    let config = load_config("claude_five_hour_pacing_pct = 55.0\n", &path)
+        .expect("load the partial config");
+    assert_eq!(config.claude_five_hour_pacing_pct, 55.0);
+    assert_eq!(config.hard_ceiling_pct, Config::default().hard_ceiling_pct);
+    assert_eq!(
+        config.headroom_flip_gap,
+        Config::default().headroom_flip_gap
+    );
+    assert!(config.policy.weekly_routing);
+}

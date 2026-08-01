@@ -29,9 +29,13 @@ log: row 87 in /home/you/.local/state/agent-router/router.db
    force and the decision is tagged `classifier_failed`.
 2. **Apply hard gates.** A missing connector or two or more Claude signals pins the task to Claude
    regardless of usage. These are capability decisions, so headroom never overrides them.
-3. **Modulate on weekly headroom.** A confident verdict is flipped only when its provider is at or
-   over the hard ceiling and the other is not. A borderline verdict is flipped when the other
-   provider has a large enough weekly headroom advantage.
+3. **Modulate on weekly headroom, then pace on Claude's 5 hour window.** A confident verdict is
+   flipped only when its provider is at or over the hard ceiling and the other is not. A borderline
+   verdict is flipped when the other provider has a large enough weekly headroom advantage. After
+   those rules settle, a task still bound for Claude moves to Codex when Claude's 5 hour percent is
+   at or above `claude_five_hour_pacing_pct` and Codex is under the hard ceiling, tagged
+   `five_hour_pacing`. Pacing applies to confident verdicts too, because an exhausted 5 hour window
+   stalls the job rather than merely costing more, and it never overrides a capability pin.
 4. **Pick the model from complexity.** The complexity tier selects the model from the per provider
    tier table. Reasoning effort is deliberately not decided: the router forces none and each
    backend resolves its own. See [docs/configuration.md](docs/configuration.md#modelscodex-and-modelsclaude)
@@ -150,8 +154,10 @@ claude     12.4%   58.1%  in 41h07m
 codex       3.0%   22.7%  in 96h12m
 ```
 
-Routing uses the weekly window only. The 5 hour window is reported because it matters for pacing a
-stream of jobs, not for placing a single one.
+The weekly window is what places a single job: it decides which provider has room for the task in
+front of the router. Claude's 5 hour window is what paces a stream of them, moving work away from
+Claude once its 5 hour percent reaches `claude_five_hour_pacing_pct` and Codex still has weekly
+room. Codex's own 5 hour number is reported here for the operator and never influences routing.
 
 ### `log`
 
@@ -188,8 +194,9 @@ agent-router stats --json
 Reported over the window: the rows considered and their oldest and newest timestamps, the count per
 provider, the count per gate tag, the complexity distribution (with a row that was never scored
 counted as `unscored`), the number of auto routes, and three rates. The flip rate is the auto routed
-rows carrying a provider moving gate (`flipped_on_exhaustion` or `headroom_tiebreak`) over all auto
-routes. The classifier failure rate is the auto routed rows carrying `classifier_failed` over the
+rows carrying a provider moving gate (`flipped_on_exhaustion`, `headroom_tiebreak`, or
+`five_hour_pacing`) over all auto routes. A row carrying more than one of them counts once, because
+the route moved once. The classifier failure rate is the auto routed rows carrying `classifier_failed` over the
 same denominator. Both are denominated on auto routes only, because a row that named its provider
 never had a verdict to flip and never ran the classifier. The dry run share is denominated on every
 row instead, since any row can be a dry run. Each rate carries its numerator and denominator so it

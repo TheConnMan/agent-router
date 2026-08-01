@@ -42,8 +42,8 @@ impl Headroom {
         }
     }
 
-    /// Weekly percent still available. Routing uses weekly only: the 5h window matters for
-    /// pacing a stream of jobs, not for placing a single one.
+    /// Weekly percent still available. The weekly window is what places a single job; Claude's 5h
+    /// window is what paces a stream of them away from Claude once it is near exhausted.
     pub fn weekly_remaining(&self) -> f64 {
         100.0 - self.weekly_pct
     }
