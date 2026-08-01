@@ -1,6 +1,8 @@
 use crate::error::{Error, Result};
 use crate::run::Dispatch;
 use crate::runtime::home_dir;
+use crate::status::Observation;
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -25,8 +27,17 @@ pub trait CodexRpc {
 
 #[derive(Debug)]
 pub enum SpawnAttempt {
-    Started(String),
-    TurnFailed { thread_id: String, error: Error },
+    Started {
+        thread_id: String,
+        /// The effort the daemon reported the thread resolved to, straight off the `thread/start`
+        /// reply. None when that reply said nothing, which means the router does not know rather
+        /// than that the job runs at no effort.
+        effective_effort: Option<String>,
+    },
+    TurnFailed {
+        thread_id: String,
+        error: Error,
+    },
     NotCreated(Error),
 }
 
@@ -80,6 +91,20 @@ pub fn turn_start_request(id: i64, thread_id: &str, task: &str, effort: Option<&
     request(id, "turn/start", params)
 }
 
+/// The read the reconciler runs. `includeTurns` is load bearing and must not be dropped: without it
+/// the reply carries no turn record, every thread falls through to the status fallback, and a job
+/// that provably finished reports as unknown.
+pub fn thread_read_request(id: i64, thread_id: &str) -> String {
+    request(
+        id,
+        "thread/read",
+        serde_json::json!({
+            "threadId": thread_id,
+            "includeTurns": true
+        }),
+    )
+}
+
 fn request(id: i64, method: &str, params: serde_json::Value) -> String {
     serde_json::json!({
         "jsonrpc": "2.0",
@@ -91,6 +116,39 @@ fn request(id: i64, method: &str, params: serde_json::Value) -> String {
 }
 
 pub fn parse_thread_id(line: &str, expected_id: i64) -> Option<String> {
+    read_field(line, expected_id, "/result/thread/id")
+}
+
+/// PURE: the status of the routed turn, which is turn 0.
+///
+/// Index 0 by design and never the last turn: the router calls `turn/start` exactly once, so turn 0
+/// is the job it dispatched. Later turns exist only because a human continued the thread by hand,
+/// and a human's failed continuation is a fact about that follow up work rather than about where
+/// the task was sent. None when the reply carries no turn, which is what makes the thread status
+/// below a fallback rather than a competing source.
+pub fn parse_first_turn_status(line: &str, expected_id: i64) -> Option<String> {
+    read_field(line, expected_id, "/result/thread/turns/0/status")
+}
+
+/// PURE: the thread's own status, read only when there is no turn record to read instead.
+pub fn parse_thread_status(line: &str, expected_id: i64) -> Option<String> {
+    read_field(line, expected_id, "/result/thread/status/type")
+}
+
+/// PURE: the reasoning effort the daemon resolved this thread to, off the `thread/start` reply.
+///
+/// A SIBLING of `thread` at the result root, not a member of it, which is why the pointer stops at
+/// `/result/reasoningEffort`. It rides the reply the spawn already reads for the thread id, so
+/// observing it costs no extra call. None when the reply does not carry it: that is the router not
+/// knowing, and nothing here may substitute the decided effort, the model, or a config value for an
+/// answer the daemon did not give.
+pub fn parse_reasoning_effort(line: &str, expected_id: i64) -> Option<String> {
+    read_field(line, expected_id, "/result/reasoningEffort")
+}
+
+/// PURE: one string out of a reply that is genuinely an answer to this request. A reply to someone
+/// else's request and a reply carrying a JSON RPC error are not observations.
+fn read_field(line: &str, expected_id: i64, pointer: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(line).ok()?;
     if value.get("id").and_then(serde_json::Value::as_i64) != Some(expected_id)
         || value.get("error").is_some_and(|error| !error.is_null())
@@ -98,10 +156,63 @@ pub fn parse_thread_id(line: &str, expected_id: i64) -> Option<String> {
         return None;
     }
     value
-        .pointer("/result/thread/id")
+        .pointer(pointer)
         .and_then(serde_json::Value::as_str)
-        .filter(|id| !id.is_empty())
+        .filter(|field| !field.is_empty())
         .map(str::to_string)
+}
+
+/// IMPURE: what the app-server knows about each thread, one `thread/read` apiece.
+///
+/// This probes for a daemon and never starts one: a command reporting on jobs that already exist
+/// must not create the state it is reporting on. No daemon means every thread reports unavailable,
+/// which is the honest partial report rather than a command failure.
+pub fn thread_states(thread_ids: &[String]) -> BTreeMap<String, Observation> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(daemon) = probe_daemon()
+            && let Ok(mut client) = Client::connect(&daemon)
+        {
+            return thread_states_on_rpc(&mut client, thread_ids);
+        }
+    }
+    thread_ids
+        .iter()
+        .map(|thread_id| (thread_id.clone(), Observation::Unavailable))
+        .collect()
+}
+
+/// IMPURE only in the RPC it is handed: one read per thread, each folded on its own.
+///
+/// A failing read records `Unavailable` for that thread and the loop continues, so one bad thread
+/// never costs the rest of the window its reconciliation. Request ids count from 2 because the
+/// handshake owns id 1.
+pub fn thread_states_on_rpc(
+    rpc: &mut impl CodexRpc,
+    thread_ids: &[String],
+) -> BTreeMap<String, Observation> {
+    let mut states = BTreeMap::new();
+    for (offset, thread_id) in thread_ids.iter().enumerate() {
+        let request_id = i64::try_from(offset).unwrap_or(i64::MAX).saturating_add(2);
+        let observation = match rpc.request(request_id, &thread_read_request(request_id, thread_id))
+        {
+            Ok(line) => observe(&line, request_id),
+            Err(_) => Observation::Unavailable,
+        };
+        states.insert(thread_id.clone(), observation);
+    }
+    states
+}
+
+/// PURE: the turn record if there is one, and the thread status only if there is not.
+fn observe(line: &str, request_id: i64) -> Observation {
+    if let Some(status) = parse_first_turn_status(line, request_id) {
+        return Observation::CodexTurn(status);
+    }
+    match parse_thread_status(line, request_id) {
+        Some(status) => Observation::CodexThread(status),
+        None => Observation::Unavailable,
+    }
 }
 
 pub fn spawn_on_initialized_rpc(
@@ -121,10 +232,16 @@ pub fn spawn_on_initialized_rpc(
             "app-server thread/start returned no thread id: {thread_response}"
         )));
     };
+    // Read off the reply already in hand rather than asking again: the daemon loads the operator's
+    // own config, so this is the resolved effort the turn will actually run at.
+    let effective_effort = parse_reasoning_effort(&thread_response, 2);
     // The thread is already running, so a rejected name must not cost the caller its identity.
     let _ = rpc.request(3, &thread_set_name_request(3, &thread_id, name));
     match rpc.request(4, &turn_start_request(4, &thread_id, task, effort)) {
-        Ok(_) => SpawnAttempt::Started(thread_id),
+        Ok(_) => SpawnAttempt::Started {
+            thread_id,
+            effective_effort,
+        },
         Err(error) => SpawnAttempt::TurnFailed { thread_id, error },
     }
 }
@@ -141,9 +258,13 @@ pub fn dispatch(
         let daemon = ensure_daemon().map_err(Error::Command)?;
         let mut client = Client::connect(&daemon)?;
         match spawn_on_initialized_rpc(&mut client, cwd, task, name, model, effort) {
-            SpawnAttempt::Started(thread_id) => Ok(Dispatch {
+            SpawnAttempt::Started {
+                thread_id,
+                effective_effort,
+            } => Ok(Dispatch {
                 job_id: Some(thread_id),
                 job_name: name.to_string(),
+                effective_effort,
             }),
             SpawnAttempt::TurnFailed { thread_id, error } => Err(Error::Command(format!(
                 "app-server started thread {thread_id} but its first turn failed: {error}"
@@ -196,7 +317,8 @@ fn daemon_command(action: &str) -> Command {
 }
 
 /// IMPURE: the running app-server daemon, or None when none answers. This only asks, so a caller
-/// that must not create the state it is reporting on (doctor) uses it rather than `ensure_daemon`.
+/// that must not create the state it is reporting on (doctor, status) uses it rather than
+/// `ensure_daemon`.
 pub(crate) fn probe_daemon() -> Option<Daemon> {
     let stdout = run_reporting_failure(daemon_command("version"), PROBE_TIMEOUT).ok()?;
     parse_daemon_version(&stdout)
@@ -308,10 +430,14 @@ fn describe(command: &Command) -> String {
     parts.join(" ")
 }
 
+/// The client owns no deadline of its own. `RPC_TIMEOUT` is the budget for ONE request, granted
+/// afresh on each call, because a status sweep issues one `thread/read` per codex row down a single
+/// connection: on one shared budget a single slow read spends what is left of it and every later
+/// read then fails without being asked, reporting unavailable for rows the daemon would have
+/// answered. A lone request still gets exactly `RPC_TIMEOUT` either way.
 #[cfg(target_os = "linux")]
 struct Client {
     socket: tungstenite::WebSocket<std::os::unix::net::UnixStream>,
-    deadline: Instant,
 }
 
 #[cfg(target_os = "linux")]
@@ -324,14 +450,14 @@ impl Client {
         let (socket, _) = tungstenite::client::client(HANDSHAKE_URL, stream)
             .map_err(|error| Error::Command(format!("app-server handshake failed: {error}")))?;
         socket.get_ref().set_read_timeout(Some(READ_SLICE))?;
-        let mut client = Self { socket, deadline };
+        let mut client = Self { socket };
         client.request(1, &initialize_request(1))?;
         Ok(client)
     }
 
-    fn read_line(&mut self) -> Result<String> {
+    fn read_line(&mut self, deadline: Instant) -> Result<String> {
         loop {
-            remaining(self.deadline)?;
+            remaining(deadline)?;
             match self.socket.read() {
                 Ok(tungstenite::Message::Text(text)) => return Ok(text.to_string()),
                 Ok(tungstenite::Message::Close(_)) => {
@@ -358,11 +484,12 @@ impl Client {
 #[cfg(target_os = "linux")]
 impl CodexRpc for Client {
     fn request(&mut self, request_id: i64, request: &str) -> Result<String> {
+        let deadline = Instant::now() + RPC_TIMEOUT;
         self.socket
             .send(tungstenite::Message::text(request.to_string()))
             .map_err(|error| Error::Command(format!("app-server write failed: {error}")))?;
         loop {
-            let line = self.read_line()?;
+            let line = self.read_line(deadline)?;
             let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
                 continue;
             };

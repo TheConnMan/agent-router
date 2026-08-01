@@ -1,8 +1,11 @@
 #[cfg(target_os = "linux")]
 use agent_router_core::decide::decide_explicit;
 use agent_router_core::dispatch::claude::dispatch_with_binary;
+#[cfg(target_os = "linux")]
+use agent_router_core::dispatch::codex::thread_states;
 use agent_router_core::dispatch::codex::{
-    CodexRpc, SpawnAttempt, parse_thread_id, spawn_on_initialized_rpc, thread_set_name_request,
+    CodexRpc, SpawnAttempt, parse_first_turn_status, parse_reasoning_effort, parse_thread_id,
+    parse_thread_status, spawn_on_initialized_rpc, thread_read_request, thread_set_name_request,
     thread_start_request, turn_start_request,
 };
 #[cfg(target_os = "linux")]
@@ -11,6 +14,8 @@ use agent_router_core::dispatch::opencode::ManagedClient;
 #[cfg(target_os = "linux")]
 use agent_router_core::run::Request;
 use agent_router_core::runtime::truncated_title;
+#[cfg(target_os = "linux")]
+use agent_router_core::status::Observation;
 use agent_router_core::{Error, Result};
 #[cfg(target_os = "linux")]
 use agent_router_core::{Provider, UsageSnapshot};
@@ -151,6 +156,87 @@ fn codex_thread_identity_rejects_malformed_errors_and_other_response_ids() {
     assert_eq!(parse_thread_id("not json", 2), None);
 }
 
+/// Reconciliation reads a thread through `thread/read`, whose params are exactly `threadId` and
+/// `includeTurns`. The flag is the whole design: without it the reply carries no turn record, every
+/// codex row falls through to the thread status fallback, and a job that provably finished reports
+/// as unknown. It is also the easiest thing in this file to lose in a refactor.
+#[test]
+fn the_codex_thread_read_request_pins_the_app_server_method_and_params() {
+    let read: Value =
+        serde_json::from_str(&thread_read_request(2, "thread exact")).expect("thread read request");
+
+    assert_eq!(read["jsonrpc"], "2.0");
+    assert_eq!(read["id"], 2);
+    assert_eq!(read["method"], "thread/read");
+    assert_eq!(read["params"]["threadId"], "thread exact");
+    assert_eq!(
+        read["params"]["includeTurns"],
+        json!(true),
+        "without the turn history the reply proves nothing about the routed turn"
+    );
+    assert_eq!(
+        read["params"].as_object().expect("params object").len(),
+        2,
+        "params must carry exactly threadId and includeTurns, nothing extra"
+    );
+}
+
+/// Both readers over one reply, with the guards `parse_thread_id` already applies. A reply to
+/// someone else's request and a reply carrying a JSON RPC error are not observations.
+///
+/// Observed on a real `thread/read` with `includeTurns` true: the turn array is nested inside
+/// `thread`, and `result` carries the single key `thread`. The vendor schema agrees, listing
+/// `thread` as the only property of `ThreadReadResponse`.
+#[test]
+fn a_thread_read_reply_yields_its_first_turn_status_and_its_thread_status() {
+    let reply = json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "result": {
+            "thread": {
+                "id": "thread exact",
+                "status": {"type": "notLoaded"},
+                "turns": [{"status": "completed"}, {"status": "failed"}],
+            },
+        }
+    })
+    .to_string();
+
+    assert_eq!(
+        parse_first_turn_status(&reply, 2).as_deref(),
+        Some("completed"),
+        "turn index 0 is the routed job, and the later turn is a human continuation"
+    );
+    assert_eq!(
+        parse_thread_status(&reply, 2).as_deref(),
+        Some("notLoaded"),
+        "the thread status is still readable, as the fallback for a reply with no turns"
+    );
+
+    assert_eq!(parse_first_turn_status(&reply, 9), None);
+    assert_eq!(parse_thread_status(&reply, 9), None);
+
+    let errored = r#"{"jsonrpc":"2.0","id":2,"error":{"code":-1,"message":"failed"}}"#;
+    assert_eq!(parse_first_turn_status(errored, 2), None);
+    assert_eq!(parse_thread_status(errored, 2), None);
+
+    let turnless = json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "result": {"thread": {"id": "thread exact", "status": {"type": "idle"}, "turns": []}}
+    })
+    .to_string();
+    assert_eq!(
+        parse_first_turn_status(&turnless, 2),
+        None,
+        "an empty turn array is no turn record, not an empty status"
+    );
+    assert_eq!(parse_thread_status(&turnless, 2).as_deref(), Some("idle"));
+
+    assert_eq!(parse_first_turn_status("not json", 2), None);
+    assert_eq!(parse_thread_status("not json", 2), None);
+}
+
 #[derive(Default)]
 struct ScriptedRpc {
     replies: VecDeque<Result<String>>,
@@ -195,7 +281,7 @@ fn codex_spawn_names_the_thread_between_starting_it_and_its_first_turn() {
     );
 
     match attempt {
-        SpawnAttempt::Started(thread_id) => assert_eq!(thread_id, "thread named"),
+        SpawnAttempt::Started { thread_id, .. } => assert_eq!(thread_id, "thread named"),
         other => panic!("expected a started thread, got {other:?}"),
     }
     assert_eq!(rpc.requests.len(), 3);
@@ -236,7 +322,7 @@ fn codex_thread_name_failure_still_starts_the_turn_and_returns_the_thread() {
     );
 
     match attempt {
-        SpawnAttempt::Started(thread_id) => assert_eq!(thread_id, "thread unnamed"),
+        SpawnAttempt::Started { thread_id, .. } => assert_eq!(thread_id, "thread unnamed"),
         other => panic!("a failed name must not cost the caller the running thread, got {other:?}"),
     }
     assert_eq!(rpc.requests.len(), 3);
@@ -280,6 +366,145 @@ fn codex_partial_creation_is_one_visible_failure_without_a_retry() {
     assert_eq!(rpc.requests[1]["method"], "thread/name/set");
     assert_eq!(rpc.requests[2]["method"], "turn/start");
     assert!(rpc.replies.is_empty());
+}
+
+/// The effort a codex job runs at is the daemon's answer, not the router's: the daemon loads
+/// `~/.codex/config.toml` and reports the resolved value on the `thread/start` response the spawn
+/// already reads for the thread id. Two cases, not one, because a single case is satisfied by an
+/// implementation that hardcodes the value. The recorded value has to move when the reported value
+/// moves, which is what separates reading it from assuming it.
+#[test]
+fn a_codex_dispatch_records_the_effort_the_thread_start_response_reported() {
+    for reported in ["high", "low"] {
+        let mut rpc = ScriptedRpc::with_replies(vec![
+            Ok(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "thread": {"id": "thread observed"},
+                    "reasoningEffort": reported,
+                }
+            })
+            .to_string()),
+            Ok(r#"{"jsonrpc":"2.0","id":3,"result":{}}"#.to_string()),
+            Ok(r#"{"jsonrpc":"2.0","id":4,"result":{}}"#.to_string()),
+        ]);
+
+        let attempt = spawn_on_initialized_rpc(
+            &mut rpc,
+            Path::new("/tmp"),
+            "perform one task",
+            "Bonus: abc 123",
+            None,
+            None,
+        );
+
+        match attempt {
+            SpawnAttempt::Started {
+                thread_id,
+                effective_effort,
+            } => {
+                assert_eq!(thread_id, "thread observed");
+                assert_eq!(
+                    effective_effort.as_deref(),
+                    Some(reported),
+                    "the recorded effort must be the one the daemon reported, not a fixed value"
+                );
+            }
+            other => panic!("expected a started thread, got {other:?}"),
+        }
+        assert_eq!(
+            rpc.requests.len(),
+            3,
+            "the effort rides the response the spawn already reads, so it costs no extra RPC"
+        );
+        assert_eq!(rpc.requests[0]["method"], "thread/start");
+    }
+}
+
+/// A `thread/start` reply that says nothing about effort is not evidence of an effort. The decided
+/// effort is deliberately supplied here and provably reaches the turn, so it is sitting in scope
+/// waiting to be borrowed; borrowing it, or the model, or a config default, would put an inferred
+/// value in a column whose whole purpose is to hold an observed one.
+#[test]
+fn a_codex_response_without_a_reasoning_effort_records_null_rather_than_a_guess() {
+    let mut rpc = ScriptedRpc::with_replies(vec![
+        Ok(r#"{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread silent"}}}"#.to_string()),
+        Ok(r#"{"jsonrpc":"2.0","id":3,"result":{}}"#.to_string()),
+        Ok(r#"{"jsonrpc":"2.0","id":4,"result":{}}"#.to_string()),
+    ]);
+
+    let attempt = spawn_on_initialized_rpc(
+        &mut rpc,
+        Path::new("/tmp"),
+        "perform one task",
+        "Bonus: abc 123",
+        Some("gpt-5.6-sol"),
+        Some("xhigh"),
+    );
+
+    match attempt {
+        SpawnAttempt::Started {
+            thread_id,
+            effective_effort,
+        } => {
+            assert_eq!(thread_id, "thread silent");
+            assert_eq!(
+                effective_effort, None,
+                "a silent daemon means the router does not know, not that it may guess"
+            );
+        }
+        other => panic!("expected a started thread, got {other:?}"),
+    }
+    assert_eq!(
+        rpc.requests[2]["params"]["effort"], "xhigh",
+        "the decided effort did reach the turn, so it was available to be wrongly recorded"
+    );
+    assert_eq!(
+        rpc.requests[0]["params"]["model"], "gpt-5.6-sol",
+        "the model was available to be wrongly recorded too"
+    );
+}
+
+/// The same guards `parse_thread_id` applies, over the same reply. The pointer is pinned as well
+/// as the guards: `reasoningEffort` is a sibling of `thread` at the result root, and a reader that
+/// looked for it inside `thread` would report null on every real response.
+#[test]
+fn the_reasoning_effort_parser_refuses_a_mismatched_id_and_an_error_reply() {
+    let reply = r#"{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread exact"},"reasoningEffort":"high"}}"#;
+    assert_eq!(parse_reasoning_effort(reply, 2).as_deref(), Some("high"));
+    assert_eq!(parse_reasoning_effort(reply, 9), None);
+    assert_eq!(
+        parse_reasoning_effort(
+            r#"{"jsonrpc":"2.0","id":2,"error":{"code":-1,"message":"failed"}}"#,
+            2
+        ),
+        None
+    );
+    assert_eq!(
+        parse_reasoning_effort(
+            r#"{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread exact"},"reasoningEffort":""}}"#,
+            2
+        ),
+        None,
+        "an empty string is not a reported effort"
+    );
+    assert_eq!(
+        parse_reasoning_effort(
+            r#"{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread exact"}}}"#,
+            2
+        ),
+        None
+    );
+    assert_eq!(
+        parse_reasoning_effort(
+            r#"{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"t","reasoningEffort":"high"}}}"#,
+            2
+        ),
+        None,
+        "the field is a sibling of thread, not a member of it"
+    );
+    assert_eq!(parse_reasoning_effort("not json", 2), None);
 }
 
 struct TempDir {
@@ -813,6 +1038,12 @@ fn claude_spawns_and_finds_the_job_under_the_caller_supplied_name_verbatim() {
     );
 }
 
+/// PATH is process wide, so every test that swaps a fake `codex` onto it holds this lock for as
+/// long as its guard lives. Two of them running at once would leave one test talking to the other
+/// test's socket.
+#[cfg(target_os = "linux")]
+static ENVIRONMENT: Mutex<()> = Mutex::new(());
+
 #[cfg(target_os = "linux")]
 struct PathGuard {
     prior: Option<OsString>,
@@ -847,7 +1078,6 @@ impl Drop for PathGuard {
 #[cfg(target_os = "linux")]
 #[test]
 fn codex_decision_effort_reaches_turn_start_at_the_dispatch_boundary() {
-    static ENVIRONMENT: Mutex<()> = Mutex::new(());
     let _environment = ENVIRONMENT.lock().expect("environment lock");
     let root = TempDir::new("codex-dispatch");
     let socket_path = root.path.join("app-server.sock");
@@ -943,6 +1173,106 @@ fn codex_decision_effort_reaches_turn_start_at_the_dispatch_boundary() {
         requests[3]["params"]["input"][0]["text"],
         "exercise the real dispatch seam"
     );
+}
+
+/// One `thread/read` per codex row goes down one connection, so the transport must budget each
+/// request on its own. Under a single connection wide deadline, one read that ran the clock out
+/// left every read after it failing without ever being answered, and the rest of the window
+/// reported unavailable on the strength of one bad thread. The per row isolation
+/// `thread_states_on_rpc` promises is only real if the transport beneath it grants a fresh budget.
+///
+/// The first thread here is never answered, so it spends a whole request budget and reports
+/// unavailable, which is its own correct outcome. The second is answered as soon as the daemon
+/// picks it up: a client that kept a budget for it reads that reply, and a client whose one budget
+/// the first read consumed has already given up.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_thread_read_that_spends_its_budget_does_not_starve_the_reads_after_it() {
+    let _environment = ENVIRONMENT.lock().expect("environment lock");
+    let root = TempDir::new("codex-read-budget");
+    let socket_path = root.path.join("app-server.sock");
+    let listener = UnixListener::bind(&socket_path).expect("bind app server socket");
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept app server client");
+        let mut socket = tungstenite::accept(stream).expect("accept websocket");
+        let initialize = read_rpc_request(&mut socket);
+        let _ = socket.send(tungstenite::Message::text(
+            json!({"jsonrpc": "2.0", "id": 1, "result": {}}).to_string(),
+        ));
+        let starved = read_rpc_request(&mut socket);
+        // Longer than the transport's ten second request timeout, so the first read gets no reply
+        // inside any budget it could have.
+        std::thread::sleep(Duration::from_secs(11));
+        let later = read_rpc_request(&mut socket);
+        let _ = socket.send(tungstenite::Message::text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {
+                    "thread": {
+                        "status": {"type": "idle"},
+                        "turns": [{"status": "completed"}]
+                    }
+                }
+            })
+            .to_string(),
+        ));
+        (initialize, starved, later)
+    });
+    let daemon = json!({
+        "status": "running",
+        "socketPath": socket_path
+    })
+    .to_string();
+    let binary = root.path.join("codex");
+    fs::write(
+        &binary,
+        format!("#!/bin/sh\nprintf '%s\\n' {}\n", shell_quote(&daemon)),
+    )
+    .expect("write fake codex");
+    let mut permissions = fs::metadata(&binary).expect("fake metadata").permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&binary, permissions).expect("make fake executable");
+    let _path = PathGuard::prepend(&root.path);
+
+    let states = thread_states(&["slow thread".to_string(), "later thread".to_string()]);
+
+    assert_eq!(
+        states.len(),
+        2,
+        "a starved read dropped rows instead of reporting them: {states:?}"
+    );
+    assert_eq!(
+        states["slow thread"],
+        Observation::Unavailable,
+        "the read nobody answered must report itself as unasked"
+    );
+    assert_eq!(
+        states["later thread"],
+        Observation::CodexTurn("completed".to_string()),
+        "the read after the starved one was answered by the daemon and still reported unavailable, \
+         so one slow read spent the whole window's budget"
+    );
+
+    let (initialize, starved, later) = server.join().expect("app server thread");
+    assert_eq!(initialize["method"], "initialize");
+    assert_eq!(starved["method"], "thread/read");
+    assert_eq!(starved["params"]["threadId"], "slow thread");
+    assert_eq!(
+        later["params"]["threadId"], "later thread",
+        "the second read must reach the daemon rather than fail in the client"
+    );
+    assert_eq!(later["id"], 3);
+}
+
+/// One JSON RPC request off the fake app-server's socket, skipping the frames that carry no text.
+#[cfg(target_os = "linux")]
+fn read_rpc_request(socket: &mut tungstenite::WebSocket<std::os::unix::net::UnixStream>) -> Value {
+    loop {
+        if let tungstenite::Message::Text(text) = socket.read().expect("read request") {
+            return serde_json::from_str(&text).expect("request JSON");
+        }
+    }
 }
 
 /// Only claude accepts MCP scoping, so an auto decision that lands on another provider must fail
@@ -1191,6 +1521,43 @@ fn opencode_session_identity_uses_the_caller_supplied_name_verbatim() {
     assert_eq!(dispatch.job_id.as_deref(), Some("session supplied name"));
     let requests = server.join().expect("server thread");
     assert_eq!(requests[0].body["title"], json!(name));
+}
+
+/// OpenCode discards effort entirely: the session create and the prompt carry no effort field and
+/// the reply reports none, so there is nothing observed to record and the column stays null. The
+/// only way to fill it here would be to invent a value from the decision or the model, which is
+/// the failure this commit exists to prevent.
+#[test]
+fn an_opencode_dispatch_records_no_effective_effort() {
+    let (address, server) = loopback_server(vec![
+        (200, "application/json", r#"{"id":"session no effort"}"#),
+        (204, "application/json", ""),
+    ]);
+    let client =
+        ManagedClient::for_loopback_test(address, "router test secret").expect("loopback client");
+
+    let dispatch = client
+        .dispatch(
+            Path::new("/tmp"),
+            "one submission",
+            "Bonus: abc 123",
+            Some("openai/gpt-5.6-sol"),
+        )
+        .expect("managed dispatch");
+
+    assert_eq!(dispatch.job_id.as_deref(), Some("session no effort"));
+    assert_eq!(
+        dispatch.effective_effort, None,
+        "opencode reports no effort, so the router knows none"
+    );
+    let requests = server.join().expect("server thread");
+    for request in &requests {
+        assert!(
+            request.body.get("effort").is_none(),
+            "opencode was never sent an effort to report back: {:?}",
+            request.body
+        );
+    }
 }
 
 #[test]
