@@ -33,7 +33,9 @@ log: row 87 in /home/you/.local/state/agent-router/router.db
    over the hard ceiling and the other is not. A borderline verdict is flipped when the other
    provider has a large enough weekly headroom advantage.
 4. **Pick the model from complexity.** The complexity tier selects the model from the per provider
-   tier table. Reasoning effort is deliberately not forced: each model runs at its own default.
+   tier table. Reasoning effort is deliberately not decided: the router forces none and each
+   backend resolves its own. See [docs/configuration.md](docs/configuration.md#modelscodex-and-modelsclaude)
+   for what that actually means per backend, because it is not the model default on Codex.
 5. **Dispatch and log.** The job is spawned detached, its backend job id is resolved, and the whole
    decision lands in a SQLite decision log.
 

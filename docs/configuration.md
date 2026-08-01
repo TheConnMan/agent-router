@@ -163,8 +163,10 @@ verdict, and the resulting tier picks the model the job is spawned with.
 
 Two deliberate choices are worth knowing before tuning these.
 
-There is no effort table, on purpose. The model is the toggle, and each model then runs at its own
-default reasoning effort. Forcing an effort on top of a model choice was tried and removed.
+There is no effort table, on purpose. The model is the toggle, and the reasoning effort is left to
+the backend to resolve. Forcing an effort on top of a model choice was tried and removed, because
+both tables read the same complexity value, so the second one carried no signal the first did not
+and only multiplied the cost of a misscored task.
 
 Complexity never changes the verdict and the verdict never changes complexity. A low complexity
 task can belong to either provider, and so can an ultra one.
@@ -172,6 +174,36 @@ task can belong to either provider, and so can an ultra one.
 The Codex defaults point `high` and `ultra` at the same model because `sol` is the top of the Codex
 catalogue. The Claude defaults reserve `fable` for `ultra` alone, which is why the rubric is written
 to keep `ultra` deliberately hard to earn.
+
+### What reasoning effort a dispatched job actually runs at
+
+The router decides none, so this is the backend's own resolution, and it is not the same on both.
+
+On Claude it is the model's own default. The router passes no `--effort` unless a decision carries
+one, and nothing else sets it.
+
+On Codex it is whatever your own `~/.codex/config.toml` resolves. Dispatch goes through
+`codex app-server daemon`, and the daemon loads user config, unlike the classifier, which passes
+`--ignore-user-config`. So a `model_reasoning_effort` in that file applies to every routed Codex
+job at every tier, and the router neither controls nor records it. The decision log's `effort`
+column records what the router decided, which is nothing; it is not the effort the job ran at.
+
+Only when that file names no `model_reasoning_effort` does a Codex job fall through to the model's
+own catalogue default, and those defaults are not ordered the way the tier table is. Read them from
+the running daemon rather than assuming:
+
+```bash
+{ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"probe","version":"0"},"capabilities":{"experimentalApi":true}}}'
+  sleep 2
+  printf '%s\n' '{"jsonrpc":"2.0","method":"initialized"}'
+  printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"model/list","params":{"includeHidden":true,"limit":50}}'
+  sleep 15
+} | codex app-server --listen stdio://
+```
+
+Each entry carries a `defaultReasoningEffort` and a `supportedReasoningEfforts` list. The list is
+per model and not uniform, which matters if you ever do set an effort: `sol` and `terra` accept a
+rung that `luna` does not, and no Codex rung above `max` is a value Claude accepts at all.
 
 ## `[parity]`
 
