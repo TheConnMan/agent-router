@@ -72,16 +72,24 @@ pub struct Decision {
     pub provider: Provider,
     /// The model to spawn with. None means the backend resolves its own default.
     pub model: Option<String>,
-    /// The reasoning effort to force. Always None: the model tier is the toggle, so the router
-    /// decides no effort at all and each backend resolves its own. That resolution is not the
-    /// same on both. Claude runs at the model's own default, because nothing else sets one. Codex
-    /// runs at whatever `~/.codex/config.toml` resolves, because dispatch goes through
+    /// The reasoning effort the router asks the backend to run at. Dispatch honours it on codex
+    /// (`turn/start` `effort`) and on claude (`--effort`), and opencode discards it. Nothing
+    /// currently sets it: the model tier is the toggle, so the router decides no effort at all and
+    /// each backend resolves its own. The field is kept because that dispatch path is live and
+    /// proven by `claude_argv_carries_the_decided_effort_and_omits_the_flag_without_one` and
+    /// `codex_requests_pin_security_posture_and_put_effort_on_the_turn`, which pin backend argv and
+    /// param shapes that drift on the backends' schedule rather than ours.
+    ///
+    /// What the backends then resolve is not the same on both. Claude runs at the model's own
+    /// default, because nothing else sets one, and it reports that value nowhere. Codex runs at
+    /// whatever `~/.codex/config.toml` resolves, because dispatch goes through
     /// `codex app-server daemon`, which loads user config; only when that file names no
     /// `model_reasoning_effort` does a codex job fall through to the model's catalogue default.
-    /// So the effort a codex job runs at is neither decided nor recorded here.
     ///
-    /// Dispatch still honours a value if one is set, on codex (`turn/start` `effort`) and on
-    /// claude (`--effort`). Opencode discards it.
+    /// So this is the effort the router decided, and it is not the effort a job ran at. The codex
+    /// daemon reports the resolved value on the `thread/start` reply, and that reading is recorded
+    /// separately in the log's `effective_effort` column. Claude and opencode record nothing there,
+    /// because neither exposes one to read.
     pub effort: Option<String>,
     /// None when the caller named a provider and no classification ran.
     pub classification: Option<Classification>,

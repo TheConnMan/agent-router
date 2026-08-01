@@ -258,15 +258,24 @@ to keep `ultra` deliberately hard to earn.
 ### What reasoning effort a dispatched job actually runs at
 
 The router decides none, so this is the backend's own resolution, and it is not the same on both.
+The router does not control it on either backend. It records it on the one backend that reports it.
 
 On Claude it is the model's own default. The router passes no `--effort` unless a decision carries
-one, and nothing else sets it.
+one, and nothing else sets it. Claude reports the value it settled on nowhere, so there is nothing
+to record: `effective_effort` on a Claude row is null, permanently. It is null on an OpenCode row
+too, because OpenCode discards effort in both directions.
 
 On Codex it is whatever your own `~/.codex/config.toml` resolves. Dispatch goes through
 `codex app-server daemon`, and the daemon loads user config, unlike the classifier, which passes
 `--ignore-user-config`. So a `model_reasoning_effort` in that file applies to every routed Codex
-job at every tier, and the router neither controls nor records it. The decision log's `effort`
-column records what the router decided, which is nothing; it is not the effort the job ran at.
+job at every tier. The daemon reports the value it resolved on the `thread/start` reply, and the
+router records that reading in the decision log's `effective_effort` column, so a Codex row says
+what the job will actually run at and follows that file when you change it.
+
+The two effort columns are different facts and the log keeps them apart on purpose. `effort` is what
+the router decided, which is nothing; `effective_effort` is what the backend reported. Null in the
+second one means nobody observed an effort, which is not the same as a job running at no effort: it
+covers a Claude or OpenCode row, a dry run, and a row written before the column existed.
 
 Only when that file names no `model_reasoning_effort` does a Codex job fall through to the model's
 own catalogue default, and those defaults are not ordered the way the tier table is. Read them from

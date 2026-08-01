@@ -3,7 +3,7 @@
 //! answer to "why did this route here".
 
 use crate::decide::Decision;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::runtime::{home_dir, now_ms};
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
@@ -24,6 +24,10 @@ pub struct Entry<'a> {
     pub job_name: Option<&'a str>,
     /// "dispatched", "dry-run", or "error: ...".
     pub outcome: &'a str,
+    /// What the backend reported this job will actually run its reasoning at, which is a different
+    /// fact from the effort the router decided. None where the backend says nothing, which is every
+    /// claude and opencode dispatch and every dry run.
+    pub effective_effort: Option<&'a str>,
 }
 
 /// One row read back, flattened for display.
@@ -36,6 +40,8 @@ pub struct Row {
     pub requested: String,
     pub provider: String,
     pub model: Option<String>,
+    /// The reasoning effort the router decided, which nothing currently sets. Not the effort the
+    /// job ran at: that is `effective_effort` below.
     pub effort: Option<String>,
     /// The four scores the classifier no longer produces. Kept on the read model because the rows
     /// already in the database carry them and are the corpus every backtest replays; None on
@@ -61,6 +67,8 @@ pub struct Row {
     pub dry_run: bool,
     pub job_id: Option<String>,
     pub job_name: Option<String>,
+    /// What became of the job. The dispatch time value until `status` has read a backend for this
+    /// row, and the reconciled state afterwards.
     pub outcome: String,
     pub rationale: String,
     /// Whether the Claude usage numbers on this row came from a fail open read rather than a live
@@ -68,6 +76,78 @@ pub struct Row {
     pub claude_usage_stale: Option<bool>,
     /// The same for Codex.
     pub codex_usage_stale: Option<bool>,
+    /// When the last reading that actually landed was taken. None means never reconciled, which is
+    /// not the same as reconciled and found unknown.
+    pub reconciled_at_ms: Option<i64>,
+    /// The human judgement on the route. None means nobody has judged this row, which is not the
+    /// same as judging it good.
+    pub mark: Option<String>,
+    /// What the human said alongside the mark. None means nothing was said.
+    pub note: Option<String>,
+    /// The reasoning effort the backend reported this job will run at, as against `effort` above,
+    /// which is what the router decided. None means nobody observed one: the backend exposes none
+    /// (claude, opencode), nothing was dispatched (a dry run), or the row predates the column. None
+    /// of those is the same as a job running at no effort.
+    pub effective_effort: Option<String>,
+}
+
+/// The human judgement on one routing decision: whether sending the task there was the right call.
+///
+/// Deliberately a separate column from `outcome`, which says only whether the job ran. A completed
+/// job can still be a bad route, and a failed job can be the right route that hit an unrelated
+/// fault, so no backend can produce this value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mark {
+    Good,
+    Bad,
+    Rerouted,
+}
+
+impl Mark {
+    pub const fn tag(self) -> &'static str {
+        match self {
+            Mark::Good => "good",
+            Mark::Bad => "bad",
+            Mark::Rerouted => "rerouted",
+        }
+    }
+}
+
+/// PURE: the mark a `--mark` value names.
+///
+/// The column is TEXT and SQLite enforces nothing about what lands in it, so this is deliberately
+/// the only way a value reaches it: a second write path added later is the regression to guard
+/// against.
+pub fn parse_mark(value: &str) -> Result<Mark> {
+    match value {
+        "good" => Ok(Mark::Good),
+        "bad" => Ok(Mark::Bad),
+        "rerouted" => Ok(Mark::Rerouted),
+        other => Err(Error::Command(format!(
+            "unknown mark {other:?}: expected good, bad, or rerouted"
+        ))),
+    }
+}
+
+/// PURE: the log row a `--mark` value names. The CLI takes the id as a string so the rejection names
+/// the value the caller actually passed rather than reporting clap's own parse failure.
+pub fn parse_row_id(value: &str) -> Result<i64> {
+    value.parse().map_err(|_| {
+        Error::Command(format!(
+            "unknown row id {value:?}: expected the id of a decision log row"
+        ))
+    })
+}
+
+/// One row as the reconciler needs it: the columns it matches a backend on, nothing else.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatusRow {
+    pub id: i64,
+    pub created_at_ms: i64,
+    pub provider: String,
+    /// Never NULL: the query that produces these rows excludes rows carrying no job.
+    pub job_id: String,
+    pub outcome: String,
 }
 
 /// One row as the stats reader needs it: the columns a metric is derived from, nothing else.
@@ -82,6 +162,13 @@ pub struct StatsRow {
     /// The gate tags that fired, comma joined. Empty when none did.
     pub gates: String,
     pub dry_run: bool,
+    /// The human judgement on the route. None means nobody has judged this row, which is why a bad
+    /// rate is denominated on the marked rows alone.
+    pub mark: Option<String>,
+    /// What became of the job: the dispatch time value until `status` has read a backend for this
+    /// row, and the reconciled state afterwards. It is the state, so a failure rate reads it
+    /// directly rather than a second column.
+    pub outcome: String,
 }
 
 const SCHEMA: &str = "\
@@ -120,6 +207,10 @@ CREATE TABLE IF NOT EXISTS decisions (
     dry_run             INTEGER NOT NULL,
     job_id              TEXT,
     job_name            TEXT,
+    reconciled_at_ms    INTEGER,
+    mark                TEXT,
+    note                TEXT,
+    effective_effort    TEXT,
     outcome             TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS decisions_created_at ON decisions(created_at_ms);
@@ -131,10 +222,21 @@ const SELECT_COLUMNS: &str = "\
 id, created_at_ms, task, dir, requested, provider, model, effort, verdict, confidence, \
 codex_ready_count, claude_signal_count, missing_connector, gates, claude_weekly_pct, \
 codex_weekly_pct, dry_run, job_id, job_name, outcome, rationale, complexity, \
-claude_usage_stale, codex_usage_stale, orchestration, claude_pace_delta, codex_pace_delta";
+claude_usage_stale, codex_usage_stale, orchestration, claude_pace_delta, codex_pace_delta, \
+reconciled_at_ms, mark, note, effective_effort";
 
 /// The narrower list the stats reader needs, so a report never pays for columns it drops.
-const STATS_COLUMNS: &str = "created_at_ms, requested, provider, complexity, gates, dry_run";
+const STATS_COLUMNS: &str =
+    "created_at_ms, requested, provider, complexity, gates, dry_run, mark, outcome";
+
+/// The narrower list the reconciler needs.
+const STATUS_COLUMNS: &str = "id, created_at_ms, provider, job_id, outcome";
+
+/// The rows a reconciliation may touch: the ones that actually produced a job. A dry run dispatched
+/// nothing, and a failed dispatch bound its `job_id` to NULL while putting the backend's own
+/// message in `outcome`, so this single predicate keeps both out of every reconciliation and leaves
+/// that message untouched.
+const RECONCILABLE: &str = "dry_run = 0 AND job_id IS NOT NULL";
 
 pub struct DecisionLog {
     conn: Connection,
@@ -199,10 +301,10 @@ impl DecisionLog {
                 claude_weekly_reset, codex_five_hour_pct, codex_five_hour_reset,
                 codex_weekly_pct, codex_weekly_reset, dry_run, job_id, job_name, outcome,
                 complexity, claude_usage_stale, codex_usage_stale,
-                claude_pace_delta, codex_pace_delta
+                claude_pace_delta, codex_pace_delta, effective_effort
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28
+                ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29
             )",
             rusqlite::params![
                 now_ms(),
@@ -233,6 +335,7 @@ impl DecisionLog {
                 usage.codex.stale,
                 decision.claude_pace_delta,
                 decision.codex_pace_delta,
+                entry.effective_effort,
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -249,6 +352,8 @@ impl DecisionLog {
                 complexity: row.get(3)?,
                 gates: row.get(4)?,
                 dry_run: row.get(5)?,
+                mark: row.get(6)?,
+                outcome: row.get(7)?,
             })
         };
         let rows = match since_ms {
@@ -271,6 +376,85 @@ impl DecisionLog {
             }
         };
         Ok(rows)
+    }
+
+    /// IMPURE: the `limit` newest rows a reconciliation may touch, newest first. `since_ms` is an
+    /// inclusive floor on `created_at_ms`, filtering first so the limit caps what is left, exactly
+    /// as the stats window does.
+    pub fn status_rows(&self, limit: usize, since_ms: Option<i64>) -> Result<Vec<StatusRow>> {
+        let read = |row: &rusqlite::Row| {
+            Ok(StatusRow {
+                id: row.get(0)?,
+                created_at_ms: row.get(1)?,
+                provider: row.get(2)?,
+                job_id: row.get(3)?,
+                outcome: row.get(4)?,
+            })
+        };
+        let rows = match since_ms {
+            Some(floor) => {
+                let sql = format!(
+                    "SELECT {STATUS_COLUMNS} FROM decisions WHERE created_at_ms >= ?1 \
+                     AND {RECONCILABLE} ORDER BY id DESC LIMIT ?2"
+                );
+                let mut statement = self.conn.prepare(&sql)?;
+                let rows =
+                    statement.query_map([floor, i64::try_from(limit).unwrap_or(i64::MAX)], read)?;
+                rows.collect::<rusqlite::Result<Vec<StatusRow>>>()?
+            }
+            None => {
+                let sql = format!(
+                    "SELECT {STATUS_COLUMNS} FROM decisions WHERE {RECONCILABLE} \
+                     ORDER BY id DESC LIMIT ?1"
+                );
+                let mut statement = self.conn.prepare(&sql)?;
+                let rows = statement.query_map([i64::try_from(limit).unwrap_or(i64::MAX)], read)?;
+                rows.collect::<rusqlite::Result<Vec<StatusRow>>>()?
+            }
+        };
+        Ok(rows)
+    }
+
+    /// IMPURE: record what the backend said about one row, and when it said it.
+    ///
+    /// The caller reaches here only for a state the monotonicity rule admitted, so this writes
+    /// whatever it is handed and the rule that protects a proven outcome lives outside SQL where it
+    /// is testable with no database.
+    pub fn reconcile(&self, id: i64, outcome: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE decisions SET outcome = ?1, reconciled_at_ms = ?2 WHERE id = ?3",
+            rusqlite::params![outcome, now_ms(), id],
+        )?;
+        Ok(())
+    }
+
+    /// IMPURE: record the human judgement on one row, replacing any earlier one.
+    ///
+    /// Both columns are written every time, including the note when there is none. A mark with no
+    /// note landing after a mark that had one would otherwise leave the old note attached to a new
+    /// judgement, which is a sentence no human said.
+    ///
+    /// A zero row update is an error rather than a quiet success: a bare UPDATE that matched
+    /// nothing exits 0 and reports a judgement as recorded when nothing was recorded at all.
+    pub fn mark(&self, id: i64, mark: Mark, note: Option<&str>) -> Result<()> {
+        // An empty or whitespace only note is Some, so it would land in the column and read as a
+        // note nobody wrote. A loud error is correct, exactly as it is for an empty --name, since a
+        // caller passing a note believes it recorded one.
+        if let Some(note) = note
+            && note.trim().is_empty()
+        {
+            return Err(Error::Command(
+                "--note must not be empty or whitespace only".to_string(),
+            ));
+        }
+        let changed = self.conn.execute(
+            "UPDATE decisions SET mark = ?1, note = ?2 WHERE id = ?3",
+            rusqlite::params![mark.tag(), note, id],
+        )?;
+        if changed == 0 {
+            return Err(Error::Command(format!("no decision log row with id {id}")));
+        }
+        Ok(())
     }
 
     /// IMPURE: this provider's own weekly percent at each dispatched decision on this exact model,
@@ -333,6 +517,10 @@ impl DecisionLog {
                     orchestration: row.get(24)?,
                     claude_pace_delta: row.get(25)?,
                     codex_pace_delta: row.get(26)?,
+                    reconciled_at_ms: row.get(27)?,
+                    mark: row.get(28)?,
+                    note: row.get(29)?,
+                    effective_effort: row.get(30)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<Row>>>()?;
@@ -347,13 +535,17 @@ impl DecisionLog {
 /// Same columns, different physical order: `SCHEMA` places these mid table while `ALTER TABLE ADD
 /// COLUMN` can only append them, so a fresh and a migrated database disagree on every ordinal and
 /// every read must name the columns it wants rather than `SELECT *` or a `pragma_table_info` index.
-const MISSING_COLUMNS: [(&str, &str); 6] = [
+const MISSING_COLUMNS: [(&str, &str); 10] = [
     ("complexity", "TEXT"),
     ("claude_usage_stale", "INTEGER"),
     ("codex_usage_stale", "INTEGER"),
     ("orchestration", "INTEGER"),
     ("claude_pace_delta", "REAL"),
     ("codex_pace_delta", "REAL"),
+    ("reconciled_at_ms", "INTEGER"),
+    ("mark", "TEXT"),
+    ("note", "TEXT"),
+    ("effective_effort", "TEXT"),
 ];
 
 /// IMPURE: bring a database written before any of those columns up to the current schema. Guarded
@@ -455,6 +647,7 @@ mod tests {
                 job_id: Some("thread-abc"),
                 job_name: None,
                 outcome: "dispatched",
+                effective_effort: None,
             })
             .expect("records");
         assert!(id > 0);
@@ -494,6 +687,7 @@ mod tests {
             job_id: None,
             job_name: Some("t"),
             outcome: "dry-run",
+            effective_effort: None,
         })
         .expect("records");
         let conn = rusqlite::Connection::open(&path).expect("reopen");
@@ -528,6 +722,7 @@ mod tests {
             job_id: Some("session-1"),
             job_name: None,
             outcome: "dispatched",
+            effective_effort: None,
         })
         .expect("records");
         let row = &log.recent(1).expect("reads")[0];
@@ -555,6 +750,7 @@ mod tests {
                 job_id: None,
                 job_name: None,
                 outcome: "dry-run",
+                effective_effort: None,
             })
             .expect("records");
         }
@@ -613,6 +809,190 @@ mod tests {
         DecisionLog::open_at(&path).expect("reopens");
     }
 
+    /// A database written before reconciliation gains the column on open, keeps its rows, and reads
+    /// them back as never reconciled rather than failing the SELECT.
+    #[test]
+    fn an_older_database_gains_the_reconciled_at_column_and_keeps_its_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("router.db");
+        let older = SCHEMA.replace("    reconciled_at_ms    INTEGER,\n", "");
+        assert!(
+            !older.contains("reconciled_at_ms"),
+            "the older schema fixture"
+        );
+        {
+            let conn = rusqlite::Connection::open(&path).expect("create older database");
+            conn.execute_batch(&older).expect("older schema");
+            conn.execute(
+                "INSERT INTO decisions (
+                    created_at_ms, task, dir, requested, provider, gates, rationale,
+                    claude_five_hour_pct, claude_five_hour_reset, claude_weekly_pct,
+                    claude_weekly_reset, codex_five_hour_pct, codex_five_hour_reset,
+                    codex_weekly_pct, codex_weekly_reset, dry_run, job_id, outcome
+                ) VALUES (1, 'older row', '/tmp', 'auto', 'claude', '', 'why', 0, 0, 0, 0, 0, 0, \
+                 0, 0, 0, 'c0ffee42', 'dispatched')",
+                [],
+            )
+            .expect("older row");
+        }
+
+        let log = DecisionLog::open_at(&path).expect("migrates on open");
+        let rows = log.recent(10).expect("reads the older row back");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].task, "older row");
+        assert_eq!(rows[0].reconciled_at_ms, None);
+
+        // The reconciler reads the migrated database through its own projection, whose columns sit
+        // at different ordinals here than in a fresh one.
+        let status = log
+            .status_rows(10, None)
+            .expect("reads the status projection");
+        assert_eq!(status.len(), 1);
+        assert_eq!(status[0].job_id, "c0ffee42");
+        assert_eq!(status[0].outcome, "dispatched");
+
+        log.reconcile(status[0].id, "unknown").expect("reconciles");
+        let reconciled = &log.recent(10).expect("reads back")[0];
+        assert_eq!(reconciled.outcome, "unknown");
+        assert!(reconciled.reconciled_at_ms.is_some());
+
+        // The migration is idempotent: opening again must not try to add the column twice.
+        DecisionLog::open_at(&path).expect("reopens");
+    }
+
+    /// A database written before the human judgement gains both columns on open, keeps its rows,
+    /// and reads them back as unjudged rather than failing the SELECT.
+    #[test]
+    fn an_older_database_gains_the_mark_columns_and_keeps_its_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("router.db");
+        let older = SCHEMA
+            .replace("    mark                TEXT,\n", "")
+            .replace("    note                TEXT,\n", "");
+        assert!(!older.contains("mark"), "the older schema fixture");
+        assert!(!older.contains("note"), "the older schema fixture");
+        {
+            let conn = rusqlite::Connection::open(&path).expect("create older database");
+            conn.execute_batch(&older).expect("older schema");
+            conn.execute(
+                "INSERT INTO decisions (
+                    created_at_ms, task, dir, requested, provider, gates, rationale,
+                    claude_five_hour_pct, claude_five_hour_reset, claude_weekly_pct,
+                    claude_weekly_reset, codex_five_hour_pct, codex_five_hour_reset,
+                    codex_weekly_pct, codex_weekly_reset, dry_run, job_id, outcome
+                ) VALUES (1, 'older row', '/tmp', 'auto', 'codex', '', 'why', 0, 0, 0, 0, 0, 0, \
+                 0, 0, 0, 'c0ffee42', 'dispatched')",
+                [],
+            )
+            .expect("older row");
+        }
+
+        let log = DecisionLog::open_at(&path).expect("migrates on open");
+        let rows = log.recent(10).expect("reads the older row back");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].task, "older row");
+        assert_eq!(rows[0].mark, None);
+        assert_eq!(rows[0].note, None);
+
+        // The judgement is written to the migrated database, whose appended columns sit at
+        // different ordinals here than the same columns do in a fresh one.
+        log.mark(rows[0].id, Mark::Bad, Some("needed connectors"))
+            .expect("marks the older row");
+        let marked = &log.recent(10).expect("reads back")[0];
+        assert_eq!(marked.mark.as_deref(), Some("bad"));
+        assert_eq!(marked.note.as_deref(), Some("needed connectors"));
+        assert_eq!(marked.outcome, "dispatched");
+
+        // The migration is idempotent: opening again must not try to add the columns twice.
+        DecisionLog::open_at(&path).expect("reopens");
+    }
+
+    /// The accepted set is a closed enum of three and this parse is its only entry point, so every
+    /// accepted value round trips through `tag()` and anything else is refused by name with the
+    /// accepted values in the message.
+    #[test]
+    fn an_unknown_mark_is_rejected_by_name() {
+        for mark in [Mark::Good, Mark::Bad, Mark::Rerouted] {
+            assert_eq!(parse_mark(mark.tag()).expect("round trips"), mark);
+        }
+        assert_eq!(parse_mark("good").expect("good"), Mark::Good);
+        assert_eq!(parse_mark("bad").expect("bad"), Mark::Bad);
+        assert_eq!(parse_mark("rerouted").expect("rerouted"), Mark::Rerouted);
+
+        let rejection = parse_mark("great")
+            .expect_err("great is not a mark")
+            .to_string();
+        assert!(rejection.contains("great"), "{rejection}");
+        for accepted in ["good", "bad", "rerouted"] {
+            assert!(rejection.contains(accepted), "{rejection}");
+        }
+    }
+
+    /// An empty note is Some, so nothing but this check keeps it out of the column, and a caller
+    /// passing one believes it recorded a judgement.
+    #[test]
+    fn an_empty_note_is_rejected_rather_than_stored() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = DecisionLog::open_at(&dir.path().join("router.db")).expect("opens");
+        let decision = decision();
+        let id = log
+            .record(&Entry {
+                task: "t",
+                dir: Path::new("/tmp"),
+                requested: "auto",
+                decision: &decision,
+                dry_run: false,
+                job_id: Some("thread-abc"),
+                job_name: None,
+                outcome: "dispatched",
+                effective_effort: None,
+            })
+            .expect("records");
+
+        log.mark(id, Mark::Good, Some("   "))
+            .expect_err("a whitespace only note");
+
+        let row = &log.recent(1).expect("reads")[0];
+        assert_eq!(
+            row.mark, None,
+            "the rejected note carried a mark in with it"
+        );
+        assert_eq!(row.note, None);
+    }
+
+    /// The predicate the whole in place update rests on: a dry run and a dispatch error are outside
+    /// the window by construction, so neither can be overwritten by a reconciliation.
+    #[test]
+    fn the_status_window_holds_only_rows_that_produced_a_job() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = DecisionLog::open_at(&dir.path().join("router.db")).expect("opens");
+        let decision = decision();
+        let mut entry = Entry {
+            task: "t",
+            dir: Path::new("/tmp"),
+            requested: "auto",
+            decision: &decision,
+            dry_run: true,
+            job_id: None,
+            job_name: None,
+            outcome: "dry-run",
+            effective_effort: None,
+        };
+        log.record(&entry).expect("a dry run row");
+        entry.dry_run = false;
+        entry.outcome = "error: app-server spawn failed";
+        log.record(&entry).expect("a dispatch error row");
+        entry.job_id = Some("thread-abc");
+        entry.outcome = "dispatched";
+        let dispatched = log.record(&entry).expect("a dispatched row");
+
+        let rows = log.status_rows(10, None).expect("reads the window");
+        assert_eq!(
+            rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![dispatched]
+        );
+    }
+
     #[test]
     fn opening_an_existing_log_twice_keeps_its_rows() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -629,6 +1009,7 @@ mod tests {
                 job_id: None,
                 job_name: None,
                 outcome: "dry-run",
+                effective_effort: None,
             })
             .expect("records");
         }
