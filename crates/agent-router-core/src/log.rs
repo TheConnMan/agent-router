@@ -89,6 +89,10 @@ pub struct Row {
     /// (claude, opencode), nothing was dispatched (a dry run), or the row predates the column. None
     /// of those is the same as a job running at no effort.
     pub effective_effort: Option<String>,
+    /// The `agent-router` build that made this decision, from `CARGO_PKG_VERSION` at record time.
+    /// None on a row written before this column, which is not the same as a version that is
+    /// genuinely empty: an aggregate spanning both a None and a real version is mixed regardless.
+    pub router_version: Option<String>,
 }
 
 /// The human judgement on one routing decision: whether sending the task there was the right call.
@@ -169,6 +173,9 @@ pub struct StatsRow {
     /// row, and the reconciled state afterwards. It is the state, so a failure rate reads it
     /// directly rather than a second column.
     pub outcome: String,
+    /// The `agent-router` build that made this decision. None on a row written before this column,
+    /// which a report must count separately from a row that genuinely carries a known version.
+    pub router_version: Option<String>,
 }
 
 const SCHEMA: &str = "\
@@ -211,6 +218,7 @@ CREATE TABLE IF NOT EXISTS decisions (
     mark                TEXT,
     note                TEXT,
     effective_effort    TEXT,
+    router_version      TEXT,
     outcome             TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS decisions_created_at ON decisions(created_at_ms);
@@ -223,11 +231,11 @@ id, created_at_ms, task, dir, requested, provider, model, effort, verdict, confi
 codex_ready_count, claude_signal_count, missing_connector, gates, claude_weekly_pct, \
 codex_weekly_pct, dry_run, job_id, job_name, outcome, rationale, complexity, \
 claude_usage_stale, codex_usage_stale, orchestration, claude_pace_delta, codex_pace_delta, \
-reconciled_at_ms, mark, note, effective_effort";
+reconciled_at_ms, mark, note, effective_effort, router_version";
 
 /// The narrower list the stats reader needs, so a report never pays for columns it drops.
-const STATS_COLUMNS: &str =
-    "created_at_ms, requested, provider, complexity, gates, dry_run, mark, outcome";
+const STATS_COLUMNS: &str = "created_at_ms, requested, provider, complexity, gates, dry_run, \
+mark, outcome, router_version";
 
 /// The narrower list the reconciler needs.
 const STATUS_COLUMNS: &str = "id, created_at_ms, provider, job_id, outcome";
@@ -237,6 +245,13 @@ const STATUS_COLUMNS: &str = "id, created_at_ms, provider, job_id, outcome";
 /// message in `outcome`, so this single predicate keeps both out of every reconciliation and leaves
 /// that message untouched.
 const RECONCILABLE: &str = "dry_run = 0 AND job_id IS NOT NULL";
+
+/// The `agent-router` build writing this process, stamped onto every row at record time so an
+/// aggregate spanning code that changed the routing rules is visibly mixed rather than silently
+/// pooled. Never touched by `reconcile()` or `mark()`: those are updates to a row already written,
+/// and restamping one with the version doing the reconciling would misattribute the decision to a
+/// build that never made it.
+const ROUTER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub struct DecisionLog {
     conn: Connection,
@@ -301,10 +316,10 @@ impl DecisionLog {
                 claude_weekly_reset, codex_five_hour_pct, codex_five_hour_reset,
                 codex_weekly_pct, codex_weekly_reset, dry_run, job_id, job_name, outcome,
                 complexity, claude_usage_stale, codex_usage_stale,
-                claude_pace_delta, codex_pace_delta, effective_effort
+                claude_pace_delta, codex_pace_delta, effective_effort, router_version
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29
+                ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30
             )",
             rusqlite::params![
                 now_ms(),
@@ -336,6 +351,7 @@ impl DecisionLog {
                 decision.claude_pace_delta,
                 decision.codex_pace_delta,
                 entry.effective_effort,
+                ROUTER_VERSION,
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -354,6 +370,7 @@ impl DecisionLog {
                 dry_run: row.get(5)?,
                 mark: row.get(6)?,
                 outcome: row.get(7)?,
+                router_version: row.get(8)?,
             })
         };
         let rows = match since_ms {
@@ -521,6 +538,7 @@ impl DecisionLog {
                     mark: row.get(28)?,
                     note: row.get(29)?,
                     effective_effort: row.get(30)?,
+                    router_version: row.get(31)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<Row>>>()?;
@@ -535,7 +553,7 @@ impl DecisionLog {
 /// Same columns, different physical order: `SCHEMA` places these mid table while `ALTER TABLE ADD
 /// COLUMN` can only append them, so a fresh and a migrated database disagree on every ordinal and
 /// every read must name the columns it wants rather than `SELECT *` or a `pragma_table_info` index.
-const MISSING_COLUMNS: [(&str, &str); 10] = [
+const MISSING_COLUMNS: [(&str, &str); 11] = [
     ("complexity", "TEXT"),
     ("claude_usage_stale", "INTEGER"),
     ("codex_usage_stale", "INTEGER"),
@@ -546,6 +564,7 @@ const MISSING_COLUMNS: [(&str, &str); 10] = [
     ("mark", "TEXT"),
     ("note", "TEXT"),
     ("effective_effort", "TEXT"),
+    ("router_version", "TEXT"),
 ];
 
 /// IMPURE: bring a database written before any of those columns up to the current schema. Guarded
@@ -904,6 +923,122 @@ mod tests {
         assert_eq!(marked.outcome, "dispatched");
 
         // The migration is idempotent: opening again must not try to add the columns twice.
+        DecisionLog::open_at(&path).expect("reopens");
+    }
+
+    /// Shared setup for the two router-version migration tests below: an older-schema database
+    /// carrying one historical row, opened through the column-adding migration. Returns the
+    /// tempdir (kept alive so `router.db` survives for the caller) and the migrated log, which at
+    /// this point holds only the historical row.
+    fn open_router_version_migration_fixture() -> (tempfile::TempDir, DecisionLog) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("router.db");
+        let older = SCHEMA.replace("    router_version      TEXT,\n", "");
+        assert!(
+            !older.contains("router_version"),
+            "the older schema fixture"
+        );
+        {
+            let conn = rusqlite::Connection::open(&path).expect("create older database");
+            conn.execute_batch(&older).expect("older schema");
+            conn.execute(
+                "INSERT INTO decisions (
+                    created_at_ms, task, dir, requested, provider, gates, rationale,
+                    claude_five_hour_pct, claude_five_hour_reset, claude_weekly_pct,
+                    claude_weekly_reset, codex_five_hour_pct, codex_five_hour_reset,
+                    codex_weekly_pct, codex_weekly_reset, dry_run, outcome
+                ) VALUES (1, 'older row', '/tmp', 'auto', 'codex', '', 'why', 0, 0, 0, 0, 0, 0, \
+                 0, 0, 1, 'dry-run')",
+                [],
+            )
+            .expect("older row");
+        }
+
+        let log = DecisionLog::open_at(&path).expect("migrates on open");
+        (dir, log)
+    }
+
+    /// A database written before the router version gains the column on open, keeps its rows, and
+    /// reads the historical row's version back as None through the `Row` model rather than failing
+    /// the SELECT or guessing one: which build wrote that row is genuinely unknown, and a guess
+    /// would misattribute it, which is worse than a null. A fresh row recorded through the migrated
+    /// log afterwards is stamped normally, and `recent()` must tell the two apart through its own
+    /// projection, whose appended column sits at a different ordinal here than in a fresh database.
+    #[test]
+    fn an_older_database_gains_the_router_version_column_and_recent_keeps_its_rows() {
+        let (dir, log) = open_router_version_migration_fixture();
+        let path = dir.path().join("router.db");
+
+        let rows = log.recent(10).expect("reads the older row back");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].task, "older row");
+        assert_eq!(rows[0].router_version, None);
+
+        // A fresh row recorded after the migration is stamped with the running build's version, so
+        // the migrated database now holds one row that knows its writer and one that does not.
+        let decision = decision();
+        log.record(&Entry {
+            task: "new row",
+            dir: Path::new("/tmp"),
+            requested: "auto",
+            decision: &decision,
+            dry_run: true,
+            job_id: None,
+            job_name: None,
+            outcome: "dry-run",
+            effective_effort: None,
+        })
+        .expect("records");
+
+        // recent() reads the migrated database through its own projection, whose appended column
+        // sits at a different ordinal here than in a fresh one, and this is newest first.
+        let rows = log.recent(10).expect("reads back");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].router_version.as_deref(), Some(ROUTER_VERSION));
+        assert_eq!(rows[1].router_version, None);
+
+        // The migration is idempotent: opening again must not try to add the column twice.
+        DecisionLog::open_at(&path).expect("reopens");
+    }
+
+    /// A database written before the router version gains the column on open, keeps its rows, and
+    /// reads the historical row's version back as None through the `StatsRow` model rather than
+    /// failing the SELECT or guessing one: which build wrote that row is genuinely unknown, and a
+    /// guess would misattribute it, which is worse than a null. A fresh row recorded through the
+    /// migrated log afterwards is stamped normally, and `stats_rows()` must tell the two apart
+    /// through its own projection, whose appended column sits at a different ordinal here than in
+    /// a fresh database.
+    #[test]
+    fn an_older_database_gains_the_router_version_column_and_stats_rows_keeps_its_rows() {
+        let (dir, log) = open_router_version_migration_fixture();
+        let path = dir.path().join("router.db");
+
+        // A fresh row recorded after the migration is stamped with the running build's version, so
+        // the migrated database now holds one row that knows its writer and one that does not.
+        let decision = decision();
+        log.record(&Entry {
+            task: "new row",
+            dir: Path::new("/tmp"),
+            requested: "auto",
+            decision: &decision,
+            dry_run: true,
+            job_id: None,
+            job_name: None,
+            outcome: "dry-run",
+            effective_effort: None,
+        })
+        .expect("records");
+
+        // stats_rows() reads the migrated database through its own projection, whose appended
+        // column sits at a different ordinal here than in a fresh one, and this is newest first.
+        let stats = log
+            .stats_rows(10, None)
+            .expect("reads the stats projection");
+        assert_eq!(stats.len(), 2);
+        assert_eq!(stats[0].router_version.as_deref(), Some(ROUTER_VERSION));
+        assert_eq!(stats[1].router_version, None);
+
+        // The migration is idempotent: opening again must not try to add the column twice.
         DecisionLog::open_at(&path).expect("reopens");
     }
 

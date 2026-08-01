@@ -30,13 +30,14 @@ const FLIP_GATES: [&str; 4] = [
 /// compiles, it lints, and every assertion below still passes. `expected_metrics` binds this list
 /// to the report's own fields, and the test asserts the whole key set rather than the presence of
 /// the keys this file happens to read, so neither half can drift alone.
-const METRICS: [&str; 16] = [
+const METRICS: [&str; 17] = [
     "rows_considered",
     "oldest_created_at_ms",
     "newest_created_at_ms",
     "routes",
     "gates",
     "complexity",
+    "router_versions",
     "auto_routes",
     "flip_rate",
     "classifier_failure_rate",
@@ -346,6 +347,7 @@ fn expected_metrics() -> BTreeSet<String> {
         routes: _,
         gates: _,
         complexity: _,
+        router_versions: _,
         auto_routes: _,
         flip_rate: _,
         classifier_failure_rate: _,
@@ -657,6 +659,72 @@ fn the_human_report_prints_a_dash_for_a_rate_nobody_has_judged() {
         !stdout.to_lowercase().contains("nan"),
         "a rate with no denominator rendered a NaN: {stdout}"
     );
+}
+
+/// The pooling regression through the real binary, in both renderings of the report.
+///
+/// On 2026-08-01 a routing quality review pooled 114 rows written by four incompatible routers and
+/// read them as one population. The reader of that report was a human looking at the terminal, so a
+/// version breakdown that only reached the JSON would have left the same reader with the same
+/// undifferentiated totals: the human line is the one that had to exist, and it is asserted here.
+///
+/// This fixture runs one binary, so every row it writes must land under that binary's own version.
+/// The reconciliation against `log --json` is what proves the report is counting the rows it claims
+/// to be summarizing, and the pinned key is what stops both halves from agreeing on nothing: a
+/// report and a log that both published null would reconcile perfectly.
+#[test]
+fn stats_reports_the_router_version_every_row_it_pooled_was_written_by() {
+    let fixture = StatsFixture::new();
+    fixture.dry_run(SCORED_LOW, None, IDLE);
+    fixture.dry_run(SCORED_MEDIUM, None, IDLE);
+    fixture.dry_run("explicitly on claude", Some("claude"), IDLE);
+
+    let rows: Vec<Value> = fixture
+        .json(&["log", "--json", "--limit", "200"])
+        .as_array()
+        .expect("log --json prints an array")
+        .clone();
+    assert_eq!(rows.len(), 3, "the fixture must have recorded three rows");
+    let stats = fixture.json(&["stats", "--json"]);
+
+    assert_eq!(
+        top_level_keys(&stats),
+        expected_metrics(),
+        "stats --json must publish every metric and nothing else"
+    );
+
+    // Both crates in this workspace ship at one version, so the version stamped into a row is the
+    // version of the binary that wrote it. Equality with the version, not merely a present key: a
+    // row labelled with the wrong build misattributes history exactly as an unlabelled one pools it.
+    let version = env!("CARGO_PKG_VERSION").to_string();
+    for row in &rows {
+        assert_eq!(
+            text(row, "router_version"),
+            version,
+            "every logged row must name the build that wrote it: {row}"
+        );
+    }
+    let published = object_counts(&stats, "router_versions");
+    assert_eq!(
+        published,
+        tally(rows.iter().map(|row| text(row, "router_version")).collect()),
+        "the report must attribute the rows the log printed"
+    );
+
+    // The human reading the terminal is who pooled the versions in the first place, so the same
+    // breakdown has to be on the screen, not only in the JSON a script reads.
+    let output = fixture.stats();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    let line = stdout
+        .lines()
+        .find(|line| line.starts_with("router versions:"))
+        .unwrap_or_else(|| panic!("the human report must show the router versions: {stdout}"));
+    assert_eq!(line, format!("router versions: {version} 3"));
 }
 
 #[test]
