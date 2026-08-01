@@ -14,6 +14,7 @@ pub mod provider;
 pub mod run;
 pub mod runtime;
 pub mod stats;
+pub mod status;
 pub mod usage;
 
 pub use classify::{Classification, Confidence, Verdict};

@@ -1,6 +1,8 @@
 use crate::error::{Error, Result};
 use crate::run::Dispatch;
 use crate::runtime::home_dir;
+use crate::status::Observation;
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -80,6 +82,20 @@ pub fn turn_start_request(id: i64, thread_id: &str, task: &str, effort: Option<&
     request(id, "turn/start", params)
 }
 
+/// The read the reconciler runs. `includeTurns` is load bearing and must not be dropped: without it
+/// the reply carries no turn record, every thread falls through to the status fallback, and a job
+/// that provably finished reports as unknown.
+pub fn thread_read_request(id: i64, thread_id: &str) -> String {
+    request(
+        id,
+        "thread/read",
+        serde_json::json!({
+            "threadId": thread_id,
+            "includeTurns": true
+        }),
+    )
+}
+
 fn request(id: i64, method: &str, params: serde_json::Value) -> String {
     serde_json::json!({
         "jsonrpc": "2.0",
@@ -91,6 +107,28 @@ fn request(id: i64, method: &str, params: serde_json::Value) -> String {
 }
 
 pub fn parse_thread_id(line: &str, expected_id: i64) -> Option<String> {
+    read_field(line, expected_id, "/result/thread/id")
+}
+
+/// PURE: the status of the routed turn, which is turn 0.
+///
+/// Index 0 by design and never the last turn: the router calls `turn/start` exactly once, so turn 0
+/// is the job it dispatched. Later turns exist only because a human continued the thread by hand,
+/// and a human's failed continuation is a fact about that follow up work rather than about where
+/// the task was sent. None when the reply carries no turn, which is what makes the thread status
+/// below a fallback rather than a competing source.
+pub fn parse_first_turn_status(line: &str, expected_id: i64) -> Option<String> {
+    read_field(line, expected_id, "/result/thread/turns/0/status")
+}
+
+/// PURE: the thread's own status, read only when there is no turn record to read instead.
+pub fn parse_thread_status(line: &str, expected_id: i64) -> Option<String> {
+    read_field(line, expected_id, "/result/thread/status/type")
+}
+
+/// PURE: one string out of a reply that is genuinely an answer to this request. A reply to someone
+/// else's request and a reply carrying a JSON RPC error are not observations.
+fn read_field(line: &str, expected_id: i64, pointer: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(line).ok()?;
     if value.get("id").and_then(serde_json::Value::as_i64) != Some(expected_id)
         || value.get("error").is_some_and(|error| !error.is_null())
@@ -98,10 +136,63 @@ pub fn parse_thread_id(line: &str, expected_id: i64) -> Option<String> {
         return None;
     }
     value
-        .pointer("/result/thread/id")
+        .pointer(pointer)
         .and_then(serde_json::Value::as_str)
-        .filter(|id| !id.is_empty())
+        .filter(|field| !field.is_empty())
         .map(str::to_string)
+}
+
+/// IMPURE: what the app-server knows about each thread, one `thread/read` apiece.
+///
+/// This probes for a daemon and never starts one: a command reporting on jobs that already exist
+/// must not create the state it is reporting on. No daemon means every thread reports unavailable,
+/// which is the honest partial report rather than a command failure.
+pub fn thread_states(thread_ids: &[String]) -> BTreeMap<String, Observation> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(daemon) = probe_daemon()
+            && let Ok(mut client) = Client::connect(&daemon)
+        {
+            return thread_states_on_rpc(&mut client, thread_ids);
+        }
+    }
+    thread_ids
+        .iter()
+        .map(|thread_id| (thread_id.clone(), Observation::Unavailable))
+        .collect()
+}
+
+/// IMPURE only in the RPC it is handed: one read per thread, each folded on its own.
+///
+/// A failing read records `Unavailable` for that thread and the loop continues, so one bad thread
+/// never costs the rest of the window its reconciliation. Request ids count from 2 because the
+/// handshake owns id 1.
+pub fn thread_states_on_rpc(
+    rpc: &mut impl CodexRpc,
+    thread_ids: &[String],
+) -> BTreeMap<String, Observation> {
+    let mut states = BTreeMap::new();
+    for (offset, thread_id) in thread_ids.iter().enumerate() {
+        let request_id = i64::try_from(offset).unwrap_or(i64::MAX).saturating_add(2);
+        let observation = match rpc.request(request_id, &thread_read_request(request_id, thread_id))
+        {
+            Ok(line) => observe(&line, request_id),
+            Err(_) => Observation::Unavailable,
+        };
+        states.insert(thread_id.clone(), observation);
+    }
+    states
+}
+
+/// PURE: the turn record if there is one, and the thread status only if there is not.
+fn observe(line: &str, request_id: i64) -> Observation {
+    if let Some(status) = parse_first_turn_status(line, request_id) {
+        return Observation::CodexTurn(status);
+    }
+    match parse_thread_status(line, request_id) {
+        Some(status) => Observation::CodexThread(status),
+        None => Observation::Unavailable,
+    }
 }
 
 pub fn spawn_on_initialized_rpc(
@@ -196,7 +287,8 @@ fn daemon_command(action: &str) -> Command {
 }
 
 /// IMPURE: the running app-server daemon, or None when none answers. This only asks, so a caller
-/// that must not create the state it is reporting on (doctor) uses it rather than `ensure_daemon`.
+/// that must not create the state it is reporting on (doctor, status) uses it rather than
+/// `ensure_daemon`.
 pub(crate) fn probe_daemon() -> Option<Daemon> {
     let stdout = run_reporting_failure(daemon_command("version"), PROBE_TIMEOUT).ok()?;
     parse_daemon_version(&stdout)

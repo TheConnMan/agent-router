@@ -3,6 +3,7 @@ use agent_router_core::log::{DecisionLog, Row};
 use agent_router_core::parity::{Difference, GlobalReport, ParityReport, ServerProjection, Status};
 use agent_router_core::run::{Outcome, Request};
 use agent_router_core::stats::{Rate, Stats, Window};
+use agent_router_core::status::Report;
 use clap::{Parser, Subcommand};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -71,6 +72,18 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Reconcile recent dispatched decisions against the backends that ran them.
+    Status {
+        /// The default is smaller than the stats one on purpose: every row here costs a live
+        /// backend call, where a stats window is pure SQL.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Also drop rows older than a lookback window, for example 24h, 7d, or 2w.
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Preflight the provider binaries, credentials, usage provenance, config, and decision log.
     Doctor,
     /// Compare the global and project scoped Claude and Codex declarations.
@@ -87,6 +100,7 @@ fn main() -> std::process::ExitCode {
     match cli.command {
         Command::Doctor => doctor_exit(),
         Command::Parity { roots, json } => parity_exit(roots, json),
+        Command::Status { limit, since, json } => status_exit(limit, since, json),
         command => match run(Cli { command }) {
             Ok(()) => std::process::ExitCode::SUCCESS,
             Err(e) => {
@@ -164,6 +178,104 @@ fn parity_exit(roots: Vec<PathBuf>, json: bool) -> std::process::ExitCode {
     }
 }
 
+/// Status owns its exit code the way doctor and parity do, because the report is the output: 0 when
+/// nothing in the window is known to have failed, 1 when something is, and 2 when the command could
+/// not run at all. An `unknown` never moves it, since an absence of information is not a finding.
+fn status_exit(limit: usize, since: Option<String>, json: bool) -> std::process::ExitCode {
+    let since_ms = match since.as_deref().map(agent_router_core::stats::parse_since) {
+        Some(Ok(lookback)) => Some(agent_router_core::runtime::now_ms() - lookback),
+        Some(Err(error)) => return status_unrunnable(&error),
+        None => None,
+    };
+    let log = match DecisionLog::open() {
+        Ok(log) => log,
+        Err(error) => return status_unrunnable(&error),
+    };
+    let report = match agent_router_core::status::reconcile(&log, Window { limit, since_ms }) {
+        Ok(report) => report,
+        Err(error) => return status_unrunnable(&error),
+    };
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&status_json(&report))
+                .expect("serializing a JSON value cannot fail")
+        );
+    } else {
+        print_status(&report);
+    }
+
+    if report.failed() {
+        std::process::ExitCode::FAILURE
+    } else {
+        std::process::ExitCode::SUCCESS
+    }
+}
+
+/// A command that never ran exits 2, which is a different fact from a window carrying a failure.
+fn status_unrunnable(error: &agent_router_core::Error) -> std::process::ExitCode {
+    eprintln!(
+        "agent-router: status could not run: {}",
+        escape_terminal_controls(&error.to_string())
+    );
+    std::process::ExitCode::from(2)
+}
+
+fn status_json(report: &Report) -> serde_json::Value {
+    let rows = report
+        .rows
+        .iter()
+        .map(|row| {
+            serde_json::json!({
+                "id": row.id,
+                "provider": row.provider,
+                "job_id": row.job_id,
+                "observation": row.observation.label(),
+                "state": row.state.tag(),
+                // Null on a row that was never swept, which is not the same as a sweep that found
+                // nothing.
+                "traced": row.traced,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "rows_considered": report.rows.len(),
+        "oldest_created_at_ms": report.oldest_created_at_ms,
+        "newest_created_at_ms": report.newest_created_at_ms,
+        "rows": rows,
+    })
+}
+
+fn print_status(report: &Report) {
+    println!("rows considered: {}", report.rows.len());
+    println!(
+        "window: {} to {}",
+        stamp(report.oldest_created_at_ms),
+        stamp(report.newest_created_at_ms)
+    );
+    for row in &report.rows {
+        println!(
+            "#{id} {provider} {state} {observation} job {job}{trace}",
+            id = row.id,
+            provider = escape_terminal_controls(&row.provider),
+            state = row.state.tag(),
+            observation = escape_terminal_controls(&row.observation.label()),
+            job = escape_terminal_controls(&row.job_id),
+            trace = trace_label(row.traced),
+        );
+    }
+}
+
+/// A row nobody swept prints nothing at all, because "we did not look" is not "no trace".
+fn trace_label(traced: Option<bool>) -> &'static str {
+    match traced {
+        Some(true) => " traced",
+        Some(false) => " no trace",
+        None => "",
+    }
+}
+
 fn run(cli: Cli) -> agent_router_core::Result<()> {
     match cli.command {
         Command::Run {
@@ -192,6 +304,7 @@ fn run(cli: Cli) -> agent_router_core::Result<()> {
         Command::Stats { limit, since, json } => stats(limit, since, json),
         Command::Doctor => unreachable!("doctor has a command specific exit path"),
         Command::Parity { .. } => unreachable!("parity has a command specific exit path"),
+        Command::Status { .. } => unreachable!("status has a command specific exit path"),
     }
 }
 
@@ -499,7 +612,8 @@ fn log(limit: usize, json: bool) -> agent_router_core::Result<()> {
     for row in &rows {
         println!(
             "#{id} {provider}{dry} codex_ready {ready}/6 claude_signals {signals}/6 \
-             {confidence} {complexity} gates[{gates}] codex {codex:.0}% claude {claude:.0}% {job}",
+             {confidence} {complexity} gates[{gates}] codex {codex:.0}% claude {claude:.0}% {job} \
+             {outcome}",
             id = row.id,
             provider = row.provider,
             dry = if row.dry_run { " (dry run)" } else { "" },
@@ -516,11 +630,15 @@ fn log(limit: usize, json: bool) -> agent_router_core::Result<()> {
             gates = row.gates,
             codex = row.codex_weekly_pct,
             claude = row.claude_weekly_pct,
+            // The job handle and what became of it are both printed, because a reconciled row
+            // carries a job id, so a state only reachable through --json would be a column written
+            // and never read back.
             job = row
                 .job_id
                 .as_deref()
                 .or(row.job_name.as_deref())
-                .unwrap_or(&row.outcome),
+                .unwrap_or("-"),
+            outcome = escape_terminal_controls(&row.outcome),
         );
         println!("     {}", first_line(&row.task));
     }
@@ -647,6 +765,8 @@ fn row_json(row: &Row) -> serde_json::Value {
         // Null on a row written before the marker, which is not the same as a live read.
         "claude_usage_stale": row.claude_usage_stale,
         "codex_usage_stale": row.codex_usage_stale,
+        // Null on a row no reconciliation has ever read a backend for.
+        "reconciled_at_ms": row.reconciled_at_ms,
     })
 }
 

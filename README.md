@@ -268,6 +268,57 @@ can be checked by hand, and a rate with no denominator reads `-` rather than a p
 `--limit` defaults to 200, which is the same window as `agent-router log --json --limit 200`, so
 every number here reconciles by hand against the rows that command prints.
 
+### `status`
+
+Reconcile logged decisions against the backends that actually ran them, and write a terminal state
+back into the decision log's `outcome` column.
+
+```bash
+$ agent-router status --limit 3
+rows considered: 3
+window: 1737330000000 to 1737336000000
+#88 codex completed turn completed job 019c3f2c
+#87 claude running working job 019c3f2a
+#86 claude unknown absent job 019c2f11 no trace
+```
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--limit <N>` | `20` | Newest matching rows to reconcile. Smaller than the `stats` default on purpose: every row here costs a live backend call, where a `stats` window is pure SQL. |
+| `--since <WINDOW>` | none | Also drop rows older than a lookback window, for example `24h`, `7d`, or `2w`. Same parser as `stats --since`. |
+| `--json` | off | Emit the reconciliation as structured JSON instead of one line per row. |
+
+Only rows that actually dispatched are ever touched: the predicate is `dry_run = 0 AND job_id IS
+NOT NULL`. A `--dry-run` row and a row whose dispatch itself failed (which carries no job id, and
+whose `outcome` already holds the backend's own error text) are both left alone.
+
+Claude jobs resolve through `claude agents --json --all`. That list is a bounded recent window, so
+a job missing from it reports `unknown`, never `completed`: absence is equally consistent with
+completed, crashed on startup, or never started, and the router refuses to guess which. A claude
+job reporting `stopped` also reports `unknown` rather than `failed`, because an operator stopping a
+healthy job is not a routing failure.
+
+Codex jobs resolve through the app-server `thread/read` call with `includeTurns` set, and the state
+comes from the first turn record, since the router starts exactly one turn per thread. Turn history
+is read from disk, so a codex job still resolves even when the daemon has not loaded the thread.
+
+Every row settles into one of four states written to `outcome`: `running`, `completed`, `failed`,
+or `unknown`. `unknown` never overwrites an already proven `completed` or `failed`: once a job is
+proven finished, a later run that can no longer see the backend leaves that fact alone, which is
+what makes rerunning `status` safe.
+
+Claude rows also carry a `traced` flag: whether a session transcript exists on disk for that job.
+It is evidence only and never changes the state, so a traced but unresolvable job still reports
+`unknown`. It exists to tell "ran and we lost track of it" apart from "vanished without a trace".
+
+`--json` emits `rows_considered`, `oldest_created_at_ms`, and `newest_created_at_ms` at the top
+level, plus a `rows` array where each row carries `id`, `provider`, `job_id`, `observation`,
+`state`, and `traced`.
+
+`status` owns its own exit code the way `doctor` does: `0` when nothing in the window is known to
+have failed, `1` when something is, `2` when the command could not run at all. An `unknown` never
+moves it, since an absence of information is not a finding.
+
 ### `parity`
 
 Compare project scoped Claude and Codex declarations, so either provider can take over a project

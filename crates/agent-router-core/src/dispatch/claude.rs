@@ -2,6 +2,7 @@ use crate::error::{Error, Result};
 use crate::run::Dispatch;
 use crate::runtime::{canonicalize_dir, now_ms, router_log_path, spawn_detached};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -21,6 +22,11 @@ struct AgentRow {
     started_at: i64,
     #[serde(default)]
     kind: String,
+    /// What claude says the job is doing: `working`, `done`, or `stopped`. Optional because a
+    /// claude that stops printing it must leave the router reading absence rather than failing to
+    /// parse the whole list.
+    #[serde(default)]
+    state: Option<String>,
 }
 
 pub fn dispatch(
@@ -153,6 +159,22 @@ fn resolve_short_id(
         }
         std::thread::sleep(POLL_INTERVAL.min(remaining));
     }
+}
+
+/// IMPURE: every job the recent list knows, short id to the state claude reports for it.
+///
+/// The `--all` flag on the list below is load bearing: without it the list is running jobs only, so
+/// every finished job would read as absent. The list is still a bounded recent window, so a job
+/// missing from this map is a job the router cannot resolve, never a job that completed.
+pub fn agent_states(timeout: Duration) -> Result<BTreeMap<String, String>> {
+    let rows = list_agents(Path::new("claude"), timeout)?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            let id = row.id.filter(|id| !id.is_empty())?;
+            Some((id, row.state?))
+        })
+        .collect())
 }
 
 fn list_agents(binary: &Path, timeout: Duration) -> Result<Vec<AgentRow>> {
