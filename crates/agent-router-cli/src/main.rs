@@ -1,3 +1,4 @@
+use agent_router_core::doctor::Health;
 use agent_router_core::log::{DecisionLog, Row};
 use agent_router_core::parity::{Difference, ParityReport, ServerProjection, Status};
 use agent_router_core::run::{Outcome, Request};
@@ -70,6 +71,8 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Preflight the provider binaries, credentials, usage provenance, config, and decision log.
+    Doctor,
     /// Compare project scoped Claude and Codex declarations.
     Parity {
         #[arg(long = "root")]
@@ -82,6 +85,7 @@ enum Command {
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     match cli.command {
+        Command::Doctor => doctor_exit(),
         Command::Parity { roots, json } => parity_exit(roots, json),
         command => match run(Cli { command }) {
             Ok(()) => std::process::ExitCode::SUCCESS,
@@ -90,6 +94,33 @@ fn main() -> std::process::ExitCode {
                 std::process::ExitCode::FAILURE
             }
         },
+    }
+}
+
+/// Doctor owns its exit code the same way parity does: a failing check is reported by exiting
+/// nonzero, not by an error, since the report itself is the output.
+fn doctor_exit() -> std::process::ExitCode {
+    let report = agent_router_core::doctor::run();
+    for check in &report.checks {
+        println!(
+            "{:<4} {:<19} {}",
+            health_label(check.health),
+            check.name,
+            escape_terminal_controls(&check.detail)
+        );
+    }
+    if report.failed() {
+        std::process::ExitCode::FAILURE
+    } else {
+        std::process::ExitCode::SUCCESS
+    }
+}
+
+fn health_label(health: Health) -> &'static str {
+    match health {
+        Health::Pass => "pass",
+        Health::Warn => "warn",
+        Health::Fail => "fail",
     }
 }
 
@@ -158,6 +189,7 @@ fn run(cli: Cli) -> agent_router_core::Result<()> {
         Command::Usage { json } => usage(json),
         Command::Log { limit, json } => log(limit, json),
         Command::Stats { limit, since, json } => stats(limit, since, json),
+        Command::Doctor => unreachable!("doctor has a command specific exit path"),
         Command::Parity { .. } => unreachable!("parity has a command specific exit path"),
     }
 }
@@ -414,12 +446,13 @@ fn usage(json: bool) -> agent_router_core::Result<()> {
         println!("{}", serde_json::to_string_pretty(&snapshot)?);
         return Ok(());
     }
-    println!("provider  5h      weekly  weekly reset");
+    println!("provider  5h      weekly  source     weekly reset");
     for (name, headroom) in [("claude", snapshot.claude), ("codex", snapshot.codex)] {
         println!(
-            "{name:<9} {:>5.1}%  {:>5.1}%  {}",
+            "{name:<9} {:>5.1}%  {:>5.1}%  {:<9}  {}",
             headroom.five_hour_pct,
             headroom.weekly_pct,
+            usage_source_label(headroom.stale),
             reset_label(headroom.weekly_reset_epoch)
         );
     }
@@ -581,6 +614,9 @@ fn row_json(row: &Row) -> serde_json::Value {
         "job_name": row.job_name,
         "outcome": row.outcome,
         "rationale": row.rationale,
+        // Null on a row written before the marker, which is not the same as a live read.
+        "claude_usage_stale": row.claude_usage_stale,
+        "codex_usage_stale": row.codex_usage_stale,
     })
 }
 
@@ -591,6 +627,13 @@ fn first_line(task: &str) -> String {
         return line.to_string();
     }
     format!("{}...", line.chars().take(97).collect::<String>())
+}
+
+/// Where a provider's numbers came from. Two zeroes from a fail open read and two zeroes from a
+/// provider that has consumed nothing are the same line without this, and only one of them means
+/// the router knows anything.
+fn usage_source_label(stale: bool) -> &'static str {
+    if stale { "fail-open" } else { "live" }
 }
 
 /// "in 2h13m" for a future reset, "-" when the epoch is unknown, "elapsed" once it has passed.
