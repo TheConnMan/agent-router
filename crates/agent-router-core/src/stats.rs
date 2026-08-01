@@ -31,6 +31,13 @@ const CLASSIFIER_FAILED: &str = "classifier_failed";
 /// row count instead of quietly losing the unscored rows.
 const UNSCORED: &str = "unscored";
 
+/// What a row written before the `router_version` column counts as, so the version distribution
+/// still sums to the row count instead of quietly losing the rows that predate the column. Not the
+/// same claim as a row that carries a genuinely empty version string, which cannot happen since the
+/// value is always `CARGO_PKG_VERSION`, but the count still has to name the bucket rather than drop
+/// the row.
+const UNKNOWN_ROUTER_VERSION: &str = "unknown";
+
 /// What the caller named when it asked the router to classify rather than pick a provider.
 const AUTO: &str = "auto";
 
@@ -81,6 +88,10 @@ pub struct Stats {
     pub gates: BTreeMap<String, usize>,
     /// Complexity tier to its count, with unscored rows counted as `unscored`.
     pub complexity: BTreeMap<String, usize>,
+    /// Router build to the count of rows carrying it, with rows written before the column counted
+    /// as `unknown`. The whole point of the column: an aggregate spanning several of these keys is
+    /// visibly mixed rather than pooled as one population.
+    pub router_versions: BTreeMap<String, usize>,
     pub auto_routes: usize,
     /// Rows whose route moved off the provider it started on, over auto routes.
     pub flip_rate: Rate,
@@ -111,6 +122,7 @@ pub fn summarize(rows: &[StatsRow]) -> Stats {
     let mut routes: BTreeMap<String, usize> = BTreeMap::new();
     let mut gates: BTreeMap<String, usize> = BTreeMap::new();
     let mut complexity: BTreeMap<String, usize> = BTreeMap::new();
+    let mut router_versions: BTreeMap<String, usize> = BTreeMap::new();
     let mut oldest_created_at_ms: Option<i64> = None;
     let mut newest_created_at_ms: Option<i64> = None;
     let mut auto_routes = 0;
@@ -131,6 +143,11 @@ pub fn summarize(rows: &[StatsRow]) -> Stats {
             .clone()
             .unwrap_or_else(|| UNSCORED.to_string());
         *complexity.entry(tier.clone()).or_insert(0) += 1;
+        let version = row
+            .router_version
+            .clone()
+            .unwrap_or_else(|| UNKNOWN_ROUTER_VERSION.to_string());
+        *router_versions.entry(version).or_insert(0) += 1;
 
         let tags = gate_tags(&row.gates);
         for tag in &tags {
@@ -186,6 +203,7 @@ pub fn summarize(rows: &[StatsRow]) -> Stats {
         routes,
         gates,
         complexity,
+        router_versions,
         auto_routes,
         flip_rate: Rate {
             numerator: flipped,
