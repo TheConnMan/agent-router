@@ -10,8 +10,10 @@ use std::path::{Path, PathBuf};
 const DEFAULT_HARD_CEILING_PCT: f64 = 97.0;
 /// Weekly-headroom gap (in points) that flips a borderline classification.
 const DEFAULT_HEADROOM_FLIP_GAP: f64 = 25.0;
-/// Ceiling on the classifier call.
-const DEFAULT_CLASSIFIER_TIMEOUT_SECS: u64 = 30;
+/// Ceiling on the classifier call. Headroom over the measured worst case rather than a target:
+/// the fast path is 3.4-7.0s, so this only has to be generous enough that a slow tail falls back
+/// far less often than it did at 30s, where 6 of 18 measured calls lost the deadline.
+const DEFAULT_CLASSIFIER_TIMEOUT_SECS: u64 = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]

@@ -25,7 +25,7 @@ Two rules govern the whole file:
 ```toml
 hard_ceiling_pct = 97.0
 headroom_flip_gap = 25.0
-classifier_timeout_secs = 30
+classifier_timeout_secs = 60
 connectors = [
     "local shell",
     "git",
@@ -80,12 +80,14 @@ is tagged `headroom_tiebreak`. Raising it makes routing respect the rubric more 
 
 ### `classifier_timeout_secs`
 
-Default `30`. How long the classifier call may take before it counts as failed.
+Default `60`. How long the classifier call may take before it counts as failed.
 
-A failed classifier is not fatal. The configured `default_provider` stays in force, complexity
-reads as `high`, and the decision is tagged `classifier_failed`. The default is viable only because
-the classifier invocation strips CLI startup cost; see the note in `classify.rs` for the measured
-numbers behind that.
+A failed classifier is not fatal, but it is not cheap either: the configured `default_provider`
+stays in force, complexity reads as `high`, and the decision is tagged `classifier_failed`, so a
+timeout can pick both the wrong provider and the top model tier. The measured call is 3.4-7.0s, so
+this default is headroom for a slow tail rather than a target. It is viable only because the
+classifier invocation strips both CLI startup cost and the model's thinking tokens; see the note in
+`classify.rs` for the measured numbers behind that.
 
 ### `connectors`
 
