@@ -6,6 +6,7 @@ pub mod config;
 pub mod decide;
 pub mod dispatch;
 pub mod error;
+pub mod estimate;
 pub mod log;
 pub mod parity;
 pub mod provider;
