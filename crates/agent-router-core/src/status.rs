@@ -87,6 +87,13 @@ pub struct Reconciled {
     /// sweep that could not run. Evidence about whether there is anything to go read, never a
     /// verdict.
     pub traced: Option<bool>,
+    /// What the log holds for this row once the run that produced this report is done: the state
+    /// just written, or the stored value where nothing was written.
+    ///
+    /// A string rather than a `State` because the column is TEXT and holds values no state names,
+    /// `dispatched` among them. It differs from `state` above exactly where the monotonicity rule
+    /// refused a write, which is the case any verdict over the window has to read this field for.
+    pub persisted: String,
 }
 
 /// One reconciliation over one window.
@@ -98,10 +105,18 @@ pub struct Report {
 }
 
 impl Report {
-    /// PURE: whether any job in the window is known to have failed. An unknown never counts: an
-    /// absence of information is not a finding.
+    /// PURE: whether any job in the window is known to have failed, read from what the log holds
+    /// rather than from the fresh reading alone. An unknown never counts: an absence of information
+    /// is not a finding.
+    ///
+    /// The two are not the same question. A job proven failed ages out of its backend's window and
+    /// reads `Unknown` on the next run, `settle` keeps the stored `failed`, and a verdict taken
+    /// from the fresh reading would then report a clean window over a database that records a
+    /// failure. Reading the settled value is what keeps the two from ever disagreeing.
     pub fn failed(&self) -> bool {
-        self.rows.iter().any(|row| row.state == State::Failed)
+        self.rows
+            .iter()
+            .any(|row| row.persisted == State::Failed.tag())
     }
 }
 
@@ -161,8 +176,14 @@ pub fn settle(current: &str, observed: State) -> Option<State> {
 }
 
 /// PURE: assemble one reported row. `state` comes from `classify(observation)` alone, and `traced`
-/// rides beside it rather than into it.
-fn report_row(row: &StatusRow, observation: Observation, traced: Option<bool>) -> Reconciled {
+/// rides beside it rather than into it. `written` is the state this reconciliation stores, or None
+/// where it stores nothing, so `persisted` names what the log holds either way.
+fn report_row(
+    row: &StatusRow,
+    observation: Observation,
+    traced: Option<bool>,
+    written: Option<State>,
+) -> Reconciled {
     Reconciled {
         id: row.id,
         provider: row.provider.clone(),
@@ -170,6 +191,10 @@ fn report_row(row: &StatusRow, observation: Observation, traced: Option<bool>) -
         state: classify(observation.clone()),
         observation,
         traced,
+        persisted: match written {
+            Some(state) => state.tag().to_string(),
+            None => row.outcome.clone(),
+        },
     }
 }
 
@@ -204,11 +229,18 @@ pub fn reconcile(log: &DecisionLog, window: Window) -> Result<Report> {
             "claude" => transcript_exists(&row.job_id),
             _ => None,
         };
-        let reconciled = report_row(row, observation, traced);
-        if let Some(state) = settle(&row.outcome, reconciled.state) {
+        // A provider the reconciler cannot ask about is never offered to `settle`, so its row is
+        // left exactly as it stands. `Unsupported` classifies `Unknown`, which `settle` would write
+        // over `dispatched`, and that trades a true fact about the row for a less informative one
+        // on every run and for good, on behalf of a reading that never happened.
+        let written = match observation {
+            Observation::Unsupported => None,
+            _ => settle(&row.outcome, classify(observation.clone())),
+        };
+        if let Some(state) = written {
             log.reconcile(row.id, state.tag())?;
         }
-        reported.push(reconciled);
+        reported.push(report_row(row, observation, traced, written));
     }
 
     Ok(Report {

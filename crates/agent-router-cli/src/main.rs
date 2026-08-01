@@ -622,6 +622,16 @@ fn log(
     json: bool,
 ) -> agent_router_core::Result<()> {
     if !mark.is_empty() {
+        // --mark short circuits the listing, so there is no listing for --json to shape. The
+        // combination is refused rather than accepted and ignored, on the same rule as --note
+        // below: a caller passing a flag believes it did something.
+        if json {
+            return Err(agent_router_core::Error::Command(
+                "--json cannot be combined with --mark: a mark prints one confirmation line, not \
+                 a listing"
+                    .to_string(),
+            ));
+        }
         return mark_row(mark, note);
     }
     // A note with nothing to attach it to is refused rather than dropped, mirroring the rule that
@@ -673,8 +683,14 @@ fn log(
 /// following it with a listing the caller did not ask for. Every value is validated in core, which
 /// owns the accepted vocabulary and is the only thing that writes the columns.
 fn mark_row(mark: &[String], note: Option<&str>) -> agent_router_core::Result<()> {
+    // clap appends on a repeated option, so a second --mark arrives here as four values rather
+    // than as a parse failure. A repeat is a command error like any other, never a panic.
     let [row_id, value] = mark else {
-        unreachable!("clap takes --mark as exactly two values, ROW_ID and MARK")
+        return Err(agent_router_core::Error::Command(
+            "--mark takes one ROW_ID and one MARK and cannot be repeated: judge one row per \
+             invocation"
+                .to_string(),
+        ));
     };
     let id = agent_router_core::log::parse_row_id(row_id)?;
     let mark = agent_router_core::log::parse_mark(value)?;

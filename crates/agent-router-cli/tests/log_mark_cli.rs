@@ -324,6 +324,82 @@ fn re_marking_a_row_overwrites_the_earlier_mark_and_its_note() {
     );
 }
 
+/// clap appends on a repeated option, so a second `--mark` reaches the handler as four values.
+/// That used to hit an `unreachable!()` and abort with a panic, which is never an acceptable answer
+/// to user input. The exit status is the whole point of this test: a clean command error exits 1
+/// with a readable message, where the panic abort exited 101 and printed a backtrace notice, so
+/// asserting merely "nonzero" would pass against the broken behaviour.
+#[test]
+fn a_repeated_mark_exits_with_a_clean_error_rather_than_a_panic() {
+    let fixture = MarkFixture::new();
+    let first = fixture.seed(Provider::Codex, false, "dispatched");
+    let second = fixture.seed(Provider::Claude, false, "dispatched");
+
+    let output = fixture.log(&[
+        "--mark",
+        &first.to_string(),
+        "good",
+        "--mark",
+        &second.to_string(),
+        "bad",
+    ]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("panicked"),
+        "a repeated --mark panicked rather than reporting a command error: {stderr}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a repeated --mark exited {:?} rather than with the ordinary command failure status, \
+         stderr: {stderr}",
+        output.status.code()
+    );
+    assert!(
+        stderr.contains("--mark"),
+        "the rejection must name the flag that was repeated: {stderr}"
+    );
+
+    for id in [first, second] {
+        let logged = fixture.logged(id);
+        assert_eq!(
+            field(&logged, "mark"),
+            &Value::Null,
+            "a rejected invocation wrote a judgement anyway: {logged}"
+        );
+    }
+}
+
+/// `--mark` prints one confirmation line and no listing, so there is nothing for `--json` to shape.
+/// The combination is refused rather than accepted and ignored, on the same rule the note without a
+/// mark follows: a caller passing a flag believes it did something.
+#[test]
+fn mark_with_json_is_rejected_rather_than_ignored() {
+    let fixture = MarkFixture::new();
+    let id = fixture.seed(Provider::Codex, false, "dispatched");
+
+    let output = fixture.log(&["--mark", &id.to_string(), "good", "--json"]);
+
+    assert!(
+        !output.status.success(),
+        "--json alongside --mark was accepted, stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--json") && stderr.contains("--mark"),
+        "the rejection must name both flags: {stderr}"
+    );
+
+    let logged = fixture.logged(id);
+    assert_eq!(
+        field(&logged, "mark"),
+        &Value::Null,
+        "a rejected invocation wrote a judgement anyway: {logged}"
+    );
+}
+
 /// A note with no mark is rejected rather than silently dropped, mirroring the existing rule that
 /// `--model` requires an explicit `--provider`. A caller passing a note believes it recorded one.
 #[test]

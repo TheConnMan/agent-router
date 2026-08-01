@@ -1,6 +1,8 @@
 #[cfg(target_os = "linux")]
 use agent_router_core::decide::decide_explicit;
 use agent_router_core::dispatch::claude::dispatch_with_binary;
+#[cfg(target_os = "linux")]
+use agent_router_core::dispatch::codex::thread_states;
 use agent_router_core::dispatch::codex::{
     CodexRpc, SpawnAttempt, parse_first_turn_status, parse_reasoning_effort, parse_thread_id,
     parse_thread_status, spawn_on_initialized_rpc, thread_read_request, thread_set_name_request,
@@ -12,6 +14,8 @@ use agent_router_core::dispatch::opencode::ManagedClient;
 #[cfg(target_os = "linux")]
 use agent_router_core::run::Request;
 use agent_router_core::runtime::truncated_title;
+#[cfg(target_os = "linux")]
+use agent_router_core::status::Observation;
 use agent_router_core::{Error, Result};
 #[cfg(target_os = "linux")]
 use agent_router_core::{Provider, UsageSnapshot};
@@ -1034,6 +1038,12 @@ fn claude_spawns_and_finds_the_job_under_the_caller_supplied_name_verbatim() {
     );
 }
 
+/// PATH is process wide, so every test that swaps a fake `codex` onto it holds this lock for as
+/// long as its guard lives. Two of them running at once would leave one test talking to the other
+/// test's socket.
+#[cfg(target_os = "linux")]
+static ENVIRONMENT: Mutex<()> = Mutex::new(());
+
 #[cfg(target_os = "linux")]
 struct PathGuard {
     prior: Option<OsString>,
@@ -1068,7 +1078,6 @@ impl Drop for PathGuard {
 #[cfg(target_os = "linux")]
 #[test]
 fn codex_decision_effort_reaches_turn_start_at_the_dispatch_boundary() {
-    static ENVIRONMENT: Mutex<()> = Mutex::new(());
     let _environment = ENVIRONMENT.lock().expect("environment lock");
     let root = TempDir::new("codex-dispatch");
     let socket_path = root.path.join("app-server.sock");
@@ -1164,6 +1173,106 @@ fn codex_decision_effort_reaches_turn_start_at_the_dispatch_boundary() {
         requests[3]["params"]["input"][0]["text"],
         "exercise the real dispatch seam"
     );
+}
+
+/// One `thread/read` per codex row goes down one connection, so the transport must budget each
+/// request on its own. Under a single connection wide deadline, one read that ran the clock out
+/// left every read after it failing without ever being answered, and the rest of the window
+/// reported unavailable on the strength of one bad thread. The per row isolation
+/// `thread_states_on_rpc` promises is only real if the transport beneath it grants a fresh budget.
+///
+/// The first thread here is never answered, so it spends a whole request budget and reports
+/// unavailable, which is its own correct outcome. The second is answered as soon as the daemon
+/// picks it up: a client that kept a budget for it reads that reply, and a client whose one budget
+/// the first read consumed has already given up.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_thread_read_that_spends_its_budget_does_not_starve_the_reads_after_it() {
+    let _environment = ENVIRONMENT.lock().expect("environment lock");
+    let root = TempDir::new("codex-read-budget");
+    let socket_path = root.path.join("app-server.sock");
+    let listener = UnixListener::bind(&socket_path).expect("bind app server socket");
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept app server client");
+        let mut socket = tungstenite::accept(stream).expect("accept websocket");
+        let initialize = read_rpc_request(&mut socket);
+        let _ = socket.send(tungstenite::Message::text(
+            json!({"jsonrpc": "2.0", "id": 1, "result": {}}).to_string(),
+        ));
+        let starved = read_rpc_request(&mut socket);
+        // Longer than the transport's ten second request timeout, so the first read gets no reply
+        // inside any budget it could have.
+        std::thread::sleep(Duration::from_secs(11));
+        let later = read_rpc_request(&mut socket);
+        let _ = socket.send(tungstenite::Message::text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {
+                    "thread": {
+                        "status": {"type": "idle"},
+                        "turns": [{"status": "completed"}]
+                    }
+                }
+            })
+            .to_string(),
+        ));
+        (initialize, starved, later)
+    });
+    let daemon = json!({
+        "status": "running",
+        "socketPath": socket_path
+    })
+    .to_string();
+    let binary = root.path.join("codex");
+    fs::write(
+        &binary,
+        format!("#!/bin/sh\nprintf '%s\\n' {}\n", shell_quote(&daemon)),
+    )
+    .expect("write fake codex");
+    let mut permissions = fs::metadata(&binary).expect("fake metadata").permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&binary, permissions).expect("make fake executable");
+    let _path = PathGuard::prepend(&root.path);
+
+    let states = thread_states(&["slow thread".to_string(), "later thread".to_string()]);
+
+    assert_eq!(
+        states.len(),
+        2,
+        "a starved read dropped rows instead of reporting them: {states:?}"
+    );
+    assert_eq!(
+        states["slow thread"],
+        Observation::Unavailable,
+        "the read nobody answered must report itself as unasked"
+    );
+    assert_eq!(
+        states["later thread"],
+        Observation::CodexTurn("completed".to_string()),
+        "the read after the starved one was answered by the daemon and still reported unavailable, \
+         so one slow read spent the whole window's budget"
+    );
+
+    let (initialize, starved, later) = server.join().expect("app server thread");
+    assert_eq!(initialize["method"], "initialize");
+    assert_eq!(starved["method"], "thread/read");
+    assert_eq!(starved["params"]["threadId"], "slow thread");
+    assert_eq!(
+        later["params"]["threadId"], "later thread",
+        "the second read must reach the daemon rather than fail in the client"
+    );
+    assert_eq!(later["id"], 3);
+}
+
+/// One JSON RPC request off the fake app-server's socket, skipping the frames that carry no text.
+#[cfg(target_os = "linux")]
+fn read_rpc_request(socket: &mut tungstenite::WebSocket<std::os::unix::net::UnixStream>) -> Value {
+    loop {
+        if let tungstenite::Message::Text(text) = socket.read().expect("read request") {
+            return serde_json::from_str(&text).expect("request JSON");
+        }
+    }
 }
 
 /// Only claude accepts MCP scoping, so an auto decision that lands on another provider must fail

@@ -138,15 +138,7 @@ pub fn run(request: &Request, config: &Config) -> Result<Outcome> {
     let dispatched = crate::dispatch::dispatch(&decision, request);
     // The decision is logged either way: a dispatch that failed is exactly the row worth
     // keeping, and losing it would hide the failure from the tuning data.
-    let (job_id, job_name, effective_effort, outcome) = match &dispatched {
-        Ok(dispatch) => (
-            dispatch.job_id.clone(),
-            Some(dispatch.job_name.clone()),
-            dispatch.effective_effort.clone(),
-            "dispatched".to_string(),
-        ),
-        Err(e) => (None, None, None, format!("error: {e}")),
-    };
+    let (job_id, job_name, effective_effort, outcome) = recorded_fields(&dispatched);
     let recorded = log.record(&Entry {
         task: request.task,
         dir: request.dir,
@@ -173,6 +165,24 @@ pub fn run(request: &Request, config: &Config) -> Result<Outcome> {
         log_error,
         estimate: None,
     })
+}
+
+/// PURE: the job id, job name, effective effort, and outcome one dispatch result contributes to
+/// its log row. The effective effort is the backend's own report, carried straight through: a run
+/// that dropped it here would write a row indistinguishable from a backend that reports no effort
+/// at all, so this seam is where the observed value either survives or silently disappears.
+pub fn recorded_fields(
+    dispatched: &Result<Dispatch>,
+) -> (Option<String>, Option<String>, Option<String>, String) {
+    match dispatched {
+        Ok(dispatch) => (
+            dispatch.job_id.clone(),
+            Some(dispatch.job_name.clone()),
+            dispatch.effective_effort.clone(),
+            "dispatched".to_string(),
+        ),
+        Err(e) => (None, None, None, format!("error: {e}")),
+    }
 }
 
 /// PURE: the provider a `--provider` value names. None for "auto".
