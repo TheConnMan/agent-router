@@ -16,7 +16,7 @@ pub mod runtime;
 pub mod stats;
 pub mod usage;
 
-pub use classify::{Classification, Confidence, Verdict};
+pub use classify::Classification;
 pub use config::{
     Classifier, ClassifierEngine, Config, DefaultProvider, ParityConfig, ParityException,
     ParityKind, Policy,

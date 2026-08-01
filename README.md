@@ -17,9 +17,8 @@ log: row 87 in /home/you/.local/state/agent-router/router.db
 
 ## How a task is routed
 
-1. **Classify.** One small model call scores the task against a fixed twelve criterion rubric and
-   returns strict JSON: six "Codex ready" criteria, six "Claude signal" criteria, a verdict, a
-   confidence, and a complexity tier. The call is deliberately hermetic. On the Claude engine it
+1. **Classify.** One small model call scores the task and returns strict JSON: `orchestration`,
+   `missing_connector`, and a complexity tier. The call is deliberately hermetic. On the Claude engine it
    runs with `--safe-mode` and `--strict-mcp-config`; on the Codex engine with
    `--ignore-user-config`, `--ignore-rules`, and `project_doc_max_bytes=0`. Either way no project
    `CLAUDE.md`, `AGENTS.md`, skill, plugin, hook, or MCP server can shift the score. The Codex
@@ -27,15 +26,18 @@ log: row 87 in /home/you/.local/state/agent-router/router.db
    tools disabled: scoring needs no tool, and a task carrying an injected instruction must have
    nothing to reach for. If the call fails or times out, the configured default provider stays in
    force and the decision is tagged `classifier_failed`.
-2. **Apply hard gates.** A missing connector or two or more Claude signals pins the task to Claude
-   regardless of usage. These are capability decisions, so headroom never overrides them.
-3. **Modulate on weekly headroom, then pace on Claude's 5 hour window.** A confident verdict is
-   flipped only when its provider is at or over the hard ceiling and the other is not. A borderline
-   verdict is flipped when the other provider has a large enough weekly headroom advantage. After
-   those rules settle, a task still bound for Claude moves to Codex when Claude's 5 hour percent is
-   at or above `claude_five_hour_pacing_pct` and Codex is under the hard ceiling, tagged
-   `five_hour_pacing`. Pacing applies to confident verdicts too, because an exhausted 5 hour window
-   stalls the job rather than merely costing more, and it never overrides a capability pin.
+2. **Apply the capability pin.** A missing connector, or a task needing several agents to exchange
+   findings mid-run, pins to Claude regardless of usage. These are statements that the task cannot
+   run on Codex at all, so every usage rule below is bypassed.
+3. **Apply the hard ceiling, then the run rate override, then pace on Claude's 5 hour window.** A
+   provider at or above `hard_ceiling_pct` is ineligible: exactly one ineligible sends the task to
+   the other (`flipped_on_exhaustion`), both ineligible keeps the default (`over_ceiling`). With
+   both eligible, the task moves only when the provider it is on is burning more than
+   `pace_flip_gap` points further ahead of its own weekly window than the other is of its own
+   (`pace_flip`), which is rare on purpose. Finally a task still bound for Claude moves to Codex
+   when Claude's 5 hour percent is at or above `claude_five_hour_pacing_pct` and Codex is under the
+   hard ceiling (`five_hour_pacing`), because an exhausted 5 hour window stalls the job rather than
+   merely costing more.
 4. **Pick the model from complexity.** The complexity tier selects the model from the per provider
    tier table. Reasoning effort is deliberately not decided: the router forces none and each
    backend resolves its own. See [docs/configuration.md](docs/configuration.md#modelscodex-and-modelsclaude)
@@ -43,8 +45,8 @@ log: row 87 in /home/you/.local/state/agent-router/router.db
 5. **Dispatch and log.** The job is spawned detached, its backend job id is resolved, and the whole
    decision lands in a SQLite decision log.
 
-Complexity is scored independently of the verdict. A low complexity task can belong to either
-provider, and so can an ultra one.
+Complexity is scored independently of the capability pins and never influences which provider a
+task lands on. A low complexity task can run on either provider, and so can an ultra one.
 
 ## Install
 
@@ -228,14 +230,17 @@ Recent routing decisions, newest first.
 
 ```bash
 $ agent-router log --limit 3
-#87 codex codex_ready 6/6 claude_signals 0/6 high medium gates[] codex 23% claude 58% 019c3f2a
+#87 codex orchestration no medium pace claude -12 codex +6 gates[] codex 23% claude 58% 019c3f2a
      Port usage.sh to Rust with the same fail-open semantics
-#86 claude codex_ready 4/6 claude_signals 2/6 high high gates[claude_signals] codex 23% claude 58% Fix the flaky ...
+#86 claude orchestration yes high pace claude -12 codex +6 gates[orchestration] codex 23% claude 58% Fix the ...
      Fix the flaky parity test and work out why it only fails in CI
 ```
 
 `--json` emits every recorded column, including the full task text, the rationale, and the
-dispatch outcome. The log is the tuning surface: each gate tag names a specific rule that fired, so
+dispatch outcome. It also still prints the scores the classifier no longer produces
+(`verdict`, `confidence`, and the two rubric counts), because the rows already in the log carry
+them and this is the only way to read one back through the tool; they are null on every row
+written since. The log is the tuning surface: each gate tag names a specific rule that fired, so
 routing behaviour can be audited against outcomes rather than recalled.
 
 ### `stats`
@@ -257,11 +262,12 @@ agent-router stats --json
 Reported over the window: the rows considered and their oldest and newest timestamps, the count per
 provider, the count per gate tag, the complexity distribution (with a row that was never scored
 counted as `unscored`), the number of auto routes, and three rates. The flip rate is the auto routed
-rows carrying a provider moving gate (`flipped_on_exhaustion`, `headroom_tiebreak`, or
-`five_hour_pacing`) over all auto routes. A row carrying more than one of them counts once, because
+rows carrying a provider moving gate (`flipped_on_exhaustion`, `pace_flip`, `five_hour_pacing`, or
+the retired `headroom_tiebreak`, which rows already in the log still carry) over all auto routes. A
+row carrying more than one of them counts once, because
 the route moved once. The classifier failure rate is the auto routed rows carrying `classifier_failed` over the
 same denominator. Both are denominated on auto routes only, because a row that named its provider
-never had a verdict to flip and never ran the classifier. The dry run share is denominated on every
+never ran a usage rule and never ran the classifier. The dry run share is denominated on every
 row instead, since any row can be a dry run. Each rate carries its numerator and denominator so it
 can be checked by hand, and a rate with no denominator reads `-` rather than a percentage.
 
