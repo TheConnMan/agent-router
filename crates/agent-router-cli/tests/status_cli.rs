@@ -575,6 +575,84 @@ fn status_exits_nonzero_only_when_a_row_reconciled_to_failed() {
     assert_eq!(finished.logged(id)["outcome"], "completed");
 }
 
+/// The other half of the exit contract, and the half that only shows up on the second run. A job
+/// proven failed ages out of its backend's window, the fresh reading is `unavailable`, and the
+/// monotonicity rule keeps the stored `failed`. An exit code taken from the fresh reading alone
+/// would report a clean window over a database that still records the failure, so the exit code and
+/// the log would disagree about the same row.
+#[test]
+fn a_persisted_failure_still_exits_nonzero_once_the_backend_can_no_longer_be_asked() {
+    let fixture = StatusFixture::new();
+    let id = fixture.seed(
+        Provider::Codex,
+        Some("019fbce9-ca50-7f32-93d1-54a783a45b51"),
+        Some("a routed job"),
+        false,
+        "dispatched",
+    );
+
+    // What an earlier reconciliation left behind when the codex turn record proved the job failed.
+    // This fixture keeps no daemon, so the reconciler's own writer stands in for that first run.
+    let log = DecisionLog::open_at(&fixture.db_path()).expect("open the fixture log");
+    log.reconcile(id, "failed")
+        .expect("record the proven failure");
+    drop(log);
+
+    let output = fixture.status();
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(
+        stdout.contains("unknown unavailable"),
+        "the second run has to genuinely fail to reach the daemon, which is what makes this a \
+         regression test, stdout: {stdout}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "the window still holds a row recorded as failed, stdout: {stdout}"
+    );
+
+    let logged = fixture.logged(id);
+    assert_eq!(
+        logged["outcome"], "failed",
+        "the exit code and the log must never disagree about the same row: {logged}"
+    );
+}
+
+/// Opencode exposes no status API, so the reconciler cannot resolve its rows at all. Rewriting a
+/// row it admits it cannot ask about trades a true fact, that the job was dispatched, for a less
+/// informative one, on every run and with no path back.
+#[test]
+fn an_opencode_row_keeps_its_outcome_because_the_reconciler_cannot_ask() {
+    let fixture = StatusFixture::new();
+    let id = fixture.seed(
+        Provider::Opencode,
+        Some("ses_a1b2c3"),
+        Some("a routed job"),
+        false,
+        "dispatched",
+    );
+
+    let status = fixture.status_json();
+
+    let row = reported_row(&status, id);
+    assert_eq!(
+        row["observation"], "unsupported",
+        "the report has to say the router has no way to ask: {row}"
+    );
+    assert_eq!(row["state"], "unknown", "the reported row: {row}");
+
+    let logged = fixture.logged(id);
+    assert_eq!(
+        logged["outcome"], "dispatched",
+        "a provider the reconciler cannot resolve had its row degraded anyway: {logged}"
+    );
+    assert_eq!(
+        logged["reconciled_at_ms"],
+        Value::Null,
+        "nothing was read for this row, so nothing may claim it was: {logged}"
+    );
+}
+
 /// An empty window prints its header and exits zero, in the same shape `stats` reports a window
 /// with no denominator.
 #[test]

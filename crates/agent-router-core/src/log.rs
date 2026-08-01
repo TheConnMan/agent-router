@@ -147,7 +147,6 @@ pub struct StatusRow {
     pub provider: String,
     /// Never NULL: the query that produces these rows excludes rows carrying no job.
     pub job_id: String,
-    pub job_name: Option<String>,
     pub outcome: String,
 }
 
@@ -231,7 +230,7 @@ const STATS_COLUMNS: &str =
     "created_at_ms, requested, provider, complexity, gates, dry_run, mark, outcome";
 
 /// The narrower list the reconciler needs.
-const STATUS_COLUMNS: &str = "id, created_at_ms, provider, job_id, job_name, outcome";
+const STATUS_COLUMNS: &str = "id, created_at_ms, provider, job_id, outcome";
 
 /// The rows a reconciliation may touch: the ones that actually produced a job. A dry run dispatched
 /// nothing, and a failed dispatch bound its `job_id` to NULL while putting the backend's own
@@ -389,8 +388,7 @@ impl DecisionLog {
                 created_at_ms: row.get(1)?,
                 provider: row.get(2)?,
                 job_id: row.get(3)?,
-                job_name: row.get(4)?,
-                outcome: row.get(5)?,
+                outcome: row.get(4)?,
             })
         };
         let rows = match since_ms {

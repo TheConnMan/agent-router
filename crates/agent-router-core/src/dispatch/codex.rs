@@ -430,10 +430,14 @@ fn describe(command: &Command) -> String {
     parts.join(" ")
 }
 
+/// The client owns no deadline of its own. `RPC_TIMEOUT` is the budget for ONE request, granted
+/// afresh on each call, because a status sweep issues one `thread/read` per codex row down a single
+/// connection: on one shared budget a single slow read spends what is left of it and every later
+/// read then fails without being asked, reporting unavailable for rows the daemon would have
+/// answered. A lone request still gets exactly `RPC_TIMEOUT` either way.
 #[cfg(target_os = "linux")]
 struct Client {
     socket: tungstenite::WebSocket<std::os::unix::net::UnixStream>,
-    deadline: Instant,
 }
 
 #[cfg(target_os = "linux")]
@@ -446,14 +450,14 @@ impl Client {
         let (socket, _) = tungstenite::client::client(HANDSHAKE_URL, stream)
             .map_err(|error| Error::Command(format!("app-server handshake failed: {error}")))?;
         socket.get_ref().set_read_timeout(Some(READ_SLICE))?;
-        let mut client = Self { socket, deadline };
+        let mut client = Self { socket };
         client.request(1, &initialize_request(1))?;
         Ok(client)
     }
 
-    fn read_line(&mut self) -> Result<String> {
+    fn read_line(&mut self, deadline: Instant) -> Result<String> {
         loop {
-            remaining(self.deadline)?;
+            remaining(deadline)?;
             match self.socket.read() {
                 Ok(tungstenite::Message::Text(text)) => return Ok(text.to_string()),
                 Ok(tungstenite::Message::Close(_)) => {
@@ -480,11 +484,12 @@ impl Client {
 #[cfg(target_os = "linux")]
 impl CodexRpc for Client {
     fn request(&mut self, request_id: i64, request: &str) -> Result<String> {
+        let deadline = Instant::now() + RPC_TIMEOUT;
         self.socket
             .send(tungstenite::Message::text(request.to_string()))
             .map_err(|error| Error::Command(format!("app-server write failed: {error}")))?;
         loop {
-            let line = self.read_line()?;
+            let line = self.read_line(deadline)?;
             let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
                 continue;
             };

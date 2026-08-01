@@ -231,9 +231,9 @@ Recent routing decisions, newest first.
 
 ```bash
 $ agent-router log --limit 3
-#87 codex orchestration no medium pace claude -12 codex +6 gates[] codex 23% claude 58% 019c3f2a
+#87 codex orchestration no medium pace claude -12 codex +6 gates[] codex 23% claude 58% 019c3f2a dispatched
      Port usage.sh to Rust with the same fail-open semantics
-#86 claude orchestration yes high pace claude -12 codex +6 gates[orchestration] codex 23% claude 58% Fix the ...
+#86 claude orchestration yes high pace claude -12 codex +6 gates[orchestration] codex 23% claude 58% 019c3f19 dispatched mark bad note routed to codex, needed connectors
      Fix the flaky parity test and work out why it only fails in CI
 
 # Judge a decision: was routing it there the right call.
@@ -245,7 +245,7 @@ agent-router log --mark 87 bad --note "routed to codex, needed connectors"
 | `--limit <N>` | `10` | Newest rows to print. |
 | `--mark <ROW_ID> <MARK>` | none | Record the human judgement on one row: `good`, `bad`, or `rerouted`. Any other value is rejected and exits nonzero naming the accepted three. An unknown `ROW_ID` also exits nonzero, without writing anything. Short circuits: it prints one confirmation line instead of the listing. |
 | `--note <TEXT>` | none | Free text alongside `--mark`. Requires `--mark`; a note with no mark is rejected. An empty or whitespace only note is rejected rather than stored. |
-| `--json` | off | Emit the full decision, including gates, classification, and usage. |
+| `--json` | off | Emit the full decision, including gates, classification, and usage. Rejected alongside `--mark`, which prints a confirmation line rather than a listing. |
 
 `--json` emits every recorded column, including the full task text, the rationale, and the
 dispatch outcome. It also still prints the scores the classifier no longer produces
@@ -300,11 +300,14 @@ row instead, since any row can be a dry run. Each rate carries its numerator and
 can be checked by hand, and a rate with no denominator reads `-` rather than a percentage.
 
 Then the feedback breakdowns: a bad rate and a failure rate, each broken down by gate tag, by
-provider, and by complexity tier. The bad rate is the rows a human marked `bad` with
-`agent-router log --mark`; the failure rate is the rows `agent-router status` settled to `failed`,
-plus the rows whose dispatch itself errored. A row carrying several gate tags counts under each of
-them, since a gate breakdown is per gate by definition, unlike the flip rate, where one route that
-moved counts once however many gates fired on it.
+provider, and by complexity tier. The bad rate is the rows a human marked `bad` or `rerouted` with
+`agent-router log --mark`, over the rows carrying any of the three marks: `good` is the only mark
+outside the numerator, because `bad` and `rerouted` both say the route was the wrong call and
+`rerouted` says in addition that the job had to be moved off it. The failure rate is the rows
+`agent-router status` settled to `failed`, plus the rows whose dispatch itself errored. A row
+carrying several gate tags counts under each of them, since a gate breakdown is per gate by
+definition, unlike the flip rate, where one route that moved counts once however many gates fired
+on it.
 
 Both denominators are deliberately narrower than the row count, and that is what makes the numbers
 worth trusting. A bad rate counts only the rows a human actually judged, because an unmarked row is

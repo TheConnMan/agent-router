@@ -343,7 +343,8 @@ fn one_erroring_thread_read_affects_only_its_own_row() {
     assert_eq!(
         classify(observation(&states, "third thread")),
         State::Failed,
-        "the read after the failing one never ran, so the fold aborted on the first error"
+        "the read after the failing one still ran and reported its own outcome, so the fold \
+         carried on past the error"
     );
 
     // One read per row, and the request ids count from 2 because the handshake owns id 1.

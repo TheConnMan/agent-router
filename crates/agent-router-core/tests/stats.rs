@@ -629,9 +629,10 @@ fn collect_summarizes_exactly_the_window_it_was_asked_for() {
 /// 7. codex, low, over_ceiling, live, good, completed
 /// 8. codex, low, no gate, live, bad, failed
 ///
-/// Six of the eight carry a mark, and three of those six are `bad`. Five of the eight are settled
-/// (two completed, two failed, one dispatch error), and three of those five are failures. The two
-/// populations overlap on four rows and neither is the row count, which is the whole point.
+/// Six of the eight carry a mark, and four of those six say the route was wrong: three `bad` and
+/// one `rerouted`. Five of the eight are settled (two completed, two failed, one dispatch error),
+/// and three of those five are failures. The two populations overlap on four rows and neither is
+/// the row count, which is the whole point.
 #[test]
 fn bad_and_failure_rates_break_down_by_gate_provider_and_complexity() {
     let rows = vec![
@@ -725,7 +726,7 @@ fn bad_and_failure_rates_break_down_by_gate_provider_and_complexity() {
     // grows.
     assert_eq!(
         stats.bad_rate_by_provider,
-        rates(&[("claude", 1, 1), ("codex", 1, 4), ("opencode", 1, 1)])
+        rates(&[("claude", 1, 1), ("codex", 2, 4), ("opencode", 1, 1)])
     );
     assert_eq!(
         stats.bad_rate_by_complexity,
@@ -733,7 +734,7 @@ fn bad_and_failure_rates_break_down_by_gate_provider_and_complexity() {
             ("high", 1, 1),
             ("low", 1, 2),
             ("medium", 0, 1),
-            ("unscored", 1, 2),
+            ("unscored", 2, 2),
         ])
     );
     // A row carrying two tags counts in both gates, which is deliberately different from the flip
@@ -743,7 +744,7 @@ fn bad_and_failure_rates_break_down_by_gate_provider_and_complexity() {
     assert_eq!(
         stats.bad_rate_by_gate,
         rates(&[
-            ("classifier_failed", 0, 1),
+            ("classifier_failed", 1, 1),
             ("explicit_provider", 1, 1),
             ("five_hour_pacing", 1, 1),
             ("over_ceiling", 1, 2),
@@ -829,12 +830,13 @@ fn bad_and_failure_rates_break_down_by_gate_provider_and_complexity() {
         );
     }
 
-    // Three shares that are three different answers: one in four codex routes judged bad, a real
-    // zero over one judged medium row, and no answer at all for the opencode row that dispatched
-    // nothing. A zero and a null must not collapse into each other.
+    // Three shares that are three different answers: two in four codex routes judged wrong, one
+    // marked `bad` and one marked `rerouted`, a real zero over one judged medium row, and no answer
+    // at all for the opencode row that dispatched nothing. A zero and a null must not collapse into
+    // each other.
     assert_share(
         stats.bad_rate_by_provider["codex"].share(),
-        0.25,
+        0.5,
         "bad rate for codex",
     );
     assert_share(
@@ -912,6 +914,84 @@ fn an_unmarked_row_is_not_counted_as_good() {
         stats.failure_rate_by_provider,
         rates(&[("claude", 0, 1), ("codex", 1, 2)])
     );
+}
+
+/// A `rerouted` mark records that the human had to move the job because the route was wrong, so it
+/// belongs in the bad rate numerator beside `bad`. Counting it as not bad left it in the
+/// denominator alone, which made every rerouting improve the reported rate: the metric understated
+/// routing errors exactly as more rerouting was recorded, which is the opposite of what it is for.
+#[test]
+fn a_rerouted_mark_raises_the_bad_rate_rather_than_diluting_it() {
+    let good_only = vec![judged(
+        1_000,
+        "auto",
+        "codex",
+        Some("low"),
+        "pace_flip",
+        false,
+        Some("good"),
+        "completed",
+    )];
+    let with_rerouted = vec![
+        judged(
+            2_000,
+            "auto",
+            "codex",
+            Some("low"),
+            "pace_flip",
+            false,
+            Some("rerouted"),
+            "completed",
+        ),
+        judged(
+            1_000,
+            "auto",
+            "codex",
+            Some("low"),
+            "pace_flip",
+            false,
+            Some("good"),
+            "completed",
+        ),
+    ];
+
+    let baseline = summarize(&good_only);
+    let stats = summarize(&with_rerouted);
+
+    assert_eq!(
+        baseline.bad_rate_by_provider,
+        rates(&[("codex", 0, 1)]),
+        "one route a human called good is one judged route with nothing wrong"
+    );
+    assert_eq!(
+        stats.bad_rate_by_provider,
+        rates(&[("codex", 1, 2)]),
+        "a rerouted route must count as a wrong route, not as a judged route that was fine"
+    );
+    assert_eq!(stats.bad_rate_by_complexity, rates(&[("low", 1, 2)]));
+    assert_eq!(stats.bad_rate_by_gate, rates(&[("pace_flip", 1, 2)]));
+
+    let before = baseline.bad_rate_by_provider["codex"]
+        .share()
+        .expect("the good only window must carry a share");
+    let after = stats.bad_rate_by_provider["codex"]
+        .share()
+        .expect("the window carrying a rerouted row must carry a share");
+    assert_share(Some(before), 0.0, "bad rate over one good row");
+    assert_share(
+        Some(after),
+        0.5,
+        "bad rate over one good and one rerouted row",
+    );
+    assert!(
+        after > before,
+        "recording that a route had to be rerouted moved the bad rate from {before} to {after}, so \
+         rerouting made routing look better instead of worse"
+    );
+
+    // Both rows completed, so the mark change stays inside the bad rate and never reaches the
+    // population the failure rate is counted over.
+    assert_eq!(stats.failure_rate_by_provider, rates(&[("codex", 0, 2)]));
 }
 
 /// A row nobody has heard back about has not been shown to have succeeded. `dispatched` is the
