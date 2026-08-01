@@ -59,6 +59,14 @@ enum Command {
     Log {
         #[arg(long, default_value_t = 10)]
         limit: usize,
+        /// Judge one decision: the row id and one of good, bad, or rerouted. This records whether
+        /// routing the task there was the right call, which no backend can answer, and prints one
+        /// confirmation line rather than the listing.
+        #[arg(long, num_args = 2, value_names = ["ROW_ID", "MARK"])]
+        mark: Vec<String>,
+        /// What the judgement was, in free text. Requires --mark.
+        #[arg(long)]
+        note: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -300,7 +308,12 @@ fn run(cli: Cli) -> agent_router_core::Result<()> {
             json,
         ),
         Command::Usage { json } => usage(json),
-        Command::Log { limit, json } => log(limit, json),
+        Command::Log {
+            limit,
+            mark,
+            note,
+            json,
+        } => log(limit, &mark, note.as_deref(), json),
         Command::Stats { limit, since, json } => stats(limit, since, json),
         Command::Doctor => unreachable!("doctor has a command specific exit path"),
         Command::Parity { .. } => unreachable!("parity has a command specific exit path"),
@@ -602,7 +615,22 @@ fn usage(json: bool) -> agent_router_core::Result<()> {
     Ok(())
 }
 
-fn log(limit: usize, json: bool) -> agent_router_core::Result<()> {
+fn log(
+    limit: usize,
+    mark: &[String],
+    note: Option<&str>,
+    json: bool,
+) -> agent_router_core::Result<()> {
+    if !mark.is_empty() {
+        return mark_row(mark, note);
+    }
+    // A note with nothing to attach it to is refused rather than dropped, mirroring the rule that
+    // --model requires an explicit --provider: a caller passing a note believes it recorded one.
+    if note.is_some() {
+        return Err(agent_router_core::Error::Command(
+            "--note requires --mark: a note is the reason for one row's judgement".to_string(),
+        ));
+    }
     let rows = DecisionLog::open()?.recent(limit)?;
     if json {
         let rows: Vec<serde_json::Value> = rows.iter().map(row_json).collect();
@@ -613,7 +641,7 @@ fn log(limit: usize, json: bool) -> agent_router_core::Result<()> {
         println!(
             "#{id} {provider}{dry} codex_ready {ready}/6 claude_signals {signals}/6 \
              {confidence} {complexity} gates[{gates}] codex {codex:.0}% claude {claude:.0}% {job} \
-             {outcome}",
+             {outcome}{judgement}",
             id = row.id,
             provider = row.provider,
             dry = if row.dry_run { " (dry run)" } else { "" },
@@ -639,10 +667,50 @@ fn log(limit: usize, json: bool) -> agent_router_core::Result<()> {
                 .or(row.job_name.as_deref())
                 .unwrap_or("-"),
             outcome = escape_terminal_controls(&row.outcome),
+            judgement = judgement_label(row.mark.as_deref(), row.note.as_deref()),
         );
         println!("     {}", first_line(&row.task));
     }
     Ok(())
+}
+
+/// `--mark` short circuits: it records one judgement and prints one confirmation line, rather than
+/// following it with a listing the caller did not ask for. Every value is validated in core, which
+/// owns the accepted vocabulary and is the only thing that writes the columns.
+fn mark_row(mark: &[String], note: Option<&str>) -> agent_router_core::Result<()> {
+    let [row_id, value] = mark else {
+        unreachable!("clap takes --mark as exactly two values, ROW_ID and MARK")
+    };
+    let id = agent_router_core::log::parse_row_id(row_id)?;
+    let mark = agent_router_core::log::parse_mark(value)?;
+    DecisionLog::open()?.mark(id, mark, note)?;
+    println!(
+        "#{id} marked {}{}",
+        mark.tag(),
+        judgement_note(note.map(first_line).as_deref())
+    );
+    Ok(())
+}
+
+/// An unjudged row prints nothing at all, because nobody having judged it is not a judgement. The
+/// note is operator supplied free text on its way back to a terminal, so it is escaped here and
+/// capped to one line by the same rule the task text already follows.
+fn judgement_label(mark: Option<&str>, note: Option<&str>) -> String {
+    match mark {
+        Some(mark) => format!(
+            " mark {}{}",
+            escape_terminal_controls(mark),
+            judgement_note(note.map(first_line).as_deref())
+        ),
+        None => String::new(),
+    }
+}
+
+fn judgement_note(note: Option<&str>) -> String {
+    match note {
+        Some(note) => format!(" note {}", escape_terminal_controls(note)),
+        None => String::new(),
+    }
 }
 
 fn stats(limit: usize, since: Option<String>, json: bool) -> agent_router_core::Result<()> {
@@ -767,6 +835,9 @@ fn row_json(row: &Row) -> serde_json::Value {
         "codex_usage_stale": row.codex_usage_stale,
         // Null on a row no reconciliation has ever read a backend for.
         "reconciled_at_ms": row.reconciled_at_ms,
+        // Null on a row nobody has judged, which is not the same as judging it good.
+        "mark": row.mark,
+        "note": row.note,
     })
 }
 

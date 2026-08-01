@@ -232,11 +232,27 @@ $ agent-router log --limit 3
      Port usage.sh to Rust with the same fail-open semantics
 #86 claude codex_ready 4/6 claude_signals 2/6 high high gates[claude_signals] codex 23% claude 58% Fix the flaky ...
      Fix the flaky parity test and work out why it only fails in CI
+
+# Judge a decision: was routing it there the right call.
+agent-router log --mark 87 bad --note "routed to codex, needed connectors"
 ```
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--limit <N>` | `10` | Newest rows to print. |
+| `--mark <ROW_ID> <MARK>` | none | Record the human judgement on one row: `good`, `bad`, or `rerouted`. Any other value is rejected and exits nonzero naming the accepted three. An unknown `ROW_ID` also exits nonzero, without writing anything. Short circuits: it prints one confirmation line instead of the listing. |
+| `--note <TEXT>` | none | Free text alongside `--mark`. Requires `--mark`; a note with no mark is rejected. An empty or whitespace only note is rejected rather than stored. |
+| `--json` | off | Emit the full decision, including gates, classification, and usage. |
 
 `--json` emits every recorded column, including the full task text, the rationale, and the
 dispatch outcome. The log is the tuning surface: each gate tag names a specific rule that fired, so
 routing behaviour can be audited against outcomes rather than recalled.
+
+Marking a row is the human half of the loop: `status` can only say whether a job ran, never whether
+routing it to that provider was the right call, and the mark is what makes the log tunable against
+outcomes rather than intuition. Marking a row again replaces the earlier judgement outright. Because
+the mark and the note are written together as one annotation, re marking without a note clears any
+note stored from an earlier mark on that row.
 
 ### `stats`
 
