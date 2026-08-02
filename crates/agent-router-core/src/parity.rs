@@ -98,6 +98,9 @@ struct CodexDocument {
 struct InputServer {
     command: Option<String>,
     args: Option<Vec<String>>,
+    #[serde(rename = "type")]
+    transport: Option<String>,
+    url: Option<String>,
     #[serde(default, deserialize_with = "deserialize_environment_keys")]
     env: BTreeSet<String>,
 }
@@ -106,7 +109,30 @@ struct InputServer {
 struct EffectiveServer {
     command: Option<String>,
     args: Option<Vec<String>>,
+    transport: Option<String>,
+    endpoint: Option<String>,
     env_keys: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Transport {
+    Stdio,
+    Http,
+    Sse,
+    Other(String),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ServerSource {
+    Claude,
+    Codex,
+}
+
+#[derive(Debug, Clone)]
+struct ComparisonServer {
+    transport: Transport,
+    endpoint: Option<String>,
+    projection: ServerProjection,
 }
 
 impl EffectiveServer {
@@ -117,14 +143,37 @@ impl EffectiveServer {
         if let Some(args) = layer.args {
             self.args = Some(args);
         }
+        if let Some(transport) = layer.transport {
+            self.transport = Some(transport);
+        }
+        if let Some(endpoint) = layer.url {
+            self.endpoint = Some(endpoint);
+        }
         self.env_keys.extend(layer.env);
     }
 
-    fn into_projection(self) -> ServerProjection {
-        ServerProjection {
+    fn into_comparison(self, source: ServerSource) -> ComparisonServer {
+        let transport = match source {
+            ServerSource::Codex if self.endpoint.is_some() => Transport::Http,
+            ServerSource::Codex => Transport::Stdio,
+            ServerSource::Claude => match self.transport.as_deref() {
+                Some("http") => Transport::Http,
+                Some("sse") => Transport::Sse,
+                Some("stdio") | None if self.endpoint.is_none() => Transport::Stdio,
+                None => Transport::Http,
+                Some(other) => Transport::Other(other.to_string()),
+            },
+        };
+        let endpoint = self.endpoint;
+        let projection = ServerProjection {
             command: self.command,
             args: self.args.unwrap_or_default(),
             env_keys: self.env_keys.into_iter().collect(),
+        };
+        ComparisonServer {
+            transport,
+            endpoint,
+            projection,
         }
     }
 }
@@ -330,8 +379,8 @@ fn compare_candidate(
 fn compare_servers(
     root: &Path,
     exceptions: &[ResolvedException<'_>],
-    claude: &BTreeMap<String, ServerProjection>,
-    codex: &BTreeMap<String, ServerProjection>,
+    claude: &BTreeMap<String, ComparisonServer>,
+    codex: &BTreeMap<String, ComparisonServer>,
     differences: &mut Vec<Difference>,
 ) {
     let server_names = claude
@@ -348,7 +397,7 @@ fn compare_servers(
                 root,
                 Some(server),
                 ParityKind::MissingInCodex,
-                Some(claude.clone()),
+                Some(claude.projection.clone()),
                 None,
             ),
             (None, Some(codex)) => push_difference(
@@ -358,40 +407,62 @@ fn compare_servers(
                 Some(server),
                 ParityKind::MissingInClaude,
                 None,
-                Some(codex.clone()),
+                Some(codex.projection.clone()),
             ),
             (Some(claude), Some(codex)) => {
-                if claude.command != codex.command {
+                if claude.transport != codex.transport {
+                    push_difference(
+                        differences,
+                        exceptions,
+                        root,
+                        Some(server.clone()),
+                        ParityKind::TransportDiffers,
+                        None,
+                        None,
+                    );
+                }
+                if claude.endpoint != codex.endpoint {
+                    push_difference(
+                        differences,
+                        exceptions,
+                        root,
+                        Some(server.clone()),
+                        ParityKind::EndpointDiffers,
+                        None,
+                        None,
+                    );
+                }
+                if claude.projection.command != codex.projection.command {
                     push_difference(
                         differences,
                         exceptions,
                         root,
                         Some(server.clone()),
                         ParityKind::CommandDiffers,
-                        Some(claude.clone()),
-                        Some(codex.clone()),
+                        Some(claude.projection.clone()),
+                        Some(codex.projection.clone()),
                     );
                 }
-                if claude.args != codex.args {
+                if claude.projection.args != codex.projection.args {
                     push_difference(
                         differences,
                         exceptions,
                         root,
                         Some(server.clone()),
                         ParityKind::ArgsDiffer,
-                        Some(claude.clone()),
-                        Some(codex.clone()),
+                        Some(claude.projection.clone()),
+                        Some(codex.projection.clone()),
                     );
                 }
-                if claude.env_keys != codex.env_keys {
+                if claude.projection.env_keys != codex.projection.env_keys {
                     push_difference(
                         differences,
                         exceptions,
                         root,
                         Some(server),
                         ParityKind::EnvKeysDiffer,
-                        Some(claude.clone()),
-                        Some(codex.clone()),
+                        Some(claude.projection.clone()),
+                        Some(codex.projection.clone()),
                     );
                 }
             }
@@ -435,14 +506,14 @@ fn push_difference(
     });
 }
 
-fn read_claude_servers(candidate: &Path) -> Result<BTreeMap<String, ServerProjection>> {
+fn read_claude_servers(candidate: &Path) -> Result<BTreeMap<String, ComparisonServer>> {
     read_claude_servers_at(&candidate.join(".mcp.json"))
 }
 
 /// One Claude JSON document, whether it is a project `.mcp.json` or the global `~/.claude.json`. An
 /// absent file means no declared servers; a present one that does not parse is an error naming only
 /// the file and its position, because the document can carry MCP server credentials.
-fn read_claude_servers_at(path: &Path) -> Result<BTreeMap<String, ServerProjection>> {
+fn read_claude_servers_at(path: &Path) -> Result<BTreeMap<String, ComparisonServer>> {
     if !path.exists() {
         return Ok(BTreeMap::new());
     }
@@ -456,14 +527,14 @@ fn read_claude_servers_at(path: &Path) -> Result<BTreeMap<String, ServerProjecti
         .map(|(name, server)| {
             let mut effective = EffectiveServer::default();
             effective.apply(server);
-            (name, effective.into_projection())
+            (name, effective.into_comparison(ServerSource::Claude))
         })
         .collect())
 }
 
 /// The global Codex file, which is one fixed path rather than a layered project tree, so none of the
 /// directory walking or path identity validation the project reader performs applies to it.
-fn read_global_codex_servers(path: &Path) -> Result<BTreeMap<String, ServerProjection>> {
+fn read_global_codex_servers(path: &Path) -> Result<BTreeMap<String, ComparisonServer>> {
     if !path.exists() {
         return Ok(BTreeMap::new());
     }
@@ -478,12 +549,12 @@ fn read_global_codex_servers(path: &Path) -> Result<BTreeMap<String, ServerProje
         .map(|(name, layer)| {
             let mut effective = EffectiveServer::default();
             effective.apply(layer);
-            (name, effective.into_projection())
+            (name, effective.into_comparison(ServerSource::Codex))
         })
         .collect())
 }
 
-fn read_codex_servers(candidate: &Path) -> Result<BTreeMap<String, ServerProjection>> {
+fn read_codex_servers(candidate: &Path) -> Result<BTreeMap<String, ComparisonServer>> {
     let root = project_root(candidate);
     let mut effective = BTreeMap::<String, EffectiveServer>::new();
     for directory in layer_directories(&root, candidate) {
@@ -522,7 +593,7 @@ fn read_codex_servers(candidate: &Path) -> Result<BTreeMap<String, ServerProject
 
     Ok(effective
         .into_iter()
-        .map(|(name, server)| (name, server.into_projection()))
+        .map(|(name, server)| (name, server.into_comparison(ServerSource::Codex)))
         .collect())
 }
 

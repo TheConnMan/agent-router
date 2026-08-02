@@ -554,6 +554,129 @@ fn environment_values_are_excluded_from_human_and_json_differences() {
     }
 }
 
+#[test]
+fn identical_http_endpoint_is_aligned_in_human_and_json_reports() {
+    let tree = TempTree::new("identical_http_endpoint");
+    let home = tree.path().join("home");
+    let project = tree.path().join("project");
+    fs::create_dir_all(&home).expect("create home");
+    write_empty_parity_config(&home);
+    write_file(
+        &project.join(".mcp.json"),
+        r#"{
+  "mcpServers": {
+    "remote": {
+      "type": "http",
+      "url": "https://mcp.example/service"
+    }
+  }
+}
+"#,
+    );
+    write_file(
+        &project.join(".codex/config.toml"),
+        r#"[mcp_servers.remote]
+url = "https://mcp.example/service"
+"#,
+    );
+
+    let human = run_parity(&home, tree.path(), &[&project], false);
+    let json = run_parity(&home, tree.path(), &[&project], true);
+
+    assert_exit(&human, 0);
+    assert_exit(&json, 0);
+    assert!(
+        stdout(&human).to_ascii_lowercase().contains("aligned"),
+        "{}",
+        diagnostic(&human)
+    );
+    assert!(json_contains_string(&parse_json(&json), "aligned"));
+}
+
+#[test]
+fn hidden_endpoint_differences_exit_one_without_leaking_secrets() {
+    let tree = TempTree::new("hidden_endpoint_differences");
+    let home = tree.path().join("home");
+    let project = tree.path().join("project");
+    fs::create_dir_all(&home).expect("create home");
+    write_empty_parity_config(&home);
+    write_file(
+        &project.join(".mcp.json"),
+        r#"{
+  "mcpServers": {
+    "fragment_case": {
+      "command": "runner",
+      "args": ["--credential", "ENDPOINT_ARGUMENT_SECRET_2718"],
+      "type": "http",
+      "url": "https://mcp.example/service#CLAUDE_FRAGMENT_SENTINEL"
+    },
+    "path_case": {
+      "type": "http",
+      "url": "https://mcp.example/CLAUDE_PATH_SENTINEL"
+    },
+    "query_case": {
+      "type": "http",
+      "url": "https://mcp.example/service?token=CLAUDE_QUERY_SENTINEL"
+    },
+    "userinfo_case": {
+      "type": "http",
+      "url": "https://CLAUDE_USER_SENTINEL:CLAUDE_PASSWORD_SENTINEL@mcp.example/service"
+    }
+  }
+}
+"#,
+    );
+    write_file(
+        &project.join(".codex/config.toml"),
+        r#"[mcp_servers.fragment_case]
+command = "runner"
+args = ["--credential", "ENDPOINT_ARGUMENT_SECRET_2718"]
+url = "https://mcp.example/service#CODEX_FRAGMENT_SENTINEL"
+
+[mcp_servers.path_case]
+url = "https://mcp.example/CODEX_PATH_SENTINEL"
+
+[mcp_servers.query_case]
+url = "https://mcp.example/service?token=CODEX_QUERY_SENTINEL"
+
+[mcp_servers.userinfo_case]
+url = "https://CODEX_USER_SENTINEL:CODEX_PASSWORD_SENTINEL@mcp.example/service"
+"#,
+    );
+
+    let human = run_parity(&home, tree.path(), &[&project], false);
+    let json = run_parity(&home, tree.path(), &[&project], true);
+
+    assert_exit(&human, 1);
+    assert_exit(&json, 1);
+    let json_report = parse_json(&json);
+    assert!(
+        stdout(&human).to_ascii_lowercase().contains("endpoint"),
+        "{}",
+        diagnostic(&human)
+    );
+    assert!(json_contains_string(&json_report, "endpoint_differs"));
+    for output in [&human, &json] {
+        let report = diagnostic(output);
+        assert!(!report.contains("mcp.example"), "endpoint leaked\n{report}");
+        for secret in [
+            "CLAUDE_FRAGMENT_SENTINEL",
+            "CODEX_FRAGMENT_SENTINEL",
+            "CLAUDE_PATH_SENTINEL",
+            "CODEX_PATH_SENTINEL",
+            "CLAUDE_QUERY_SENTINEL",
+            "CODEX_QUERY_SENTINEL",
+            "CLAUDE_USER_SENTINEL",
+            "CODEX_USER_SENTINEL",
+            "CLAUDE_PASSWORD_SENTINEL",
+            "CODEX_PASSWORD_SENTINEL",
+            "ENDPOINT_ARGUMENT_SECRET_2718",
+        ] {
+            assert!(!report.contains(secret), "endpoint secret leaked\n{report}");
+        }
+    }
+}
+
 /// One server name paired with the kind reported for it, so a difference set can be compared
 /// without spelling the tuple out at every call site.
 type ServerKind<'a> = (&'a str, &'a str);

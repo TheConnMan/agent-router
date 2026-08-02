@@ -251,8 +251,10 @@ agent-router log --mark 87 bad --note "routed to codex, needed connectors"
 dispatch outcome. It also still prints the scores the classifier no longer produces
 (`verdict`, `confidence`, and the two rubric counts), because the rows already in the log carry
 them and this is the only way to read one back through the tool; they are null on every row
-written since. The log is the tuning surface: each gate tag names a specific rule that fired, so
-routing behaviour can be audited against outcomes rather than recalled.
+written since. It also carries `router_version`, stamped from the router's own build on every
+write; null there means the row predates the column, so its provenance is genuinely unknown
+rather than absent. The log is the tuning surface: each gate tag names a specific rule that fired,
+so routing behaviour can be audited against outcomes rather than recalled.
 
 Two of those columns are about reasoning effort and they are not the same fact. `effort` is what the
 router decided, which is nothing, because the model tier is the toggle. `effective_effort` is what
@@ -289,7 +291,8 @@ agent-router stats --json
 
 Reported over the window: the rows considered and their oldest and newest timestamps, the count per
 provider, the count per gate tag, the complexity distribution (with a row that was never scored
-counted as `unscored`), the number of auto routes, and three rates. The flip rate is the auto routed
+counted as `unscored`), the router version distribution (with a row carrying no version counted as
+`unknown`), the number of auto routes, and three rates. The flip rate is the auto routed
 rows carrying a provider moving gate (`flipped_on_exhaustion`, `pace_flip`, `five_hour_pacing`, or
 the retired `headroom_tiebreak`, which rows already in the log still carry) over all auto routes. A
 row carrying more than one of them counts once, because
@@ -397,8 +400,9 @@ agent-router parity --json
 The scan walks each root for directories containing any of `.mcp.json`, `.codex/config.toml`,
 `CLAUDE.md`, or `AGENTS.md`, then compares the MCP servers each side declares. Reported difference
 kinds are `missing_in_codex`, `missing_in_claude`, `command_differs`, `args_differ`,
-`env_keys_differ`, and `standalone_claude_md` (a `CLAUDE.md` with no `AGENTS.md` beside it, which
-Codex cannot consume).
+`env_keys_differ`, `transport_differs`, `endpoint_differs`, and `standalone_claude_md` (a
+`CLAUDE.md` with no `AGENTS.md` beside it, which Codex cannot consume). Transport declarations are
+compared semantically and private endpoints exactly, but endpoint values are never emitted in reports.
 
 The ambient configuration every project inherits is compared too, as its own entry: `~/.claude.json`
 against `~/.codex/config.toml`. It is reported first in the human output and as a top level `global`
