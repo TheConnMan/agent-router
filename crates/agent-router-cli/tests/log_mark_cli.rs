@@ -23,24 +23,32 @@ use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 /// The task text every seeded row carries. The human listing prints it on its own line, so a
 /// `--mark` run that printed the listing rather than short circuiting is visible in stdout.
 const SEEDED_TASK: &str = "a seeded routing decision";
 
+/// Makes every temp directory this file creates distinct from every other one, whatever the clock
+/// does. `fs::create_dir_all` succeeds silently on a path that already exists, so two tests deriving
+/// the same path would share one HOME and therefore one `router.db`, and one fixture's `Drop` would
+/// delete a live sibling's directories mid run.
+static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(0);
+
 struct TempDir {
     path: PathBuf,
 }
 
 impl TempDir {
-    fn new() -> Self {
+    fn new(label: &str) -> Self {
+        let serial = NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed);
         let unique = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "agent-router-log-mark-cli-{}-{unique}",
+            "agent-router-log-mark-cli-{}-{serial}-{label}-{unique}",
             std::process::id()
         ));
         fs::create_dir_all(&path).expect("create temp directory");
@@ -59,8 +67,8 @@ struct MarkFixture {
 }
 
 impl MarkFixture {
-    fn new() -> Self {
-        let root = TempDir::new();
+    fn new(label: &str) -> Self {
+        let root = TempDir::new(label);
         fs::create_dir_all(root.path.join("home")).expect("create the fixture home");
         Self { root }
     }
@@ -141,7 +149,7 @@ fn field<'a>(row: &'a Value, key: &str) -> &'a Value {
 /// log publishes rather than only in the confirmation line.
 #[test]
 fn a_marked_row_survives_a_reopen_and_appears_in_the_log_json() {
-    let fixture = MarkFixture::new();
+    let fixture = MarkFixture::new("reopen");
     let id = fixture.seed(Provider::Codex, false, "dispatched");
 
     let marked = fixture.log(&[
@@ -181,7 +189,7 @@ fn a_marked_row_survives_a_reopen_and_appears_in_the_log_json() {
 /// the untouched neighbour row is the proof that the miss wrote nothing on its way out.
 #[test]
 fn marking_a_row_id_that_does_not_exist_exits_nonzero() {
-    let fixture = MarkFixture::new();
+    let fixture = MarkFixture::new("absent-row");
     let present = fixture.seed(Provider::Claude, false, "dispatched");
     let absent = present + 4242;
 
@@ -228,7 +236,7 @@ fn marking_a_row_id_that_does_not_exist_exits_nonzero() {
 /// with the accepted values in the message, rather than reaching the column.
 #[test]
 fn an_unknown_mark_value_exits_nonzero_naming_the_accepted_values() {
-    let fixture = MarkFixture::new();
+    let fixture = MarkFixture::new("outside-the-enum");
     let id = fixture.seed(Provider::Codex, false, "dispatched");
 
     let output = fixture.log(&["--mark", &id.to_string(), "excellent"]);
@@ -258,7 +266,7 @@ fn an_unknown_mark_value_exits_nonzero_naming_the_accepted_values() {
 /// every other nullable column on this row means "nothing was said".
 #[test]
 fn a_mark_with_no_note_persists_the_mark_and_a_null_note() {
-    let fixture = MarkFixture::new();
+    let fixture = MarkFixture::new("noteless");
     let id = fixture.seed(Provider::Claude, false, "dispatched");
 
     let output = fixture.log(&["--mark", &id.to_string(), "good"]);
@@ -282,7 +290,7 @@ fn a_mark_with_no_note_persists_the_mark_and_a_null_note() {
 /// note attached to a new mark would make the row say something no human ever said.
 #[test]
 fn re_marking_a_row_overwrites_the_earlier_mark_and_its_note() {
-    let fixture = MarkFixture::new();
+    let fixture = MarkFixture::new("overwrite");
     let id = fixture.seed(Provider::Codex, false, "dispatched");
 
     let first = fixture.log(&[
@@ -331,7 +339,7 @@ fn re_marking_a_row_overwrites_the_earlier_mark_and_its_note() {
 /// asserting merely "nonzero" would pass against the broken behaviour.
 #[test]
 fn a_repeated_mark_exits_with_a_clean_error_rather_than_a_panic() {
-    let fixture = MarkFixture::new();
+    let fixture = MarkFixture::new("repeated-flag");
     let first = fixture.seed(Provider::Codex, false, "dispatched");
     let second = fixture.seed(Provider::Claude, false, "dispatched");
 
@@ -376,7 +384,7 @@ fn a_repeated_mark_exits_with_a_clean_error_rather_than_a_panic() {
 /// mark follows: a caller passing a flag believes it did something.
 #[test]
 fn mark_with_json_is_rejected_rather_than_ignored() {
-    let fixture = MarkFixture::new();
+    let fixture = MarkFixture::new("shape-conflict");
     let id = fixture.seed(Provider::Codex, false, "dispatched");
 
     let output = fixture.log(&["--mark", &id.to_string(), "good", "--json"]);
@@ -404,7 +412,7 @@ fn mark_with_json_is_rejected_rather_than_ignored() {
 /// `--model` requires an explicit `--provider`. A caller passing a note believes it recorded one.
 #[test]
 fn a_note_without_a_mark_is_rejected() {
-    let fixture = MarkFixture::new();
+    let fixture = MarkFixture::new("orphan-note");
     let id = fixture.seed(Provider::Claude, false, "dispatched");
 
     let output = fixture.log(&["--note", "a judgement with nothing to attach it to"]);
@@ -433,7 +441,7 @@ fn a_note_without_a_mark_is_rejected() {
 /// than as any default judgement.
 #[test]
 fn a_row_that_was_never_marked_reads_back_with_a_null_mark_and_note() {
-    let fixture = MarkFixture::new();
+    let fixture = MarkFixture::new("resting-state");
     let id = fixture.seed(Provider::Codex, false, "dispatched");
 
     let logged = fixture.logged(id);
@@ -454,7 +462,7 @@ fn a_row_that_was_never_marked_reads_back_with_a_null_mark_and_note() {
 /// why commit 4's bad rate includes dry runs where its failure rate excludes them.
 #[test]
 fn a_dry_run_row_can_be_marked() {
-    let fixture = MarkFixture::new();
+    let fixture = MarkFixture::new("unpriced-row");
     let id = fixture.seed(Provider::Claude, true, "dry-run");
 
     let output = fixture.log(&[
