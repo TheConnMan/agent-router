@@ -56,6 +56,9 @@ fn judged(
         dry_run,
         mark: mark.map(str::to_string),
         outcome: outcome.to_string(),
+        // The build that wrote the row, which every test but the version distribution below is
+        // indifferent to. Unattributed here, exactly as a row written before the column is.
+        router_version: None,
     }
 }
 
@@ -298,6 +301,47 @@ fn the_metric_matrix_over_a_hand_countable_row_set() {
     assert_share(stats.dry_run_share.share(), 3.0 / 8.0, "dry_run_share");
 }
 
+/// The pooling regression, as a fold. A window spanning several builds of the router reports each
+/// build's own count rather than one undifferentiated total, so a reader can see at a glance that
+/// the population is mixed.
+///
+/// On 2026-08-01 a routing quality review read 114 rows written by four incompatible routers as one
+/// population and drew conclusions about a router that never existed. Nothing in the report said
+/// the window was mixed, and nothing could: there was no version on a row to count.
+///
+/// A row written before the column knows nothing about its writer, and `unknown` is the honest key
+/// for it, matching how an unscored complexity is counted rather than dropped. Counted that way the
+/// distribution still sums to the row count, so the share of the window that cannot be attributed
+/// is on the screen instead of quietly missing from it.
+#[test]
+fn the_router_version_distribution_separates_a_window_spanning_several_builds() {
+    let versioned = |created_at_ms: i64, provider: &str, version: Option<&str>| {
+        let mut built = row(created_at_ms, "auto", provider, Some("medium"), "", false);
+        built.router_version = version.map(str::to_string);
+        built
+    };
+    let rows = vec![
+        versioned(5_000, "codex", Some("0.4.0")),
+        versioned(4_000, "claude", Some("0.4.0")),
+        versioned(3_000, "codex", Some("0.3.0")),
+        versioned(2_000, "claude", None),
+        versioned(1_000, "codex", Some("0.3.0")),
+    ];
+
+    let stats = summarize(&rows);
+
+    assert_eq!(
+        stats.router_versions,
+        counts(&[("0.3.0", 2), ("0.4.0", 2), ("unknown", 1)])
+    );
+    // Every row lands under exactly one key, so the distribution is a partition of the window and a
+    // reader can check the total by eye against `rows_considered`.
+    assert_eq!(
+        stats.router_versions.values().sum::<usize>(),
+        stats.rows_considered
+    );
+}
+
 #[test]
 fn an_empty_window_reports_zero_counts_and_no_rates() {
     let stats = summarize(&[]);
@@ -308,6 +352,7 @@ fn an_empty_window_reports_zero_counts_and_no_rates() {
     assert!(stats.routes.is_empty());
     assert!(stats.gates.is_empty());
     assert!(stats.complexity.is_empty());
+    assert!(stats.router_versions.is_empty());
     assert_eq!(stats.auto_routes, 0);
 
     // A rate with no denominator has no answer. None is the only honest one: 0.0 reads as
