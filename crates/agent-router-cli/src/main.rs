@@ -750,6 +750,7 @@ fn stats_json(stats: &Stats) -> serde_json::Value {
         "routes": stats.routes,
         "gates": stats.gates,
         "complexity": stats.complexity,
+        "router_versions": stats.router_versions,
         "auto_routes": stats.auto_routes,
         "flip_rate": rate_json(&stats.flip_rate),
         "classifier_failure_rate": rate_json(&stats.classifier_failure_rate),
@@ -794,6 +795,7 @@ fn print_stats(stats: &Stats) {
     print_counts("routes", &stats.routes);
     print_counts("gates", &stats.gates);
     print_counts("complexity", &stats.complexity);
+    print_counts("router versions", &stats.router_versions);
     print_rate("flip rate", &stats.flip_rate);
     print_rate("classifier failure rate", &stats.classifier_failure_rate);
     print_rate("dry run share", &stats.dry_run_share);
@@ -909,6 +911,10 @@ fn row_json(row: &Row) -> serde_json::Value {
         // Null on a row nobody has judged, which is not the same as judging it good.
         "mark": row.mark,
         "note": row.note,
+        // Null on a row written before this column, which is not the same as a genuinely empty
+        // version: the point of the column is that an aggregate spanning several of these is
+        // visibly mixed rather than pooled as one population.
+        "router_version": row.router_version,
     })
 }
 
