@@ -9,10 +9,16 @@ use agent_router_core::stats::Stats;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
+
+// One copy of the stub helper, included by path from the core crate's tests. A workspace
+// `test-support` dev-dependency crate is the intended follow-up; this shape keeps the helper single
+// sourced without editing Cargo.toml while another stream owns it.
+#[path = "../../agent-router-core/tests/common/mod.rs"]
+mod common;
 
 /// The gates that move a task off the provider it started on, as the router defines them.
 /// Restated here rather than imported so the reconciliation below is an independent count rather
@@ -74,18 +80,25 @@ const SCORED_MEDIUM: &str = "a normal well scoped implementation";
 const CLASSIFIER_FAILS: &str = "CLASSIFIER FAILS: nothing can score this one";
 const ON_EXHAUSTED_CODEX: &str = "a normal well scoped implementation, codex out of room";
 
+/// Makes every temp directory this file creates distinct from every other one, whatever the clock
+/// does. `fs::create_dir_all` succeeds silently on a path that already exists, so two tests deriving
+/// the same path would share one HOME and therefore one `router.db`, and one fixture's `Drop` would
+/// delete a live sibling's directories mid run.
+static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(0);
+
 struct TempDir {
     path: PathBuf,
 }
 
 impl TempDir {
-    fn new() -> Self {
+    fn new(label: &str) -> Self {
+        let serial = NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed);
         let unique = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "agent-router-stats-cli-{}-{unique}",
+            "agent-router-stats-cli-{}-{serial}-{label}-{unique}",
             std::process::id()
         ));
         fs::create_dir_all(&path).expect("create temp directory");
@@ -125,9 +138,13 @@ fn envelope(complexity: &str) -> String {
 /// rather than observed. The nonzero exit is how the real fallback path, and with it the
 /// `classifier_failed` gate, is reached without a model.
 fn write_fake_claude(bin: &Path) {
-    let script = format!(
-        "#!/bin/sh\n\
-         for argument in \"$@\"; do prompt=$argument; done\n\
+    // No interpreter line: the helper supplies exactly one, and its probe guard is emitted ahead of
+    // this body. The ordering is load bearing rather than incidental. The `case` below reads the
+    // LAST argument and its `*)` arm matches anything at all, so a probe that reached it would be
+    // answered with a `medium` envelope instead of exiting; the guard is what keeps the catch-all
+    // out of reach. Do not restructure this so the case can see the probe argument.
+    let body = format!(
+        "for argument in \"$@\"; do prompt=$argument; done\n\
          case \"$prompt\" in\n\
            *'CLASSIFIER FAILS'*) exit 3 ;;\n\
            *'SCORED LOW'*) printf '%s\\n' {} ;;\n\
@@ -138,11 +155,7 @@ fn write_fake_claude(bin: &Path) {
         shell_quote(&envelope("ultra")),
         shell_quote(&envelope("medium")),
     );
-    let binary = bin.join("claude");
-    fs::write(&binary, script).expect("write fake claude");
-    let mut permissions = fs::metadata(&binary).expect("fake metadata").permissions();
-    permissions.set_mode(0o700);
-    fs::set_permissions(&binary, permissions).expect("make fake executable");
+    common::write_stub(&bin.join("claude"), &body);
 }
 
 /// One rollout whose weekly window is past the hard ceiling, so a codex route read against it
@@ -175,8 +188,8 @@ struct StatsFixture {
 }
 
 impl StatsFixture {
-    fn new() -> Self {
-        let root = TempDir::new();
+    fn new(label: &str) -> Self {
+        let root = TempDir::new(label);
         for child in ["home", "bin", "working directory", IDLE, EXHAUSTED] {
             fs::create_dir_all(root.path.join(child)).expect("create fixture directory");
         }
@@ -376,7 +389,7 @@ fn top_level_keys(stats: &Value) -> BTreeSet<String> {
 /// so the two commands must be summarizing the same decisions.
 #[test]
 fn stats_json_reconciles_with_the_log_json_it_summarises() {
-    let fixture = StatsFixture::new();
+    let fixture = StatsFixture::new("log-reconciliation");
     fixture.dry_run(SCORED_LOW, None, IDLE);
     fixture.dry_run(SCORED_ULTRA, None, IDLE);
     fixture.dry_run(SCORED_MEDIUM, None, IDLE);
@@ -501,7 +514,7 @@ fn stats_json_reconciles_with_the_log_json_it_summarises() {
 /// denominator rule exists for.
 #[test]
 fn stats_json_emits_a_bad_rate_by_gate_that_reconciles_against_the_marked_rows() {
-    let fixture = StatsFixture::new();
+    let fixture = StatsFixture::new("bad-rate-by-gate");
     fixture.dry_run(SCORED_LOW, None, IDLE);
     fixture.dry_run(SCORED_ULTRA, None, IDLE);
     fixture.dry_run(SCORED_MEDIUM, None, IDLE);
@@ -633,7 +646,7 @@ fn stats_json_emits_a_bad_rate_by_gate_that_reconciles_against_the_marked_rows()
 /// a zero over zero rendered as a number is how NaN reaches a terminal.
 #[test]
 fn the_human_report_prints_a_dash_for_a_rate_nobody_has_judged() {
-    let fixture = StatsFixture::new();
+    let fixture = StatsFixture::new("dash-for-unjudged");
     fixture.dry_run("explicitly on claude", Some("claude"), IDLE);
     fixture.dry_run("a second explicit claude route", Some("claude"), IDLE);
     fixture.dry_run("explicitly on opencode", Some("opencode"), IDLE);
@@ -674,7 +687,7 @@ fn the_human_report_prints_a_dash_for_a_rate_nobody_has_judged() {
 /// report and a log that both published null would reconcile perfectly.
 #[test]
 fn stats_reports_the_router_version_every_row_it_pooled_was_written_by() {
-    let fixture = StatsFixture::new();
+    let fixture = StatsFixture::new("router-versions");
     fixture.dry_run(SCORED_LOW, None, IDLE);
     fixture.dry_run(SCORED_MEDIUM, None, IDLE);
     fixture.dry_run("explicitly on claude", Some("claude"), IDLE);
@@ -729,7 +742,7 @@ fn stats_reports_the_router_version_every_row_it_pooled_was_written_by() {
 
 #[test]
 fn stats_on_an_empty_database_exits_zero_and_reports_no_rows() {
-    let fixture = StatsFixture::new();
+    let fixture = StatsFixture::new("empty-db");
 
     let output = fixture.stats();
     assert!(

@@ -18,28 +18,41 @@ use agent_router_core::provider::Provider;
 use agent_router_core::usage::UsageSnapshot;
 use serde_json::{Value, json};
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
+
+// One copy of the stub helper, included by path from the core crate's tests. A workspace
+// `test-support` dev-dependency crate is the intended follow-up; this shape keeps the helper single
+// sourced without editing Cargo.toml while another stream owns it.
+#[path = "../../agent-router-core/tests/common/mod.rs"]
+mod common;
 
 /// A claude short id is the first segment of a session UUID, which is what the transcript glob
 /// anchors on.
 const TRACED_JOB: &str = "a384f762";
 const UNTRACED_JOB: &str = "b1c2d3e4";
 
+/// Makes every temp directory this file creates distinct from every other one, whatever the clock
+/// does. `fs::create_dir_all` succeeds silently on a path that already exists, so two tests deriving
+/// the same path would share one HOME and therefore one `router.db`, and one fixture's `Drop` would
+/// delete a live sibling's directories mid run.
+static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(0);
+
 struct TempDir {
     path: PathBuf,
 }
 
 impl TempDir {
-    fn new() -> Self {
+    fn new(label: &str) -> Self {
+        let serial = NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed);
         let unique = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "agent-router-status-cli-{}-{unique}",
+            "agent-router-status-cli-{}-{serial}-{label}-{unique}",
             std::process::id()
         ));
         fs::create_dir_all(&path).expect("create temp directory");
@@ -55,13 +68,6 @@ impl Drop for TempDir {
 
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
-}
-
-fn write_executable(path: &Path, script: &str) {
-    fs::write(path, script).expect("write the stub");
-    let mut permissions = fs::metadata(path).expect("stub metadata").permissions();
-    permissions.set_mode(0o700);
-    fs::set_permissions(path, permissions).expect("make the stub executable");
 }
 
 /// The rows `claude agents --json --all` prints, one per running or recently finished job.
@@ -89,12 +95,13 @@ struct StatusFixture {
 impl StatusFixture {
     /// A fixture whose claude reports an empty agent list, which is the bounded window having aged
     /// every job out, and whose codex refuses every invocation, so the daemon probe answers None.
-    fn new() -> Self {
-        let root = TempDir::new();
+    fn new(label: &str) -> Self {
+        let root = TempDir::new(label);
         for child in ["home", "bin"] {
             fs::create_dir_all(root.path.join(child)).expect("create fixture directory");
         }
-        write_executable(&root.path.join("bin/codex"), "#!/bin/sh\nexit 1\n");
+        // The helper writes the interpreter line, so the body starts at the first real command.
+        common::write_stub(&root.path.join("bin/codex"), "exit 1\n");
         let fixture = Self { root };
         fixture.claude_reports(&[]);
         fixture
@@ -111,11 +118,10 @@ impl StatusFixture {
     /// What the next `claude agents --json --all` call answers. Rewriting it between runs is how
     /// a job aging out of the recent window is reproduced.
     fn claude_reports(&self, jobs: &[(&str, &str)]) {
-        let script = format!(
-            "#!/bin/sh\nprintf '%s\\n' {}\n",
-            shell_quote(&agent_rows(jobs))
-        );
-        write_executable(&self.root.path.join("bin/claude"), &script);
+        // No interpreter line here either: the helper supplies exactly one, and a second would run
+        // as a comment and hide the mistake.
+        let body = format!("printf '%s\\n' {}\n", shell_quote(&agent_rows(jobs)));
+        common::write_stub(&self.root.path.join("bin/claude"), &body);
     }
 
     /// A transcript on disk under a project directory the glob has to wildcard over, because no
@@ -241,7 +247,7 @@ fn reported_row(status: &Value, id: i64) -> Value {
 /// cannot tell. A classifier that mapped absence to `completed` would pass every other test here.
 #[test]
 fn an_unresolvable_job_reconciles_to_unknown_rather_than_completed() {
-    let fixture = StatusFixture::new();
+    let fixture = StatusFixture::new("unresolvable");
     let id = fixture.seed(
         Provider::Claude,
         Some("c0ffee42"),
@@ -273,7 +279,7 @@ fn an_unresolvable_job_reconciles_to_unknown_rather_than_completed() {
 /// be a sticky wrong terminal state that the monotonicity rule then protects forever.
 #[test]
 fn a_stopped_claude_job_settles_to_unknown_rather_than_failed() {
-    let fixture = StatusFixture::new();
+    let fixture = StatusFixture::new("stopped");
     let id = fixture.seed(
         Provider::Claude,
         Some("57099ed0"),
@@ -307,7 +313,7 @@ fn a_stopped_claude_job_settles_to_unknown_rather_than_failed() {
 /// the router had already established.
 #[test]
 fn an_aged_out_job_keeps_its_proven_completion_rather_than_regressing_to_unknown() {
-    let fixture = StatusFixture::new();
+    let fixture = StatusFixture::new("aged-out");
     let id = fixture.seed(
         Provider::Claude,
         Some("d0ne1234"),
@@ -353,7 +359,7 @@ fn an_aged_out_job_keeps_its_proven_completion_rather_than_regressing_to_unknown
 /// router cannot resolve.
 #[test]
 fn a_traced_but_unresolvable_job_still_settles_to_unknown() {
-    let fixture = StatusFixture::new();
+    let fixture = StatusFixture::new("traced");
     let id = fixture.seed(
         Provider::Claude,
         Some(TRACED_JOB),
@@ -385,7 +391,7 @@ fn a_traced_but_unresolvable_job_still_settles_to_unknown() {
 /// does not, which is what makes the separation real rather than merely asserted.
 #[test]
 fn an_untraced_unresolvable_job_reports_no_trace_and_the_same_state() {
-    let fixture = StatusFixture::new();
+    let fixture = StatusFixture::new("untraced");
     let id = fixture.seed(
         Provider::Claude,
         Some(UNTRACED_JOB),
@@ -414,7 +420,7 @@ fn an_untraced_unresolvable_job_reports_no_trace_and_the_same_state() {
 /// path while the claude row in the same window still reconciles.
 #[test]
 fn a_codex_row_carries_no_trace_probe() {
-    let fixture = StatusFixture::new();
+    let fixture = StatusFixture::new("codex-no-trace");
     let codex = fixture.seed(
         Provider::Codex,
         Some("019fbce9-ca50-7f32-93d1-54a783a45b51"),
@@ -459,7 +465,7 @@ fn a_codex_row_carries_no_trace_probe() {
 /// failure. Treating it as a job nobody has heard from is what would poison the failure rate.
 #[test]
 fn a_dry_run_row_is_never_reconciled() {
-    let fixture = StatusFixture::new();
+    let fixture = StatusFixture::new("dry-run");
     let id = fixture.seed(Provider::Claude, None, None, true, "dry-run");
 
     let status = fixture.status_json();
@@ -482,7 +488,7 @@ fn a_dry_run_row_is_never_reconciled() {
 /// construction, and it is the most valuable text in the tuning data.
 #[test]
 fn a_failed_dispatch_row_is_never_reconciled_because_it_has_no_job_id() {
-    let fixture = StatusFixture::new();
+    let fixture = StatusFixture::new("failed-dispatch");
     let message = "error: app-server spawn failed: connection refused";
     let id = fixture.seed(Provider::Codex, None, None, false, message);
 
@@ -508,7 +514,7 @@ fn a_failed_dispatch_row_is_never_reconciled_because_it_has_no_job_id() {
 /// predicate. Keeping `dispatched` is honest, because the router holds no handle on the job.
 #[test]
 fn a_row_with_no_job_id_reconciles_to_nothing_and_keeps_dispatched() {
-    let fixture = StatusFixture::new();
+    let fixture = StatusFixture::new("no-job-id");
     let id = fixture.seed(
         Provider::Claude,
         None,
@@ -540,7 +546,7 @@ fn a_row_with_no_job_id_reconciles_to_nothing_and_keeps_dispatched() {
 /// this fixture deliberately refuses to provide. `tests/status.rs` owns those two classifications.
 #[test]
 fn status_exits_nonzero_only_when_a_row_reconciled_to_failed() {
-    let absent = StatusFixture::new();
+    let absent = StatusFixture::new("exit-absent");
     absent.seed(
         Provider::Claude,
         Some("c0ffee42"),
@@ -556,7 +562,7 @@ fn status_exits_nonzero_only_when_a_row_reconciled_to_failed() {
         String::from_utf8_lossy(&output.stdout)
     );
 
-    let finished = StatusFixture::new();
+    let finished = StatusFixture::new("exit-finished");
     let id = finished.seed(
         Provider::Claude,
         Some("d0ne1234"),
@@ -582,7 +588,7 @@ fn status_exits_nonzero_only_when_a_row_reconciled_to_failed() {
 /// the log would disagree about the same row.
 #[test]
 fn a_persisted_failure_still_exits_nonzero_once_the_backend_can_no_longer_be_asked() {
-    let fixture = StatusFixture::new();
+    let fixture = StatusFixture::new("persisted-failure");
     let id = fixture.seed(
         Provider::Codex,
         Some("019fbce9-ca50-7f32-93d1-54a783a45b51"),
@@ -623,7 +629,7 @@ fn a_persisted_failure_still_exits_nonzero_once_the_backend_can_no_longer_be_ask
 /// informative one, on every run and with no path back.
 #[test]
 fn an_opencode_row_keeps_its_outcome_because_the_reconciler_cannot_ask() {
-    let fixture = StatusFixture::new();
+    let fixture = StatusFixture::new("opencode");
     let id = fixture.seed(
         Provider::Opencode,
         Some("ses_a1b2c3"),
@@ -657,7 +663,7 @@ fn an_opencode_row_keeps_its_outcome_because_the_reconciler_cannot_ask() {
 /// with no denominator.
 #[test]
 fn status_on_an_empty_database_exits_zero_and_reports_no_rows() {
-    let fixture = StatusFixture::new();
+    let fixture = StatusFixture::new("empty-db");
 
     let output = fixture.status();
     assert!(
