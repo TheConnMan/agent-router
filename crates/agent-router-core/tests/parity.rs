@@ -136,6 +136,9 @@ args = ["root_arg"]
 [mcp_servers."shared.server".env]
 ROOT_KEY = "root_secret"
 SHARED_KEY = "root_secret"
+
+[mcp_servers."layered.remote"]
+url = "https://root.example/service"
 "#,
     );
     write(
@@ -151,6 +154,9 @@ env = { MIDDLE_KEY = "middle_secret", SHARED_KEY = "middle_secret" }
         r#"
 [mcp_servers."shared.server"]
 args = ["leaf_arg", "second_arg"]
+
+[mcp_servers."layered.remote"]
+url = "https://leaf.example/service"
 "#,
     );
     write(
@@ -165,6 +171,10 @@ args = ["leaf_arg", "second_arg"]
         "ROOT_KEY": "claude_secret",
         "MIDDLE_KEY": "claude_secret"
       }
+    },
+    "layered.remote": {
+      "type": "http",
+      "url": "https://leaf.example/service"
     }
   }
 }"#,
@@ -206,6 +216,16 @@ fn every_drift_kind_uses_only_secret_safe_server_projections() {
     "safe_case": {
       "command": "runner",
       "env": {"TOKEN_KEY": "claude_token_secret"}
+    },
+    "endpoint_case": {
+      "command": "runner",
+      "args": ["--credential", "ENDPOINT_ARGUMENT_SECRET_2718"],
+      "type": "http",
+      "url": "https://claude.example/service"
+    },
+    "transport_case": {
+      "type": "sse",
+      "url": "https://mcp.example/service"
     }
   }
 }"#,
@@ -231,6 +251,14 @@ env = { A_KEY = "codex_env_secret", C_KEY = "codex_env_secret" }
 [mcp_servers.safe_case]
 command = "runner"
 env = { TOKEN_KEY = "codex_token_secret" }
+
+[mcp_servers.endpoint_case]
+command = "runner"
+args = ["--credential", "ENDPOINT_ARGUMENT_SECRET_2718"]
+url = "https://codex.example/service"
+
+[mcp_servers.transport_case]
+url = "https://mcp.example/service"
 "#,
     );
     write(&project.join("CLAUDE.md"), "instructions");
@@ -243,6 +271,8 @@ env = { TOKEN_KEY = "codex_token_secret" }
         ParityKind::CommandDiffers,
         ParityKind::ArgsDiffer,
         ParityKind::EnvKeysDiffer,
+        ParityKind::TransportDiffers,
+        ParityKind::EndpointDiffers,
         ParityKind::StandaloneClaudeMd,
     ] {
         assert_eq!(
@@ -255,7 +285,7 @@ env = { TOKEN_KEY = "codex_token_secret" }
             "expected one {kind:?}"
         );
     }
-    assert_eq!(report.differences.len(), 6);
+    assert_eq!(report.differences.len(), 8);
     assert_eq!(report.status(), Status::Drift);
 
     let command = report
@@ -330,6 +360,27 @@ env = { TOKEN_KEY = "codex_token_secret" }
             .all(|difference| difference.server.as_deref() != Some("safe_case"))
     );
 
+    for (server, kind) in [
+        ("endpoint_case", ParityKind::EndpointDiffers),
+        ("transport_case", ParityKind::TransportDiffers),
+    ] {
+        let difference = report
+            .differences
+            .iter()
+            .find(|difference| {
+                difference.server.as_deref() == Some(server) && difference.kind == kind
+            })
+            .expect("transport or endpoint difference");
+        assert!(
+            difference.claude.is_none(),
+            "{server} leaked Claude projection"
+        );
+        assert!(
+            difference.codex.is_none(),
+            "{server} leaked Codex projection"
+        );
+    }
+
     let serialized = serde_json::to_string(&report).expect("serialize report");
     for secret in [
         "claude_only_secret",
@@ -338,6 +389,7 @@ env = { TOKEN_KEY = "codex_token_secret" }
         "codex_env_secret",
         "claude_token_secret",
         "codex_token_secret",
+        "ENDPOINT_ARGUMENT_SECRET_2718",
     ] {
         assert!(
             !serialized.contains(secret),
@@ -420,7 +472,7 @@ TOKEN_KEY = "codex_secret"
 }
 
 #[test]
-fn url_only_servers_align_even_when_the_urls_differ() {
+fn identical_http_endpoints_are_aligned() {
     let fixture = tempfile::tempdir().expect("tempdir");
     let project = fixture.path().join("project");
     write(
@@ -429,7 +481,7 @@ fn url_only_servers_align_even_when_the_urls_differ() {
   "mcpServers": {
     "remote": {
       "type": "http",
-      "url": "https://claude.invalid/mcp"
+      "url": "https://mcp.example/service"
     }
   }
 }"#,
@@ -438,7 +490,7 @@ fn url_only_servers_align_even_when_the_urls_differ() {
         &project.join(".codex/config.toml"),
         r#"
 [mcp_servers.remote]
-url = "https://codex.invalid/mcp"
+url = "https://mcp.example/service"
 startup_timeout_sec = 10
 enabled = false
 "#,
@@ -449,6 +501,150 @@ enabled = false
 
     assert_eq!(report.status(), Status::Aligned);
     assert!(report.differences.is_empty());
+}
+
+#[test]
+fn distinct_http_endpoints_report_endpoint_drift() {
+    let fixture = tempfile::tempdir().expect("tempdir");
+    let project = fixture.path().join("project");
+    write(
+        &project.join(".mcp.json"),
+        r#"{
+  "mcpServers": {
+    "remote": {
+      "type": "http",
+      "url": "https://claude.example/service"
+    }
+  }
+}"#,
+    );
+    write(
+        &project.join(".codex/config.toml"),
+        r#"
+[mcp_servers.remote]
+url = "https://codex.example/service"
+"#,
+    );
+
+    let report =
+        check(&[project], &default_config(), &empty_home(fixture.path())).expect("scan succeeds");
+    let serialized = serde_json::to_value(&report).expect("serialize report");
+
+    assert_eq!(report.status(), Status::Drift);
+    assert_eq!(report.differences.len(), 1);
+    assert_eq!(report.differences[0].server.as_deref(), Some("remote"));
+    assert_eq!(serialized["differences"][0]["kind"], "endpoint_differs");
+}
+
+#[test]
+fn claude_sse_and_codex_http_report_transport_drift() {
+    let fixture = tempfile::tempdir().expect("tempdir");
+    let project = fixture.path().join("project");
+    write(
+        &project.join(".mcp.json"),
+        r#"{
+  "mcpServers": {
+    "remote": {
+      "type": "sse",
+      "url": "https://mcp.example/service"
+    }
+  }
+}"#,
+    );
+    write(
+        &project.join(".codex/config.toml"),
+        r#"
+[mcp_servers.remote]
+url = "https://mcp.example/service"
+"#,
+    );
+
+    let report =
+        check(&[project], &default_config(), &empty_home(fixture.path())).expect("scan succeeds");
+    let serialized = serde_json::to_value(&report).expect("serialize report");
+
+    assert_eq!(report.status(), Status::Drift);
+    assert_eq!(report.differences.len(), 1);
+    assert_eq!(report.differences[0].server.as_deref(), Some("remote"));
+    assert_eq!(serialized["differences"][0]["kind"], "transport_differs");
+}
+
+#[test]
+fn hidden_endpoint_components_drift_without_entering_the_serialized_report() {
+    let fixture = tempfile::tempdir().expect("tempdir");
+    let project = fixture.path().join("project");
+    write(
+        &project.join(".mcp.json"),
+        r#"{
+  "mcpServers": {
+    "fragment_case": {
+      "type": "http",
+      "url": "https://mcp.example/service#CLAUDE_FRAGMENT_SENTINEL"
+    },
+    "path_case": {
+      "type": "http",
+      "url": "https://mcp.example/CLAUDE_PATH_SENTINEL"
+    },
+    "query_case": {
+      "type": "http",
+      "url": "https://mcp.example/service?token=CLAUDE_QUERY_SENTINEL"
+    },
+    "userinfo_case": {
+      "type": "http",
+      "url": "https://CLAUDE_USER_SENTINEL:CLAUDE_PASSWORD_SENTINEL@mcp.example/service"
+    }
+  }
+}"#,
+    );
+    write(
+        &project.join(".codex/config.toml"),
+        r#"
+[mcp_servers.fragment_case]
+url = "https://mcp.example/service#CODEX_FRAGMENT_SENTINEL"
+
+[mcp_servers.path_case]
+url = "https://mcp.example/CODEX_PATH_SENTINEL"
+
+[mcp_servers.query_case]
+url = "https://mcp.example/service?token=CODEX_QUERY_SENTINEL"
+
+[mcp_servers.userinfo_case]
+url = "https://CODEX_USER_SENTINEL:CODEX_PASSWORD_SENTINEL@mcp.example/service"
+"#,
+    );
+
+    let report =
+        check(&[project], &default_config(), &empty_home(fixture.path())).expect("scan succeeds");
+    let serialized = serde_json::to_string(&report).expect("serialize report");
+    let value: serde_json::Value = serde_json::from_str(&serialized).expect("report json parses");
+
+    assert_eq!(report.status(), Status::Drift);
+    assert_eq!(report.differences.len(), 4);
+    assert!(
+        value["differences"]
+            .as_array()
+            .expect("differences array")
+            .iter()
+            .all(|difference| difference["kind"] == "endpoint_differs")
+    );
+    assert!(!serialized.contains("mcp.example"));
+    for secret in [
+        "CLAUDE_FRAGMENT_SENTINEL",
+        "CODEX_FRAGMENT_SENTINEL",
+        "CLAUDE_PATH_SENTINEL",
+        "CODEX_PATH_SENTINEL",
+        "CLAUDE_QUERY_SENTINEL",
+        "CODEX_QUERY_SENTINEL",
+        "CLAUDE_USER_SENTINEL",
+        "CODEX_USER_SENTINEL",
+        "CLAUDE_PASSWORD_SENTINEL",
+        "CODEX_PASSWORD_SENTINEL",
+    ] {
+        assert!(
+            !serialized.contains(secret),
+            "serialized report leaked {secret}"
+        );
+    }
 }
 
 #[test]

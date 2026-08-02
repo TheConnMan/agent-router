@@ -400,8 +400,9 @@ agent-router parity --json
 The scan walks each root for directories containing any of `.mcp.json`, `.codex/config.toml`,
 `CLAUDE.md`, or `AGENTS.md`, then compares the MCP servers each side declares. Reported difference
 kinds are `missing_in_codex`, `missing_in_claude`, `command_differs`, `args_differ`,
-`env_keys_differ`, and `standalone_claude_md` (a `CLAUDE.md` with no `AGENTS.md` beside it, which
-Codex cannot consume).
+`env_keys_differ`, `transport_differs`, `endpoint_differs`, and `standalone_claude_md` (a
+`CLAUDE.md` with no `AGENTS.md` beside it, which Codex cannot consume). Transport declarations are
+compared semantically and private endpoints exactly, but endpoint values are never emitted in reports.
 
 The ambient configuration every project inherits is compared too, as its own entry: `~/.claude.json`
 against `~/.codex/config.toml`. It is reported first in the human output and as a top level `global`

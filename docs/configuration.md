@@ -348,7 +348,9 @@ the discovery markers. The two stay separate entries in the report; one exceptio
 both.
 
 Valid `kind` values are `missing_in_codex`, `missing_in_claude`, `command_differs`, `args_differ`,
-`env_keys_differ`, and `standalone_claude_md`.
+`env_keys_differ`, `transport_differs`, `endpoint_differs`, and `standalone_claude_md`. Transport
+declarations are compared semantically and private endpoints exactly, but endpoint values are never
+emitted in reports.
 
 A `reason` is mandatory by design. An exception without one would let a real gap hide as expected
 behaviour, which is the exact failure the parity command exists to prevent. A project whose
