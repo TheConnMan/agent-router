@@ -16,10 +16,16 @@
 
 use serde_json::{Value, json};
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
+
+// One copy of the stub helper, included by path from the core crate's tests. A workspace
+// `test-support` dev-dependency crate is the intended follow-up; this shape keeps the helper single
+// sourced without editing Cargo.toml while another stream owns it.
+#[path = "../../agent-router-core/tests/common/mod.rs"]
+mod common;
 
 /// A rollout directory with nothing in it, so the codex reader has no `rate_limits` event to read
 /// and fails open.
@@ -29,18 +35,30 @@ const LIVE_SESSIONS: &str = "live codex sessions";
 
 const DRY_RUN_TASK: &str = "a task decided without readable credentials";
 
+/// Makes every temp directory this file creates distinct from every other one, whatever the clock
+/// does. `fs::create_dir_all` succeeds silently on a path that already exists, so two tests deriving
+/// the same path would share one HOME and therefore one `router.db`, and one fixture's `Drop` would
+/// delete a live sibling's directories mid run.
+///
+/// Doctor prints the paths it resolved its provider binaries at, so a label reaches stdout and
+/// `check_line` matches on `contains`. A label must therefore carry no token an assertion greps
+/// for, `opencode` above all: `missing-opencode` made the `claude_on_path` line answer the opencode
+/// lookup.
+static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(0);
+
 struct TempDir {
     path: PathBuf,
 }
 
 impl TempDir {
-    fn new() -> Self {
+    fn new(label: &str) -> Self {
+        let serial = NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed);
         let unique = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "agent-router-doctor-cli-{}-{unique}",
+            "agent-router-doctor-cli-{}-{serial}-{label}-{unique}",
             std::process::id()
         ));
         fs::create_dir_all(&path).expect("create temp directory");
@@ -57,11 +75,7 @@ impl Drop for TempDir {
 /// A stub that refuses every invocation. It exists to be found on PATH, and to make the codex
 /// app-server probe fail fast rather than reach a real daemon on this box.
 fn write_refusing_stub(bin: &Path, name: &str) {
-    let binary = bin.join(name);
-    fs::write(&binary, "#!/bin/sh\nexit 1\n").expect("write the stub");
-    let mut permissions = fs::metadata(&binary).expect("stub metadata").permissions();
-    permissions.set_mode(0o700);
-    fs::set_permissions(&binary, permissions).expect("make the stub executable");
+    common::write_stub(&bin.join(name), "exit 1\n");
 }
 
 fn write_live_rollout(sessions: &Path) {
@@ -92,8 +106,8 @@ struct DoctorFixture {
 }
 
 impl DoctorFixture {
-    fn new() -> Self {
-        let root = TempDir::new();
+    fn new(label: &str) -> Self {
+        let root = TempDir::new(label);
         for child in [
             "home",
             "bin",
@@ -210,7 +224,7 @@ fn provider_line(stdout: &str, provider: &str) -> String {
 /// makes it win every headroom tiebreak, so this is a failure and doctor has to name the file.
 #[test]
 fn doctor_exits_nonzero_and_names_credentials_when_they_are_missing() {
-    let fixture = DoctorFixture::new();
+    let fixture = DoctorFixture::new("credentials-missing");
 
     let output = fixture.doctor(LIVE_SESSIONS, true);
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
@@ -231,7 +245,7 @@ fn doctor_exits_nonzero_and_names_credentials_when_they_are_missing() {
 /// distinction, so both surfaces use the same two.
 #[test]
 fn doctor_reports_a_fail_open_usage_read_as_such_rather_than_as_idle() {
-    let fixture = DoctorFixture::new();
+    let fixture = DoctorFixture::new("read-provenance");
     fixture.write_credentials();
 
     let fail_open = fixture.doctor_stdout(IDLE_SESSIONS, false);
@@ -277,7 +291,7 @@ fn doctor_reports_a_fail_open_usage_read_as_such_rather_than_as_idle() {
 /// and then costs nothing. Installing it or not must not move doctor's exit code.
 #[test]
 fn a_missing_opencode_is_not_a_failure() {
-    let fixture = DoctorFixture::new();
+    let fixture = DoctorFixture::new("absent-extra-provider");
     fixture.write_credentials();
 
     let without = fixture.doctor(LIVE_SESSIONS, false);
@@ -311,7 +325,7 @@ fn a_missing_opencode_is_not_a_failure() {
 /// row a dispatch leaves behind records that it was decided on a read nobody could trust.
 #[test]
 fn a_decision_logged_with_unreadable_credentials_carries_the_stale_marker() {
-    let fixture = DoctorFixture::new();
+    let fixture = DoctorFixture::new("stale-marker");
 
     let dry_run = fixture
         .router(IDLE_SESSIONS, false)
@@ -358,7 +372,7 @@ fn a_decision_logged_with_unreadable_credentials_carries_the_stale_marker() {
 /// it would create the very state it was asked to report on.
 #[test]
 fn doctor_does_not_create_a_config_file_it_was_asked_to_check() {
-    let fixture = DoctorFixture::new();
+    let fixture = DoctorFixture::new("config-untouched");
     let config = fixture.home().join(".config/agent-router/config.toml");
     assert!(
         !config.exists(),
@@ -379,7 +393,7 @@ fn doctor_does_not_create_a_config_file_it_was_asked_to_check() {
 /// indistinguishable case the marker exists to kill, so the row says where its numbers came from.
 #[test]
 fn the_usage_command_names_its_source_as_live_or_fail_open() {
-    let fixture = DoctorFixture::new();
+    let fixture = DoctorFixture::new("usage-provenance");
 
     let idle = fixture.usage_stdout(IDLE_SESSIONS);
     let header = idle.lines().next().expect("usage prints a header");

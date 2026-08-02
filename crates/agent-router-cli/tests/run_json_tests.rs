@@ -1,23 +1,37 @@
 use serde_json::{Value, json};
 use std::fs;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
+
+// One copy of the stub helper, included by path from the core crate's tests. A workspace
+// `test-support` dev-dependency crate is the intended follow-up; this shape keeps the helper single
+// sourced without editing Cargo.toml while another stream owns it.
+#[path = "../../agent-router-core/tests/common/mod.rs"]
+mod common;
+
+/// Makes every temp directory this file creates distinct from every other one, whatever the clock
+/// does. `fs::create_dir_all` succeeds silently on a path that already exists, so two tests deriving
+/// the same path would share one HOME and therefore one `router.db`, and one fixture's `Drop` would
+/// delete a live sibling's directories mid run.
+static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(0);
 
 struct TempDir {
     path: PathBuf,
 }
 
 impl TempDir {
-    fn new() -> Self {
+    fn new(label: &str) -> Self {
+        let serial = NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed);
         let unique = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("agent-router-cli-{}-{unique}", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "agent-router-cli-{}-{serial}-{label}-{unique}",
+            std::process::id()
+        ));
         fs::create_dir_all(&path).expect("create temp directory");
         Self { path }
     }
@@ -45,15 +59,15 @@ struct CliFixture {
 
 #[cfg(unix)]
 impl CliFixture {
-    fn new() -> Self {
-        Self::listing_agent_named(None)
+    fn new(label: &str) -> Self {
+        Self::listing_agent_named(label, None)
     }
 
     /// `listed` is the name the fake `claude agents` listing advertises, which is what the router
     /// matches against to resolve the short id of the job it just spawned. None means the name
     /// derived from the task.
-    fn listing_agent_named(listed: Option<&str>) -> Self {
-        let root = TempDir::new();
+    fn listing_agent_named(label: &str, listed: Option<&str>) -> Self {
+        let root = TempDir::new(label);
         let home = root.path.join("home");
         let bin = root.path.join("bin");
         let cwd = root.path.join("working directory");
@@ -74,9 +88,10 @@ impl CliFixture {
             "state": "working"
         }]);
         let agents = serde_json::to_string(&agents).expect("agents json");
-        let script = format!(
-            "#!/bin/sh\n\
-             if [ \"$1\" = \"agents\" ]; then\n\
+        // No interpreter line: the helper supplies exactly one, ahead of the probe guard, which is
+        // what keeps a probe out of the spawn log this fixture's assertions read.
+        let body = format!(
+            "if [ \"$1\" = \"agents\" ]; then\n\
                printf '%s\\n' {}\n\
                exit 0\n\
              fi\n\
@@ -85,12 +100,7 @@ impl CliFixture {
             shell_quote(&spawn_log.to_string_lossy())
         );
         let fake_claude = bin.join("claude");
-        fs::write(&fake_claude, script).expect("write fake claude");
-        let mut permissions = fs::metadata(&fake_claude)
-            .expect("fake metadata")
-            .permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(&fake_claude, permissions).expect("make fake executable");
+        common::write_stub(&fake_claude, &body);
         Self {
             root,
             task,
@@ -158,7 +168,7 @@ fn wait_for_text(path: &Path) -> String {
 #[cfg(unix)]
 #[test]
 fn run_json_preserves_provider_decision_and_dispatched_job_identity() {
-    let fixture = CliFixture::new();
+    let fixture = CliFixture::new("json-identity");
     let output = fixture.run(true);
     assert!(
         output.status.success(),
@@ -208,7 +218,7 @@ fn run_json_preserves_provider_decision_and_dispatched_job_identity() {
 #[cfg(unix)]
 #[test]
 fn human_output_reports_the_job_without_a_viewer_instruction() {
-    let fixture = CliFixture::new();
+    let fixture = CliFixture::new("human-output");
     let output = fixture.run(false);
     assert!(
         output.status.success(),
@@ -229,7 +239,7 @@ fn human_output_reports_the_job_without_a_viewer_instruction() {
 #[test]
 fn a_supplied_name_reaches_the_spawned_job_and_the_decision_log_verbatim() {
     let name = "Bonus: abc-123";
-    let fixture = CliFixture::listing_agent_named(Some(name));
+    let fixture = CliFixture::listing_agent_named("supplied-name", Some(name));
     assert_ne!(fixture.name, name, "the task must not derive this name");
 
     let output = fixture
@@ -284,7 +294,7 @@ fn a_supplied_name_reaches_the_spawned_job_and_the_decision_log_verbatim() {
 #[cfg(unix)]
 #[test]
 fn a_claude_dispatch_records_no_effective_effort() {
-    let fixture = CliFixture::new();
+    let fixture = CliFixture::new("no-effective-effort");
     let output = fixture.run(true);
     assert!(
         output.status.success(),
@@ -348,7 +358,7 @@ fn a_claude_dispatch_records_no_effective_effort() {
 #[cfg(unix)]
 #[test]
 fn auto_provider_with_an_explicit_model_fails_naming_both_flags() {
-    let fixture = CliFixture::new();
+    let fixture = CliFixture::new("auto-plus-model");
 
     let output = fixture
         .run_command()
@@ -377,7 +387,7 @@ fn auto_provider_with_an_explicit_model_fails_naming_both_flags() {
 #[cfg(unix)]
 #[test]
 fn explicit_provider_with_an_explicit_model_succeeds_and_forwards_the_model() {
-    let fixture = CliFixture::new();
+    let fixture = CliFixture::new("explicit-plus-model");
 
     let output = fixture
         .run_command()
@@ -415,7 +425,7 @@ fn explicit_provider_with_an_explicit_model_succeeds_and_forwards_the_model() {
 #[cfg(unix)]
 #[test]
 fn mcp_scoping_with_an_explicit_non_claude_provider_exits_nonzero() {
-    let root = TempDir::new();
+    let root = TempDir::new("mcp-scoping");
     let bin = root.path.join("bin");
     let home = root.path.join("home");
     let cwd = root.path.join("working");
@@ -485,7 +495,7 @@ fn mcp_scoping_with_an_explicit_non_claude_provider_exits_nonzero() {
 #[cfg(unix)]
 #[test]
 fn an_empty_name_is_rejected_naming_the_flag() {
-    let fixture = CliFixture::new();
+    let fixture = CliFixture::new("empty-name");
 
     let output = fixture
         .run_command()
@@ -514,7 +524,7 @@ fn an_empty_name_is_rejected_naming_the_flag() {
 #[cfg(unix)]
 #[test]
 fn a_whitespace_only_name_is_rejected_naming_the_flag() {
-    let fixture = CliFixture::new();
+    let fixture = CliFixture::new("whitespace-name");
 
     let output = fixture
         .run_command()
@@ -541,24 +551,24 @@ fn a_whitespace_only_name_is_rejected_naming_the_flag() {
 #[cfg(target_os = "linux")]
 fn fake_opencode_cli(root: &Path, log: &Path) -> PathBuf {
     let binary = root.join("opencode");
-    fs::write(
+    // This stub writes its argv unconditionally and two tests assert the CLI was never run by
+    // checking that the log does not exist, so the probe guard the helper emits ahead of this body
+    // is what keeps a probe from inverting those assertions. No interpreter line here: the helper
+    // supplies exactly one.
+    common::write_stub(
         &binary,
-        format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n",
+        &format!(
+            "printf '%s\\n' \"$@\" > {}\n",
             shell_quote(&log.to_string_lossy())
         ),
-    )
-    .expect("write fake opencode");
-    let mut permissions = fs::metadata(&binary).expect("fake metadata").permissions();
-    permissions.set_mode(0o700);
-    fs::set_permissions(&binary, permissions).expect("make fake executable");
+    );
     binary
 }
 
 #[cfg(target_os = "linux")]
 #[test]
 fn managed_opencode_security_failure_does_not_run_the_detached_cli() {
-    let root = TempDir::new();
+    let root = TempDir::new("managed-opencode-failure");
     let bin = root.path.join("bin");
     let home = root.path.join("home");
     let cwd = root.path.join("working");
@@ -680,7 +690,7 @@ fn process_exists(pid: i32) -> bool {
 #[cfg(target_os = "linux")]
 #[test]
 fn router_terminates_a_server_that_fails_authenticated_readiness() {
-    let root = TempDir::new();
+    let root = TempDir::new("readiness-rejection");
     let home = root.path.join("home");
     let cwd = root.path.join("working");
     let pid_file = root.path.join("server.pid");
