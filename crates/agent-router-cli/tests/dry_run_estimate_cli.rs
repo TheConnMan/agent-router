@@ -11,10 +11,16 @@
 
 use serde_json::{Value, json};
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
+
+// One copy of the stub helper, included by path from the core crate's tests. A workspace
+// `test-support` dev-dependency crate is the intended follow-up; this shape keeps the helper single
+// sourced without editing Cargo.toml while another stream owns it.
+#[path = "../../agent-router-core/tests/common/mod.rs"]
+mod common;
 
 /// The weekly percentages the seeded jobs are decided against, oldest first. The steps between
 /// them are all 10.0, so the median gap is 10.0 whichever way the sample is counted.
@@ -27,18 +33,25 @@ const NEEDED: u64 = 3;
 const SEED_TASK: &str = "a seeded job on the codex tier";
 const DRY_RUN_TASK: &str = "the task being priced";
 
+/// Makes every temp directory this file creates distinct from every other one, whatever the clock
+/// does. `fs::create_dir_all` succeeds silently on a path that already exists, so two tests deriving
+/// the same path would share one HOME and therefore one `router.db`, and one fixture's `Drop` would
+/// delete a live sibling's directories mid run.
+static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(0);
+
 struct TempDir {
     path: PathBuf,
 }
 
 impl TempDir {
-    fn new() -> Self {
+    fn new(label: &str) -> Self {
+        let serial = NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed);
         let unique = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "agent-router-estimate-cli-{}-{unique}",
+            "agent-router-estimate-cli-{}-{serial}-{label}-{unique}",
             std::process::id()
         ));
         fs::create_dir_all(&path).expect("create temp directory");
@@ -56,11 +69,7 @@ impl Drop for TempDir {
 /// here (every invocation names its provider), and codex must fail its dispatch fast rather than
 /// reach a real app-server daemon on this box.
 fn write_refusing_stub(bin: &Path, name: &str) {
-    let binary = bin.join(name);
-    fs::write(&binary, "#!/bin/sh\nexit 1\n").expect("write the stub");
-    let mut permissions = fs::metadata(&binary).expect("stub metadata").permissions();
-    permissions.set_mode(0o700);
-    fs::set_permissions(&binary, permissions).expect("make the stub executable");
+    common::write_stub(&bin.join(name), "exit 1\n");
 }
 
 struct EstimateFixture {
@@ -68,8 +77,8 @@ struct EstimateFixture {
 }
 
 impl EstimateFixture {
-    fn new() -> Self {
-        let root = TempDir::new();
+    fn new(label: &str) -> Self {
+        let root = TempDir::new(label);
         for child in ["home", "bin", "working directory"] {
             fs::create_dir_all(root.path.join(child)).expect("create fixture directory");
         }
@@ -127,8 +136,35 @@ impl EstimateFixture {
     /// One non dry run decision on the codex tier, logged at the given weekly percentage. The
     /// dispatch itself fails against the stub, which is fine and is the point: `run` records the
     /// row before it reports the failure, and it is the row the projection reads.
+    ///
+    /// So the seed is checked against the reason it failed, never against its exit status: every
+    /// way this can go wrong exits 1, including the ways that die before the row is written. The
+    /// check is a proxy. It reads which failure occurred, not directly that a row landed, because
+    /// reading the log here would cost every seed a second router invocation.
+    ///
+    /// Every failure that reaches the log names the codex dispatch, and there are more of them
+    /// than the obvious one. `... daemon start` exited is the intended path: the stub ran and
+    /// refused. Under load the same path instead reports `... daemon start` stdout was
+    /// unreadable, because `run_reporting_failure` waits only 250 ms on the stdout reader thread
+    /// and does that before it looks at the exit status; it can also report `... daemon start`
+    /// timed out after ..., or could not wait for `... daemon start`. All of those record the row
+    /// just the same, so naming the codex dispatch is what the assertion asks for, not one
+    /// particular wording of the refusal.
+    ///
+    /// One failure names the codex dispatch and must still fail loudly, so it is excluded by
+    /// name: could not run `codex app-server daemon start` means the stub could not be executed
+    /// at all, which is the ETXTBSY or ENOENT shape this fixture exists to catch. The exclusion
+    /// is anchored to that exact literal, the one `run_reporting_failure` emits when `spawn`
+    /// itself fails for this command, rather than a bare "could not run" that also appears in
+    /// unrelated production prose elsewhere in the binary; an unanchored substring could reject a
+    /// seed over a message that has nothing to do with this dispatch. The failures that record
+    /// nothing say something else entirely and name no dispatch at all (`target directory does
+    /// not exist`, or a bare os error from the log file being unopenable). Without this the first
+    /// sign of a seed that recorded nothing is the row set assertion 140 lines below, which names
+    /// the projection rather than the fixture.
     fn seed_job(&self, used_percent: i64) {
-        self.router(used_percent)
+        let output = self
+            .router(used_percent)
             .arg("run")
             .arg(SEED_TASK)
             .arg("--dir")
@@ -137,6 +173,14 @@ impl EstimateFixture {
             .arg("codex")
             .output()
             .expect("run the router");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("codex app-server daemon")
+                && !stderr.contains("could not run `codex app-server daemon start`"),
+            "the seed at {used_percent} percent did not fail the way a refused dispatch fails, so \
+             it may have recorded no row at all, status: {:?}, stderr: {stderr}",
+            output.status
+        );
     }
 
     fn seed_comparable_jobs(&self) {
@@ -223,7 +267,7 @@ fn between<'a>(line: &'a str, start: &str, end: &str) -> &'a str {
 /// prints no number at all.
 #[test]
 fn a_dry_run_prints_an_explicit_insufficient_data_line_on_an_empty_log() {
-    let fixture = EstimateFixture::new();
+    let fixture = EstimateFixture::new("empty-log");
 
     let stdout = fixture.dry_run_stdout();
     let line = estimate_line(&stdout);
@@ -248,7 +292,7 @@ fn a_dry_run_prints_an_explicit_insufficient_data_line_on_an_empty_log() {
 
 #[test]
 fn a_dry_run_projects_a_draw_once_the_log_carries_comparable_jobs() {
-    let fixture = EstimateFixture::new();
+    let fixture = EstimateFixture::new("comparable-jobs");
     fixture.seed_comparable_jobs();
 
     // The projection reads rows, so a fixture that quietly recorded none, or that recorded them
@@ -323,7 +367,7 @@ fn a_dry_run_projects_a_draw_once_the_log_carries_comparable_jobs() {
 /// edit that shortens the line back to a bare percentage is exactly the regression this pins.
 #[test]
 fn a_projected_draw_is_labelled_as_an_upper_bound() {
-    let fixture = EstimateFixture::new();
+    let fixture = EstimateFixture::new("upper-bound");
     fixture.seed_comparable_jobs();
 
     let stdout = fixture.dry_run_stdout();
