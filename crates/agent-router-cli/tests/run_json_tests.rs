@@ -78,6 +78,21 @@ impl CliFixture {
         let name = task.chars().take(40).collect::<String>();
         let spawn_log = root.path.join("claude.argv");
         let listed = listed.unwrap_or(&name);
+        let classifier_answer = json!({
+            "orchestration": false,
+            "missing_connector": false,
+            "complexity": "medium",
+            "task_context_horizon": "extended",
+            "rationale": "fixture context",
+        })
+        .to_string();
+        let classifier_result = json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "result": classifier_answer,
+        })
+        .to_string();
         let agents = json!([{
             "id": "claude exact id",
             "sessionId": "claude full id",
@@ -95,8 +110,13 @@ impl CliFixture {
                printf '%s\\n' {}\n\
                exit 0\n\
              fi\n\
+             if [ \"$1\" = \"-p\" ]; then\n\
+               printf '%s\\n' {}\n\
+               exit 0\n\
+             fi\n\
              printf '%s\\n' \"$@\" > {}\n",
             shell_quote(&agents),
+            shell_quote(&classifier_result),
             shell_quote(&spawn_log.to_string_lossy())
         );
         let fake_claude = bin.join("claude");
@@ -213,6 +233,48 @@ fn run_json_preserves_provider_decision_and_dispatched_job_identity() {
             &fixture.task
         ]
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn auto_run_json_and_log_json_expose_the_context_horizon() {
+    let fixture = CliFixture::new("context-horizon");
+    let output = fixture
+        .run_command()
+        .arg("--provider")
+        .arg("auto")
+        .arg("--dry-run")
+        .arg("--json")
+        .output()
+        .expect("run router");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("router json");
+    assert_eq!(
+        value["classification"]["task_context_horizon"],
+        "extended"
+    );
+
+    let logged = fixture
+        .router()
+        .arg("log")
+        .arg("--limit")
+        .arg("1")
+        .arg("--json")
+        .output()
+        .expect("read decision log");
+    assert!(
+        logged.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&logged.stderr)
+    );
+    let rows: Value = serde_json::from_slice(&logged.stdout).expect("log json");
+    let row = rows[0].as_object().expect("log row object");
+    assert!(row.contains_key("task_context_horizon"), "row: {row:?}");
+    assert_eq!(row["task_context_horizon"], "extended");
 }
 
 #[cfg(unix)]
@@ -350,6 +412,15 @@ fn a_claude_dispatch_records_no_effective_effort() {
         row["effective_effort"],
         Value::Null,
         "and claude never said what it ran at, so nothing may be written here"
+    );
+    assert!(
+        row.contains_key("task_context_horizon"),
+        "the log must distinguish an explicit route from a missing JSON key: {row:?}"
+    );
+    assert_eq!(
+        row["task_context_horizon"],
+        Value::Null,
+        "an explicit provider skips classification and therefore records SQL null"
     );
 }
 

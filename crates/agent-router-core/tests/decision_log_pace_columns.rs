@@ -7,11 +7,11 @@
 //! These assertions go through SQL rather than the flattened read model on purpose. The contract
 //! under test is the shape of the table, which is what a later backtest reads.
 
-use agent_router_core::classify::{Classification, Complexity};
+use agent_router_core::classify::{Classification, Complexity, TaskContextHorizon};
 use agent_router_core::config::Config;
 use agent_router_core::decide::{Decision, decide};
-use agent_router_core::log::{DecisionLog, Entry};
-use agent_router_core::{Headroom, Provider, UsageSnapshot};
+use agent_router_core::log::{DecisionLog, Entry, Mark};
+use agent_router_core::{DefaultProvider, Headroom, Provider, UsageSnapshot};
 use std::path::Path;
 
 const NOW: i64 = 1_785_400_000;
@@ -37,11 +37,12 @@ fn window(weekly_pct: f64, weekly_remaining_secs: i64) -> Headroom {
     }
 }
 
-fn scored(orchestration: bool) -> Classification {
+fn scored(orchestration: bool, task_context_horizon: TaskContextHorizon) -> Classification {
     Classification {
         orchestration,
         missing_connector: false,
         complexity: Complexity::Medium,
+        task_context_horizon,
         rationale: "fixture".to_string(),
         classifier_failed: false,
     }
@@ -78,11 +79,21 @@ fn a_recorded_decision_writes_the_orchestration_score_and_both_pace_deltas() {
         codex: window(80.0, HALF_WEEK),
     };
 
-    let flipped = decide(scored(false), usage, NOW, &Config::default());
+    let flipped = decide(
+        scored(false, TaskContextHorizon::Ordinary),
+        usage,
+        NOW,
+        &Config::default(),
+    );
     assert_eq!(flipped.provider, Provider::Claude);
     record(&log, &flipped);
 
-    let pinned = decide(scored(true), usage, NOW, &Config::default());
+    let pinned = decide(
+        scored(true, TaskContextHorizon::Ordinary),
+        usage,
+        NOW,
+        &Config::default(),
+    );
     record(&log, &pinned);
 
     let conn = rusqlite::Connection::open(&path).expect("reopen");
@@ -113,7 +124,7 @@ fn an_unread_reset_records_no_pace_delta_for_that_provider() {
     let path = dir.path().join("router.db");
     let log = DecisionLog::open_at(&path).expect("opens");
     let decision = decide(
-        scored(false),
+        scored(false, TaskContextHorizon::Ordinary),
         UsageSnapshot {
             claude: Headroom {
                 weekly_pct: 10.0,
@@ -145,7 +156,7 @@ fn the_scores_the_classifier_no_longer_produces_are_left_null() {
     let path = dir.path().join("router.db");
     let log = DecisionLog::open_at(&path).expect("opens");
     let decision = decide(
-        scored(false),
+        scored(false, TaskContextHorizon::Ordinary),
         UsageSnapshot {
             claude: window(5.0, HALF_WEEK),
             codex: window(80.0, HALF_WEEK),
@@ -178,6 +189,113 @@ fn the_scores_the_classifier_no_longer_produces_are_left_null() {
         (None, None, None, None, None, None),
         "a new row must not write a score the classifier no longer produces"
     );
+}
+
+#[test]
+fn fresh_auto_rows_persist_and_expose_each_context_horizon() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("router.db");
+    let log = DecisionLog::open_at(&path).expect("opens");
+    let usage = UsageSnapshot::full();
+
+    for (task, classification) in [
+        (
+            "ordinary task",
+            scored(false, TaskContextHorizon::Ordinary),
+        ),
+        (
+            "extended task",
+            scored(false, TaskContextHorizon::Extended),
+        ),
+        (
+            "failed task",
+            Classification::fallback("fixture failure", DefaultProvider::Codex),
+        ),
+    ] {
+        let decision = decide(classification, usage.clone(), NOW, &Config::default());
+        log.record(&Entry {
+            task,
+            dir: Path::new("/tmp"),
+            requested: "auto",
+            decision: &decision,
+            dry_run: true,
+            job_id: None,
+            job_name: None,
+            outcome: "dry-run",
+            effective_effort: None,
+        })
+        .expect("records");
+    }
+
+    let rows = log.recent(10).expect("reads rows");
+    assert_eq!(rows[0].task_context_horizon.as_deref(), Some("unknown"));
+    assert_eq!(rows[1].task_context_horizon.as_deref(), Some("extended"));
+    assert_eq!(rows[2].task_context_horizon.as_deref(), Some("ordinary"));
+}
+
+#[test]
+fn explicit_provider_rows_keep_context_horizon_null() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("router.db");
+    let log = DecisionLog::open_at(&path).expect("opens");
+    let decision = agent_router_core::decide::decide_explicit(
+        Provider::Claude,
+        None,
+        UsageSnapshot::full(),
+        &Config::default(),
+    );
+    record(&log, &decision);
+
+    let horizon: Option<String> = rusqlite::Connection::open(&path)
+        .expect("reopen")
+        .query_row("SELECT task_context_horizon FROM decisions", [], |row| {
+            row.get(0)
+        })
+        .expect("query");
+    assert_eq!(horizon, None);
+    assert_eq!(
+        log.recent(1).expect("reads")[0].task_context_horizon,
+        None
+    );
+}
+
+#[test]
+fn reconciliation_and_marking_leave_context_horizon_unchanged() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("router.db");
+    let log = DecisionLog::open_at(&path).expect("opens");
+    let decision = decide(
+        scored(false, TaskContextHorizon::Extended),
+        UsageSnapshot::full(),
+        NOW,
+        &Config::default(),
+    );
+    let id = log
+        .record(&Entry {
+            task: "sustain synthesis",
+            dir: Path::new("/tmp"),
+            requested: "auto",
+            decision: &decision,
+            dry_run: false,
+            job_id: Some("thread-1"),
+            job_name: None,
+            outcome: "dispatched",
+            effective_effort: None,
+        })
+        .expect("records");
+
+    log.reconcile(id, "completed").expect("reconciles");
+    log.mark(id, Mark::Good, Some("finished")).expect("marks");
+
+    let horizon: String = rusqlite::Connection::open(&path)
+        .expect("reopen")
+        .query_row(
+            "SELECT task_context_horizon FROM decisions WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        )
+        .expect("query");
+    assert_eq!(horizon, "extended");
 }
 
 /// The shipped schema, exactly as the recorded corpus was written under it. A database in this
@@ -280,6 +398,22 @@ fn a_database_written_before_pace_gains_the_columns_and_keeps_its_rows() {
     assert_eq!(orchestration, None, "an older row scored no orchestration");
     assert_eq!(claude_pace, None);
     assert_eq!(codex_pace, None);
+
+    let decision = decide(
+        scored(false, TaskContextHorizon::Ordinary),
+        UsageSnapshot::full(),
+        NOW,
+        &Config::default(),
+    );
+    record(&log, &decision);
+    let horizons: Vec<Option<String>> = conn
+        .prepare("SELECT task_context_horizon FROM decisions ORDER BY id")
+        .expect("the new column exists")
+        .query_map([], |row| row.get(0))
+        .expect("query")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("reads horizons");
+    assert_eq!(horizons, vec![None, Some("ordinary".to_string())]);
 
     // The migration is idempotent: opening again must not try to add a column twice.
     DecisionLog::open_at(&path).expect("reopens");

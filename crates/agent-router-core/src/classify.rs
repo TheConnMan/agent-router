@@ -399,7 +399,7 @@ mod tests {
     }
 
     const GOOD: &str = r#"{"orchestration":false,"missing_connector":false,
-        "rationale":"explicit outcome, mechanical verification"}"#;
+        "task_context_horizon":"ordinary","rationale":"explicit outcome, mechanical verification"}"#;
 
     #[test]
     fn a_well_formed_answer_parses_out_of_the_cli_envelope() {
@@ -407,6 +407,22 @@ mod tests {
         assert!(!got.orchestration);
         assert!(!got.missing_connector);
         assert!(!got.classifier_failed);
+    }
+
+    /// The horizon is a closed observation emitted by every usable classifier answer. Both values
+    /// have to survive the JSON boundary, because the log must distinguish ordinary bounded work
+    /// from work that explicitly needs a long lived working context.
+    #[test]
+    fn ordinary_and_extended_context_horizons_round_trip_through_the_classifier() {
+        for horizon in ["ordinary", "extended"] {
+            let answer = GOOD.replace(
+                "\"task_context_horizon\":\"ordinary\"",
+                &format!("\"task_context_horizon\":\"{horizon}\""),
+            );
+            let got = parse_claude(&envelope(&answer)).expect("parses");
+            let serialized = serde_json::to_value(got).expect("serializes");
+            assert_eq!(serialized["task_context_horizon"], horizon);
+        }
     }
 
     #[test]
@@ -425,7 +441,7 @@ mod tests {
         {
             let text = format!(
                 r#"{{"orchestration":{orchestration},"missing_connector":{missing_connector},
-                "complexity":"high","rationale":"needs n8n"}}"#
+                "complexity":"high","task_context_horizon":"ordinary","rationale":"needs n8n"}}"#
             );
             let got = parse_claude(&envelope(&text)).expect("parses");
             assert_eq!(got.orchestration, orchestration);
@@ -447,6 +463,21 @@ mod tests {
         );
         assert!(parse_claude(r#"{"type":"result","is_error":true}"#).is_none());
         assert!(parse_claude("not json at all").is_none());
+    }
+
+    /// `unknown` is evidence that the classifier failed, not a value a model may choose. An
+    /// omitted horizon is equally unusable because a row that never received this score must not
+    /// look like ordinary work in later analysis.
+    #[test]
+    fn omitted_or_unknown_context_horizons_are_unusable() {
+        let omitted = GOOD.replace("\"task_context_horizon\":\"ordinary\",", "");
+        assert!(parse_claude(&envelope(&omitted)).is_none());
+
+        let unknown = GOOD.replace(
+            "\"task_context_horizon\":\"ordinary\"",
+            "\"task_context_horizon\":\"unknown\"",
+        );
+        assert!(parse_claude(&envelope(&unknown)).is_none());
     }
 
     /// Complexity is what picks the model, so each value must survive the parse, and an answer
@@ -503,6 +534,10 @@ mod tests {
         assert!(got.classifier_failed);
         assert!(got.rationale.contains("timed out after 30s"));
         assert!(got.rationale.contains("defaulting to claude"));
+        assert_eq!(
+            serde_json::to_value(got).expect("serializes")["task_context_horizon"],
+            "unknown"
+        );
     }
 
     /// The prompt is the whole classifier, so the instructions that are there for a measured
@@ -551,10 +586,18 @@ mod tests {
         // Ultra is the only tier that reaches fable, so the brake on over-assigning it is
         // load-bearing rather than decorative.
         assert!(prompt.contains("when torn between high and ultra, answer high"));
+        // Context horizon predicts the amount of retained working context, not how hard the task
+        // feels. The three positive cases are deliberately narrow and ordinary is the default.
+        assert!(prompt.contains("task_context_horizon"));
+        assert!(prompt.contains("large corpus"));
+        assert!(prompt.contains("resumed") || prompt.contains("continuing"));
+        assert!(prompt.contains("sustained synthesis"));
+        assert!(prompt.contains("ordinary is the default"));
+        assert!(prompt.contains("independent from complexity"));
         // The answer shape, which is what the parser accepts and nothing wider.
         assert!(prompt.contains(
             "{\"orchestration\":false,\"missing_connector\":false,\"complexity\":\"medium\",\
-             \"rationale\":\"one sentence\"}"
+             \"task_context_horizon\":\"ordinary\",\"rationale\":\"one sentence\"}"
         ));
         assert!(prompt.contains("complexity is \"low\", \"medium\", \"high\", or \"ultra\""));
         // No field of the retired fourteen field shape may still be asked for. Matched as a JSON
