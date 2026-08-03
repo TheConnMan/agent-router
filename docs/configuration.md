@@ -63,6 +63,7 @@ connectors = [
     "gh (github)",
     "airtable",
 ]
+cloud_repos = []
 
 [policy]
 default_provider = "codex"
@@ -180,6 +181,75 @@ a connector itself, only because a named system is absent from this list.
 Keep it accurate in both directions. Listing a connector Codex cannot actually reach sends work to
 a provider that will fail; omitting one it can reach sends work to Claude that did not need to go
 there.
+
+**This list describes what Codex can reach on this machine, not what a Codex cloud environment can
+reach.** A cloud submit forwards only the prompt, the environment id, and the branch: it does not
+forward local MCP configuration, connector credentials, or anything else from this box. So a task
+that needs a connector such as Airtable can be judged connector complete against this list and then
+be sent to a cloud environment that has no such connector. See `cloud_repos` below for the practical
+guidance; the router does not detect this case.
+
+### `cloud_repos`
+
+Default `[]`. The `owner/repo` slugs whose tasks may run as Codex cloud tasks instead of locally.
+
+Empty is the default and turns the feature off entirely. Eligibility short-circuits on an empty list
+before any git call and any network call, so an operator who has not asked for cloud pays nothing for
+it, and cloud is never inferred from a repository merely happening to be connected upstream. The
+compare is case-insensitive, because GitHub treats owner and repository names that way.
+
+**An existing config file will not gain this key on its own.** No migration runs for it: migrations
+exist to correct a stale value this tool once generated, and a new key with an empty default has
+nothing to correct. An absent key already reads as the default, so nothing is broken by its absence,
+but the key will not appear in your file until you add it.
+
+Being allowlisted is necessary and not sufficient. A task runs in the cloud only when the repository
+also has an `origin` remote on GitHub, is on a named branch (not a detached HEAD), resolves to a
+connected Codex cloud environment, and the branch satisfies all of:
+
+- it exists on the remote (`refs/remotes/origin/<branch>` is present)
+- the working tree is clean (tracked files only; untracked files do not count)
+- the branch is not ahead of its remote counterpart
+
+These three exist because `codex cloud exec --branch` runs the REMOTE ref, not your local working
+tree. Uncommitted edits, unpushed commits, or a branch that was never pushed at all would each let a
+cloud task run different source than the one you are looking at, and every one of those would
+succeed silently: the submit works and the task simply runs the wrong code. A branch merely behind
+its remote stays eligible, because the remote tip then contains your own work plus somebody else's,
+which is a weaker surprise than running the wrong source outright.
+
+These three checks are local git reads with no fetch, so a remote that moved, was force-pushed, or
+was deleted since your last fetch, or a stale remote-tracking ref, is not detected. What is proven is
+that your local view of the remote agrees with your working tree, not that the remote is current.
+
+Anything that does not resolve routes locally and says why on the decision's rationale line, so an
+allowlist entry that is not taking effect is visible rather than silent. The one reason that prints
+nothing is a repository that is not on the list at all, which would otherwise be a note on every
+line of every run.
+
+Resolved environments are cached in a SQLite database at
+`~/.local/state/agent-router/cloud-environments.db`, in a `cloud_environments` table keyed on the
+lowercased `owner/repo` slug and upserted, so the steady state for an allowlisted repository is no
+network call per run and two routers resolving different repositories at the same time cannot lose
+each other's entries. Failures are never cached, so connecting an environment upstream takes effect
+on the next run. Nothing expires the cache: an environment deleted or re-created upstream leaves a
+stale entry, and the correction signal is the `codex cloud exec` failure it produces, which lands in
+that row's `outcome`. Delete the database file to force a re-resolve.
+
+**Cloud tasks do not carry your local Codex connectors or credentials.** `codex cloud exec` forwards
+only the prompt, the environment id, and the branch. It does not forward local MCP configuration,
+connector credentials, or anything else from this machine. The `missing_connector` gate is scored
+only against the `connectors` list above, which is what Codex can reach on this box, not what a cloud
+environment can reach, so a task can be judged connector complete locally and then be sent to a cloud
+environment with no such connector. The router does not detect this: the classifier has no signal
+for which connectors a task needs, only whether Codex is missing one locally. The only guard today is
+not allowlisting a repository whose tasks depend on connectors configured locally.
+
+Cloud is Codex-only, and there is no key to change that. `claude --cloud` hard-requires an
+interactive TTY, so Claude has no headless cloud dispatch to route to. A task pinned to Claude by a
+missing connector or by orchestration runs locally however cloud-eligible its repository is. So does
+a run that names a provider with `--provider`, because that caller has taken control of dispatch and
+has no flag to opt back out of the cloud with.
 
 ## `[policy]`
 

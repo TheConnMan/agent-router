@@ -18,6 +18,7 @@ GATED_PATHS=(
     "crates/agent-router-core/src/decide.rs"
     "crates/agent-router-core/src/config.rs"
     "crates/agent-router-core/src/usage.rs"
+    "crates/agent-router-core/src/cloud.rs"
     "crates/agent-router-core/src/run.rs"
     "crates/agent-router-core/src/runtime.rs"
 )

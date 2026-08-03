@@ -7,6 +7,7 @@
 //! a process, a socket, or a disk sits inside either pure function, so the mapping table and the
 //! monotonicity rule are both testable with no backend at all.
 
+use crate::decide::ExecutionTarget;
 use crate::error::Result;
 use crate::log::{DecisionLog, StatusRow};
 use crate::runtime::home_dir;
@@ -217,6 +218,13 @@ pub fn reconcile(log: &DecisionLog, window: Window) -> Result<Report> {
                 },
                 None => Observation::Unavailable,
             },
+            // A cloud row's job_id is a cloud task id, not an app-server thread id. Asking the
+            // local daemon about it would answer Unknown, and `settle` would then write `unknown`
+            // over `dispatched` on every run: a permanent downgrade of a true fact, on the strength
+            // of a question asked of the wrong system. Unsupported is the honest reading, and
+            // `reconcile` already leaves an Unsupported row entirely alone. Polling
+            // `codex cloud status` is deliberately not built here.
+            "codex" if is_cloud(row) => Observation::Unsupported,
             "codex" => codex
                 .get(&row.job_id)
                 .cloned()
@@ -250,6 +258,18 @@ pub fn reconcile(log: &DecisionLog, window: Window) -> Result<Report> {
     })
 }
 
+/// PURE: whether a logged row ran in the cloud, tested against the same constant `tag` stamped into
+/// the column rather than against a literal spelled here.
+///
+/// Both cloud tests in this module go through it. The token belongs to `ExecutionTarget`, whose doc
+/// frames it as revisitable, so a `"cloud"` literal here would survive a retag as clean-compiling
+/// dead condition: every cloud row would then be asked about by the local app-server, answer
+/// Unknown, and have `dispatched` overwritten with `unknown` on every run thereafter. That is the
+/// data corruption both call sites exist to prevent, and it is silent.
+fn is_cloud(row: &StatusRow) -> bool {
+    row.execution_target.as_deref() == Some(ExecutionTarget::CLOUD_TAG)
+}
+
 /// IMPURE: the claude job list, or None when the router could not read it. One call serves the
 /// whole window, and a window holding no claude row never runs `claude` at all.
 fn claude_states(rows: &[StatusRow]) -> Option<BTreeMap<String, String>> {
@@ -261,10 +281,15 @@ fn claude_states(rows: &[StatusRow]) -> Option<BTreeMap<String, String>> {
 
 /// IMPURE: what the app-server knows about the codex threads in the window. Empty when there are
 /// none, so a window with no codex row never even probes for a daemon.
+///
+/// A cloud row is excluded here as well as at the observation match above, and the two are not
+/// redundant. This filter is what keeps a window holding only cloud rows from probing for a daemon
+/// at all, and it is what keeps a cloud task id out of the list the app-server is asked about, so
+/// no answer about it can exist to be misread later.
 fn codex_states(rows: &[StatusRow]) -> BTreeMap<String, Observation> {
     let thread_ids: Vec<String> = rows
         .iter()
-        .filter(|row| row.provider == "codex")
+        .filter(|row| row.provider == "codex" && !is_cloud(row))
         .map(|row| row.job_id.clone())
         .collect();
     if thread_ids.is_empty() {

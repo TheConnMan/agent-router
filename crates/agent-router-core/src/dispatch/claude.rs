@@ -94,6 +94,9 @@ pub fn dispatch_with_binary(
         // does not know, and exits 0 having run at its own default. So nothing was observed, and
         // filling this in from the decided effort or the model would record a guess as a reading.
         effective_effort: None,
+        // Permanently None rather than not yet implemented: Claude has no headless cloud dispatch
+        // to carry a task URL back from, because `claude --cloud` hard-requires an interactive TTY.
+        cloud_task_url: None,
     })
 }
 

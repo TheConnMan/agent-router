@@ -19,6 +19,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::SystemTime;
 
+// The fixture repository builder, included by path from the core crate's tests exactly as the
+// sibling CLI test files do. This file, `cloud_target_cli.rs`, and the core crate's
+// `cloud_eligibility.rs` all build throwaway repositories the same way.
+#[path = "../../agent-router-core/tests/common/mod.rs"]
+mod common;
+
+use common::git;
+
 /// One of the six paths the gate filters against, standing in for "routing behavior changed". The
 /// tests assert the script names it back, because a failure that does not say which file tripped
 /// it sends the developer looking.
@@ -69,29 +77,6 @@ fn write_file(repo: &Path, relative: &str, contents: &str) {
         fs::create_dir_all(parent).expect("create parent directory");
     }
     fs::write(path, contents).expect("write fixture file");
-}
-
-/// Identity is passed inline on every invocation so the fixture works on a box with no git identity
-/// configured, and signing is disabled so a globally configured signing key cannot block a commit.
-fn git(repo: &Path, args: &[&str]) {
-    let output = Command::new("git")
-        .current_dir(repo)
-        .args([
-            "-c",
-            "user.email=test@example.com",
-            "-c",
-            "user.name=test",
-            "-c",
-            "commit.gpgsign=false",
-        ])
-        .args(args)
-        .output()
-        .expect("run git");
-    assert!(
-        output.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
 }
 
 fn commit_all(repo: &Path, message: &str) {

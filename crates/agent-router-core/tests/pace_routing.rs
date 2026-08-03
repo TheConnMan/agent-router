@@ -16,6 +16,7 @@
 use agent_router_core::classify::{
     Classification, Complexity, TaskContextHorizon, parse_classification,
 };
+use agent_router_core::cloud::{CloudEligibility, CloudIneligible};
 use agent_router_core::config::{Config, DefaultProvider};
 use agent_router_core::decide::{Gate, decide};
 use agent_router_core::{Headroom, Provider, UsageSnapshot};
@@ -27,6 +28,14 @@ const NOW: i64 = 1_785_400_000;
 const WEEK: i64 = 604_800;
 /// Half the weekly window: a reset this far out means the window is exactly 50 percent elapsed.
 const HALF_WEEK: i64 = 302_400;
+
+/// The cloud eligibility every case here decides under: none. These cases are about the usage
+/// rules, which run before the target is computed and are not affected by it, so a constant keeps
+/// each one about the rule it names. A repository outside the allowlist is the state every existing
+/// operator is in, so it is also the honest default rather than a null input.
+fn no_cloud() -> CloudEligibility {
+    CloudEligibility::Ineligible(CloudIneligible::NotAllowlisted)
+}
 
 /// One provider's window, stated as how long is left of its weekly window rather than as an
 /// absolute reset, because the expected burn is a function of exactly that distance.
@@ -125,6 +134,7 @@ fn an_orchestration_task_pins_to_claude_past_every_usage_rule() {
         scored(true, false, Complexity::High),
         usage(window(99.0, HALF_WEEK, 100.0), unknown_window(0.0, 0.0)),
         NOW,
+        no_cloud(),
         &config,
     );
 
@@ -145,6 +155,7 @@ fn a_missing_connector_pins_to_claude_past_every_usage_rule() {
         scored(false, true, Complexity::High),
         usage(window(99.0, HALF_WEEK, 100.0), unknown_window(0.0, 0.0)),
         NOW,
+        no_cloud(),
         &config,
     );
 
@@ -172,6 +183,7 @@ fn the_override_can_never_flip_into_a_provider_at_the_hard_ceiling() {
             window(90.0, WEEK * 9 / 10, 0.0),
         ),
         NOW,
+        no_cloud(),
         &config,
     );
 
@@ -194,6 +206,7 @@ fn the_one_eligible_provider_takes_the_task_even_when_pace_prefers_the_other() {
             window(config.hard_ceiling_pct, 0, 0.0),
         ),
         NOW,
+        no_cloud(),
         &config,
     );
 
@@ -213,6 +226,7 @@ fn both_providers_over_the_ceiling_keep_the_default_and_flag_it() {
         plain(),
         usage(window(99.0, 0, 0.0), window(98.0, WEEK, 0.0)),
         NOW,
+        no_cloud(),
         &config,
     );
 
@@ -230,7 +244,7 @@ fn both_providers_over_the_ceiling_keep_the_default_and_flag_it() {
 #[test]
 fn a_run_rate_gap_past_the_dead_zone_moves_the_task() {
     let config = Config::default();
-    let decision = decide(plain(), blowout(), NOW, &config);
+    let decision = decide(plain(), blowout(), NOW, no_cloud(), &config);
 
     assert_eq!(decision.provider, Provider::Claude);
     assert_eq!(decision.gates, vec![Gate::PaceFlip]);
@@ -248,7 +262,7 @@ fn a_run_rate_gap_past_the_dead_zone_moves_the_task() {
 fn a_gap_inside_the_dead_zone_or_exactly_on_it_does_not_flip() {
     let config = Config::default();
 
-    let inside = decide(plain(), chronic(), NOW, &config);
+    let inside = decide(plain(), chronic(), NOW, no_cloud(), &config);
     assert_eq!(inside.provider, Provider::Codex);
     assert!(inside.gates.is_empty(), "{:?}", inside.gates);
 
@@ -257,6 +271,7 @@ fn a_gap_inside_the_dead_zone_or_exactly_on_it_does_not_flip() {
         plain(),
         usage(window(5.0, HALF_WEEK, 0.0), window(75.0, HALF_WEEK, 0.0)),
         NOW,
+        no_cloud(),
         &config,
     );
     assert_eq!(on_the_line.provider, Provider::Codex);
@@ -266,6 +281,7 @@ fn a_gap_inside_the_dead_zone_or_exactly_on_it_does_not_flip() {
         plain(),
         usage(window(5.0, HALF_WEEK, 0.0), window(75.1, HALF_WEEK, 0.0)),
         NOW,
+        no_cloud(),
         &config,
     );
     assert_eq!(just_past.provider, Provider::Claude);
@@ -282,6 +298,7 @@ fn two_providers_running_equally_light_keep_the_default_with_no_gate() {
         plain(),
         usage(window(5.0, HALF_WEEK, 0.0), window(5.0, HALF_WEEK, 0.0)),
         NOW,
+        no_cloud(),
         &config,
     );
 
@@ -305,6 +322,7 @@ fn pace_is_measured_against_each_providers_own_reset() {
         plain(),
         usage(window(10.0, WEEK, 0.0), window(85.0, WEEK / 10, 0.0)),
         NOW,
+        no_cloud(),
         &config,
     );
 
@@ -323,6 +341,7 @@ fn a_window_resetting_at_this_instant_counts_as_fully_elapsed() {
         plain(),
         usage(window(20.0, 0, 0.0), window(60.0, HALF_WEEK, 0.0)),
         NOW,
+        no_cloud(),
         &config,
     );
 
@@ -345,6 +364,7 @@ fn expected_burn_is_clamped_at_both_ends_of_the_window() {
         plain(),
         usage(window(45.0, HALF_WEEK, 0.0), window(10.0, WEEK * 2, 0.0)),
         NOW,
+        no_cloud(),
         &config,
     );
     assert_eq!(far_future_reset.provider, Provider::Codex);
@@ -354,6 +374,7 @@ fn expected_burn_is_clamped_at_both_ends_of_the_window() {
         plain(),
         usage(window(90.0, -WEEK, 0.0), window(60.0, HALF_WEEK, 0.0)),
         NOW,
+        no_cloud(),
         &config,
     );
     assert_eq!(stale_past_reset.provider, Provider::Codex);
@@ -373,7 +394,7 @@ fn the_override_is_symmetric_and_measured_from_the_current_provider() {
     let mut config = Config::default();
     config.policy.default_provider = DefaultProvider::Claude;
 
-    let stays = decide(plain(), blowout(), NOW, &config);
+    let stays = decide(plain(), blowout(), NOW, no_cloud(), &config);
     assert_eq!(stays.provider, Provider::Claude);
     assert!(stays.gates.is_empty(), "{:?}", stays.gates);
 
@@ -381,6 +402,7 @@ fn the_override_is_symmetric_and_measured_from_the_current_provider() {
         plain(),
         usage(window(80.0, HALF_WEEK, 0.0), window(5.0, HALF_WEEK, 0.0)),
         NOW,
+        no_cloud(),
         &config,
     );
     assert_eq!(leaves.provider, Provider::Codex);
@@ -404,6 +426,7 @@ fn an_unknown_reset_skips_pace_and_keeps_the_default() {
         plain(),
         usage(unknown_window(10.0, 0.0), window(90.0, HALF_WEEK, 0.0)),
         NOW,
+        no_cloud(),
         &config,
     );
     assert_eq!(claude_unknown.provider, Provider::Codex);
@@ -414,6 +437,7 @@ fn an_unknown_reset_skips_pace_and_keeps_the_default() {
         plain(),
         usage(window(10.0, HALF_WEEK, 0.0), unknown_window(90.0, 0.0)),
         NOW,
+        no_cloud(),
         &config,
     );
     assert_eq!(codex_unknown.provider, Provider::Codex);
@@ -437,12 +461,24 @@ fn complexity_picks_the_tier_and_never_the_provider() {
     ];
 
     for (complexity, codex_model, claude_model) in cases {
-        let stays = decide(scored(false, false, complexity), chronic(), NOW, &config);
+        let stays = decide(
+            scored(false, false, complexity),
+            chronic(),
+            NOW,
+            no_cloud(),
+            &config,
+        );
         assert_eq!(stays.provider, Provider::Codex, "{complexity:?} on codex");
         assert_eq!(stays.model.as_deref(), Some(codex_model));
         assert_eq!(stays.effort, None);
 
-        let flips = decide(scored(false, false, complexity), blowout(), NOW, &config);
+        let flips = decide(
+            scored(false, false, complexity),
+            blowout(),
+            NOW,
+            no_cloud(),
+            &config,
+        );
         assert_eq!(flips.provider, Provider::Claude, "{complexity:?} on claude");
         assert_eq!(flips.model.as_deref(), Some(claude_model));
         assert_eq!(flips.effort, None);
@@ -463,6 +499,7 @@ fn an_override_to_claude_is_paced_straight_back_by_the_five_hour_window() {
             window(80.0, HALF_WEEK, 0.0),
         ),
         NOW,
+        no_cloud(),
         &config,
     );
 
@@ -480,6 +517,7 @@ fn five_hour_pacing_does_not_fire_when_codex_has_no_weekly_room() {
         plain(),
         usage(window(40.0, HALF_WEEK, 100.0), window(99.0, HALF_WEEK, 0.0)),
         NOW,
+        no_cloud(),
         &config,
     );
 
@@ -498,6 +536,7 @@ fn a_codex_five_hour_window_never_moves_a_task() {
         plain(),
         usage(window(5.0, HALF_WEEK, 0.0), window(55.0, HALF_WEEK, 100.0)),
         NOW,
+        no_cloud(),
         &config,
     );
     assert_eq!(stays.provider, Provider::Codex);
@@ -507,6 +546,7 @@ fn a_codex_five_hour_window_never_moves_a_task() {
         plain(),
         usage(window(5.0, HALF_WEEK, 0.0), window(80.0, HALF_WEEK, 100.0)),
         NOW,
+        no_cloud(),
         &config,
     );
     assert_eq!(flips.provider, Provider::Claude);
@@ -520,7 +560,7 @@ fn disabled_weekly_routing_switches_the_override_off_too() {
     let mut config = Config::default();
     config.policy.weekly_routing = false;
 
-    let decision = decide(plain(), blowout(), NOW, &config);
+    let decision = decide(plain(), blowout(), NOW, no_cloud(), &config);
 
     assert_eq!(decision.provider, Provider::Codex);
     assert_eq!(decision.gates, vec![Gate::WeeklyRoutingDisabled]);
@@ -536,6 +576,7 @@ fn a_failed_classifier_keeps_the_default_and_stays_eligible_for_the_override() {
         Classification::fallback("timed out after 60s", DefaultProvider::Codex),
         blowout(),
         NOW,
+        no_cloud(),
         &config,
     );
 
@@ -563,7 +604,7 @@ fn the_old_flip_gap_key_is_not_an_alias_for_the_new_one() {
     let stale = Config::load_from(&stale_path).expect("load the stale config");
     assert_eq!(stale.pace_flip_gap, config.pace_flip_gap);
 
-    let ignored = decide(plain(), blowout(), NOW, &stale);
+    let ignored = decide(plain(), blowout(), NOW, no_cloud(), &stale);
     assert_eq!(ignored.provider, Provider::Claude);
     assert_eq!(ignored.gates, vec![Gate::PaceFlip]);
 
@@ -572,7 +613,7 @@ fn the_old_flip_gap_key_is_not_an_alias_for_the_new_one() {
     std::fs::write(&tuned_path, "pace_flip_gap = 200.0\n").expect("write the tuned config");
     let tuned = Config::load_from(&tuned_path).expect("load the tuned config");
     assert_eq!(tuned.pace_flip_gap, 200.0);
-    let honoured = decide(plain(), blowout(), NOW, &tuned);
+    let honoured = decide(plain(), blowout(), NOW, no_cloud(), &tuned);
     assert_eq!(honoured.provider, Provider::Codex);
     assert!(honoured.gates.is_empty(), "{:?}", honoured.gates);
 }

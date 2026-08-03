@@ -13,6 +13,7 @@
 //! 40 carry both resets and can be replayed through the override.
 
 use agent_router_core::classify::{Classification, Complexity, TaskContextHorizon};
+use agent_router_core::cloud::{CloudEligibility, CloudIneligible};
 use agent_router_core::config::{Config, DefaultProvider};
 use agent_router_core::decide::{Decision, Gate, decide};
 use agent_router_core::{Headroom, Provider, UsageSnapshot};
@@ -23,6 +24,22 @@ const FIXTURE: &str = include_str!("fixtures/decision_history.json");
 /// The weekly window, in seconds, for the gap the band tests SELECT rows by. Nothing here asserts
 /// this arithmetic: it picks which fixture rows a case is about, and `decide` is what is measured.
 const WEEK_SECS: f64 = 604_800.0;
+
+/// The eligibility every replayed row is decided under.
+///
+/// A CONSTANT is correct here only because every row in the current fixture predates cloud and
+/// therefore carries no `execution_target`. Eligibility changes only `execution_target` and `model`,
+/// never `provider`, so a constant reproduces the recorded provider decisions exactly.
+///
+/// WHEN THE FIXTURE IS NEXT REGENERATED WITH CLOUD-ERA ROWS, this must be reconstructed per row
+/// from that row's recorded `execution_target` column rather than synthesized as a constant. A
+/// constant applied to a cloud-era row replays it as though it had been ineligible, which changes
+/// the `model` the replay computes and makes the backtest quietly disagree with the history it is
+/// replaying. Nothing fails until then, so this comment is the only thing that carries the
+/// requirement to whoever regenerates the fixture.
+fn no_cloud() -> CloudEligibility {
+    CloudEligibility::Ineligible(CloudIneligible::NotAllowlisted)
+}
 
 /// One logged decision, with the fields a replay needs. The fixture carries more (task excerpt,
 /// model, rationale); serde drops what is not named here.
@@ -122,7 +139,13 @@ impl HistoricalRow {
     }
 
     fn replay(&self, config: &Config) -> Decision {
-        decide(self.classification(), self.usage(), self.now(), config)
+        decide(
+            self.classification(),
+            self.usage(),
+            self.now(),
+            no_cloud(),
+            config,
+        )
     }
 }
 
@@ -391,7 +414,13 @@ fn a_cold_pace_delta_never_routes_into_a_provider_at_the_ceiling() {
     // pace, a gap past the dead zone, against a Claude that still reads as under it.
     exhausted.codex.weekly_pct = 90.0;
 
-    let decision = decide(row.classification(), exhausted, row.now(), &config);
+    let decision = decide(
+        row.classification(),
+        exhausted,
+        row.now(),
+        no_cloud(),
+        &config,
+    );
     assert_eq!(decision.provider, Provider::Codex);
     assert!(!decision.gates.contains(&Gate::PaceFlip));
 }

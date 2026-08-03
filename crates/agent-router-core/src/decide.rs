@@ -3,6 +3,7 @@
 //! its inputs, the deciding instant included.
 
 use crate::classify::{Classification, Complexity};
+use crate::cloud::{CloudEligibility, CloudIneligible, CloudTarget};
 use crate::config::{Config, DefaultProvider};
 use crate::provider::Provider;
 use crate::usage::{Headroom, UsageSnapshot};
@@ -66,6 +67,44 @@ impl Gate {
     }
 }
 
+/// Where a decision runs, as against which provider runs it. The two are orthogonal: `provider`
+/// stays `codex` for a cloud job, because a cloud task draws on the same Codex weekly window and
+/// every reader that keys off that column has to keep working.
+///
+/// The variant is `CodexCloud` rather than `Cloud` on purpose. There is no provider-neutral cloud
+/// concept for a claude decision to inhabit: `claude --cloud` hard-requires an interactive TTY, so
+/// Claude has no headless cloud dispatch at all, and naming the variant after its one provider is
+/// what stops a later reader looking for the claude arm.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionTarget {
+    Local,
+    CodexCloud(CloudTarget),
+}
+
+impl ExecutionTarget {
+    /// The token a cloud row carries in the `execution_target` column, named so a reader of that
+    /// column can test for it without respelling the literal.
+    ///
+    /// It exists because `tag` is the ONLY producer of this token and its own doc frames the choice
+    /// as revisitable, while `status.rs` has to recognize a cloud row to leave it alone. A bare
+    /// `"cloud"` there would keep compiling through a retag and silently resume asking the local
+    /// app-server about cloud task ids, which answers Unknown, which `settle` then writes over
+    /// `dispatched` on every run: a permanent downgrade of a true fact. Retagging now moves the
+    /// producer and every consumer together.
+    pub const CLOUD_TAG: &'static str = "cloud";
+
+    /// PURE: the token the log column carries and the CLI prints. Deliberately not the variant
+    /// name: the column is read by humans and by `agent-router log --json`, and `codex_cloud` there
+    /// would invite the reading that a second cloud kind is coming.
+    pub const fn tag(&self) -> &'static str {
+        match self {
+            ExecutionTarget::Local => "local",
+            ExecutionTarget::CodexCloud(_) => ExecutionTarget::CLOUD_TAG,
+        }
+    }
+}
+
 /// One routing decision: where the task goes, with what model and effort, and why.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Decision {
@@ -93,6 +132,17 @@ pub struct Decision {
     pub effort: Option<String>,
     /// None when the caller named a provider and no classification ran.
     pub classification: Option<Classification>,
+    /// Where the job runs. Orthogonal to `provider`, which stays `codex` on a cloud decision.
+    ///
+    /// Only a codex decision can carry the cloud variant, and the mechanism is the single `match`
+    /// arm in `decide` that produces it, whose pattern names `Provider::Codex` literally. Claude
+    /// cannot reach it because it has no headless cloud dispatch to reach: `claude --cloud`
+    /// hard-requires an interactive TTY.
+    ///
+    /// A cloud decision carries `model: None`. `codex cloud exec` has no `--model` flag, because the
+    /// model belongs to the cloud environment, so recording the codex tier here would claim the
+    /// router picked a model it cannot set, in the column the tuning data reads as its own pick.
+    pub execution_target: ExecutionTarget,
     pub gates: Vec<Gate>,
     pub usage: UsageSnapshot,
     /// How far ahead of its own weekly window each provider was burning at the deciding instant,
@@ -127,10 +177,16 @@ impl Decision {
 ///    into an exhausted provider.
 /// 3. The run rate override, which is deliberately rare. See `pace_flip_gap`.
 /// 4. Claude's five hour pacing, last, on whichever provider the task landed on.
+///
+/// `cloud` is resolved by the caller rather than here, because resolving it reads git, the
+/// filesystem, and an HTTP endpoint. Passing it in is what keeps this function replayable: the
+/// backtest re-decides a recorded row at the instant it was decided, and an engine that resolved
+/// eligibility itself would start shelling out to git and calling the network on every replayed row.
 pub fn decide(
     classification: Classification,
     usage: UsageSnapshot,
     now_epoch_secs: i64,
+    cloud: CloudEligibility,
     config: &Config,
 ) -> Decision {
     let mut gates = Vec::new();
@@ -215,12 +271,45 @@ pub fn decide(
         model = model_for(provider, complexity, config);
     }
 
-    let rationale = rationale(&classification, provider, &gates, &usage);
+    // The ONLY site in the tree that produces a cloud target. The pattern names `Provider::Codex`
+    // literally, so a claude or opencode decision cannot reach the cloud arm, and the eligible arms
+    // enumerate every provider rather than ending in a wildcard: a provider added later has to be
+    // given an answer here at compile time instead of inheriting one.
+    //
+    // The target is computed here, after every usage rule has settled `provider`, and not alongside
+    // the default. A task paced onto Codex by the five hour window is a codex task by the time it is
+    // dispatched, so it is eligible for the cloud like any other.
+    let (execution_target, ineligible) = match (provider, cloud) {
+        (Provider::Codex, CloudEligibility::Eligible(target)) => {
+            // `codex cloud exec` takes no --model: the model belongs to the cloud environment.
+            // Carrying the codex tier across would record a model the router did not choose, in the
+            // column the tuning data reads as the router's own pick. It is the same shape opencode
+            // already produces, which `estimate::project` already handles by reporting its shortfall
+            // rather than sampling another key's rows. Cleared in the arm that builds the target, so
+            // the one target that cannot honour a model is the one place the fact is written.
+            model = None;
+            (ExecutionTarget::CodexCloud(target), None)
+        }
+        (Provider::Claude | Provider::Opencode, CloudEligibility::Eligible(_)) => {
+            (ExecutionTarget::Local, None)
+        }
+        (_, CloudEligibility::Ineligible(reason)) => (ExecutionTarget::Local, Some(reason)),
+    };
+
+    let rationale = rationale(
+        &classification,
+        provider,
+        &gates,
+        &usage,
+        &execution_target,
+        ineligible,
+    );
     Decision {
         provider,
         model,
         effort: None,
         classification: Some(classification),
+        execution_target,
         gates,
         usage,
         claude_pace_delta,
@@ -288,6 +377,12 @@ fn pace_delta(headroom: &Headroom, now_epoch_secs: i64) -> Option<f64> {
 
 /// PURE: the decision for a caller-named provider. No classification runs, but the usage
 /// snapshot is still recorded, because the log is the tuning data for the auto path.
+///
+/// Always local, and stated in the struct literal rather than inherited from a default so the
+/// choice is visible. A caller who named a provider has taken control of dispatch, and there is no
+/// `--target` flag for them to opt out of the cloud with, so this path stays local until one exists.
+/// This function takes no eligibility argument at all, which is what makes that structural: there is
+/// nothing here a cloud target could be built from.
 pub fn decide_explicit(
     provider: Provider,
     model: Option<String>,
@@ -299,6 +394,7 @@ pub fn decide_explicit(
         model: model.or_else(|| model_for(provider, UNSCORED_COMPLEXITY, config)),
         effort: None,
         classification: None,
+        execution_target: ExecutionTarget::Local,
         gates: vec![Gate::ExplicitProvider],
         usage,
         // No usage rule ran, so no run rate was measured. Recording one anyway would put a number
@@ -339,11 +435,22 @@ fn weekly_used(usage: &UsageSnapshot, provider: Provider) -> f64 {
 }
 
 /// PURE: the one-line reason, the string the CLI prints and the viewer will show.
+///
+/// The execution target is named at the end, and on a local decision so is the reason the repository
+/// did not qualify, so an operator who added an allowlist entry can see that it is not taking effect
+/// and why. `NotAllowlisted` is the one reason that prints nothing, because it is the answer for
+/// every repository of an operator who never asked for cloud, and a note on every line would be
+/// noise that trains the eye to skip the clause.
+///
+/// The reason is named and nothing else. No value read from `auth.json` reaches this string, which
+/// is why `CloudIneligible` carries no payload to reach it with.
 fn rationale(
     classification: &Classification,
     provider: Provider,
     gates: &[Gate],
     usage: &UsageSnapshot,
+    execution_target: &ExecutionTarget,
+    ineligible: Option<CloudIneligible>,
 ) -> String {
     let tags = if gates.is_empty() {
         String::new()
@@ -357,8 +464,18 @@ fn rationale(
                 .join(", ")
         )
     };
+    let target = match (execution_target, ineligible) {
+        (ExecutionTarget::CodexCloud(target), _) => {
+            format!("; cloud environment {}", target.environment_id())
+        }
+        // Spelled `Local` rather than `_`, because that is the real condition: a cloud target was
+        // answered by the arm above, so what is left is a local decision that either never asked for
+        // cloud or was not allowlisted. A wildcard here would read as depending on arm order.
+        (ExecutionTarget::Local, Some(CloudIneligible::NotAllowlisted) | None) => String::new(),
+        (ExecutionTarget::Local, Some(reason)) => format!("; cloud unavailable ({reason:?})"),
+    };
     format!(
-        "{}: {}{tags} (orchestration {}; codex weekly {:.0}%, claude weekly {:.0}%, claude 5h {:.0}%)",
+        "{}: {}{tags} (orchestration {}; codex weekly {:.0}%, claude weekly {:.0}%, claude 5h {:.0}%){target}",
         provider.name(),
         classification.rationale,
         if classification.orchestration {
@@ -377,6 +494,12 @@ mod tests {
     use super::*;
     use crate::classify::TaskContextHorizon;
     use crate::usage::Headroom;
+
+    /// The repository is not allowlisted, which is what an operator who has not asked for cloud
+    /// gets on every run: the decision is exactly what it was before the dimension existed.
+    fn no_cloud() -> CloudEligibility {
+        CloudEligibility::Ineligible(CloudIneligible::NotAllowlisted)
+    }
 
     /// The rules the engine routes by live in `tests/pace_routing.rs`, against the public API.
     /// What is left here is the explicit path, which no rule touches, and the rationale string.
@@ -446,6 +569,7 @@ mod tests {
             },
             usage(71.0, 50.0),
             1_785_400_000,
+            no_cloud(),
             &config,
         );
         assert!(

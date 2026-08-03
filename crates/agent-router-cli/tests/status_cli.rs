@@ -170,6 +170,7 @@ impl StatusFixture {
             job_name,
             outcome,
             effective_effort: None,
+            cloud_task_url: None,
         })
         .expect("seed a decision row")
     }

@@ -271,6 +271,15 @@ pub struct Config {
     /// ("Codex has every required connector") is scored against exactly this list, so anything
     /// absent here is what forces a task to Claude.
     pub connectors: Vec<String>,
+    /// The `owner/repo` slugs whose tasks may run as Codex cloud tasks. Empty is the default and
+    /// means cloud is off entirely: eligibility short-circuits on it before any git or network call,
+    /// so cloud is never inferred from a repository merely happening to be connected upstream. The
+    /// compare is ASCII case-insensitive, because GitHub treats owner and repo names that way.
+    ///
+    /// Declared above `policy` for the same reason `claude_five_hour_pacing_pct` is: an array of
+    /// strings serializes as a value rather than a table, and a value after a table typed field
+    /// makes `toml::to_string_pretty` fail when the default file is written on first run.
+    pub cloud_repos: Vec<String>,
     pub policy: Policy,
     /// Which engine and model score a task.
     pub classifier: Classifier,
@@ -293,6 +302,7 @@ impl Default for Config {
                 "gh (github)".to_string(),
                 "airtable".to_string(),
             ],
+            cloud_repos: Vec::new(),
             policy: Policy::default(),
             classifier: Classifier::default(),
             models: Models::default(),

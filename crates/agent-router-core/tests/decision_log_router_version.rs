@@ -35,6 +35,7 @@ fn record(log: &DecisionLog, task: &str) -> i64 {
         job_name: None,
         outcome: "dispatched",
         effective_effort: None,
+        cloud_task_url: None,
     })
     .expect("records the decision")
 }

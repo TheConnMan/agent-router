@@ -524,6 +524,10 @@ fn outcome_json(outcome: &Outcome) -> serde_json::Value {
     let decision = &outcome.decision;
     serde_json::json!({
         "provider": decision.provider.name(),
+        // Emitted on every run, local and cloud alike, so a consumer never has to read an absent
+        // key as a value. `cloud_task_url` rides out under "dispatch", which serializes `Dispatch`
+        // whole.
+        "execution_target": decision.execution_target.tag(),
         "model": decision.model,
         "effort": decision.effort,
         "gates": decision.gate_tags(),
@@ -552,15 +556,31 @@ fn print_outcome(outcome: &Outcome) {
     if let Some(effort) = &decision.effort {
         line.push_str(&format!(" effort {effort}"));
     }
+    // `=` rather than a space, so the token is greppable and a caller can assert on it exactly.
+    // Printed on every run, local and cloud alike, so its absence never has to be interpreted.
+    line.push_str(&format!(
+        " execution_target={}",
+        decision.execution_target.tag()
+    ));
     match &outcome.dispatch {
         Some(dispatch) => {
-            let id = dispatch.job_id.as_deref().unwrap_or("(id unresolved)");
+            // `job_id` is backend supplied text on its way to a terminal (a cloud row's id is
+            // parsed out of `codex cloud exec` stdout), the same reason `target_label` escapes it
+            // in the log listing below. `job_name` needs no matching escape: it prints via `{:?}`,
+            // and `Debug` for `str` already escapes control characters.
+            let id = dispatch
+                .job_id
+                .as_deref()
+                .map(escape_terminal_controls)
+                .unwrap_or_else(|| "(id unresolved)".to_string());
             line.push_str(&format!(" job {id} name {:?}", dispatch.job_name));
         }
         None => line.push_str(" (dry run, nothing dispatched)"),
     }
     println!("{line}");
-    println!("why: {}", decision.rationale);
+    // The rationale is model generated text now carrying a third-party environment id, so it is
+    // escaped for the same reason `job_id` above is: it reaches a raw terminal write unformatted.
+    println!("why: {}", escape_terminal_controls(&decision.rationale));
     if let Some(estimate) = &outcome.estimate {
         print_estimate(estimate);
     }
@@ -651,13 +671,19 @@ fn log(
     }
     for row in &rows {
         println!(
-            "#{id} {provider}{dry} orchestration {orchestration} {complexity} \
+            "#{id} {provider}{dry} {target} orchestration {orchestration} {complexity} \
              pace claude {claude_pace} codex {codex_pace} \
              gates[{gates}] codex {codex:.0}% claude {claude:.0}% {job} \
-             {outcome}{judgement}",
+             {outcome}{task_url}{judgement}",
             id = row.id,
             provider = row.provider,
             dry = if row.dry_run { " (dry run)" } else { "" },
+            // Where the job ran, and for a cloud row where the task itself went. The url is the
+            // only way back to a submitted task, and it reaches the human listing rather than
+            // `--json` alone because this is the surface an operator reads when a cloud dispatch
+            // failed, which is the whole correction path for a stale cached environment id.
+            target = target_label(row.execution_target.as_deref()),
+            task_url = task_url_label(row.cloud_task_url.as_deref()),
             complexity = row.complexity.as_deref().unwrap_or("-"),
             orchestration = flag(row.orchestration),
             claude_pace = pace(row.claude_pace_delta),
@@ -918,7 +944,33 @@ fn row_json(row: &Row) -> serde_json::Value {
         // version: the point of the column is that an aggregate spanning several of these is
         // visibly mixed rather than pooled as one population.
         "router_version": row.router_version,
+        // Null on a row written before this column, which is not the same as `local`: every row
+        // this build writes names its target, so a null here means the row does not know.
+        "execution_target": row.execution_target,
+        // Null on every local row, where no cloud task was submitted, and on every pre-column row.
+        "cloud_task_url": row.cloud_task_url,
     })
+}
+
+/// Where a row says it ran, or "-" when it does not know. A row written before the column is not a
+/// local one, and printing "local" for it would invent a fact, exactly as it would for the router
+/// version beside it.
+fn target_label(execution_target: Option<&str>) -> String {
+    match execution_target {
+        Some(target) => escape_terminal_controls(target),
+        None => "-".to_string(),
+    }
+}
+
+/// The cloud task's url, printed only where there is one. A local row has no such thing rather than
+/// one that went unread, so it prints nothing at all rather than a placeholder every line would
+/// carry. Escaped for the same reason the outcome is: it is backend supplied text on its way to a
+/// terminal.
+fn task_url_label(cloud_task_url: Option<&str>) -> String {
+    match cloud_task_url {
+        Some(url) => format!(" task {}", escape_terminal_controls(url)),
+        None => String::new(),
+    }
 }
 
 /// A recorded boolean, or "-" when the row does not know. An older row scored no orchestration and

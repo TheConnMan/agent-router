@@ -187,8 +187,9 @@ impl ManagedClient {
             job_id: Some(created.id),
             job_name: name.to_string(),
             // Opencode is never sent an effort and reports none back, so there is nothing observed
-            // to record here.
+            // to record here. Nor does anything carry a cloud task in either direction.
             effective_effort: None,
+            cloud_task_url: None,
         })
     }
 
@@ -333,8 +334,10 @@ fn dispatch_cli(cwd: &Path, task: &str, name: &str, model: Option<&str>) -> Resu
     Ok(Dispatch {
         job_id: None,
         job_name: name.to_string(),
-        // Same as the managed path: nothing carries an effort in either direction.
+        // Same as the managed path: nothing carries an effort, or a cloud task, in either
+        // direction.
         effective_effort: None,
+        cloud_task_url: None,
     })
 }
 

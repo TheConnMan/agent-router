@@ -20,4 +20,8 @@ ureq = "3"
 libc = "0.2.186"
 
 [dev-dependencies]
+# The integration tests seed and read back the cloud environment cache, which is a SQLite table.
+# Seeding it through the same library production writes it with is what keeps those tests pointed at
+# the real storage rather than at a test-only affordance.
+rusqlite = { version = "0.40.1", features = ["bundled"] }
 tempfile = "3.27.0"

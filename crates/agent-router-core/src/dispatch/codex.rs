@@ -265,6 +265,9 @@ pub fn dispatch(
                 job_id: Some(thread_id),
                 job_name: name.to_string(),
                 effective_effort,
+                // The local app-server path: no cloud task exists here, rather than one whose URL
+                // went unread.
+                cloud_task_url: None,
             }),
             SpawnAttempt::TurnFailed { thread_id, error } => Err(Error::Command(format!(
                 "app-server started thread {thread_id} but its first turn failed: {error}"
@@ -348,7 +351,11 @@ fn ensure_daemon() -> std::result::Result<Daemon, String> {
     }
 }
 
-fn run_reporting_failure(
+/// Shared with `dispatch/codex_cloud.rs`, which needs exactly this and nothing else out of the
+/// app-server transport: run a child, bound it by a timeout that kills it, and report its stdout or
+/// a description of how it failed. Duplicating it there would be roughly sixty lines of process
+/// plumbing kept in sync by hand.
+pub(crate) fn run_reporting_failure(
     mut command: Command,
     timeout: Duration,
 ) -> std::result::Result<String, String> {

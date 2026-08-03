@@ -1,15 +1,25 @@
-//! Shared fixture helper for writing an executable shell stub.
+//! Shared fixtures: an executable shell stub, a throwaway git repository, and a stand-in for the
+//! environments endpoint.
 //!
 //! Every stub-writing fixture in this workspace used to inline the same three steps: `fs::write`
 //! the script, `set_mode(0o700)`, then exec it. This module is the single place that shape lives,
 //! so the fixture's postcondition can be established once rather than nine times.
+//!
+//! The endpoint stub and the `git` runner arrived the same way, as near-verbatim copies in
+//! `cloud_eligibility.rs` (core) and `cloud_target_cli.rs` (cli), which are separate crates and
+//! reach this file by `#[path]` include. They live here for the same reason: an HTTP head parser and
+//! a fixture repository builder are not what either of those files is about, and two copies of a
+//! parser drift into two different ideas of what the endpoint said.
 #![cfg(unix)]
 #![allow(dead_code)]
 
 use std::fs;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// How long the probe keeps retrying before it gives up and fails the fixture.
@@ -133,4 +143,177 @@ pub fn write_stub(path: &Path, body: &str) {
             ),
         }
     }
+}
+
+/// Run `git` in `repo` and fail the fixture with git's own stderr if it did not succeed.
+///
+/// Identity and signing are passed inline on every invocation, so the fixture works on a box with no
+/// git identity configured and a globally configured signing key cannot block a commit. `git` is not
+/// mocked anywhere it is used: it is the real dependency of the things under test, and a mocked one
+/// would test the fixture's idea of a repository rather than a repository.
+pub fn git(repo: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .current_dir(repo)
+        .args([
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=test",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Ceiling on reading one request head, so a client that opens a socket and says nothing cannot
+/// wedge the accept loop and therefore cannot hang the test binary.
+const STUB_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Ceiling on one request head, so a client that never sends the blank line cannot grow it
+/// unboundedly either.
+const STUB_MAX_HEAD: usize = 16 * 1024;
+
+/// One request the stub received, reduced to the two things worth asserting on: where it was aimed
+/// and what it carried.
+#[derive(Clone, Debug)]
+pub struct RecordedRequest {
+    pub target: String,
+    pub headers: Vec<(String, String)>,
+}
+
+impl RecordedRequest {
+    /// The request line's target and every header, names lowercased because HTTP header names are
+    /// case-insensitive and which case `ureq` sends in is not this suite's business.
+    fn parse(head: &str) -> Option<RecordedRequest> {
+        let mut lines = head.split("\r\n");
+        let target = lines.next()?.split_whitespace().nth(1)?.to_string();
+        let headers = lines
+            .take_while(|line| !line.is_empty())
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string()))
+            .collect();
+        Some(RecordedRequest { target, headers })
+    }
+
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(header, _)| header == name)
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+/// A stand-in for the environments endpoint, bound on a loopback port.
+///
+/// This exists so the credential path can be executed offline. Without it the only route to
+/// `Eligible` is a seeded cache, which returns before the credential is ever opened, and the
+/// credential-confinement property is then asserted by a test that never runs the code it is about.
+///
+/// The accept loop runs on a detached thread and never stops. Nothing joins it: the libtest process
+/// exits when its tests finish and takes the thread with it, and a stop signal would buy only a
+/// tidier shutdown of a socket the kernel closes anyway. What the loop does guarantee is that no
+/// single connection can wedge it, hence the read timeout and the head ceiling.
+pub struct EnvironmentsStub {
+    /// What a case hands `eligibility_in`, or a child process, as its base URL. No trailing slash:
+    /// production joins `{base}/{owner}/{repo}`, so one here would send a doubled separator and the
+    /// target assertions would be testing the fixture.
+    base_url: String,
+    requests: Arc<Mutex<Vec<RecordedRequest>>>,
+}
+
+impl EnvironmentsStub {
+    /// One canned body for every request target, for a case that resolves exactly one repository.
+    pub fn serving(body: &'static str) -> EnvironmentsStub {
+        EnvironmentsStub::routing(move |_| body)
+    }
+
+    /// A body chosen by request PATH, for one stub shared by several cases.
+    ///
+    /// Routing on the path is what makes sharing sound: it is the thing production varies anyway, so
+    /// a shared stub distinguishes cases the same way the real endpoint does rather than by holding
+    /// per-case state. A case that answers `[]` because its path was registered with a typo would
+    /// read as a repository nobody connected, which is why every case asserts its own request count.
+    pub fn routing(body_for: impl Fn(&str) -> &'static str + Send + 'static) -> EnvironmentsStub {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind the stub endpoint");
+        let port = listener.local_addr().expect("stub endpoint address").port();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let _ = stream.set_read_timeout(Some(STUB_READ_TIMEOUT));
+                let Some(head) = read_request_head(&mut stream) else {
+                    continue;
+                };
+                let Some(request) = RecordedRequest::parse(&head) else {
+                    continue;
+                };
+                let body = body_for(&request.target);
+                // Recorded BEFORE the response is written, which is what makes reading the log
+                // race-free: a caller that has received its response has necessarily already had
+                // its request recorded, so a case reading the log after the run returns never
+                // observes a half-handled request.
+                recorded.lock().expect("stub request log").push(request);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        EnvironmentsStub {
+            base_url: format!("http://127.0.0.1:{port}"),
+            requests,
+        }
+    }
+
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// Every request this stub received, for a stub only one case is using.
+    pub fn requests(&self) -> Vec<RecordedRequest> {
+        self.requests.lock().expect("stub request log").clone()
+    }
+
+    /// The requests aimed at one target, which is how a case reads its own traffic out of a stub
+    /// shared with every other case in the binary.
+    pub fn requests_for(&self, target: &str) -> Vec<RecordedRequest> {
+        self.requests
+            .lock()
+            .expect("stub request log")
+            .iter()
+            .filter(|request| request.target == target)
+            .cloned()
+            .collect()
+    }
+}
+
+/// Everything up to and including the blank line that ends an HTTP request head. None on a closed
+/// connection, a timeout, a head past the ceiling, or bytes that are not UTF-8.
+///
+/// A GET carries no body, so the head is the whole request and there is nothing further to drain.
+fn read_request_head(stream: &mut TcpStream) -> Option<String> {
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        if head.len() >= STUB_MAX_HEAD {
+            return None;
+        }
+        match stream.read(&mut byte) {
+            Ok(0) | Err(_) => return None,
+            Ok(_) => head.push(byte[0]),
+        }
+    }
+    String::from_utf8(head).ok()
 }

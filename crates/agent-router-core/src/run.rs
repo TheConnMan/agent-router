@@ -45,6 +45,10 @@ pub struct Dispatch {
     /// reply. None for claude and opencode, permanently: neither exposes one, so there is nothing
     /// observed to record and an inferred value here would read as an observed one.
     pub effective_effort: Option<String>,
+    /// The cloud task's URL, as `codex cloud exec` printed it. None on every local dispatch, where
+    /// there is no such thing rather than one that went unread. The task id parsed out of it is in
+    /// `job_id`, so a cloud job is findable by the same field as every other backend's.
+    pub cloud_task_url: Option<String>,
 }
 
 /// The whole outcome, including the decision log row id.
@@ -93,12 +97,21 @@ pub fn run(request: &Request, config: &Config) -> Result<Outcome> {
         Some(provider) => decide_explicit(provider, request.model.clone(), usage, config),
         // `decide` is pure and takes the instant it decides at, so the clock is read here, on the
         // impure side, and after the usage snapshot the run rate rules measure against it.
-        None => decide(
-            classify(request.task, config),
-            usage,
-            crate::usage::now_epoch(),
-            config,
-        ),
+        None => {
+            // Resolved here for the same reason and never inside `decide`: this reads git, the
+            // filesystem, and an HTTP endpoint, and `decide` staying pure is what lets
+            // `pace_backtest` replay a recorded row at the instant it was decided. Only the auto
+            // path resolves it, so an explicit --provider run makes no git call and no network
+            // call at all.
+            let cloud = crate::cloud::eligibility(request.dir, config);
+            decide(
+                classify(request.task, config),
+                usage,
+                crate::usage::now_epoch(),
+                cloud,
+                config,
+            )
+        }
     };
     let requested = request
         .provider
@@ -125,6 +138,10 @@ pub fn run(request: &Request, config: &Config) -> Result<Outcome> {
             outcome: "dry-run",
             // A dry run dispatched nothing, so no backend said anything about an effort.
             effective_effort: None,
+            // Nor did it submit a cloud task, so there is no URL. This is what makes a cloud dry
+            // run a projection rather than a submission: `run` returns above `dispatch`, so no
+            // `codex cloud exec` process is ever created.
+            cloud_task_url: None,
         })?;
         return Ok(Outcome {
             decision,
@@ -138,17 +155,18 @@ pub fn run(request: &Request, config: &Config) -> Result<Outcome> {
     let dispatched = crate::dispatch::dispatch(&decision, request);
     // The decision is logged either way: a dispatch that failed is exactly the row worth
     // keeping, and losing it would hide the failure from the tuning data.
-    let (job_id, job_name, effective_effort, outcome) = recorded_fields(&dispatched);
+    let fields = recorded_fields(&dispatched);
     let recorded = log.record(&Entry {
         task: request.task,
         dir: request.dir,
         requested,
         decision: &decision,
         dry_run: false,
-        job_id: job_id.as_deref(),
-        job_name: job_name.as_deref(),
-        outcome: &outcome,
-        effective_effort: effective_effort.as_deref(),
+        job_id: fields.job_id.as_deref(),
+        job_name: fields.job_name.as_deref(),
+        outcome: &fields.outcome,
+        effective_effort: fields.effective_effort.as_deref(),
+        cloud_task_url: fields.cloud_task_url.as_deref(),
     });
     // The dispatch decides the result, not the logging: once a job is running, returning Err
     // because a row could not be written would hide the job identity from the caller, who would
@@ -167,21 +185,44 @@ pub fn run(request: &Request, config: &Config) -> Result<Outcome> {
     })
 }
 
-/// PURE: the job id, job name, effective effort, and outcome one dispatch result contributes to
-/// its log row. The effective effort is the backend's own report, carried straight through: a run
-/// that dropped it here would write a row indistinguishable from a backend that reports no effort
-/// at all, so this seam is where the observed value either survives or silently disappears.
-pub fn recorded_fields(
-    dispatched: &Result<Dispatch>,
-) -> (Option<String>, Option<String>, Option<String>, String) {
+/// What one dispatch result contributes to its log row.
+///
+/// Both `effective_effort` and `cloud_task_url` are the backend's own report, carried straight
+/// through: a run that dropped either here would write a row indistinguishable from a backend that
+/// reports none at all, so this seam is where an observed value either survives or silently
+/// disappears.
+///
+/// Named fields rather than a positional tuple, and the reason is the seam itself. A fifth member
+/// would put four consecutive `Option<String>` values in a destructure, in the one function whose
+/// whole job is not losing a field to its neighbour, and a transposed effort and url would satisfy
+/// every type check and every assertion that only looks at whether a value arrived.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecordedFields {
+    pub job_id: Option<String>,
+    pub job_name: Option<String>,
+    pub effective_effort: Option<String>,
+    pub cloud_task_url: Option<String>,
+    pub outcome: String,
+}
+
+/// PURE: the fields one dispatch result contributes to its log row. A failure observed nothing, so
+/// every option is None and the outcome carries the backend's own message.
+pub fn recorded_fields(dispatched: &Result<Dispatch>) -> RecordedFields {
     match dispatched {
-        Ok(dispatch) => (
-            dispatch.job_id.clone(),
-            Some(dispatch.job_name.clone()),
-            dispatch.effective_effort.clone(),
-            "dispatched".to_string(),
-        ),
-        Err(e) => (None, None, None, format!("error: {e}")),
+        Ok(dispatch) => RecordedFields {
+            job_id: dispatch.job_id.clone(),
+            job_name: Some(dispatch.job_name.clone()),
+            effective_effort: dispatch.effective_effort.clone(),
+            cloud_task_url: dispatch.cloud_task_url.clone(),
+            outcome: "dispatched".to_string(),
+        },
+        Err(e) => RecordedFields {
+            job_id: None,
+            job_name: None,
+            effective_effort: None,
+            cloud_task_url: None,
+            outcome: format!("error: {e}"),
+        },
     }
 }
 

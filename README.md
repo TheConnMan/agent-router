@@ -10,7 +10,7 @@ data instead of memory.
 
 ```
 $ agent-router run "Port usage.sh to Rust with the same fail-open semantics"
-codex complexity medium model gpt-5.6-terra job 019c3f2a name "Port usage.sh to Rust with the same fail"
+codex complexity medium model gpt-5.6-terra execution_target=local job 019c3f2a name "Port usage.sh to Rust with the same fail"
 why: codex ready on all six criteria, no claude signals, weekly headroom codex 41% claude 12%
 log: row 87 in /home/you/.local/state/agent-router/router.db
 ```
@@ -50,8 +50,10 @@ log: row 87 in /home/you/.local/state/agent-router/router.db
    backend resolves its own, and the log records that resolution wherever the backend reports one.
    See [docs/configuration.md](docs/configuration.md#modelscodex-and-modelsclaude)
    for what that actually means per backend, because it is not the model default on Codex.
-5. **Dispatch and log.** The job is spawned detached, its backend job id is resolved, and the whole
-   decision lands in a SQLite decision log.
+5. **Dispatch and log.** The job is spawned detached, or, on an eligible cloud route, submitted
+   upstream via `codex cloud exec` and never spawned locally at all. Either way its backend job id
+   is resolved, and the whole decision lands in a SQLite decision log. See
+   [Cloud execution](#cloud-execution) below for what makes a route eligible.
 
 Complexity is scored independently of the capability pins and never influences which provider a
 task lands on. A low complexity task can run on either provider, and so can an ultra one.
@@ -165,6 +167,52 @@ them. That interacts badly with routing: a task sent to Claude precisely because
 a connector can lose the very connector it was routed for. Pass it only when the job genuinely
 needs nothing beyond the files given.
 
+### Cloud execution
+
+An eligible task is submitted as a Codex cloud task via `codex cloud exec` instead of being spawned
+as a local detached process. A repository is eligible only when all of the following hold: the
+target directory is inside a git repository, with a GitHub `origin` remote, whose `owner/repo` is on
+the `cloud_repos` allowlist in `config.toml`, which resolves to a connected Codex cloud environment,
+and whose current branch exists on the remote, has a clean working tree, and is not ahead of its
+remote counterpart. Those last three exist because `codex cloud exec --branch` runs the REMOTE ref,
+not your local working tree: uncommitted or unpushed work would mean the cloud silently runs
+different source than you are looking at, so the router routes local instead. Being merely behind
+the remote stays eligible. See [docs/configuration.md](docs/configuration.md#cloud_repos) for the
+`cloud_repos` key, the branch checks in full, and how a resolved environment id is cached.
+
+Cloud is Codex-only. `claude --cloud` hard-requires an interactive TTY, so Claude has no headless
+cloud dispatch to route to: a task pinned to or explicitly routed to Claude always runs locally,
+however cloud-eligible its repository is.
+
+**Cloud tasks do not carry your local Codex connectors or credentials.** A submit forwards only the
+prompt, the environment id, and the branch, never local MCP configuration or connector credentials,
+so a task judged connector complete against the `connectors` list in `config.toml` can still land in
+a cloud environment with no such connector, and the router has no way to detect it. See
+[docs/configuration.md](docs/configuration.md#cloud_repos) for the full explanation and the
+practical guidance.
+
+A cloud dry run drops the `model` token, because `codex cloud exec` has no `--model` flag and the
+model is environment controlled instead, and it names the resolved environment on the `why` line:
+
+```bash
+$ agent-router run "Backfill the migration guard" --dry-run
+codex complexity high execution_target=cloud (dry run, nothing dispatched)
+why: codex: <classification rationale> [<gates>] (orchestration no; codex weekly 6%, claude weekly 12%, claude 5h 2%); cloud environment 69aff82dc7848191992d3858fe1d3987
+```
+
+The same task from a repository that is not allowlisted, or one whose environment fails to resolve,
+dispatches locally instead and keeps the `model` token:
+
+```bash
+$ agent-router run "Backfill the migration guard" --dry-run
+codex complexity high model gpt-5.6-sol execution_target=local (dry run, nothing dispatched)
+why: codex: <classification rationale> [<gates>] (orchestration no; codex weekly 6%, claude weekly 12%, claude 5h 2%)
+```
+
+`agent-router status` does not poll cloud task state: a cloud row stays `dispatched`, and status
+deliberately leaves it alone rather than reporting a state it cannot observe. The task url recorded
+on the row (see `log` above) is how an operator checks on it for now.
+
 ### `usage`
 
 Weekly and 5 hour headroom for both providers.
@@ -238,9 +286,9 @@ Recent routing decisions, newest first.
 
 ```bash
 $ agent-router log --limit 3
-#87 codex orchestration no medium pace claude -12 codex +6 gates[] codex 23% claude 58% 019c3f2a dispatched
+#87 codex local orchestration no medium pace claude -12 codex +6 gates[] codex 23% claude 58% 019c3f2a dispatched
      Port usage.sh to Rust with the same fail-open semantics
-#86 claude orchestration yes high pace claude -12 codex +6 gates[orchestration] codex 23% claude 58% 019c3f19 dispatched mark bad note routed to codex, needed connectors
+#86 claude local orchestration yes high pace claude -12 codex +6 gates[orchestration] codex 23% claude 58% 019c3f19 dispatched mark bad note routed to codex, needed connectors
      Fix the flaky parity test and work out why it only fails in CI
 
 # Judge a decision: was routing it there the right call.
@@ -260,8 +308,12 @@ dispatch outcome. It also still prints the scores the classifier no longer produ
 them and this is the only way to read one back through the tool; they are null on every row
 written since. It also carries `router_version`, stamped from the router's own build on every
 write; null there means the row predates the column, so its provenance is genuinely unknown
-rather than absent. The log is the tuning surface: each gate tag names a specific rule that fired,
-so routing behaviour can be audited against outcomes rather than recalled.
+rather than absent. It also carries `execution_target` (`local` or `cloud`) and `cloud_task_url`
+(the submitted task's url on a cloud row, null on every local row). Null on either column means the
+row predates them, which is not the same as the row having run locally; see
+[Cloud execution](#cloud-execution) above for what decides the target. The log is the tuning
+surface: each gate tag names a specific rule that fired, so routing behaviour can be audited
+against outcomes rather than recalled.
 
 Two of those columns are about reasoning effort and they are not the same fact. `effort` is what the
 router decided, which is nothing, because the model tier is the toggle. `effective_effort` is what

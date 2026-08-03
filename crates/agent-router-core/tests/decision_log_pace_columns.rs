@@ -8,6 +8,7 @@
 //! under test is the shape of the table, which is what a later backtest reads.
 
 use agent_router_core::classify::{Classification, Complexity, TaskContextHorizon};
+use agent_router_core::cloud::{CloudEligibility, CloudIneligible};
 use agent_router_core::config::Config;
 use agent_router_core::decide::{Decision, decide};
 use agent_router_core::log::{DecisionLog, Entry, Mark};
@@ -28,6 +29,13 @@ type RetiredScores = (
     Option<i64>,
     Option<i64>,
 );
+
+/// Every row this file records was decided in a repository outside the cloud allowlist, which is
+/// the state every existing operator is in. The columns under test are the pace ones, and the
+/// target does not influence them.
+fn no_cloud() -> CloudEligibility {
+    CloudEligibility::Ineligible(CloudIneligible::NotAllowlisted)
+}
 
 fn window(weekly_pct: f64, weekly_remaining_secs: i64) -> Headroom {
     Headroom {
@@ -59,6 +67,7 @@ fn record(log: &DecisionLog, decision: &Decision) {
         job_name: None,
         outcome: "dispatched",
         effective_effort: None,
+        cloud_task_url: None,
     })
     .expect("records the decision");
 }
@@ -83,6 +92,7 @@ fn a_recorded_decision_writes_the_orchestration_score_and_both_pace_deltas() {
         scored(false, TaskContextHorizon::Ordinary),
         usage,
         NOW,
+        no_cloud(),
         &Config::default(),
     );
     assert_eq!(flipped.provider, Provider::Claude);
@@ -92,6 +102,7 @@ fn a_recorded_decision_writes_the_orchestration_score_and_both_pace_deltas() {
         scored(true, TaskContextHorizon::Ordinary),
         usage,
         NOW,
+        no_cloud(),
         &Config::default(),
     );
     record(&log, &pinned);
@@ -134,6 +145,7 @@ fn an_unread_reset_records_no_pace_delta_for_that_provider() {
             codex: window(90.0, HALF_WEEK),
         },
         NOW,
+        no_cloud(),
         &Config::default(),
     );
     record(&log, &decision);
@@ -162,6 +174,7 @@ fn the_scores_the_classifier_no_longer_produces_are_left_null() {
             codex: window(80.0, HALF_WEEK),
         },
         NOW,
+        no_cloud(),
         &Config::default(),
     );
     record(&log, &decision);
@@ -206,7 +219,7 @@ fn fresh_auto_rows_persist_and_expose_each_context_horizon() {
             Classification::fallback("fixture failure", DefaultProvider::Codex),
         ),
     ] {
-        let decision = decide(classification, usage, NOW, &Config::default());
+        let decision = decide(classification, usage, NOW, no_cloud(), &Config::default());
         log.record(&Entry {
             task,
             dir: Path::new("/tmp"),
@@ -217,6 +230,7 @@ fn fresh_auto_rows_persist_and_expose_each_context_horizon() {
             job_name: None,
             outcome: "dry-run",
             effective_effort: None,
+            cloud_task_url: None,
         })
         .expect("records");
     }
@@ -259,6 +273,7 @@ fn reconciliation_and_marking_leave_context_horizon_unchanged() {
         scored(false, TaskContextHorizon::Extended),
         UsageSnapshot::full(),
         NOW,
+        no_cloud(),
         &Config::default(),
     );
     let id = log
@@ -272,6 +287,7 @@ fn reconciliation_and_marking_leave_context_horizon_unchanged() {
             job_name: None,
             outcome: "dispatched",
             effective_effort: None,
+            cloud_task_url: None,
         })
         .expect("records");
 
@@ -394,6 +410,7 @@ fn a_database_written_before_pace_gains_the_columns_and_keeps_its_rows() {
         scored(false, TaskContextHorizon::Ordinary),
         UsageSnapshot::full(),
         NOW,
+        no_cloud(),
         &Config::default(),
     );
     record(&log, &decision);

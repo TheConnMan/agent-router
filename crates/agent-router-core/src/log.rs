@@ -28,6 +28,10 @@ pub struct Entry<'a> {
     /// fact from the effort the router decided. None where the backend says nothing, which is every
     /// claude and opencode dispatch and every dry run.
     pub effective_effort: Option<&'a str>,
+    /// The cloud task's own URL, straight off `codex cloud exec`. None on every local dispatch and
+    /// every dry run: nothing was submitted, so there is no task to link to. The task id itself
+    /// lives in `job_id`, like every other backend's job identity.
+    pub cloud_task_url: Option<&'a str>,
 }
 
 /// One row read back, flattened for display.
@@ -96,6 +100,13 @@ pub struct Row {
     /// None on a row written before this column, which is not the same as a version that is
     /// genuinely empty: an aggregate spanning both a None and a real version is mixed regardless.
     pub router_version: Option<String>,
+    /// Where the job ran: "local" or "cloud". None on a row written before this column, which is
+    /// not the same as a local run: every row this build writes carries a value, cloud or local,
+    /// dry run or not, because it is a property of the decision rather than of what dispatch did.
+    pub execution_target: Option<String>,
+    /// The cloud task's URL, as the submit reported it. None on every local row, where there is no
+    /// such thing rather than one that went unread, and on every pre-column row.
+    pub cloud_task_url: Option<String>,
 }
 
 /// The human judgement on one routing decision: whether sending the task there was the right call.
@@ -155,6 +166,10 @@ pub struct StatusRow {
     /// Never NULL: the query that produces these rows excludes rows carrying no job.
     pub job_id: String,
     pub outcome: String,
+    /// "local", "cloud", or None on a row written before the column. The reconciler asks the local
+    /// codex app-server about a thread id, and a cloud row's `job_id` is a cloud task id, not a
+    /// thread id, so this column is what keeps the reconciler from asking the wrong system.
+    pub execution_target: Option<String>,
 }
 
 /// One row as the stats reader needs it: the columns a metric is derived from, nothing else.
@@ -223,6 +238,8 @@ CREATE TABLE IF NOT EXISTS decisions (
     note                TEXT,
     effective_effort    TEXT,
     router_version      TEXT,
+    execution_target    TEXT,
+    cloud_task_url      TEXT,
     outcome             TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS decisions_created_at ON decisions(created_at_ms);
@@ -236,14 +253,14 @@ codex_ready_count, claude_signal_count, missing_connector, gates, claude_weekly_
 codex_weekly_pct, dry_run, job_id, job_name, outcome, rationale, complexity, \
 task_context_horizon, claude_usage_stale, codex_usage_stale, orchestration, \
 claude_pace_delta, codex_pace_delta, \
-reconciled_at_ms, mark, note, effective_effort, router_version";
+reconciled_at_ms, mark, note, effective_effort, router_version, execution_target, cloud_task_url";
 
 /// The narrower list the stats reader needs, so a report never pays for columns it drops.
 const STATS_COLUMNS: &str = "created_at_ms, requested, provider, complexity, gates, dry_run, \
 mark, outcome, router_version";
 
 /// The narrower list the reconciler needs.
-const STATUS_COLUMNS: &str = "id, created_at_ms, provider, job_id, outcome";
+const STATUS_COLUMNS: &str = "id, created_at_ms, provider, job_id, outcome, execution_target";
 
 /// The rows a reconciliation may touch: the ones that actually produced a job. A dry run dispatched
 /// nothing, and a failed dispatch bound its `job_id` to NULL while putting the backend's own
@@ -321,11 +338,12 @@ impl DecisionLog {
                 claude_weekly_reset, codex_five_hour_pct, codex_five_hour_reset,
                 codex_weekly_pct, codex_weekly_reset, dry_run, job_id, job_name, outcome,
                 complexity, task_context_horizon, claude_usage_stale, codex_usage_stale,
-                claude_pace_delta, codex_pace_delta, effective_effort, router_version
+                claude_pace_delta, codex_pace_delta, effective_effort, router_version,
+                execution_target, cloud_task_url
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
                 ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30,
-                ?31
+                ?31, ?32, ?33
             )",
             rusqlite::params![
                 now_ms(),
@@ -359,6 +377,12 @@ impl DecisionLog {
                 decision.codex_pace_delta,
                 entry.effective_effort,
                 ROUTER_VERSION,
+                // Off the decision, not off `Entry`: where a job was routed is a property of the
+                // routing decision rather than of what dispatch then did with it. That is also why
+                // this column is never NULL on a row this build writes, cloud or local, dry run or
+                // not, and why a NULL read back can only mean the row predates the column.
+                decision.execution_target.tag(),
+                entry.cloud_task_url,
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -413,6 +437,7 @@ impl DecisionLog {
                 provider: row.get(2)?,
                 job_id: row.get(3)?,
                 outcome: row.get(4)?,
+                execution_target: row.get(5)?,
             })
         };
         let rows = match since_ms {
@@ -547,6 +572,8 @@ impl DecisionLog {
                     note: row.get(30)?,
                     effective_effort: row.get(31)?,
                     router_version: row.get(32)?,
+                    execution_target: row.get(33)?,
+                    cloud_task_url: row.get(34)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<Row>>>()?;
@@ -561,7 +588,7 @@ impl DecisionLog {
 /// Same columns, different physical order: `SCHEMA` places these mid table while `ALTER TABLE ADD
 /// COLUMN` can only append them, so a fresh and a migrated database disagree on every ordinal and
 /// every read must name the columns it wants rather than `SELECT *` or a `pragma_table_info` index.
-const MISSING_COLUMNS: [(&str, &str); 12] = [
+const MISSING_COLUMNS: [(&str, &str); 14] = [
     ("complexity", "TEXT"),
     ("task_context_horizon", "TEXT"),
     ("claude_usage_stale", "INTEGER"),
@@ -574,6 +601,8 @@ const MISSING_COLUMNS: [(&str, &str); 12] = [
     ("note", "TEXT"),
     ("effective_effort", "TEXT"),
     ("router_version", "TEXT"),
+    ("execution_target", "TEXT"),
+    ("cloud_task_url", "TEXT"),
 ];
 
 /// IMPURE: bring a database written before any of those columns up to the current schema. Guarded
@@ -626,6 +655,7 @@ fn restrict_to_owner(_dir: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::classify::{Classification, Complexity, TaskContextHorizon};
+    use crate::cloud::{CloudEligibility, CloudIneligible};
     use crate::config::Config;
     use crate::usage::{Headroom, UsageSnapshot};
 
@@ -658,7 +688,15 @@ mod tests {
                 ..Headroom::full()
             },
         };
-        crate::decide::decide(classification, usage, NOW, &Config::default())
+        // These tests are about the round trip, not about the target, so the fixture is ineligible
+        // for the cheapest reason there is: an operator who never opted a repository in.
+        crate::decide::decide(
+            classification,
+            usage,
+            NOW,
+            CloudEligibility::Ineligible(CloudIneligible::NotAllowlisted),
+            &Config::default(),
+        )
     }
 
     #[test]
@@ -677,6 +715,7 @@ mod tests {
                 job_name: None,
                 outcome: "dispatched",
                 effective_effort: None,
+                cloud_task_url: None,
             })
             .expect("records");
         assert!(id > 0);
@@ -717,6 +756,7 @@ mod tests {
             job_name: Some("t"),
             outcome: "dry-run",
             effective_effort: None,
+            cloud_task_url: None,
         })
         .expect("records");
         let conn = rusqlite::Connection::open(&path).expect("reopen");
@@ -752,6 +792,7 @@ mod tests {
             job_name: None,
             outcome: "dispatched",
             effective_effort: None,
+            cloud_task_url: None,
         })
         .expect("records");
         let row = &log.recent(1).expect("reads")[0];
@@ -780,6 +821,7 @@ mod tests {
                 job_name: None,
                 outcome: "dry-run",
                 effective_effort: None,
+                cloud_task_url: None,
             })
             .expect("records");
         }
@@ -997,6 +1039,7 @@ mod tests {
             job_name: None,
             outcome: "dry-run",
             effective_effort: None,
+            cloud_task_url: None,
         })
         .expect("records");
 
@@ -1036,6 +1079,7 @@ mod tests {
             job_name: None,
             outcome: "dry-run",
             effective_effort: None,
+            cloud_task_url: None,
         })
         .expect("records");
 
@@ -1091,6 +1135,7 @@ mod tests {
                 job_name: None,
                 outcome: "dispatched",
                 effective_effort: None,
+                cloud_task_url: None,
             })
             .expect("records");
 
@@ -1122,6 +1167,7 @@ mod tests {
             job_name: None,
             outcome: "dry-run",
             effective_effort: None,
+            cloud_task_url: None,
         };
         log.record(&entry).expect("a dry run row");
         entry.dry_run = false;
@@ -1155,6 +1201,7 @@ mod tests {
                 job_name: None,
                 outcome: "dry-run",
                 effective_effort: None,
+                cloud_task_url: None,
             })
             .expect("records");
         }

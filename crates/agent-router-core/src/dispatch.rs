@@ -4,6 +4,7 @@ use crate::run::{Dispatch, Request};
 
 pub mod claude;
 pub mod codex;
+pub mod codex_cloud;
 pub mod opencode;
 
 pub fn dispatch(decision: &crate::decide::Decision, request: &Request) -> Result<Dispatch> {
@@ -18,30 +19,41 @@ pub fn dispatch(decision: &crate::decide::Decision, request: &Request) -> Result
         .name
         .clone()
         .unwrap_or_else(|| crate::runtime::truncated_title(request.task));
-    match decision.provider {
-        Provider::Codex => codex::dispatch(
-            request.dir,
-            request.task,
-            &name,
-            decision.model.as_deref(),
-            decision.effort.as_deref(),
-        ),
-        Provider::Claude => claude::dispatch(
-            request.dir,
-            request.task,
-            &name,
-            decision.model.as_deref(),
-            decision.effort.as_deref(),
-            request.mcp_configs,
-            request.strict_mcp_config,
-        ),
-        Provider::Opencode => opencode::dispatch(
-            request.dir,
-            request.task,
-            &name,
-            decision.model.as_deref(),
-            decision.effort.as_deref(),
-        ),
+    // Matched on the target FIRST, and the cloud arm dispatches from inside that arm without ever
+    // reading `decision.provider`. There is no expression here in which a provider value could steer
+    // into or out of the cloud backend: the `CodexCloud` variant names its own backend, and `decide`
+    // is the only thing that can build one. Only the local arm reads the provider at all. A runtime
+    // check on the provider would put that guarantee in a condition somebody can later relax; this
+    // way a claude or opencode decision has no path to reach `codex_cloud::dispatch` at all.
+    match &decision.execution_target {
+        crate::decide::ExecutionTarget::CodexCloud(target) => {
+            codex_cloud::dispatch(request.task, &name, target)
+        }
+        crate::decide::ExecutionTarget::Local => match decision.provider {
+            Provider::Codex => codex::dispatch(
+                request.dir,
+                request.task,
+                &name,
+                decision.model.as_deref(),
+                decision.effort.as_deref(),
+            ),
+            Provider::Claude => claude::dispatch(
+                request.dir,
+                request.task,
+                &name,
+                decision.model.as_deref(),
+                decision.effort.as_deref(),
+                request.mcp_configs,
+                request.strict_mcp_config,
+            ),
+            Provider::Opencode => opencode::dispatch(
+                request.dir,
+                request.task,
+                &name,
+                decision.model.as_deref(),
+                decision.effort.as_deref(),
+            ),
+        },
     }
 }
 
