@@ -9,6 +9,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The version gate diffs against a base commit: the PR base ref on a pull request, or
+          # HEAD^1 on a merge pushed straight to main. The default depth of 1 has neither.
+          fetch-depth: 0
+      - name: Check the router version was bumped
+        run: scripts/check-version-bump.sh
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

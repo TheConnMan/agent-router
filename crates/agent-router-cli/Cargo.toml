@@ -1,6 +1,6 @@
 [package]
 name = "agent-router-cli"
-version = "0.1.1"
+version.workspace = true
 edition = "2024"
 license = "MIT"
 description = "Route a task to codex, claude, or opencode by task shape and weekly usage headroom"

@@ -229,6 +229,8 @@ impl TryFrom<ParityExceptionDocument> for ParityException {
 pub enum ParityKind {
     MissingInCodex,
     MissingInClaude,
+    TransportDiffers,
+    EndpointDiffers,
     CommandDiffers,
     ArgsDiffer,
     EnvKeysDiffer,

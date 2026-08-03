@@ -474,6 +474,8 @@ fn kind_label(difference: &Difference) -> &'static str {
     match difference.kind {
         agent_router_core::ParityKind::MissingInCodex => "missing_in_codex",
         agent_router_core::ParityKind::MissingInClaude => "missing_in_claude",
+        agent_router_core::ParityKind::TransportDiffers => "transport_differs",
+        agent_router_core::ParityKind::EndpointDiffers => "endpoint_differs",
         agent_router_core::ParityKind::CommandDiffers => "command_differs",
         agent_router_core::ParityKind::ArgsDiffer => "args_differ",
         agent_router_core::ParityKind::EnvKeysDiffer => "env_keys_differ",
