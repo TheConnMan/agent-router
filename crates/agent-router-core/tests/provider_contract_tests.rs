@@ -30,7 +30,16 @@ use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 #[cfg(target_os = "linux")]
-use std::{ffi::OsString, os::unix::net::UnixListener, sync::Mutex};
+use std::{
+    ffi::OsString,
+    os::unix::net::UnixListener,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+};
+
+mod common;
 
 #[test]
 fn router_build_inputs_are_independent_of_the_sibling_viewer() {
@@ -543,8 +552,7 @@ fn fake_claude(root: &Path, listing: &Value) -> (PathBuf, PathBuf) {
     let log = root.join("spawn.argv");
     let listing = serde_json::to_string(listing).expect("listing json");
     let script = format!(
-        "#!/bin/sh\n\
-         if [ \"$1\" = \"agents\" ]; then\n\
+        "if [ \"$1\" = \"agents\" ]; then\n\
            printf '%s\\n' {}\n\
            exit 0\n\
          fi\n\
@@ -552,10 +560,7 @@ fn fake_claude(root: &Path, listing: &Value) -> (PathBuf, PathBuf) {
         shell_quote(&listing),
         shell_quote(&log.to_string_lossy())
     );
-    fs::write(&binary, script).expect("write fake claude");
-    let mut permissions = fs::metadata(&binary).expect("fake metadata").permissions();
-    permissions.set_mode(0o700);
-    fs::set_permissions(&binary, permissions).expect("make fake executable");
+    common::write_stub(&binary, &script);
     (binary, log)
 }
 
@@ -1112,14 +1117,10 @@ fn codex_decision_effort_reaches_turn_start_at_the_dispatch_boundary() {
     })
     .to_string();
     let binary = root.path.join("codex");
-    fs::write(
+    common::write_stub(
         &binary,
-        format!("#!/bin/sh\nprintf '%s\\n' {}\n", shell_quote(&daemon)),
-    )
-    .expect("write fake codex");
-    let mut permissions = fs::metadata(&binary).expect("fake metadata").permissions();
-    permissions.set_mode(0o700);
-    fs::set_permissions(&binary, permissions).expect("make fake executable");
+        &format!("printf '%s\\n' {}\n", shell_quote(&daemon)),
+    );
     let _path = PathGuard::prepend(&root.path);
 
     let decision = decide_explicit(
@@ -1192,10 +1193,17 @@ fn a_thread_read_that_spends_its_budget_does_not_starve_the_reads_after_it() {
     let root = TempDir::new("codex-read-budget");
     let socket_path = root.path.join("app-server.sock");
     let listener = UnixListener::bind(&socket_path).expect("bind app server socket");
+    // Set once the fake daemon has actually been asked something. `thread_states` answers
+    // `Unavailable` for every row when the probe or the connect fails, and that answer is
+    // indistinguishable from a starved read, so the server thread is the only place that can say
+    // whether the router got here at all.
+    let contacted = Arc::new(AtomicBool::new(false));
+    let server_contacted = Arc::clone(&contacted);
     let server = std::thread::spawn(move || {
         let (stream, _) = listener.accept().expect("accept app server client");
         let mut socket = tungstenite::accept(stream).expect("accept websocket");
         let initialize = read_rpc_request(&mut socket);
+        server_contacted.store(true, Ordering::SeqCst);
         let _ = socket.send(tungstenite::Message::text(
             json!({"jsonrpc": "2.0", "id": 1, "result": {}}).to_string(),
         ));
@@ -1225,18 +1233,20 @@ fn a_thread_read_that_spends_its_budget_does_not_starve_the_reads_after_it() {
     })
     .to_string();
     let binary = root.path.join("codex");
-    fs::write(
+    common::write_stub(
         &binary,
-        format!("#!/bin/sh\nprintf '%s\\n' {}\n", shell_quote(&daemon)),
-    )
-    .expect("write fake codex");
-    let mut permissions = fs::metadata(&binary).expect("fake metadata").permissions();
-    permissions.set_mode(0o700);
-    fs::set_permissions(&binary, permissions).expect("make fake executable");
+        &format!("printf '%s\\n' {}\n", shell_quote(&daemon)),
+    );
     let _path = PathGuard::prepend(&root.path);
 
     let states = thread_states(&["slow thread".to_string(), "later thread".to_string()]);
 
+    assert!(
+        contacted.load(Ordering::SeqCst),
+        "the router never reached the fake app-server: it sent no request at all, so nothing here \
+         says anything about the read budget. This is a fixture or transport failure, not a \
+         starvation regression: {states:?}"
+    );
     assert_eq!(
         states.len(),
         2,

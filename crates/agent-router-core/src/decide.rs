@@ -375,6 +375,7 @@ fn rationale(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::classify::TaskContextHorizon;
     use crate::usage::Headroom;
 
     /// The rules the engine routes by live in `tests/pace_routing.rs`, against the public API.
@@ -439,6 +440,7 @@ mod tests {
                 orchestration: false,
                 missing_connector: true,
                 complexity: Complexity::High,
+                task_context_horizon: TaskContextHorizon::Ordinary,
                 rationale: "fixture".to_string(),
                 classifier_failed: false,
             },

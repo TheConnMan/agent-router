@@ -17,8 +17,15 @@ log: row 87 in /home/you/.local/state/agent-router/router.db
 
 ## How a task is routed
 
-1. **Classify.** One small model call scores the task and returns strict JSON: `orchestration`,
-   `missing_connector`, and a complexity tier. The call is deliberately hermetic. On the Claude engine it
+1. **Classify.** One small model call scores the task and returns strict JSON:
+
+   ```json
+   {"orchestration": false, "missing_connector": false, "complexity": "medium", "task_context_horizon": "ordinary"}
+   ```
+
+   `task_context_horizon` is `ordinary` or `extended`. It is observed and recorded for later
+   analysis only: it never selects a provider or model. `unknown` is recorded only when the
+   classifier falls back after a failure or timeout. The call is deliberately hermetic. On the Claude engine it
    runs with `--safe-mode` and `--strict-mcp-config`; on the Codex engine with
    `--ignore-user-config`, `--ignore-rules`, and `project_doc_max_bytes=0`. Either way no project
    `CLAUDE.md`, `AGENTS.md`, skill, plugin, hook, or MCP server can shift the score. The Codex

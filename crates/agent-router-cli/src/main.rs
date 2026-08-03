@@ -888,6 +888,7 @@ fn row_json(row: &Row) -> serde_json::Value {
         "verdict": row.verdict,
         "confidence": row.confidence,
         "complexity": row.complexity,
+        "task_context_horizon": row.task_context_horizon,
         // Null on every row written since the classifier stopped scoring them. Still printed
         // because the rows recorded under them are the corpus every backtest replays, and this is
         // the only way to read one back through the tool.

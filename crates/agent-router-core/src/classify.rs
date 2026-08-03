@@ -37,12 +37,34 @@ impl Complexity {
     }
 }
 
-/// One scored task: the two capability pins, plus how much reasoning it needs.
+/// How much retained working context the task explicitly requires. This is an observation for
+/// later analysis only and never participates in routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskContextHorizon {
+    Ordinary,
+    Extended,
+    /// Classifier failure, emitted only by `Classification::fallback`.
+    Unknown,
+}
+
+impl TaskContextHorizon {
+    pub const fn tag(self) -> &'static str {
+        match self {
+            TaskContextHorizon::Ordinary => "ordinary",
+            TaskContextHorizon::Extended => "extended",
+            TaskContextHorizon::Unknown => "unknown",
+        }
+    }
+}
+
+/// One scored task: the two capability pins, how much reasoning it needs, and an observational
+/// working context horizon that never participates in routing.
 ///
-/// Three scored fields and no verdict, because the rubric's other ten criteria never changed an
-/// outcome. Measured over the 108 recorded decisions, the retired `claude_signals >= 2` pin fired
-/// 45 times and every one of those rows already carried a claude verdict, so it decided nothing;
-/// the provider is now decided by capability and usage alone.
+/// Four scored fields and no verdict. The provider is decided by capability and usage alone;
+/// complexity chooses the model, while the context horizon is logged only for later analysis.
+/// Measured over the 108 recorded decisions, the retired `claude_signals >= 2` pin fired 45 times
+/// and every one of those rows already carried a claude verdict, so it decided nothing.
 ///
 /// Neither pin carries a serde default, deliberately. An answer in the retired fourteen field
 /// shape must fail the parse rather than read as "no orchestration": a defaulted pin would route
@@ -56,6 +78,8 @@ pub struct Classification {
     /// Absent from an older log row or an answer that omitted it, which both read as high.
     #[serde(default)]
     pub complexity: Complexity,
+    /// The predicted working context horizon. Required in every usable classifier answer.
+    pub task_context_horizon: TaskContextHorizon,
     pub rationale: String,
     /// True when this is the fallback rather than a real score. Not part of the model's JSON.
     #[serde(default)]
@@ -74,6 +98,7 @@ impl Classification {
             orchestration: false,
             missing_connector: false,
             complexity: Complexity::High,
+            task_context_horizon: TaskContextHorizon::Unknown,
             rationale: format!("classifier failed ({why}), defaulting to {provider_name}"),
             classifier_failed: true,
         }
@@ -210,7 +235,7 @@ fn run_from_home(cmd: &mut Command) {
     }
 }
 
-/// PURE: the classifier prompt. Three scored fields, each judged on its own evidence; the
+/// PURE: the classifier prompt. Four scored fields, each judged on its own evidence; the
 /// connector inventory is the config's, because `missing_connector` is scored against exactly
 /// that list.
 ///
@@ -232,15 +257,17 @@ pub fn classifier_prompt(task: &str, connectors: &[String]) -> String {
     format!(
         r#"You are a routing classifier. Score ONE task against a fixed rubric. Output ONE JSON object and NOTHING else: no prose, no reasoning, no code fence, no commentary before or after.
 
-Score three fields, each on its own evidence. There is no overall verdict and no total to balance, so no field may be inferred from another or from an overall impression of the task. Judge each one literally, as written, and answer false when the task does not say so.
+Score four fields, each on its own evidence. There is no overall verdict and no total to balance, so no field may be inferred from another or from an overall impression of the task. Judge each one literally, as written, and answer false when the task does not say so.
 
 orchestration: several agents must exchange findings with each other partway through the run, so that what one agent finds changes what another does next. That is the entire test. Judge it independently: orchestration is never inferred from how difficult the task is, how large its scope is, how many files, directories or repositories it touches, whether it only reads or also writes, how important it is, or how long it will run. One agent working alone is not orchestration, however hard the work. A task that merely mentions agents, subagents, or a team without needing findings passed between them mid-run is not orchestration. Planning, reviewing, investigating, and debugging are not orchestration by themselves. When in any doubt, answer false.
 
-Degenerate input scores false on both booleans: an empty task, a greeting, a single word, or a fragment nobody could act on gives you nothing to score, and nothing to score is not orchestration. Score such a task complexity "low" and say in the rationale that there was nothing to score.
+Degenerate input scores false on both booleans: an empty task, a greeting, a single word, or a fragment nobody could act on gives you nothing to score, and nothing to score is not orchestration. Score such a task complexity "low", task_context_horizon "ordinary", and say in the rationale that there was nothing to score.
 
 The connector inventory is authoritative: Codex on this box can reach {inventory}. Set missing_connector true ONLY when the task must reach a named system absent from that list. Never set it because you cannot see a connector yourself.
 
 Separately, and independently of both booleans, judge how much reasoning the task needs. complexity is "low" when it is conversational, one step, mechanical, or a single file with an obvious answer; "medium" for a normal well scoped implementation or investigation; "high" when it spans several files or is subtle enough to need heavy reasoning or design judgment; "ultra" only for the rare hardest work, where a wrong call is expensive and hard to reverse: architecture or plan review, a root cause hunt that has already defeated ordinary debugging, or a design decision that sets a direction. Ultra is not "large" or "long running", and it is not "important to the user": when torn between high and ultra, answer high. Complexity is orthogonal to the provider: a low task can run on either provider, and so can an ultra one. Never let complexity change orchestration or missing_connector, and never let either of them change complexity.
+
+Separately, task_context_horizon is "extended" only when the task explicitly requires processing a large corpus, resuming or continuing work whose prior history must remain available, or sustained synthesis across many artifacts or steps. Otherwise "ordinary" is the default. This horizon is independent from complexity, orchestration, duration, importance, file count, provider or model capacity, and routing. Difficult or long running bounded work is ordinary.
 
 TASK
 <<<
@@ -248,8 +275,8 @@ TASK
 >>>
 
 Reply with exactly this JSON object, filled in:
-{{"orchestration":false,"missing_connector":false,"complexity":"medium","rationale":"one sentence"}}
-orchestration and missing_connector are booleans. complexity is "low", "medium", "high", or "ultra". rationale is one sentence."#
+{{"orchestration":false,"missing_connector":false,"complexity":"medium","task_context_horizon":"ordinary","rationale":"one sentence"}}
+orchestration and missing_connector are booleans. complexity is "low", "medium", "high", or "ultra". task_context_horizon is "ordinary" or "extended". rationale is one sentence."#
     )
 }
 
@@ -298,6 +325,9 @@ pub fn parse_classification(text: &str) -> Option<Classification> {
         return None;
     }
     let mut classification: Classification = serde_json::from_str(text.get(start..=end)?).ok()?;
+    if classification.task_context_horizon == TaskContextHorizon::Unknown {
+        return None;
+    }
     // Only `fallback` may set this; a model that echoes the field must not claim it failed.
     classification.classifier_failed = false;
     Some(classification)
@@ -399,7 +429,7 @@ mod tests {
     }
 
     const GOOD: &str = r#"{"orchestration":false,"missing_connector":false,
-        "rationale":"explicit outcome, mechanical verification"}"#;
+        "task_context_horizon":"ordinary","rationale":"explicit outcome, mechanical verification"}"#;
 
     #[test]
     fn a_well_formed_answer_parses_out_of_the_cli_envelope() {
@@ -407,6 +437,22 @@ mod tests {
         assert!(!got.orchestration);
         assert!(!got.missing_connector);
         assert!(!got.classifier_failed);
+    }
+
+    /// The horizon is a closed observation emitted by every usable classifier answer. Both values
+    /// have to survive the JSON boundary, because the log must distinguish ordinary bounded work
+    /// from work that explicitly needs a long lived working context.
+    #[test]
+    fn ordinary_and_extended_context_horizons_round_trip_through_the_classifier() {
+        for horizon in ["ordinary", "extended"] {
+            let answer = GOOD.replace(
+                "\"task_context_horizon\":\"ordinary\"",
+                &format!("\"task_context_horizon\":\"{horizon}\""),
+            );
+            let got = parse_claude(&envelope(&answer)).expect("parses");
+            let serialized = serde_json::to_value(got).expect("serializes");
+            assert_eq!(serialized["task_context_horizon"], horizon);
+        }
     }
 
     #[test]
@@ -425,7 +471,7 @@ mod tests {
         {
             let text = format!(
                 r#"{{"orchestration":{orchestration},"missing_connector":{missing_connector},
-                "complexity":"high","rationale":"needs n8n"}}"#
+                "complexity":"high","task_context_horizon":"ordinary","rationale":"needs n8n"}}"#
             );
             let got = parse_claude(&envelope(&text)).expect("parses");
             assert_eq!(got.orchestration, orchestration);
@@ -447,6 +493,21 @@ mod tests {
         );
         assert!(parse_claude(r#"{"type":"result","is_error":true}"#).is_none());
         assert!(parse_claude("not json at all").is_none());
+    }
+
+    /// `unknown` is evidence that the classifier failed, not a value a model may choose. An
+    /// omitted horizon is equally unusable because a row that never received this score must not
+    /// look like ordinary work in later analysis.
+    #[test]
+    fn omitted_or_unknown_context_horizons_are_unusable() {
+        let omitted = GOOD.replace("\"task_context_horizon\":\"ordinary\",", "");
+        assert!(parse_claude(&envelope(&omitted)).is_none());
+
+        let unknown = GOOD.replace(
+            "\"task_context_horizon\":\"ordinary\"",
+            "\"task_context_horizon\":\"unknown\"",
+        );
+        assert!(parse_claude(&envelope(&unknown)).is_none());
     }
 
     /// Complexity is what picks the model, so each value must survive the parse, and an answer
@@ -503,6 +564,10 @@ mod tests {
         assert!(got.classifier_failed);
         assert!(got.rationale.contains("timed out after 30s"));
         assert!(got.rationale.contains("defaulting to claude"));
+        assert_eq!(
+            serde_json::to_value(got).expect("serializes")["task_context_horizon"],
+            "unknown"
+        );
     }
 
     /// The prompt is the whole classifier, so the instructions that are there for a measured
@@ -551,10 +616,18 @@ mod tests {
         // Ultra is the only tier that reaches fable, so the brake on over-assigning it is
         // load-bearing rather than decorative.
         assert!(prompt.contains("when torn between high and ultra, answer high"));
+        // Context horizon predicts the amount of retained working context, not how hard the task
+        // feels. The three positive cases are deliberately narrow and ordinary is the default.
+        assert!(prompt.contains("task_context_horizon"));
+        assert!(prompt.contains("large corpus"));
+        assert!(prompt.contains("resumed") || prompt.contains("continuing"));
+        assert!(prompt.contains("sustained synthesis"));
+        assert!(prompt.contains("Otherwise \"ordinary\" is the default."));
+        assert!(prompt.contains("independent from complexity"));
         // The answer shape, which is what the parser accepts and nothing wider.
         assert!(prompt.contains(
             "{\"orchestration\":false,\"missing_connector\":false,\"complexity\":\"medium\",\
-             \"rationale\":\"one sentence\"}"
+             \"task_context_horizon\":\"ordinary\",\"rationale\":\"one sentence\"}"
         ));
         assert!(prompt.contains("complexity is \"low\", \"medium\", \"high\", or \"ultra\""));
         // No field of the retired fourteen field shape may still be asked for. Matched as a JSON
