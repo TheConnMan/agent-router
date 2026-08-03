@@ -122,6 +122,7 @@ fn envelope(complexity: &str) -> String {
         "orchestration": false,
         "missing_connector": false,
         "complexity": complexity,
+        "task_context_horizon": "ordinary",
         "rationale": "stats fixture",
     })
     .to_string();

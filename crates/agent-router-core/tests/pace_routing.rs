@@ -68,7 +68,7 @@ fn chronic() -> UsageSnapshot {
 }
 
 /// The whole classifier answer. The field list is exhaustive on purpose: a classifier that grows
-/// a seventh scored field back stops compiling here rather than quietly influencing a route.
+/// a fifth scored field stops compiling here rather than quietly influencing a route.
 fn scored(orchestration: bool, missing_connector: bool, complexity: Complexity) -> Classification {
     Classification {
         orchestration,
@@ -87,20 +87,21 @@ fn plain() -> Classification {
 
 // ------------------------------------------------------------------ rule 1: the scored fields
 
-/// Rule 1. The classifier answers with exactly three scored fields, and an answer in the old
-/// fourteen field shape is a failed score rather than a partially understood one. This is the
+/// Rule 1. The classifier answers with exactly four scored fields, and an answer in the old
+/// multi signal shape is a failed score rather than a partially understood one. This is the
 /// parse level half of "no compatibility path": if `orchestration` were given a serde default, an
 /// old shaped answer would parse as "no orchestration" and route silently on a field the model
 /// never scored.
 #[test]
-fn the_classifier_answer_carries_the_three_scored_fields_and_nothing_else() {
+fn the_classifier_answer_carries_the_four_scored_fields_and_nothing_else() {
     let scored = parse_classification(
-        r#"{"orchestration":true,"missing_connector":false,"complexity":"ultra","rationale":"needs a council"}"#,
+        r#"{"orchestration":true,"missing_connector":false,"complexity":"ultra","task_context_horizon":"ordinary","rationale":"needs a council"}"#,
     )
     .expect("the new answer shape parses");
     assert!(scored.orchestration);
     assert!(!scored.missing_connector);
     assert_eq!(scored.complexity, Complexity::Ultra);
+    assert_eq!(scored.task_context_horizon, TaskContextHorizon::Ordinary);
     assert!(!scored.classifier_failed);
 
     let old_shape = parse_classification(
@@ -108,7 +109,7 @@ fn the_classifier_answer_carries_the_three_scored_fields_and_nothing_else() {
     );
     assert!(
         old_shape.is_none(),
-        "an answer without the orchestration score must fail, not default"
+        "an answer without every required score must fail, not default"
     );
 }
 

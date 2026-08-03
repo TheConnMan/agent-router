@@ -60,13 +60,25 @@ struct CliFixture {
 #[cfg(unix)]
 impl CliFixture {
     fn new(label: &str) -> Self {
-        Self::listing_agent_named(label, None)
+        Self::listing_agent_named_with_context_horizon(label, None, "extended")
+    }
+
+    fn with_context_horizon(label: &str, task_context_horizon: &str) -> Self {
+        Self::listing_agent_named_with_context_horizon(label, None, task_context_horizon)
     }
 
     /// `listed` is the name the fake `claude agents` listing advertises, which is what the router
     /// matches against to resolve the short id of the job it just spawned. None means the name
     /// derived from the task.
     fn listing_agent_named(label: &str, listed: Option<&str>) -> Self {
+        Self::listing_agent_named_with_context_horizon(label, listed, "extended")
+    }
+
+    fn listing_agent_named_with_context_horizon(
+        label: &str,
+        listed: Option<&str>,
+        task_context_horizon: &str,
+    ) -> Self {
         let root = TempDir::new(label);
         let home = root.path.join("home");
         let bin = root.path.join("bin");
@@ -82,7 +94,7 @@ impl CliFixture {
             "orchestration": false,
             "missing_connector": false,
             "complexity": "medium",
-            "task_context_horizon": "extended",
+            "task_context_horizon": task_context_horizon,
             "rationale": "fixture context",
         })
         .to_string();
@@ -237,9 +249,11 @@ fn run_json_preserves_provider_decision_and_dispatched_job_identity() {
 
 #[cfg(unix)]
 #[test]
-fn auto_run_json_and_log_json_expose_the_context_horizon() {
-    let fixture = CliFixture::new("context-horizon");
-    let output = fixture
+fn auto_runs_log_context_horizon_without_changing_provider_or_model() {
+    let ordinary_fixture = CliFixture::with_context_horizon("ordinary-context-horizon", "ordinary");
+    let extended_fixture = CliFixture::with_context_horizon("extended-context-horizon", "extended");
+
+    let ordinary_output = ordinary_fixture
         .run_command()
         .arg("--provider")
         .arg("auto")
@@ -248,14 +262,39 @@ fn auto_run_json_and_log_json_expose_the_context_horizon() {
         .output()
         .expect("run router");
     assert!(
-        output.status.success(),
+        ordinary_output.status.success(),
         "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
+        String::from_utf8_lossy(&ordinary_output.stderr)
     );
-    let value: Value = serde_json::from_slice(&output.stdout).expect("router json");
-    assert_eq!(value["classification"]["task_context_horizon"], "extended");
+    let ordinary: Value = serde_json::from_slice(&ordinary_output.stdout).expect("router json");
 
-    let logged = fixture
+    let extended_output = extended_fixture
+        .run_command()
+        .arg("--provider")
+        .arg("auto")
+        .arg("--dry-run")
+        .arg("--json")
+        .output()
+        .expect("run router");
+    assert!(
+        extended_output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&extended_output.stderr)
+    );
+    let extended: Value = serde_json::from_slice(&extended_output.stdout).expect("router json");
+
+    assert_eq!(
+        ordinary["classification"]["task_context_horizon"],
+        "ordinary"
+    );
+    assert_eq!(
+        extended["classification"]["task_context_horizon"],
+        "extended"
+    );
+    assert_eq!(ordinary["provider"], extended["provider"]);
+    assert_eq!(ordinary["model"], extended["model"]);
+
+    let ordinary_logged = ordinary_fixture
         .router()
         .arg("log")
         .arg("--limit")
@@ -264,14 +303,38 @@ fn auto_run_json_and_log_json_expose_the_context_horizon() {
         .output()
         .expect("read decision log");
     assert!(
-        logged.status.success(),
+        ordinary_logged.status.success(),
         "stderr: {}",
-        String::from_utf8_lossy(&logged.stderr)
+        String::from_utf8_lossy(&ordinary_logged.stderr)
     );
-    let rows: Value = serde_json::from_slice(&logged.stdout).expect("log json");
-    let row = rows[0].as_object().expect("log row object");
-    assert!(row.contains_key("task_context_horizon"), "row: {row:?}");
-    assert_eq!(row["task_context_horizon"], "extended");
+    let ordinary_rows: Value = serde_json::from_slice(&ordinary_logged.stdout).expect("log json");
+    let ordinary_row = ordinary_rows[0].as_object().expect("log row object");
+    assert!(
+        ordinary_row.contains_key("task_context_horizon"),
+        "row: {ordinary_row:?}"
+    );
+    assert_eq!(ordinary_row["task_context_horizon"], "ordinary");
+
+    let extended_logged = extended_fixture
+        .router()
+        .arg("log")
+        .arg("--limit")
+        .arg("1")
+        .arg("--json")
+        .output()
+        .expect("read decision log");
+    assert!(
+        extended_logged.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&extended_logged.stderr)
+    );
+    let extended_rows: Value = serde_json::from_slice(&extended_logged.stdout).expect("log json");
+    let extended_row = extended_rows[0].as_object().expect("log row object");
+    assert!(
+        extended_row.contains_key("task_context_horizon"),
+        "row: {extended_row:?}"
+    );
+    assert_eq!(extended_row["task_context_horizon"], "extended");
 }
 
 #[cfg(unix)]

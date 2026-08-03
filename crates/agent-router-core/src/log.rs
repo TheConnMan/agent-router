@@ -625,7 +625,7 @@ fn restrict_to_owner(_dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::classify::{Classification, Complexity};
+    use crate::classify::{Classification, Complexity, TaskContextHorizon};
     use crate::config::Config;
     use crate::usage::{Headroom, UsageSnapshot};
 
@@ -640,6 +640,7 @@ mod tests {
             orchestration: false,
             missing_connector: false,
             complexity: Complexity::Ultra,
+            task_context_horizon: TaskContextHorizon::Ordinary,
             rationale: "bounded contract".to_string(),
             classifier_failed: false,
         };

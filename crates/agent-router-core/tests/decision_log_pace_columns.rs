@@ -206,7 +206,7 @@ fn fresh_auto_rows_persist_and_expose_each_context_horizon() {
             Classification::fallback("fixture failure", DefaultProvider::Codex),
         ),
     ] {
-        let decision = decide(classification, usage.clone(), NOW, &Config::default());
+        let decision = decide(classification, usage, NOW, &Config::default());
         log.record(&Entry {
             task,
             dir: Path::new("/tmp"),

@@ -1,6 +1,6 @@
 [package]
 name = "agent-router-core"
-version = "0.3.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT"
 description = "Routing machinery for agent-router: usage readers, classifier, decision engine, and dispatch"

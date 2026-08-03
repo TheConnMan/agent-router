@@ -58,12 +58,13 @@ impl TaskContextHorizon {
     }
 }
 
-/// One scored task: the two capability pins, plus how much reasoning it needs.
+/// One scored task: the two capability pins, how much reasoning it needs, and an observational
+/// working context horizon that never participates in routing.
 ///
-/// Three scored fields and no verdict, because the rubric's other ten criteria never changed an
-/// outcome. Measured over the 108 recorded decisions, the retired `claude_signals >= 2` pin fired
-/// 45 times and every one of those rows already carried a claude verdict, so it decided nothing;
-/// the provider is now decided by capability and usage alone.
+/// Four scored fields and no verdict. The provider is decided by capability and usage alone;
+/// complexity chooses the model, while the context horizon is logged only for later analysis.
+/// Measured over the 108 recorded decisions, the retired `claude_signals >= 2` pin fired 45 times
+/// and every one of those rows already carried a claude verdict, so it decided nothing.
 ///
 /// Neither pin carries a serde default, deliberately. An answer in the retired fourteen field
 /// shape must fail the parse rather than read as "no orchestration": a defaulted pin would route
@@ -621,7 +622,7 @@ mod tests {
         assert!(prompt.contains("large corpus"));
         assert!(prompt.contains("resumed") || prompt.contains("continuing"));
         assert!(prompt.contains("sustained synthesis"));
-        assert!(prompt.contains("ordinary is the default"));
+        assert!(prompt.contains("Otherwise \"ordinary\" is the default."));
         assert!(prompt.contains("independent from complexity"));
         // The answer shape, which is what the parser accepts and nothing wider.
         assert!(prompt.contains(
