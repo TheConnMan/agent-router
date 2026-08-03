@@ -13,7 +13,9 @@
 //! 58 points over pace chronically, which is a plan size artifact and not a signal. The dead zone
 //! has to clear that band, or the override stops being an override and becomes the routing rule.
 
-use agent_router_core::classify::{Classification, Complexity, parse_classification};
+use agent_router_core::classify::{
+    Classification, Complexity, TaskContextHorizon, parse_classification,
+};
 use agent_router_core::config::{Config, DefaultProvider};
 use agent_router_core::decide::{Gate, decide};
 use agent_router_core::{Headroom, Provider, UsageSnapshot};
@@ -72,6 +74,7 @@ fn scored(orchestration: bool, missing_connector: bool, complexity: Complexity) 
         orchestration,
         missing_connector,
         complexity,
+        task_context_horizon: TaskContextHorizon::Ordinary,
         rationale: "fixture".to_string(),
         classifier_failed: false,
     }

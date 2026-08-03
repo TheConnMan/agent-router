@@ -253,10 +253,7 @@ fn auto_run_json_and_log_json_expose_the_context_horizon() {
         String::from_utf8_lossy(&output.stderr)
     );
     let value: Value = serde_json::from_slice(&output.stdout).expect("router json");
-    assert_eq!(
-        value["classification"]["task_context_horizon"],
-        "extended"
-    );
+    assert_eq!(value["classification"]["task_context_horizon"], "extended");
 
     let logged = fixture
         .router()

@@ -12,7 +12,7 @@
 //! A dry run drew nothing, so it is evidence about the classifier and not about spend. 39 of those
 //! 40 carry both resets and can be replayed through the override.
 
-use agent_router_core::classify::{Classification, Complexity};
+use agent_router_core::classify::{Classification, Complexity, TaskContextHorizon};
 use agent_router_core::config::{Config, DefaultProvider};
 use agent_router_core::decide::{Decision, Gate, decide};
 use agent_router_core::{Headroom, Provider, UsageSnapshot};
@@ -115,6 +115,7 @@ impl HistoricalRow {
             orchestration: signals.as_bytes()[1] == b'1',
             missing_connector: self.missing_connector.unwrap_or(0) != 0,
             complexity: complexity(self.complexity.as_deref()),
+            task_context_horizon: TaskContextHorizon::Ordinary,
             rationale: "replayed".to_string(),
             classifier_failed: false,
         }

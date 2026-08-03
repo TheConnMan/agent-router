@@ -52,6 +52,9 @@ pub struct Row {
     pub claude_signal_count: Option<i64>,
     /// None for a row written before complexity scaling, and for an explicit provider.
     pub complexity: Option<String>,
+    /// The classifier predicted working context horizon. None on a historical row and on an
+    /// explicit provider row.
+    pub task_context_horizon: Option<String>,
     /// The capability pin the classifier does still produce. None on a row written before it, and
     /// on an explicit provider.
     pub orchestration: Option<bool>,
@@ -191,6 +194,7 @@ CREATE TABLE IF NOT EXISTS decisions (
     verdict             TEXT,
     confidence          TEXT,
     complexity          TEXT,
+    task_context_horizon TEXT,
     codex_ready         TEXT,
     codex_ready_count   INTEGER,
     claude_signals      TEXT,
@@ -230,7 +234,8 @@ const SELECT_COLUMNS: &str = "\
 id, created_at_ms, task, dir, requested, provider, model, effort, verdict, confidence, \
 codex_ready_count, claude_signal_count, missing_connector, gates, claude_weekly_pct, \
 codex_weekly_pct, dry_run, job_id, job_name, outcome, rationale, complexity, \
-claude_usage_stale, codex_usage_stale, orchestration, claude_pace_delta, codex_pace_delta, \
+task_context_horizon, claude_usage_stale, codex_usage_stale, orchestration, \
+claude_pace_delta, codex_pace_delta, \
 reconciled_at_ms, mark, note, effective_effort, router_version";
 
 /// The narrower list the stats reader needs, so a report never pays for columns it drops.
@@ -315,11 +320,12 @@ impl DecisionLog {
                 claude_five_hour_pct, claude_five_hour_reset, claude_weekly_pct,
                 claude_weekly_reset, codex_five_hour_pct, codex_five_hour_reset,
                 codex_weekly_pct, codex_weekly_reset, dry_run, job_id, job_name, outcome,
-                complexity, claude_usage_stale, codex_usage_stale,
+                complexity, task_context_horizon, claude_usage_stale, codex_usage_stale,
                 claude_pace_delta, codex_pace_delta, effective_effort, router_version
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30
+                ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30,
+                ?31
             )",
             rusqlite::params![
                 now_ms(),
@@ -346,6 +352,7 @@ impl DecisionLog {
                 entry.job_name,
                 entry.outcome,
                 classification.map(|c| c.complexity.tag()),
+                classification.map(|c| c.task_context_horizon.tag()),
                 usage.claude.stale,
                 usage.codex.stale,
                 decision.claude_pace_delta,
@@ -529,16 +536,17 @@ impl DecisionLog {
                     outcome: row.get(19)?,
                     rationale: row.get(20)?,
                     complexity: row.get(21)?,
-                    claude_usage_stale: row.get(22)?,
-                    codex_usage_stale: row.get(23)?,
-                    orchestration: row.get(24)?,
-                    claude_pace_delta: row.get(25)?,
-                    codex_pace_delta: row.get(26)?,
-                    reconciled_at_ms: row.get(27)?,
-                    mark: row.get(28)?,
-                    note: row.get(29)?,
-                    effective_effort: row.get(30)?,
-                    router_version: row.get(31)?,
+                    task_context_horizon: row.get(22)?,
+                    claude_usage_stale: row.get(23)?,
+                    codex_usage_stale: row.get(24)?,
+                    orchestration: row.get(25)?,
+                    claude_pace_delta: row.get(26)?,
+                    codex_pace_delta: row.get(27)?,
+                    reconciled_at_ms: row.get(28)?,
+                    mark: row.get(29)?,
+                    note: row.get(30)?,
+                    effective_effort: row.get(31)?,
+                    router_version: row.get(32)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<Row>>>()?;
@@ -553,8 +561,9 @@ impl DecisionLog {
 /// Same columns, different physical order: `SCHEMA` places these mid table while `ALTER TABLE ADD
 /// COLUMN` can only append them, so a fresh and a migrated database disagree on every ordinal and
 /// every read must name the columns it wants rather than `SELECT *` or a `pragma_table_info` index.
-const MISSING_COLUMNS: [(&str, &str); 11] = [
+const MISSING_COLUMNS: [(&str, &str); 12] = [
     ("complexity", "TEXT"),
+    ("task_context_horizon", "TEXT"),
     ("claude_usage_stale", "INTEGER"),
     ("codex_usage_stale", "INTEGER"),
     ("orchestration", "INTEGER"),

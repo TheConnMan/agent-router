@@ -37,6 +37,27 @@ impl Complexity {
     }
 }
 
+/// How much retained working context the task explicitly requires. This is an observation for
+/// later analysis only and never participates in routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskContextHorizon {
+    Ordinary,
+    Extended,
+    /// Classifier failure, emitted only by `Classification::fallback`.
+    Unknown,
+}
+
+impl TaskContextHorizon {
+    pub const fn tag(self) -> &'static str {
+        match self {
+            TaskContextHorizon::Ordinary => "ordinary",
+            TaskContextHorizon::Extended => "extended",
+            TaskContextHorizon::Unknown => "unknown",
+        }
+    }
+}
+
 /// One scored task: the two capability pins, plus how much reasoning it needs.
 ///
 /// Three scored fields and no verdict, because the rubric's other ten criteria never changed an
@@ -56,6 +77,8 @@ pub struct Classification {
     /// Absent from an older log row or an answer that omitted it, which both read as high.
     #[serde(default)]
     pub complexity: Complexity,
+    /// The predicted working context horizon. Required in every usable classifier answer.
+    pub task_context_horizon: TaskContextHorizon,
     pub rationale: String,
     /// True when this is the fallback rather than a real score. Not part of the model's JSON.
     #[serde(default)]
@@ -74,6 +97,7 @@ impl Classification {
             orchestration: false,
             missing_connector: false,
             complexity: Complexity::High,
+            task_context_horizon: TaskContextHorizon::Unknown,
             rationale: format!("classifier failed ({why}), defaulting to {provider_name}"),
             classifier_failed: true,
         }
@@ -210,7 +234,7 @@ fn run_from_home(cmd: &mut Command) {
     }
 }
 
-/// PURE: the classifier prompt. Three scored fields, each judged on its own evidence; the
+/// PURE: the classifier prompt. Four scored fields, each judged on its own evidence; the
 /// connector inventory is the config's, because `missing_connector` is scored against exactly
 /// that list.
 ///
@@ -232,15 +256,17 @@ pub fn classifier_prompt(task: &str, connectors: &[String]) -> String {
     format!(
         r#"You are a routing classifier. Score ONE task against a fixed rubric. Output ONE JSON object and NOTHING else: no prose, no reasoning, no code fence, no commentary before or after.
 
-Score three fields, each on its own evidence. There is no overall verdict and no total to balance, so no field may be inferred from another or from an overall impression of the task. Judge each one literally, as written, and answer false when the task does not say so.
+Score four fields, each on its own evidence. There is no overall verdict and no total to balance, so no field may be inferred from another or from an overall impression of the task. Judge each one literally, as written, and answer false when the task does not say so.
 
 orchestration: several agents must exchange findings with each other partway through the run, so that what one agent finds changes what another does next. That is the entire test. Judge it independently: orchestration is never inferred from how difficult the task is, how large its scope is, how many files, directories or repositories it touches, whether it only reads or also writes, how important it is, or how long it will run. One agent working alone is not orchestration, however hard the work. A task that merely mentions agents, subagents, or a team without needing findings passed between them mid-run is not orchestration. Planning, reviewing, investigating, and debugging are not orchestration by themselves. When in any doubt, answer false.
 
-Degenerate input scores false on both booleans: an empty task, a greeting, a single word, or a fragment nobody could act on gives you nothing to score, and nothing to score is not orchestration. Score such a task complexity "low" and say in the rationale that there was nothing to score.
+Degenerate input scores false on both booleans: an empty task, a greeting, a single word, or a fragment nobody could act on gives you nothing to score, and nothing to score is not orchestration. Score such a task complexity "low", task_context_horizon "ordinary", and say in the rationale that there was nothing to score.
 
 The connector inventory is authoritative: Codex on this box can reach {inventory}. Set missing_connector true ONLY when the task must reach a named system absent from that list. Never set it because you cannot see a connector yourself.
 
 Separately, and independently of both booleans, judge how much reasoning the task needs. complexity is "low" when it is conversational, one step, mechanical, or a single file with an obvious answer; "medium" for a normal well scoped implementation or investigation; "high" when it spans several files or is subtle enough to need heavy reasoning or design judgment; "ultra" only for the rare hardest work, where a wrong call is expensive and hard to reverse: architecture or plan review, a root cause hunt that has already defeated ordinary debugging, or a design decision that sets a direction. Ultra is not "large" or "long running", and it is not "important to the user": when torn between high and ultra, answer high. Complexity is orthogonal to the provider: a low task can run on either provider, and so can an ultra one. Never let complexity change orchestration or missing_connector, and never let either of them change complexity.
+
+Separately, task_context_horizon is "extended" only when the task explicitly requires processing a large corpus, resuming or continuing work whose prior history must remain available, or sustained synthesis across many artifacts or steps. Otherwise "ordinary" is the default. This horizon is independent from complexity, orchestration, duration, importance, file count, provider or model capacity, and routing. Difficult or long running bounded work is ordinary.
 
 TASK
 <<<
@@ -248,8 +274,8 @@ TASK
 >>>
 
 Reply with exactly this JSON object, filled in:
-{{"orchestration":false,"missing_connector":false,"complexity":"medium","rationale":"one sentence"}}
-orchestration and missing_connector are booleans. complexity is "low", "medium", "high", or "ultra". rationale is one sentence."#
+{{"orchestration":false,"missing_connector":false,"complexity":"medium","task_context_horizon":"ordinary","rationale":"one sentence"}}
+orchestration and missing_connector are booleans. complexity is "low", "medium", "high", or "ultra". task_context_horizon is "ordinary" or "extended". rationale is one sentence."#
     )
 }
 
@@ -298,6 +324,9 @@ pub fn parse_classification(text: &str) -> Option<Classification> {
         return None;
     }
     let mut classification: Classification = serde_json::from_str(text.get(start..=end)?).ok()?;
+    if classification.task_context_horizon == TaskContextHorizon::Unknown {
+        return None;
+    }
     // Only `fallback` may set this; a model that echoes the field must not claim it failed.
     classification.classifier_failed = false;
     Some(classification)

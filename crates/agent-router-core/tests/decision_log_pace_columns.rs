@@ -199,14 +199,8 @@ fn fresh_auto_rows_persist_and_expose_each_context_horizon() {
     let usage = UsageSnapshot::full();
 
     for (task, classification) in [
-        (
-            "ordinary task",
-            scored(false, TaskContextHorizon::Ordinary),
-        ),
-        (
-            "extended task",
-            scored(false, TaskContextHorizon::Extended),
-        ),
+        ("ordinary task", scored(false, TaskContextHorizon::Ordinary)),
+        ("extended task", scored(false, TaskContextHorizon::Extended)),
         (
             "failed task",
             Classification::fallback("fixture failure", DefaultProvider::Codex),
@@ -253,10 +247,7 @@ fn explicit_provider_rows_keep_context_horizon_null() {
         })
         .expect("query");
     assert_eq!(horizon, None);
-    assert_eq!(
-        log.recent(1).expect("reads")[0].task_context_horizon,
-        None
-    );
+    assert_eq!(log.recent(1).expect("reads")[0].task_context_horizon, None);
 }
 
 #[test]
