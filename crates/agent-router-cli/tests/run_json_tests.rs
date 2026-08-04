@@ -1,3 +1,4 @@
+use agent_router_core::runtime::short_job_name;
 use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -86,8 +87,8 @@ impl CliFixture {
         fs::create_dir_all(&home).expect("create home");
         fs::create_dir_all(&bin).expect("create bin");
         fs::create_dir_all(&cwd).expect("create cwd");
-        let task = "雪".repeat(45);
-        let name = task.chars().take(40).collect::<String>();
+        let task = "/implement RS-123 rename background sessions".to_string();
+        let name = short_job_name(&task);
         let spawn_log = root.path.join("claude.argv");
         let listed = listed.unwrap_or(&name);
         let classifier_answer = json!({
