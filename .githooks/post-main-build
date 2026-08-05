@@ -6,4 +6,5 @@ if [[ "$(git branch --show-current)" != "main" ]]; then
 fi
 
 ~/.cargo/bin/cargo build --release --workspace &&
+    cp target/release/agent-router ~/.cargo/bin/agent-router &&
     cp target/release/agent-router ~/.local/bin/agent-router
