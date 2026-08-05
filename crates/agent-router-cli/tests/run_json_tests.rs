@@ -61,24 +61,29 @@ struct CliFixture {
 #[cfg(unix)]
 impl CliFixture {
     fn new(label: &str) -> Self {
-        Self::listing_agent_named_with_context_horizon(label, None, "extended")
+        Self::listing_agent_named_with_context_horizon(label, None, "extended", false)
     }
 
     fn with_context_horizon(label: &str, task_context_horizon: &str) -> Self {
-        Self::listing_agent_named_with_context_horizon(label, None, task_context_horizon)
+        Self::listing_agent_named_with_context_horizon(label, None, task_context_horizon, false)
     }
 
     /// `listed` is the name the fake `claude agents` listing advertises, which is what the router
     /// matches against to resolve the short id of the job it just spawned. None means the name
     /// derived from the task.
     fn listing_agent_named(label: &str, listed: Option<&str>) -> Self {
-        Self::listing_agent_named_with_context_horizon(label, listed, "extended")
+        Self::listing_agent_named_with_context_horizon(label, listed, "extended", false)
+    }
+
+    fn auto_claude_job(label: &str, listed: &str) -> Self {
+        Self::listing_agent_named_with_context_horizon(label, Some(listed), "extended", true)
     }
 
     fn listing_agent_named_with_context_horizon(
         label: &str,
         listed: Option<&str>,
         task_context_horizon: &str,
+        orchestration: bool,
     ) -> Self {
         let root = TempDir::new(label);
         let home = root.path.join("home");
@@ -89,14 +94,16 @@ impl CliFixture {
         fs::create_dir_all(&cwd).expect("create cwd");
         let task = "/implement RS-123 rename background sessions".to_string();
         let name = short_job_name(&task);
+        let classifier_name = "RS-123 Input Box Searching";
         let spawn_log = root.path.join("claude.argv");
         let listed = listed.unwrap_or(&name);
         let classifier_answer = json!({
-            "orchestration": false,
+            "orchestration": orchestration,
             "missing_connector": false,
             "complexity": "medium",
             "task_context_horizon": task_context_horizon,
             "rationale": "fixture context",
+            "job_name": classifier_name,
         })
         .to_string();
         let classifier_result = json!({
@@ -336,6 +343,40 @@ fn auto_runs_log_context_horizon_without_changing_provider_or_model() {
         "row: {extended_row:?}"
     );
     assert_eq!(extended_row["task_context_horizon"], "extended");
+}
+
+#[cfg(unix)]
+#[test]
+fn auto_route_uses_the_classifier_generated_job_name() {
+    let fixture = CliFixture::auto_claude_job("classifier-job-name", "RS-123 Input Box Searching");
+    let output = fixture
+        .run_command()
+        .arg("--provider")
+        .arg("auto")
+        .arg("--json")
+        .output()
+        .expect("run router");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("router json");
+    assert_eq!(value["dispatch"]["job_name"], "RS-123 Input Box Searching");
+    assert_eq!(value["dispatch"]["job_id"], "claude exact id");
+    assert_eq!(
+        wait_for_text(&fixture.spawn_log)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "--bg",
+            "--model",
+            "opus[1m]",
+            "--name",
+            "RS-123 Input Box Searching",
+            &fixture.task
+        ]
+    );
 }
 
 #[cfg(unix)]

@@ -130,6 +130,46 @@ pub fn short_job_name(task: &str) -> String {
         .join(" ")
 }
 
+/// Validate and normalize a title returned by the classifier model.
+///
+/// A ticket in the task must lead the title. The remaining title must contain two to six words,
+/// and punctuation is rejected so a model explanation cannot become a session name.
+pub fn validate_job_name(task: &str, candidate: &str) -> Option<String> {
+    let words: Vec<&str> = candidate.split_whitespace().collect();
+    if words.is_empty() || words.iter().any(|word| !valid_title_word(word)) {
+        return None;
+    }
+
+    let ticket = task
+        .split(|character: char| !(character.is_alphanumeric() || character == '-'))
+        .find(|word| is_ticket(word));
+    let description = if let Some(ticket) = ticket {
+        if words.first().copied() != Some(ticket) {
+            return None;
+        }
+        &words[1..]
+    } else {
+        words.as_slice()
+    };
+    if !(2..=6).contains(&description.len()) {
+        return None;
+    }
+
+    let mut normalized = Vec::with_capacity(words.len());
+    if let Some(ticket) = ticket {
+        normalized.push(ticket.to_string());
+        normalized.extend(description.iter().map(|word| title_case(word)));
+    } else {
+        normalized.extend(words.iter().map(|word| title_case(word)));
+    }
+    Some(normalized.join(" "))
+}
+
+fn valid_title_word(word: &str) -> bool {
+    word.chars()
+        .all(|character| character.is_alphanumeric() || character == '-')
+}
+
 fn is_ticket(value: &str) -> bool {
     let Some((prefix, number)) = value.split_once('-') else {
         return false;
@@ -209,7 +249,7 @@ pub fn spawn_detached(mut command: Command, log_path: &Path) -> Result<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::short_job_name;
+    use super::{short_job_name, validate_job_name};
 
     #[test]
     fn an_implement_prompt_uses_its_ticket_and_a_short_task_title() {
@@ -230,5 +270,32 @@ mod tests {
     #[test]
     fn a_ticket_without_a_description_keeps_a_useful_fallback_title() {
         assert_eq!(short_job_name("/implement GH-432"), "GH-432 Implement Task");
+    }
+
+    #[test]
+    fn a_model_title_keeps_the_task_ticket_and_normalizes_title_case() {
+        assert_eq!(
+            validate_job_name(
+                "/implement RS-123 search the input box",
+                "RS-123 input box search"
+            ),
+            Some("RS-123 Input Box Search".to_string())
+        );
+    }
+
+    #[test]
+    fn a_model_title_must_start_with_the_task_ticket_and_have_two_to_six_description_words() {
+        assert_eq!(
+            validate_job_name("/implement GH-123 fix bugs", "Fix Bugs GH-123"),
+            None
+        );
+        assert_eq!(
+            validate_job_name("/implement GH-123 fix bugs", "GH-123 Fix"),
+            None
+        );
+        assert_eq!(
+            validate_job_name("audit the scheduler", "Audit The Scheduler"),
+            Some("Audit The Scheduler".to_string())
+        );
     }
 }

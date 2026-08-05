@@ -209,9 +209,9 @@ Which engine scores a task, and the model each engine scores it with.
 
 Default `"claude"`. Either `"claude"` or `"codex"`. Any other value is a configuration error.
 
-Scoring is one small strict JSON answer, so either engine can do it. The choice is about which
-weekly budget the per task classifier call is drawn from. If Claude weekly budget is the scarce
-resource, set this to `"codex"`.
+Scoring and job naming are one small strict JSON answer, so either engine can do both. The choice is
+about which weekly budget the per task classifier call is drawn from. If Claude weekly budget is the
+scarce resource, set this to `"codex"`.
 
 Two consequences of `"codex"` worth knowing. Scoring runs with every tool disabled, so it cannot
 read a file even though the sandbox is read only. And it writes a session rollout per scored task
@@ -227,7 +227,7 @@ regardless of which engine is in force, so flipping `engine` is a one word edit 
 re-pick of the model.
 
 Both want the cheapest model that reliably holds the output contract, since the classifier runs on
-every automatically routed task and its only job is to emit one JSON object.
+every automatically routed task and emits the routing scores plus a concise job title.
 
 ## `[models.codex]` and `[models.claude]`
 
