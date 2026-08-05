@@ -33,7 +33,7 @@ enum Command {
         /// Model override, requires an explicit --provider.
         #[arg(long)]
         model: Option<String>,
-        /// Job name (defaults to the first 40 characters of the task).
+        /// Job name (defaults to a short, ticket-prefixed title derived from the task).
         #[arg(long)]
         name: Option<String>,
         /// Decide and log without dispatching.

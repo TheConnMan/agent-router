@@ -1,7 +1,7 @@
 //! One routed task end to end: read usage, classify (unless the caller named a provider),
 //! decide, dispatch, log.
 
-use crate::classify::classify;
+use crate::classify::classify_with_name;
 use crate::config::Config;
 use crate::decide::{Decision, decide, decide_explicit};
 use crate::error::{Error, Result};
@@ -89,16 +89,25 @@ pub fn run(request: &Request, config: &Config) -> Result<Outcome> {
         )));
     }
     let usage = UsageSnapshot::read();
-    let decision = match request.provider {
-        Some(provider) => decide_explicit(provider, request.model.clone(), usage, config),
+    let (decision, generated_name) = match request.provider {
+        Some(provider) => (
+            decide_explicit(provider, request.model.clone(), usage, config),
+            None,
+        ),
         // `decide` is pure and takes the instant it decides at, so the clock is read here, on the
         // impure side, and after the usage snapshot the run rate rules measure against it.
-        None => decide(
-            classify(request.task, config),
-            usage,
-            crate::usage::now_epoch(),
-            config,
-        ),
+        None => {
+            let classified = classify_with_name(request.task, config);
+            (
+                decide(
+                    classified.classification,
+                    usage,
+                    crate::usage::now_epoch(),
+                    config,
+                ),
+                classified.job_name,
+            )
+        }
     };
     let requested = request
         .provider
@@ -135,7 +144,17 @@ pub fn run(request: &Request, config: &Config) -> Result<Outcome> {
         });
     }
 
-    let dispatched = crate::dispatch::dispatch(&decision, request);
+    let dispatch_request = Request {
+        task: request.task,
+        dir: request.dir,
+        provider: request.provider,
+        model: request.model.clone(),
+        name: request.name.clone().or(generated_name),
+        dry_run: request.dry_run,
+        mcp_configs: request.mcp_configs,
+        strict_mcp_config: request.strict_mcp_config,
+    };
+    let dispatched = crate::dispatch::dispatch(&decision, &dispatch_request);
     // The decision is logged either way: a dispatch that failed is exactly the row worth
     // keeping, and losing it would hide the failure from the tuning data.
     let (job_id, job_name, effective_effort, outcome) = recorded_fields(&dispatched);

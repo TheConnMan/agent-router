@@ -17,7 +17,7 @@ pub fn dispatch(decision: &crate::decide::Decision, request: &Request) -> Result
     let name = request
         .name
         .clone()
-        .unwrap_or_else(|| crate::runtime::truncated_title(request.task));
+        .unwrap_or_else(|| crate::runtime::short_job_name(request.task));
     match decision.provider {
         Provider::Codex => codex::dispatch(
             request.dir,

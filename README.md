@@ -20,7 +20,7 @@ log: row 87 in /home/you/.local/state/agent-router/router.db
 1. **Classify.** One small model call scores the task and returns strict JSON:
 
    ```json
-   {"orchestration": false, "missing_connector": false, "complexity": "medium", "task_context_horizon": "ordinary"}
+   {"orchestration": false, "missing_connector": false, "complexity": "medium", "task_context_horizon": "ordinary", "job_name": "GH-123 Sprint 2 Bug Fixes"}
    ```
 
    `task_context_horizon` is `ordinary` or `extended`. It is observed and recorded for later
@@ -32,7 +32,9 @@ log: row 87 in /home/you/.local/state/agent-router/router.db
    engine additionally runs with its shell, browser, computer use, image, app, and skill search
    tools disabled: scoring needs no tool, and a task carrying an injected instruction must have
    nothing to reach for. If the call fails or times out, the configured default provider stays in
-   force and the decision is tagged `classifier_failed`.
+   force and the decision is tagged `classifier_failed`. The same classifier model also generates
+   the job title. A ticket ID leads the title, followed by two to six concise Title Case words, such
+   as `GH-123 Sprint 2 Bug Fixes` or `RS-123 Input Box Searching`.
 2. **Apply the capability pin.** A missing connector, or a task needing several agents to exchange
    findings mid-run, pins to Claude regardless of usage. These are statements that the task cannot
    run on Codex at all, so every usage rule below is bypassed.

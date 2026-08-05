@@ -3,7 +3,7 @@
 //! retains the configured default and stays eligible for weekly routing.
 
 use crate::config::{Classifier, ClassifierEngine, Config, DefaultProvider};
-use crate::runtime::home_dir;
+use crate::runtime::{home_dir, validate_job_name};
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -105,19 +105,44 @@ impl Classification {
     }
 }
 
+/// The classifier's routing score plus its optional user-facing session title.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClassifiedTask {
+    pub classification: Classification,
+    pub job_name: Option<String>,
+}
+
 /// IMPURE: score `task` with the configured classifier engine. Never fails: an unusable answer
 /// becomes the fallback.
 pub fn classify(task: &str, config: &Config) -> Classification {
+    classify_with_name(task, config).classification
+}
+
+/// IMPURE: score `task` and ask the same small classifier model for a session title. Never fails:
+/// an unusable score becomes the fallback and an unusable title becomes `None`.
+pub fn classify_with_name(task: &str, config: &Config) -> ClassifiedTask {
     let prompt = classifier_prompt(task, &config.connectors);
     let timeout = Duration::from_secs(config.classifier_timeout_secs);
     let engine = config.classifier.engine;
     let cmd = classifier_command(&prompt, &config.classifier);
     match capture(cmd, engine.name(), timeout) {
-        Ok(stdout) => match parse_classifier_output(&stdout, engine) {
-            Some(classification) => classification,
-            None => Classification::fallback("unparseable json", config.policy.default_provider),
+        Ok(stdout) => match parse_classifier_output_with_name(&stdout, engine) {
+            Some((classification, job_name)) => ClassifiedTask {
+                classification,
+                job_name: job_name.and_then(|name| validate_job_name(task, &name)),
+            },
+            None => ClassifiedTask {
+                classification: Classification::fallback(
+                    "unparseable json",
+                    config.policy.default_provider,
+                ),
+                job_name: None,
+            },
         },
-        Err(why) => Classification::fallback(&why, config.policy.default_provider),
+        Err(why) => ClassifiedTask {
+            classification: Classification::fallback(&why, config.policy.default_provider),
+            job_name: None,
+        },
     }
 }
 
@@ -269,25 +294,45 @@ Separately, and independently of both booleans, judge how much reasoning the tas
 
 Separately, task_context_horizon is "extended" only when the task explicitly requires processing a large corpus, resuming or continuing work whose prior history must remain available, or sustained synthesis across many artifacts or steps. Otherwise "ordinary" is the default. This horizon is independent from complexity, orchestration, duration, importance, file count, provider or model capacity, and routing. Difficult or long running bounded work is ordinary.
 
+job_name: create a concise human-readable session title for this task. If the task contains a ticket ID such as GH-123 or RS-123, start with that exact ticket ID. Then add two to six Title Case words describing the feature or thread. If there is no ticket ID, use two to six Title Case words. Return only the title words, with no explanation or punctuation. Examples: "GH-123 Sprint 2 Bug Fixes" and "RS-123 Input Box Searching".
+
 TASK
 <<<
 {task}
 >>>
 
 Reply with exactly this JSON object, filled in:
-{{"orchestration":false,"missing_connector":false,"complexity":"medium","task_context_horizon":"ordinary","rationale":"one sentence"}}
-orchestration and missing_connector are booleans. complexity is "low", "medium", "high", or "ultra". task_context_horizon is "ordinary" or "extended". rationale is one sentence."#
+{{"orchestration":false,"missing_connector":false,"complexity":"medium","task_context_horizon":"ordinary","rationale":"one sentence","job_name":"GH-123 Sprint 2 Bug Fixes"}}
+orchestration and missing_connector are booleans. complexity is "low", "medium", "high", or "ultra". task_context_horizon is "ordinary" or "extended". rationale is one sentence. job_name is two to six Title Case words, or a ticket ID followed by two to six Title Case words."#
     )
 }
 
 /// PURE: the classification out of `engine`'s stdout. Each engine wraps the model's text in its
 /// own envelope, so unwrapping is per engine and the classification parse below is shared.
 pub fn parse_classifier_output(stdout: &str, engine: ClassifierEngine) -> Option<Classification> {
+    parse_classifier_output_with_name(stdout, engine).map(|(classification, _)| classification)
+}
+
+/// PURE: parse the classifier score and optional title from either engine's output envelope.
+pub fn parse_classifier_output_with_name(
+    stdout: &str,
+    engine: ClassifierEngine,
+) -> Option<(Classification, Option<String>)> {
     let text = match engine {
         ClassifierEngine::Claude => claude_answer(stdout)?,
         ClassifierEngine::Codex => codex_answer(stdout)?,
     };
-    parse_classification(&text)
+    let value = parse_classifier_value(&text)?;
+    let mut classification: Classification = serde_json::from_value(value.clone()).ok()?;
+    if classification.task_context_horizon == TaskContextHorizon::Unknown {
+        return None;
+    }
+    classification.classifier_failed = false;
+    let job_name = value
+        .get("job_name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    Some((classification, job_name))
 }
 
 /// PURE: the model's text out of `claude -p --output-format json` stdout, which is one JSON
@@ -319,18 +364,23 @@ fn codex_answer(stdout: &str) -> Option<String> {
 /// PURE: the classification out of the model's own text, tolerating a code fence or a sentence
 /// around the object (the object itself must still be exact).
 pub fn parse_classification(text: &str) -> Option<Classification> {
-    let start = text.find('{')?;
-    let end = text.rfind('}')?;
-    if end < start {
-        return None;
-    }
-    let mut classification: Classification = serde_json::from_str(text.get(start..=end)?).ok()?;
+    let value = parse_classifier_value(text)?;
+    let mut classification: Classification = serde_json::from_value(value).ok()?;
     if classification.task_context_horizon == TaskContextHorizon::Unknown {
         return None;
     }
     // Only `fallback` may set this; a model that echoes the field must not claim it failed.
     classification.classifier_failed = false;
     Some(classification)
+}
+
+fn parse_classifier_value(text: &str) -> Option<serde_json::Value> {
+    let start = text.find('{')?;
+    let end = text.rfind('}')?;
+    if end < start {
+        return None;
+    }
+    serde_json::from_str(text.get(start..=end)?).ok()
 }
 
 /// IMPURE: run `cmd` to completion within `timeout`, returning stdout. The failure is a
@@ -437,6 +487,15 @@ mod tests {
         assert!(!got.orchestration);
         assert!(!got.missing_connector);
         assert!(!got.classifier_failed);
+    }
+
+    #[test]
+    fn a_well_formed_answer_also_returns_the_model_generated_job_name() {
+        let answer = r#"{"orchestration":false,"missing_connector":false,"task_context_horizon":"ordinary","rationale":"explicit outcome","job_name":"GH-123 Sprint 2 Bug Fixes"}"#;
+        let (_, job_name) =
+            parse_classifier_output_with_name(&envelope(answer), ClassifierEngine::Claude)
+                .expect("parses");
+        assert_eq!(job_name.as_deref(), Some("GH-123 Sprint 2 Bug Fixes"));
     }
 
     /// The horizon is a closed observation emitted by every usable classifier answer. Both values
@@ -604,6 +663,9 @@ mod tests {
              that list"
         ));
         assert!(prompt.contains("do a thing"));
+        assert!(prompt.contains("GH-123 Sprint 2 Bug Fixes"));
+        assert!(prompt.contains("RS-123 Input Box Searching"));
+        assert!(prompt.contains("start with that exact ticket ID"));
         // The complexity rubric and its independence from both pins, which is what stops a
         // trivial conversational task from being scored hard because it looks like Claude work.
         assert!(prompt.contains("conversational, one step, mechanical, or a single file"));
@@ -627,7 +689,8 @@ mod tests {
         // The answer shape, which is what the parser accepts and nothing wider.
         assert!(prompt.contains(
             "{\"orchestration\":false,\"missing_connector\":false,\"complexity\":\"medium\",\
-             \"task_context_horizon\":\"ordinary\",\"rationale\":\"one sentence\"}"
+             \"task_context_horizon\":\"ordinary\",\"rationale\":\"one sentence\",\
+             \"job_name\":\"GH-123 Sprint 2 Bug Fixes\"}"
         ));
         assert!(prompt.contains("complexity is \"low\", \"medium\", \"high\", or \"ultra\""));
         // No field of the retired fourteen field shape may still be asked for. Matched as a JSON
