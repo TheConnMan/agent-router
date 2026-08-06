@@ -2,10 +2,15 @@
 //! surfaces on `agent-router usage` and on a logged decision.
 //!
 //! `claude_headroom()` reads the machine wide `/tmp/claude-usage-cache.json`, which pointing HOME
-//! at a temp directory does not isolate, so nothing here fixes what Claude's usage read must
-//! return. Codex is the provider every deterministic usage assertion is made against, isolated by
-//! `CODEX_SESSIONS_DIR`. Where Claude is asserted at all, it is asserted against `usage --json`'s
-//! own report of the same read, so the two surfaces have to agree whichever way this box reads.
+//! at a temp directory does not isolate. Codex is therefore the provider every deterministic usage
+//! assertion is made against, isolated by `CODEX_SESSIONS_DIR`. Where Claude is asserted at all, it
+//! is asserted against `usage --json`'s own report of the same read, so the two surfaces have to
+//! agree whichever way this box reads.
+//!
+//! `the_usage_cache_override_decides_what_the_claude_read_returns` is the exception and the reason
+//! the rest can stay as they are: `CLAUDE_USAGE_CACHE` moves that path, so that one test fixes
+//! Claude's read outright, in both directions, and owns proving the override works. The others were
+//! left alone rather than rewritten onto it.
 //!
 //! PATH holds only what the fixture put on it, so a provider binary this box happens to have
 //! installed cannot decide a check.
@@ -424,5 +429,79 @@ fn the_usage_command_names_its_source_as_live_or_fail_open() {
     assert!(
         claude_line.contains(expected),
         "the snapshot reports a {expected} claude read, the usage line does not: {claude_line}"
+    );
+}
+
+/// The env var name is written out rather than imported from the core crate. It is the interface a
+/// test harness and `scripts/local-checks.sh` both address the router by, so a rename of the const's
+/// value has to break something, and a test that reads the const with the const would not.
+const CACHE_ENV: &str = "CLAUDE_USAGE_CACHE";
+
+#[test]
+fn the_usage_cache_override_decides_what_the_claude_read_returns() {
+    let fixture = DoctorFixture::new("usage cache override");
+
+    // A cache this fixture wrote, freshly, carrying numbers no live read would coincidentally
+    // produce. Writing it now puts its mtime inside the 5 minute freshness window.
+    let seeded = fixture.root.path.join("seeded-usage-cache.json");
+    fs::write(
+        &seeded,
+        json!({
+            "five_hour": {"utilization": 11.0, "resets_at": "2026-08-01T13:00:00+00:00"},
+            "seven_day": {"utilization": 73.0, "resets_at": "2026-08-01T13:00:00+00:00"},
+        })
+        .to_string(),
+    )
+    .expect("write the seeded cache");
+
+    let read = |cache: &Path| -> Value {
+        let output = fixture
+            .router(IDLE_SESSIONS, false)
+            .env(CACHE_ENV, cache)
+            .args(["usage", "--json"])
+            .output()
+            .expect("run the router");
+        assert!(
+            output.status.success(),
+            "usage --json failed, stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).expect("usage json")
+    };
+
+    // Pointed at the seeded cache, the read is those numbers and nothing else. This box's own
+    // /tmp/claude-usage-cache.json holds whatever the statusline last wrote, so 73.0 arriving here
+    // is the whole proof that the override was honoured rather than ignored.
+    let seeded_read = read(&seeded);
+    assert_eq!(
+        seeded_read["claude"]["weekly_pct"].as_f64(),
+        Some(73.0),
+        "the seeded cache must be the cache that was read: {seeded_read}"
+    );
+    assert_eq!(
+        seeded_read["claude"]["stale"].as_bool(),
+        Some(false),
+        "a parsed cache is a live read: {seeded_read}"
+    );
+
+    // Pointed at nothing, with no credentials under this fixture's HOME, which is a GitHub runner
+    // exactly: no cache to read and no token to fetch with, so the read fails open. Before the
+    // override existed this state was unreachable on a developer box, and a test that depended on
+    // it passed locally and failed only in CI.
+    let absent = fixture
+        .root
+        .path
+        .join("no such directory")
+        .join("cache.json");
+    let absent_read = read(&absent);
+    assert_eq!(
+        absent_read["claude"]["stale"].as_bool(),
+        Some(true),
+        "no cache and no credentials is a fail open read: {absent_read}"
+    );
+    assert_eq!(
+        absent_read["claude"]["weekly_pct"].as_f64(),
+        Some(0.0),
+        "a fail open read is full headroom: {absent_read}"
     );
 }

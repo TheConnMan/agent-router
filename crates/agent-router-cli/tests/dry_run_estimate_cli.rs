@@ -4,6 +4,8 @@
 //! percentage in it comes from a codex rollout the fixture wrote, so nothing here depends on this
 //! box's real usage. Claude is deliberately never the provider under test: `claude_headroom()`
 //! reads the machine wide `/tmp/claude-usage-cache.json`, which a temp HOME does not isolate.
+//! `CLAUDE_USAGE_CACHE` now moves that path, so a fixture here could fix Claude's read too; nothing
+//! in this file has been rewritten to depend on it.
 //!
 //! The whole file is unix only because the fixture stubs its provider binaries as shell scripts,
 //! which is the idiom `run_json_tests.rs` and `stats_cli.rs` already use.

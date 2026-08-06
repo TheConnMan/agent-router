@@ -17,11 +17,23 @@
 //! distinction routing acts on, and `usage.sh` reports the same cache the same way.
 
 use crate::runtime::{default_codex_home, home_dir};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 /// The Claude usage cache the statusline and bonus-drain already share.
-pub const CLAUDE_USAGE_CACHE: &str = "/tmp/claude-usage-cache.json";
+pub const CLAUDE_USAGE_CACHE_DEFAULT: &str = "/tmp/claude-usage-cache.json";
+/// Points the Claude reader at a different cache. Empty or unset means the shared default.
+///
+/// It exists so a test can decide what Claude's usage read returns. The default is a machine wide
+/// path that no fixture can unset: a test with no credentials in its temp HOME still gets a live
+/// read off whatever the statusline last wrote there, so a Claude usage assertion passes on a
+/// developer box and fails on a runner that has neither the cache nor credentials. That divergence
+/// turned `main` red on 2026-08-06, on a merge that was green on every box it was built on.
+///
+/// Pointed at a path that does not exist, this reproduces a runner exactly: no cache to read, and
+/// `claude_oauth_token` already finds nothing under a temp HOME, so the read fails open.
+pub const CLAUDE_USAGE_CACHE_ENV: &str = "CLAUDE_USAGE_CACHE";
 /// How old the shared cache may be before it is refreshed from the API.
 const CACHE_MAX_AGE: Duration = Duration::from_secs(300);
 /// Ceiling on the usage HTTP call, matching `usage.sh`'s `curl --max-time 6`.
@@ -111,11 +123,28 @@ impl UsageSnapshot {
 
 // ---------------------------------------------------------------- Claude
 
+/// IMPURE: the cache path the Claude reader will use, from `CLAUDE_USAGE_CACHE` or the shared
+/// default.
+pub fn claude_usage_cache() -> PathBuf {
+    claude_usage_cache_from(std::env::var_os(CLAUDE_USAGE_CACHE_ENV).as_deref())
+}
+
+/// PURE: the resolution rule behind `claude_usage_cache`, split out so it is testable without
+/// touching the environment. Env vars are process global and Rust runs tests in threads, so a test
+/// that set one would decide what a sibling test read.
+pub fn claude_usage_cache_from(var: Option<&OsStr>) -> PathBuf {
+    match var {
+        Some(path) if !path.is_empty() => PathBuf::from(path),
+        _ => PathBuf::from(CLAUDE_USAGE_CACHE_DEFAULT),
+    }
+}
+
 /// IMPURE: the Claude snapshot, from the shared cache when it is under 5 minutes old and from
 /// the OAuth usage endpoint otherwise. A stale cache is preferred over nothing; nothing at all
 /// reads as full headroom.
 pub fn claude_headroom() -> Headroom {
-    let cache = Path::new(CLAUDE_USAGE_CACHE);
+    let cache = claude_usage_cache();
+    let cache = cache.as_path();
     if is_fresh(cache, CACHE_MAX_AGE)
         && let Some(headroom) = std::fs::read_to_string(cache)
             .ok()
@@ -458,6 +487,28 @@ mod tests {
       "extra_usage": {"is_enabled": true, "monthly_limit": 20000},
       "limits": [{"kind": "weekly_all", "percent": 50, "is_active": true}]
     }"#;
+
+    #[test]
+    fn the_usage_cache_path_prefers_the_environment_over_the_shared_default() {
+        assert_eq!(
+            claude_usage_cache_from(None),
+            PathBuf::from(CLAUDE_USAGE_CACHE_DEFAULT),
+            "with nothing set, the reader must still share bonus-drain's cache"
+        );
+        assert_eq!(
+            claude_usage_cache_from(Some(OsStr::new("/nonexistent/usage.json"))),
+            PathBuf::from("/nonexistent/usage.json"),
+            "an override must win outright, including when it names a path that does not exist"
+        );
+        // An empty value is how a shell writes "unset" by accident (`CLAUDE_USAGE_CACHE= cmd`).
+        // Taken literally it is the current working directory, which reads as a cache that never
+        // parses, so the reader would fail open forever and blame the API.
+        assert_eq!(
+            claude_usage_cache_from(Some(OsStr::new(""))),
+            PathBuf::from(CLAUDE_USAGE_CACHE_DEFAULT),
+            "an empty override is unset, not a path"
+        );
+    }
 
     #[test]
     fn claude_usage_reads_both_windows_and_their_resets() {
