@@ -122,7 +122,7 @@ impl Decision {
 /// 1. The capability pin. A task Codex cannot do is not a cheaper job when routed there, it is a
 ///    failed one, so a pin bypasses every usage rule below including the ceiling.
 /// 2. The hard ceiling, before the override. Being out of weekly budget is a capacity fact, and a
-///    run rate can read a provider with two points left as running cold (95 percent used against
+///    run rate can read a provider down to its reserve as running cold (95 percent used against
 ///    99 percent elapsed is a negative delta), so an override allowed to run first would route
 ///    into an exhausted provider.
 /// 3. The run rate override, which is deliberately rare. See `pace_flip_gap`.

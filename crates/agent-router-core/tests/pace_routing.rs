@@ -584,18 +584,18 @@ fn the_old_flip_gap_key_is_not_an_alias_for_the_new_one() {
 /// The 70 point default is a measured property of this box's plan mix rather than a round number,
 /// so it is pinned here as well as behaviourally: moving it silently re-tunes every route.
 #[test]
-fn the_written_config_carries_pace_flip_gap_at_version_two() {
+fn the_written_config_carries_pace_flip_gap_at_the_current_version() {
     let dir = tempfile::tempdir().expect("tempdir");
 
     let fresh_path = dir.path().join("fresh/config.toml");
     let created = Config::load_from(&fresh_path).expect("create the default config");
-    assert_eq!(created.config_version, 2);
+    assert_eq!(created.config_version, 3);
     assert_eq!(created.pace_flip_gap, 70.0);
 
     let document: toml::Value =
         toml::from_str(&std::fs::read_to_string(&fresh_path).expect("read the written config"))
             .expect("parse the written config");
-    assert_eq!(document["config_version"].as_integer(), Some(2));
+    assert_eq!(document["config_version"].as_integer(), Some(3));
     assert_eq!(document["pace_flip_gap"].as_float(), Some(70.0));
     assert!(document.get("headroom_flip_gap").is_none());
 
@@ -603,12 +603,47 @@ fn the_written_config_carries_pace_flip_gap_at_version_two() {
     std::fs::write(&old_path, "config_version = 1\nheadroom_flip_gap = 25.0\n")
         .expect("write the v1 config");
     let migrated = Config::load_from(&old_path).expect("load the v1 config");
-    assert_eq!(migrated.config_version, 2);
+    assert_eq!(migrated.config_version, 3);
     assert_eq!(migrated.pace_flip_gap, 70.0);
 
     let rewritten: toml::Value =
         toml::from_str(&std::fs::read_to_string(&old_path).expect("re-read the migrated config"))
             .expect("parse the migrated config");
-    assert_eq!(rewritten["config_version"].as_integer(), Some(2));
+    assert_eq!(rewritten["config_version"].as_integer(), Some(3));
     assert!(rewritten.get("headroom_flip_gap").is_none());
+}
+
+/// Rule 7. The reserve, stated as the number rather than as `config.hard_ceiling_pct`: every other
+/// ceiling case in this file reads the threshold off the config, so all of them would follow the
+/// default silently wherever it moved. This one is the assertion that a provider inside the last 5
+/// points of its weekly limit is not a routing destination.
+///
+/// Both sides of the boundary, because "95 is refused" is also true of a rule that refuses
+/// everything, and the comparison is at-or-above, so 94.9 must still route.
+#[test]
+fn a_provider_within_five_points_of_its_weekly_limit_takes_no_more_work() {
+    let config = Config::default();
+    assert_eq!(config.hard_ceiling_pct, 95.0);
+
+    // Codex is the default provider, and at 95 percent used it is out. Its window is fully
+    // elapsed, so run rate reads it as 5 points COLD and argues for staying; the ceiling wins.
+    let refused = decide(
+        plain(),
+        usage(window(40.0, WEEK, 0.0), window(95.0, 0, 0.0)),
+        NOW,
+        &config,
+    );
+    assert_eq!(refused.provider, Provider::Claude);
+    assert!(refused.gates.contains(&Gate::FlippedOnExhaustion));
+
+    // A tenth of a point below it, the same task stays on Codex with no gate at all: the reserve
+    // is a boundary and not a general aversion to a busy provider.
+    let allowed = decide(
+        plain(),
+        usage(window(40.0, WEEK, 0.0), window(94.9, 0, 0.0)),
+        NOW,
+        &config,
+    );
+    assert_eq!(allowed.provider, Provider::Codex);
+    assert!(allowed.gates.is_empty(), "{:?}", allowed.gates);
 }

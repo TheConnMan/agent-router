@@ -6,8 +6,9 @@ use crate::error::Result;
 use crate::runtime::home_dir;
 use std::path::{Path, PathBuf};
 
-/// Weekly percent at which a provider counts as exhausted.
-const DEFAULT_HARD_CEILING_PCT: f64 = 97.0;
+/// Weekly percent at which a provider counts as exhausted: within 5 points of the weekly limit is
+/// close enough that the provider is no longer a routing destination.
+const DEFAULT_HARD_CEILING_PCT: f64 = 95.0;
 /// Run rate gap (in points of window) that moves a task off the provider it is on. Measured, not
 /// chosen: see the field's own doc comment.
 const DEFAULT_PACE_FLIP_GAP: f64 = 70.0;
@@ -19,10 +20,13 @@ const DEFAULT_CLAUDE_FIVE_HOUR_PACING_PCT: f64 = 90.0;
 const DEFAULT_CLASSIFIER_TIMEOUT_SECS: u64 = 60;
 /// The classifier timeout this tool used to generate into new config files.
 const PRE_MIGRATION_CLASSIFIER_TIMEOUT_SECS: u64 = 30;
+/// The hard ceiling this tool used to generate into new config files, which left a provider a
+/// routing destination until it was within 3 points of its weekly limit.
+const PRE_MIGRATION_HARD_CEILING_PCT: f64 = 97.0;
 
 /// The migration level a config file written by this build carries. Raise this, and add a step to
 /// `migrate`, whenever a stale generated value has to be corrected in place.
-const CURRENT_CONFIG_VERSION: u32 = 2;
+const CURRENT_CONFIG_VERSION: u32 = 3;
 
 /// The level a file that predates versioning reads as. This is deliberately NOT
 /// `CURRENT_CONFIG_VERSION`: an absent key has to be distinguishable from a stamped one, or every
@@ -246,6 +250,13 @@ pub struct Config {
     #[serde(default = "pre_versioning")]
     pub config_version: u32,
     /// Weekly percent used at or above which a provider is treated as exhausted.
+    ///
+    /// The default of 95 keeps a 5 point reserve: a provider within 5 points of its weekly limit
+    /// is no longer a routing destination. The reserve is what the last points are for, since the
+    /// router is not the only thing spending them. Interactive sessions, the classifier's own
+    /// per-task call, and a `--provider` dispatch all draw on the same weekly window without
+    /// consulting this ceiling, so a router that spends down to the limit leaves nothing for the
+    /// work a person is doing by hand.
     pub hard_ceiling_pct: f64,
     /// How many points a provider must be burning ahead of the other, each measured against its
     /// own weekly window, before a task moves off it. Strictly greater: a gap exactly here holds.
@@ -360,6 +371,14 @@ impl Config {
         // tuned for the old comparison means nothing under the new one, so the old key is simply
         // no longer read and the rewrite below is what drops it from the file. Leaving it on disk
         // would be a config that names a key the router ignores.
+        //
+        // v3: the ceiling was generated as 97, which left a provider eligible until it was within
+        // 3 points of its weekly limit; the reserve is 5 points now. The generated value is on
+        // every file this tool has ever written, so lowering the constant alone would reach none
+        // of them and the router would keep routing into the last 5 points on every real box.
+        if self.config_version < 3 && self.hard_ceiling_pct == PRE_MIGRATION_HARD_CEILING_PCT {
+            self.hard_ceiling_pct = DEFAULT_HARD_CEILING_PCT;
+        }
         self.config_version = CURRENT_CONFIG_VERSION;
         true
     }
@@ -412,7 +431,63 @@ mod tests {
         // the router behaves as 60 is a config that lies about what is running.
         let text = std::fs::read_to_string(&path).expect("re-read");
         assert!(text.contains("classifier_timeout_secs = 60"), "{text}");
-        assert!(text.contains("config_version = 2"), "{text}");
+        assert!(text.contains("config_version = 3"), "{text}");
+    }
+
+    /// The v3 step, and the reason it has to exist at all: every config file this tool has written
+    /// states the ceiling explicitly, so lowering the constant would leave every real box still
+    /// routing into the last 5 points of its weekly limit.
+    #[test]
+    fn a_file_carrying_the_old_generated_ceiling_is_migrated_on_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "config_version = 2\nhard_ceiling_pct = 97.0\n").expect("write");
+
+        let config = Config::load_from(&path).expect("loads");
+        assert_eq!(config.hard_ceiling_pct, DEFAULT_HARD_CEILING_PCT);
+        assert_eq!(config.config_version, CURRENT_CONFIG_VERSION);
+
+        // On disk, not merely in memory: a file that still reads 97 while the router refuses a
+        // provider at 95 is a config that lies about what is running.
+        let text = std::fs::read_to_string(&path).expect("re-read");
+        assert!(text.contains("hard_ceiling_pct = 95.0"), "{text}");
+        assert!(text.contains("config_version = 3"), "{text}");
+    }
+
+    /// A ceiling the operator chose is theirs. 90 is not the value this tool generated, so the v3
+    /// step must leave it alone even while stamping the same file to the current version.
+    #[test]
+    fn migration_stamps_the_version_without_touching_a_deliberate_ceiling() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "config_version = 2\nhard_ceiling_pct = 90.0\n").expect("write");
+
+        let config = Config::load_from(&path).expect("loads");
+        assert_eq!(config.hard_ceiling_pct, 90.0);
+        assert_eq!(config.config_version, CURRENT_CONFIG_VERSION);
+    }
+
+    /// The stamp is what makes the correction a one-time event. An operator who deliberately puts
+    /// 97 back on an already-migrated file keeps it, rather than having it rewritten on every load.
+    #[test]
+    fn a_migrated_file_never_has_its_ceiling_corrected_a_second_time() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "config_version = 2\nhard_ceiling_pct = 97.0\n").expect("write");
+        Config::load_from(&path).expect("first load migrates");
+
+        let migrated = std::fs::read_to_string(&path).expect("read");
+        std::fs::write(
+            &path,
+            migrated.replace("hard_ceiling_pct = 95.0", "hard_ceiling_pct = 97.0"),
+        )
+        .expect("write");
+
+        let config = Config::load_from(&path).expect("loads");
+        assert_eq!(
+            config.hard_ceiling_pct, 97.0,
+            "a stamped file must keep the operator's value"
+        );
     }
 
     /// A value the operator chose is not the tool's to correct, even while the same file is being
