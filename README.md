@@ -40,8 +40,10 @@ log: row 87 in /home/you/.local/state/agent-router/router.db
    run on Codex at all, so every usage rule below is bypassed.
 3. **Apply the hard ceiling, then the run rate override, then pace on Claude's 5 hour window.** A
    provider at or above `hard_ceiling_pct` is ineligible, which by default means a provider within
-   5 points of its weekly limit takes no more routed work: exactly one ineligible sends the task to
-   the other (`flipped_on_exhaustion`), both ineligible keeps the default (`over_ceiling`). With
+   5 points of its weekly limit takes no more routed work, and so is a provider whose weekly window
+   nobody read (`weekly_unknown`), because an unread window reports 0 percent used and would
+   otherwise read as maximum headroom: exactly one ineligible sends the task to the other
+   (`flipped_on_exhaustion`), both ineligible keeps the default (`over_ceiling`). With
    both eligible, the task moves only when the provider it is on is burning more than
    `pace_flip_gap` points further ahead of its own weekly window than the other is of its own
    (`pace_flip`), which is rare on purpose. Finally a task still bound for Claude moves to Codex
@@ -174,10 +176,15 @@ Weekly and 5 hour headroom for both providers.
 
 ```bash
 $ agent-router usage
-provider  5h      weekly  source     weekly reset
-claude     12.4%   58.1%  live       in 41h07m
-codex       0.0%    0.0%  fail-open  -
+provider  5h       weekly  source     weekly reset
+claude     12.4%    58.1%  live       in 41h07m
+codex       0.0%  unknown  fail-open  -
 ```
+
+The weekly column reads `unknown` when no reset epoch came back, because an unread window reports 0
+percent used and printing that as `0.0%` states a reading nobody took. Routing refuses such a
+provider, so the table says so too. It is also how a genuinely idle provider is told apart from one
+nobody could read: both would otherwise print the same number.
 
 `source` is where the numbers came from: `live` for a parsed payload, `fail-open` for a read that
 found nothing and defaulted to full headroom. Those two zeroes above are the fail open default, not

@@ -604,17 +604,28 @@ fn usage(json: bool) -> agent_router_core::Result<()> {
         println!("{}", serde_json::to_string_pretty(&snapshot)?);
         return Ok(());
     }
-    println!("provider  5h      weekly  source     weekly reset");
+    println!("provider  5h       weekly  source     weekly reset");
     for (name, headroom) in [("claude", snapshot.claude), ("codex", snapshot.codex)] {
         println!(
-            "{name:<9} {:>5.1}%  {:>5.1}%  {:<9}  {}",
+            "{name:<9} {:>5.1}%  {:>7}  {:<9}  {}",
             headroom.five_hour_pct,
-            headroom.weekly_pct,
+            weekly_label(&headroom),
             usage_source_label(headroom.stale),
             reset_label(headroom.weekly_reset_epoch)
         );
     }
     Ok(())
+}
+
+/// The weekly column. An unread window reports 0 percent used, and printing that as `0.0%` states
+/// a reading nobody took: this is the table that was showing a hard limited Codex as completely
+/// idle. Routing refuses such a provider, so the table has to say so too.
+fn weekly_label(headroom: &agent_router_core::Headroom) -> String {
+    if headroom.weekly_known() {
+        format!("{:.1}%", headroom.weekly_pct)
+    } else {
+        "unknown".to_string()
+    }
 }
 
 fn log(

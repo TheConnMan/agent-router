@@ -415,21 +415,32 @@ fn a_cold_pace_delta_never_routes_into_a_provider_at_the_ceiling() {
     assert!(!decision.gates.contains(&Gate::PaceFlip));
 }
 
-/// The one recorded dispatch whose Codex reset was never read. The override is uncomputable on it,
-/// so it keeps the default and records why, rather than treating the missing epoch as a fully
-/// elapsed window.
+/// The one recorded dispatch whose Codex reset was never read, and the row the fail closed rule was
+/// written for. Its Codex weekly number is the two zeroes an unread window produces, so the old
+/// rule read it as a completely idle provider and kept the task there; now the provider that
+/// reported nothing is ineligible and the task goes to the Claude that did report.
+///
+/// Replay agrees with what actually happened on this row: it was dispatched to Claude. That is
+/// corroboration and not the assertion, since the historical route came from the retired
+/// two-signal pin rather than from this rule.
 #[test]
-fn the_row_with_an_unread_reset_routes_without_the_override() {
+fn the_row_with_an_unread_reset_routes_to_the_provider_that_reported() {
     let config = Config::default();
     let corpus = corpus();
     let row = row(&corpus, 31);
     assert!(row.dispatched(), "row 31 is a real dispatch");
     assert_eq!(row.codex_weekly_reset, 0, "row 31 has no codex reset");
+    assert_eq!(
+        row.codex_weekly_pct, 0.0,
+        "row 31's unread window reports as idle, which is the whole problem"
+    );
 
     let decision = row.replay(&config);
-    assert_eq!(decision.provider, Provider::Codex);
-    assert!(decision.gates.contains(&Gate::PaceUnavailable));
+    assert_eq!(decision.provider, Provider::Claude);
+    assert!(decision.gates.contains(&Gate::WeeklyUnknown));
+    assert!(decision.gates.contains(&Gate::FlippedOnExhaustion));
     assert!(!decision.gates.contains(&Gate::PaceFlip));
+    assert_eq!(row.historical_provider, "claude");
 }
 
 /// The threshold is a property of how this box is provisioned, not of the algorithm, so it has to

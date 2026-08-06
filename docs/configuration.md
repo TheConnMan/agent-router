@@ -97,9 +97,27 @@ exceptions = []
 
 Default `95.0`. Weekly percent used at or above which a provider counts as exhausted.
 
-A provider at or over this ceiling is ineligible. Exactly one ineligible sends the task to the
-other and tags the decision `flipped_on_exhaustion`. Both ineligible keeps the default provider and
-tags it `over_ceiling`, because at that point there is no better destination to move to.
+A provider at or over this ceiling is ineligible, and so is a provider whose weekly window nobody
+read. Exactly one ineligible sends the task to the other and tags the decision
+`flipped_on_exhaustion`. Both ineligible keeps the default provider and tags it `over_ceiling`,
+because at that point there is no better destination to move to.
+
+An unread weekly window is ineligible because it reports 0 percent used, which is the same reading
+as a completely idle provider, so trusting it hands every job to whichever provider failed to
+report. That is not hypothetical: a Codex that has hit its limit writes a `rate_limits` payload with
+both window slots null, which parses cleanly and reads as maximum headroom, so a hard limited Codex
+won every comparison in this block while `agent-router usage` showed it at `0.0%`, live. Any
+decision whose eligibility was judged against a missing number is tagged `weekly_unknown`, whether
+or not it changed the destination, and `usage` now prints that column as `unknown` rather than as a
+percentage nobody read.
+
+A window that has genuinely reset is a different input and stays eligible: it reports 0 percent
+against a real past reset epoch, which is a provider that does have a full week.
+
+Failing closed here cannot fail to route. With neither window read there is no provider with
+confirmed room, so the decision falls through to `over_ceiling` and the default provider takes the
+job, tagged with both reasons. The usage readers themselves still fail open, unchanged; what
+changed is that routing no longer reads their default as headroom.
 
 The default keeps a 5 point reserve, so a provider within 5 points of its weekly limit takes no
 more routed work. The reserve is what the last points are for, because the router is not the only
@@ -125,9 +143,15 @@ against its own weekly window, before a task moves off it.
 Each provider's run rate is `weekly_pct` minus its expected burn, where the expected burn is how
 much of its own weekly window has elapsed. Positive is hot: 80 percent spent with half the window
 gone is 30 points over pace. The two providers reset at different instants, so each is measured
-against its own reset and never the other's. When either reset is unknown the override is skipped
-entirely and the decision is tagged `pace_unavailable`; when it fires, the decision is tagged
-`pace_flip`. The comparison is strictly greater, so a gap exactly on the threshold holds.
+against its own reset and never the other's. When it fires, the decision is tagged `pace_flip`. The
+comparison is strictly greater, so a gap exactly on the threshold holds.
+
+`pace_unavailable`, which recorded a run rate that could not be computed, can no longer fire. The
+override runs only with both providers eligible, eligibility now requires a known weekly window, and
+a known window is exactly what makes a run rate computable, so the two conditions are the same
+condition. A decision that would once have carried it now carries `weekly_unknown` instead, which
+names the reason rather than the consequence. The tag stays documented because rows already in the
+log carry it.
 
 The default is measured rather than chosen, and it is deliberately wide enough to be rare. This box
 runs two Claude 20x Max plans against one Codex 5x plan, so identical work shows as several times

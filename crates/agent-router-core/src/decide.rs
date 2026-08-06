@@ -30,10 +30,18 @@ pub enum Gate {
     /// The task needs several agents exchanging findings mid-run, which Codex cannot do: an
     /// automatic Claude decision regardless of usage.
     Orchestration,
-    /// The provider the task was on is at the hard ceiling and the other is not, so it moved.
+    /// The provider the task was on is ineligible and the other is not, so it moved. Ineligible is
+    /// either at or over the hard ceiling, or carrying a weekly number nobody read: see
+    /// `WeeklyUnknown`, which is recorded alongside this one to tell the two apart.
     FlippedOnExhaustion,
-    /// Both providers are at or over the hard ceiling; the default provider was used anyway.
+    /// Both providers are ineligible; the default provider was used anyway.
     OverCeiling,
+    /// At least one provider's weekly window was never read, so its percentage is a default rather
+    /// than a reading. Such a provider is ineligible: an unread window reports 0 percent used, and
+    /// treating that as headroom routes work into a provider that may be out of budget, which is
+    /// what an exhausted Codex looked like before this gate existed. Recorded whenever eligibility
+    /// was decided against a missing number, whether or not it changed the destination.
+    WeeklyUnknown,
     /// Weekly usage routing is disabled by policy.
     WeeklyRoutingDisabled,
     /// The provider the task was on is burning through its weekly window far enough ahead of the
@@ -58,6 +66,7 @@ impl Gate {
             Gate::Orchestration => "orchestration",
             Gate::FlippedOnExhaustion => "flipped_on_exhaustion",
             Gate::OverCeiling => "over_ceiling",
+            Gate::WeeklyUnknown => "weekly_unknown",
             Gate::WeeklyRoutingDisabled => "weekly_routing_disabled",
             Gate::PaceFlip => "pace_flip",
             Gate::PaceUnavailable => "pace_unavailable",
@@ -121,10 +130,11 @@ impl Decision {
 ///
 /// 1. The capability pin. A task Codex cannot do is not a cheaper job when routed there, it is a
 ///    failed one, so a pin bypasses every usage rule below including the ceiling.
-/// 2. The hard ceiling, before the override. Being out of weekly budget is a capacity fact, and a
-///    run rate can read a provider down to its reserve as running cold (95 percent used against
-///    99 percent elapsed is a negative delta), so an override allowed to run first would route
-///    into an exhausted provider.
+/// 2. Eligibility, before the override: a provider at or over the hard ceiling, or carrying a
+///    weekly number nobody read, is not a destination. Being out of weekly budget is a capacity
+///    fact, and a run rate can read a provider down to its reserve as running cold (95 percent used
+///    against 99 percent elapsed is a negative delta), so an override allowed to run first would
+///    route into an exhausted provider.
 /// 3. The run rate override, which is deliberately rare. See `pace_flip_gap`.
 /// 4. Claude's five hour pacing, last, on whichever provider the task landed on.
 pub fn decide(
@@ -167,7 +177,23 @@ pub fn decide(
             gates.push(Gate::WeeklyRoutingDisabled);
         } else {
             let other = other_provider(provider);
-            let eligible = |candidate| weekly_used(&usage, candidate) < config.hard_ceiling_pct;
+            // Fail closed on a weekly number nobody read. The percentage of an unread window is 0,
+            // which is the same reading as a genuinely idle provider, so trusting it hands every
+            // job to whichever provider failed to report. An exhausted Codex is exactly that
+            // shape: its rollout carried no weekly window, so it read as 0 percent used, live, and
+            // won every comparison in this block while it was actually hard limited.
+            //
+            // Closing here rather than in the reader keeps the reader's fail open contract intact.
+            // It also cannot block a dispatch: both providers unknown falls through to the
+            // `over_ceiling` arm, which still routes.
+            let eligible = |candidate| {
+                headroom(&usage, candidate).weekly_known()
+                    && weekly_used(&usage, candidate) < config.hard_ceiling_pct
+            };
+            if !headroom(&usage, provider).weekly_known() || !headroom(&usage, other).weekly_known()
+            {
+                gates.push(Gate::WeeklyUnknown);
+            }
             match (eligible(provider), eligible(other)) {
                 (false, false) => {
                     // The router routes; refusing work over a ceiling is bonus drain's job. The
@@ -197,9 +223,13 @@ pub fn decide(
             // Claude's five hour window: Codex's own is never a routing input. It applies however
             // the task got to Claude, because an exhausted five hour window is a capacity fact
             // rather than a preference, and a Claude dispatch into one stalls.
+            //
+            // "Codex has room" is the same `eligible` test the arms above used, rather than a
+            // second inline comparison that could drift away from it. That is what stops a paced
+            // job relocating a Claude stall onto a Codex whose weekly number nobody read.
             if provider == Provider::Claude
                 && usage.claude.five_hour_pct >= config.claude_five_hour_pacing_pct
-                && usage.codex.weekly_pct < config.hard_ceiling_pct
+                && eligible(Provider::Codex)
             {
                 provider = Provider::Codex;
                 gates.push(Gate::FiveHourPacing);
@@ -330,12 +360,17 @@ fn other_provider(provider: Provider) -> Provider {
     }
 }
 
-fn weekly_used(usage: &UsageSnapshot, provider: Provider) -> f64 {
+/// PURE: the snapshot half a provider is judged on. opencode has no usage source in the MVP, so it
+/// reads as the Claude side it rides on.
+fn headroom(usage: &UsageSnapshot, provider: Provider) -> &Headroom {
     match provider {
-        Provider::Codex => usage.codex.weekly_pct,
-        // opencode has no usage source in the MVP, so it reads as the Claude side it rides on.
-        Provider::Claude | Provider::Opencode => usage.claude.weekly_pct,
+        Provider::Codex => &usage.codex,
+        Provider::Claude | Provider::Opencode => &usage.claude,
     }
+}
+
+fn weekly_used(usage: &UsageSnapshot, provider: Provider) -> f64 {
+    headroom(usage, provider).weekly_pct
 }
 
 /// PURE: the one-line reason, the string the CLI prints and the viewer will show.
