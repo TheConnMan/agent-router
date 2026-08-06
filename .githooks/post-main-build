@@ -1,8 +1,39 @@
 #!/usr/bin/env bash
+#
+# On main only: run the gates CI runs, then install the release binary.
+#
+# Shared by `post-commit` and `post-merge`. Branch work reaches neither gate nor build, which is
+# deliberate on both counts: a branch push gets the same verdict from CI a minute later, and the
+# installed binary should track main rather than whatever branch was last committed on.
+#
+# The gates run first and the install is conditional on them, so a merge that fails its own tests
+# leaves the previously installed binary in place. Installing it anyway would put a build CI is
+# about to reject on PATH, where the next background job would pick it up.
+#
+# Neither hook can stop anything: git ignores their exit status, and by the time they run the commit
+# exists. Prevention lives in `pre-push`, which is the last point where a failure is still private.
+# What this buys is the timing: the answer arrives at merge time, next to the merge that caused it,
+# rather than after a push and a context switch.
+
 set -euo pipefail
 
 if [[ "$(git branch --show-current)" != "main" ]]; then
     exit 0
+fi
+
+if [ "${AGENT_ROUTER_SKIP_LOCAL_CHECKS:-}" = "1" ]; then
+    printf 'post-main-build: AGENT_ROUTER_SKIP_LOCAL_CHECKS=1, skipping the local checks.\n' >&2
+else
+    if ! "$(git rev-parse --show-toplevel)/scripts/local-checks.sh"; then
+        {
+            printf '\n'
+            printf 'post-main-build: main is red locally, so the release binary was NOT reinstalled.\n'
+            printf '\n  This commit is already made. Pushing it turns the GitHub build red, and\n'
+            printf '  pre-push will refuse it until the gates pass.\n'
+            printf '\n  Fix it on a branch and merge that, rather than committing on top here.\n'
+        } >&2
+        exit 1
+    fi
 fi
 
 ~/.cargo/bin/cargo build --release --workspace &&

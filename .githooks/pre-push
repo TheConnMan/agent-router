@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+#
+# Block a push that would turn main red on GitHub.
+#
+# `post-merge` already runs the same gates and reports, but reporting is not prevention: its output
+# scrolls past in a terminal, and in this repository the merge is usually run by an agent that goes
+# on to push regardless. The push is the moment local work becomes a public build, so it is the
+# moment worth blocking at.
+#
+# Only main is gated. Branch pushes are left alone: CI runs on every push, so a branch gets the same
+# verdict a minute later without anyone waiting on it, and gating them would put a test suite in
+# front of every work-in-progress push. Main is different only because its commits are merges that
+# no branch CI ever saw.
+#
+# stdin carries one line per ref being pushed: <local ref> <local sha> <remote ref> <remote sha>
+
+set -euo pipefail
+
+if [ "${AGENT_ROUTER_SKIP_LOCAL_CHECKS:-}" = "1" ]; then
+    printf 'pre-push: AGENT_ROUTER_SKIP_LOCAL_CHECKS=1, skipping the local checks.\n' >&2
+    exit 0
+fi
+
+main_sha=""
+while read -r _local_ref local_sha remote_ref _remote_sha; do
+    [ -n "${remote_ref:-}" ] || continue
+    [ "$remote_ref" = "refs/heads/main" ] || continue
+    # An all-zero local sha is a branch deletion. Matched as a pattern rather than against a literal,
+    # so this does not have to know whether the repository hashes with sha1 or sha256.
+    case "$local_sha" in
+    *[!0]*) main_sha="$local_sha" ;;
+    esac
+done
+
+if [ -z "$main_sha" ]; then
+    exit 0
+fi
+
+# The gates run against the working tree, so they only describe the commit being pushed when that
+# commit is HEAD. Pushing main from a checkout sitting on something else (`git push origin main`
+# from a feature worktree, or a `git push --all` that sweeps main up with it) would have this hook
+# test one commit and vouch for another.
+#
+# That is a failure rather than a skip, on the same reasoning the version gate uses: a gate that
+# passes when it could not do its job is worse than no gate, because the green is indistinguishable
+# from a real one.
+head_sha="$(git rev-parse HEAD)"
+if [ "$main_sha" != "$head_sha" ]; then
+    {
+        printf 'pre-push: refusing to push main from a checkout that is not on it.\n'
+        printf '\n  Pushing:  %s\n' "$main_sha"
+        printf '  HEAD is:  %s\n' "$head_sha"
+        printf '\n  The local checks run against the working tree, so from here they would test HEAD\n'
+        printf '  and vouch for a commit they never built.\n'
+        printf '\n  Fix: push from the primary checkout with main checked out, which is where\n'
+        printf '  CLAUDE.md has merges happen anyway. The common git directory names it, so this\n'
+        printf '  stays right from inside any worktree:\n'
+        printf '    git -C %s push\n' "$(dirname "$(cd "$(git rev-parse --git-common-dir)" && pwd)")"
+        printf '\n  Or, if the gates themselves are broken: AGENT_ROUTER_SKIP_LOCAL_CHECKS=1 git push\n'
+    } >&2
+    exit 1
+fi
+
+# `post-merge` runs the same gates on the merge commit moments before this, so the common case is
+# that this exact commit already passed. The stamp names a commit, so it can only skip a rerun of
+# the run that wrote it; anything else falls through and pays for the suite.
+common_dir="$(cd "$(git rev-parse --git-common-dir)" && pwd)"
+stamp="${common_dir}/local-checks-passed"
+if [ -f "$stamp" ] && [ "$(cat "$stamp")" = "$head_sha" ]; then
+    printf 'pre-push: the local checks already passed on %s.\n' "${head_sha:0:8}"
+    exit 0
+fi
+
+printf 'pre-push: running the local checks against %s before pushing main.\n' "${head_sha:0:8}"
+exec "$(git rev-parse --show-toplevel)/scripts/local-checks.sh"
