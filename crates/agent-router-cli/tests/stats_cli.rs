@@ -425,23 +425,27 @@ fn stats_json_reconciles_with_the_log_json_it_summarises() {
     assert_eq!(gates.get("explicit_provider").copied(), Some(2));
     assert_eq!(gates.get("classifier_failed").copied(), Some(1));
 
-    // The one usage driven row: codex reads 99 percent weekly from this fixture's rollout, so
-    // exactly one weekly gate must have fired on it. WHICH of the two it is depends on claude's
-    // own weekly number, and that comes from a machine wide cache no fixture can set, so the flip
-    // rate is not pinned to a number here; `tests/stats.rs` owns its semantics. What is pinned is
-    // that the usage plumbing reached the decision at all.
+    // The one usage driven row: codex reads 99 percent weekly from this fixture's rollout, so a
+    // weekly gate must have fired on it. WHICH gates depends on whether claude's own weekly window
+    // could be read, and that comes from a machine wide cache no fixture can set, so exactly two
+    // vectors are legitimate and both are pinned rather than loosened into a containment check:
+    //
+    // - Claude's window is readable, so claude is the eligible provider and the task flips onto it.
+    // - Claude's window is not (no cache and no credentials, which is every CI runner), so claude
+    //   is ineligible too and the pair falls through to the default with the reason recorded.
+    //
+    // Both prove the usage plumbing reached the decision, which is all this assertion is for; the
+    // flip rate is not pinned to a number here and `tests/stats.rs` owns the gate semantics.
+    //
+    // Asserting a single gate here passed on any developer box and failed only in CI, because the
+    // second vector needs a machine with no Claude usage to read.
     let exhausted = rows
         .iter()
         .find(|row| text(row, "task") == ON_EXHAUSTED_CODEX)
         .expect("the row decided against an exhausted codex");
     let fired = gate_tags(exhausted);
-    assert_eq!(
-        fired.len(),
-        1,
-        "gates on the exhausted codex row: {fired:?}"
-    );
     assert!(
-        fired[0] == "flipped_on_exhaustion" || fired[0] == "over_ceiling",
+        fired == ["flipped_on_exhaustion"] || fired == ["weekly_unknown", "over_ceiling"],
         "an exhausted codex must fire a weekly gate, got {fired:?}"
     );
 
