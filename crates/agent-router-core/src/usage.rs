@@ -209,28 +209,66 @@ pub fn codex_sessions_dir() -> PathBuf {
 }
 
 /// The Codex snapshot from `sessions_dir`, scanning the `scan_n` newest rollouts newest-first.
-/// A rollout with no `rate_limits` line is skipped (a thread with no model turn yet has none);
-/// the first one that HAS such a line decides the answer, and an unparseable payload there
-/// fails open rather than walking further back into older, staler data.
+///
+/// The scan looks for a `rate_limits` event that CARRIES A WEEKLY WINDOW, not merely for one that
+/// exists. Codex emits at least two shapes under the same key, and only one of them is about the
+/// plan:
+///
+/// ```text
+/// {"limit_id":"codex",   "plan_type":"pro", "primary":{"window_minutes":10080,...}, ...}
+/// {"limit_id":"premium", "plan_type":null,  "primary":null, "secondary":null,       ...}
+/// ```
+///
+/// The second shape is a different limit bucket and states nothing about weekly headroom. Taking
+/// it at face value put both windows through `expire(None, ..)`, which reports zero percent used
+/// with a zero reset, so an untouched second bucket read as a completely fresh plan. On 2026-08-06
+/// the five newest rollouts on this box all ended on that shape while the plan itself was at 100
+/// percent one rollout further back, and the router dispatched into the exhausted provider on a
+/// number no window had produced. The shape is rare (8 events in 25,307 recorded here) and the
+/// weekly-bearing shape has never once been window-less, which is what makes "keep scanning" the
+/// right response rather than "trust the newest".
+///
+/// Exhausting the scan without finding a weekly window still fails open to `Headroom::full`, whose
+/// `stale = true` marks the zeroes as unmeasured. That is the pre-existing contract and it is the
+/// honest answer here: no weekly window was read, so no weekly number is known.
 pub fn codex_headroom_in(sessions_dir: &Path, now: i64, scan_n: usize) -> Headroom {
-    let Some(line) = newest_rate_limits_line(sessions_dir, scan_n) else {
+    let Some(line) = newest_weekly_rate_limits_line(sessions_dir, scan_n) else {
         return Headroom::full();
     };
     parse_codex_rate_limits(&line, now).unwrap_or_else(Headroom::full)
 }
 
-/// IMPURE: the last `rate_limits` line of the newest rollout that has one.
-fn newest_rate_limits_line(sessions_dir: &Path, scan_n: usize) -> Option<String> {
+/// IMPURE: the newest `rate_limits` line that carries a weekly window, scanning rollouts
+/// newest-first and each rollout's own lines last-first. A rollout whose `rate_limits` events are
+/// all window-less is passed over entirely rather than ending the search.
+fn newest_weekly_rate_limits_line(sessions_dir: &Path, scan_n: usize) -> Option<String> {
     for path in newest_rollouts(sessions_dir, scan_n) {
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
             Err(_) => continue,
         };
-        if let Some(line) = text.lines().rfind(|line| line.contains("\"rate_limits\"")) {
+        let found = text
+            .lines()
+            .rev()
+            .find(|line| line.contains("\"rate_limits\"") && carries_weekly_window(line));
+        if let Some(line) = found {
             return Some(line.to_string());
         }
     }
     None
+}
+
+/// PURE: whether a rollout line's `rate_limits` payload states a weekly window at all. Parsing the
+/// line twice (here, then in `parse_codex_rate_limits`) is deliberate: the alternative is a
+/// half-parsed value threaded through the scan, and this runs at most `scan_n` times per read.
+fn carries_weekly_window(line: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return false;
+    };
+    let Some(limits) = value.pointer("/payload/rate_limits") else {
+        return false;
+    };
+    window_with_minutes(limits, WINDOW_WEEKLY).is_some()
 }
 
 /// IMPURE: up to `scan_n` `*.jsonl` paths under `sessions_dir`, newest mtime first.
@@ -630,6 +668,64 @@ mod tests {
         );
         let got = codex_headroom_in(dir.path(), now, 20);
         assert_eq!(got.weekly_pct, 63.0, "newest rollout WITH limits wins");
+    }
+
+    /// The `premium` bucket as codex-cli actually writes it, verbatim from a 2026-08-06 rollout.
+    /// Both windows null, so it states nothing about the weekly plan.
+    const PREMIUM_NO_WINDOWS: &str = r#"{"timestamp":"2026-08-06T09:36:39.958Z","type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"limit_id":"premium","limit_name":null,"primary":null,"secondary":null,"credits":{"has_credits":false,"unlimited":false,"balance":"0"},"individual_limit":null,"spend_control_reached":null,"plan_type":null,"rate_limit_reached_type":null}}}"#;
+
+    /// The regression this whole scan change exists for. On 2026-08-06 the five newest rollouts
+    /// all ended on a window-less `premium` event while the plan sat at 100 percent one rollout
+    /// further back. Reading the newest event that merely HAS `rate_limits` reported 0 percent
+    /// used, so an exhausted provider looked completely fresh and kept taking dispatches.
+    #[test]
+    fn a_window_less_limits_event_does_not_blank_an_exhausted_weekly_reading() {
+        let now = 1_000_000;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let exhausted = format!(
+            r#"{{"payload":{{"rate_limits":{{"limit_id":"codex","plan_type":"pro","primary":{{"window_minutes":10080,"used_percent":100,"resets_at":{}}},"secondary":null}}}}}}"#,
+            now + 3600
+        );
+        rollout(dir.path(), "plan.jsonl", &exhausted, 100);
+        for index in 0..5 {
+            rollout(
+                dir.path(),
+                &format!("premium-{index}.jsonl"),
+                PREMIUM_NO_WINDOWS,
+                200 + index,
+            );
+        }
+        let got = codex_headroom_in(dir.path(), now, 20);
+        assert_eq!(got.weekly_pct, 100.0, "the plan window is what is reported");
+        assert_eq!(got.weekly_reset_epoch, now + 3600);
+        assert!(!got.stale, "a weekly window was genuinely read");
+    }
+
+    /// The same shape one level down: the window-less event is the LAST line of the very rollout
+    /// that also carries the plan reading, which is how codex-cli appends them in a live thread.
+    #[test]
+    fn a_window_less_event_later_in_the_same_rollout_does_not_win() {
+        let now = 1_000_000;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let body = format!(
+            r#"{{"payload":{{"rate_limits":{{"primary":{{"window_minutes":10080,"used_percent":88,"resets_at":{}}},"secondary":null}}}}}}
+{PREMIUM_NO_WINDOWS}"#,
+            now + 3600
+        );
+        rollout(dir.path(), "mixed.jsonl", &body, 100);
+        assert_eq!(codex_headroom_in(dir.path(), now, 20).weekly_pct, 88.0);
+    }
+
+    /// Exhausting the scan without a single weekly window is not knowledge of an idle plan. The
+    /// zeroes still come back, but flagged, which is the contract the whole module documents.
+    #[test]
+    fn only_window_less_events_fails_open_rather_than_reporting_an_idle_plan() {
+        let now = 1_000_000;
+        let dir = tempfile::tempdir().expect("tempdir");
+        rollout(dir.path(), "premium.jsonl", PREMIUM_NO_WINDOWS, 100);
+        let got = codex_headroom_in(dir.path(), now, 20);
+        assert_eq!(got, Headroom::full());
+        assert!(got.stale, "unmeasured zeroes must never read as live");
     }
 
     #[test]
