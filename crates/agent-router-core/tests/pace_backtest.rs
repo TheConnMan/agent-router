@@ -355,27 +355,46 @@ fn the_rows_the_first_threshold_wrongly_inverted_stay_on_codex() {
 /// The quiet band, right after a Codex reset: gaps of 6 to 9, nowhere near the threshold. Rows 89,
 /// 91, 93 and 94 were historically routed to Claude by the retired two-signal pin, so they DO
 /// invert, just in the direction that spends less.
+///
+/// Rows 93 and 94 land on Codex for a different reason than the other four, and the split is
+/// asserted rather than left implicit. Claude sits at 95 percent on both, which is exactly the
+/// reserve, so those two take the one-eligible-provider arm and the run rate gap is never consulted
+/// at all. Neither arm records a gate, so the gate vector cannot tell them apart, which is why the
+/// eligibility of each row is stated here directly.
 #[test]
 fn the_quiet_band_rows_route_to_codex() {
     let config = Config::default();
     let corpus = corpus();
 
     for id in [89, 90, 91, 92, 93, 94] {
-        let decision = row(&corpus, id).replay(&config);
+        let historical = row(&corpus, id);
+        let decision = historical.replay(&config);
         assert_eq!(decision.provider, Provider::Codex, "row {id}");
         assert!(
             !decision.gates.contains(&Gate::PaceFlip),
             "row {id}: {:?}",
             decision.gates
         );
+
+        let claude_eligible = historical.claude_weekly_pct < config.hard_ceiling_pct;
+        assert_eq!(
+            claude_eligible,
+            !matches!(id, 93 | 94),
+            "row {id}: only 93 and 94 reach Codex by Claude being inside the reserve, at {} percent",
+            historical.claude_weekly_pct
+        );
     }
 }
 
 /// Row 94 is the shape that makes the ceiling load bearing: 95 percent used against 99 percent
-/// elapsed is a NEGATIVE pace delta, so run rate reads Claude as running cold while only 5 points
-/// of real capacity remain. Replayed with Claude's own numbers moved the last 2 points onto the
-/// ceiling, and with Codex hot enough to clear the dead zone, the task must still not land on a
-/// provider that is out of weekly budget.
+/// elapsed is a NEGATIVE pace delta, so run rate reads Claude as running cold while exactly the
+/// reserve remains. Replayed with Codex hot enough to clear the dead zone, the task must still not
+/// land on a provider that is out of weekly budget.
+///
+/// The row is on the ceiling as recorded, so the assignment below changes nothing at the current
+/// default and is kept for what it states: the case under test is a Claude sitting on the ceiling,
+/// whatever the ceiling is set to. A build that raises the ceiling back above 95 gets the same
+/// coverage from this test rather than silently losing it.
 #[test]
 fn a_cold_pace_delta_never_routes_into_a_provider_at_the_ceiling() {
     let config = Config::default();
@@ -388,7 +407,7 @@ fn a_cold_pace_delta_never_routes_into_a_provider_at_the_ceiling() {
     let mut exhausted = row.usage();
     exhausted.claude.weekly_pct = config.hard_ceiling_pct;
     // Codex at 90 percent used with almost none of its window elapsed is about 90 points over
-    // pace, a gap past the dead zone, against a Claude that still reads as under it.
+    // pace, a gap past the dead zone, against a Claude that reads as colder still.
     exhausted.codex.weekly_pct = 90.0;
 
     let decision = decide(row.classification(), exhausted, row.now(), &config);

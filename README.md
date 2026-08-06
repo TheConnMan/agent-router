@@ -39,7 +39,8 @@ log: row 87 in /home/you/.local/state/agent-router/router.db
    findings mid-run, pins to Claude regardless of usage. These are statements that the task cannot
    run on Codex at all, so every usage rule below is bypassed.
 3. **Apply the hard ceiling, then the run rate override, then pace on Claude's 5 hour window.** A
-   provider at or above `hard_ceiling_pct` is ineligible: exactly one ineligible sends the task to
+   provider at or above `hard_ceiling_pct` is ineligible, which by default means a provider within
+   5 points of its weekly limit takes no more routed work: exactly one ineligible sends the task to
    the other (`flipped_on_exhaustion`), both ineligible keeps the default (`over_ceiling`). With
    both eligible, the task moves only when the provider it is on is burning more than
    `pace_flip_gap` points further ahead of its own weekly window than the other is of its own

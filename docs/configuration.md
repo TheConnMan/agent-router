@@ -48,12 +48,13 @@ as predating versioning, so do not delete the key to "reset" anything.
 | --- | --- |
 | 1 | `classifier_timeout_secs` of `30`, the old generated default, becomes `60`. Any other value is left alone. |
 | 2 | `headroom_flip_gap` is gone and `pace_flip_gap` replaces it. Nothing is carried across: the two keys threshold different comparisons, so a number tuned for the old one means nothing under the new one. The rewrite drops the stale key from the file. |
+| 3 | `hard_ceiling_pct` of `97.0`, the old generated default, becomes `95.0`. Any other value is left alone. Every file this tool has written states the ceiling explicitly, so without this step a lower default would reach no existing box. |
 
 ## Defaults in full
 
 ```toml
-config_version = 2
-hard_ceiling_pct = 97.0
+config_version = 3
+hard_ceiling_pct = 95.0
 pace_flip_gap = 70.0
 claude_five_hour_pacing_pct = 90.0
 classifier_timeout_secs = 60
@@ -94,16 +95,27 @@ exceptions = []
 
 ### `hard_ceiling_pct`
 
-Default `97.0`. Weekly percent used at or above which a provider counts as exhausted.
+Default `95.0`. Weekly percent used at or above which a provider counts as exhausted.
 
 A provider at or over this ceiling is ineligible. Exactly one ineligible sends the task to the
 other and tags the decision `flipped_on_exhaustion`. Both ineligible keeps the default provider and
 tags it `over_ceiling`, because at that point there is no better destination to move to.
 
+The default keeps a 5 point reserve, so a provider within 5 points of its weekly limit takes no
+more routed work. The reserve is what the last points are for, because the router is not the only
+thing spending them: an interactive session, the classifier's own per task call, and an explicit
+`--provider` dispatch all draw on the same weekly window without consulting this ceiling. A router
+that spends down to the limit leaves nothing for the work a person is doing by hand.
+
+The reserve is not a refusal. `over_ceiling` still dispatches, because the router's job is to pick
+the better of two providers and there is no third one; declining work outright belongs to whatever
+queued it. So the reserve buys headroom while both providers are not yet in it, and the last thing
+it protects against is routing a job into an exhausted provider while the other one still has room.
+
 Eligibility is judged before the run rate override, not after, and that order is load bearing. A
-provider with two points of weekly allowance left reads as running COLD on run rate whenever its
-window is nearly elapsed (95 percent used against 99 percent elapsed is a negative pace), so an
-override allowed to run first would route into a provider that is out of budget.
+provider down to its reserve reads as running COLD on run rate whenever its window is nearly
+elapsed (95 percent used against 99 percent elapsed is a negative pace), so an override allowed to
+run first would route into a provider that is out of budget.
 
 ### `pace_flip_gap`
 
