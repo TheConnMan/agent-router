@@ -66,6 +66,23 @@ impl Headroom {
     pub fn weekly_remaining(&self) -> f64 {
         100.0 - self.weekly_pct
     }
+
+    /// Whether `weekly_pct` is a number anyone read. A reset epoch of 0 is this module's documented
+    /// "not known", and it is the only thing that separates an unread weekly window from an idle
+    /// one: both report 0 percent used.
+    ///
+    /// Three inputs land here. The fail open default has no epoch by construction. A Codex rollout
+    /// whose `rate_limits` payload carries no 10080 minute window parses to the same two zeroes
+    /// with `stale = false`, so the freshness flag does NOT catch it: that is a live read of a
+    /// payload that never stated a weekly number. And a window whose `resets_at` is absent or
+    /// unparseable reads the same way. In every case the percentage is a default rather than a
+    /// reading, which is why routing may not treat it as headroom.
+    ///
+    /// A window that has genuinely reset is a different thing and stays known: it reports 0 percent
+    /// against its real past epoch, which is a provider that really does have a full week.
+    pub fn weekly_known(&self) -> bool {
+        self.weekly_reset_epoch != 0
+    }
 }
 
 /// Both providers' snapshots, as one routing input.
@@ -490,6 +507,48 @@ mod tests {
         assert_eq!(got.weekly_reset_epoch, now + 3600);
         assert_eq!(got.five_hour_pct, 0.0);
         assert_eq!(got.five_hour_reset_epoch, 0);
+    }
+
+    /// The payload a hard limited Codex actually writes, verbatim in shape: `limit_id` set,
+    /// both window slots null, no credits left. It parses, so `stale` is false, and it reports 0
+    /// percent of a weekly window it never mentioned. `weekly_known` is the only thing that
+    /// separates it from a genuinely idle provider, and routing reads that rather than the
+    /// percentage.
+    #[test]
+    fn a_codex_payload_with_no_windows_is_not_a_known_weekly_number() {
+        let now = 1_000_000;
+        let line = r#"{"payload":{"rate_limits":{"limit_id":"premium","limit_name":null,"primary":null,"secondary":null,"credits":{"has_credits":false,"unlimited":false,"balance":"0"},"individual_limit":null,"spend_control_reached":null,"plan_type":null,"rate_limit_reached_type":null}}}"#;
+
+        let got = parse_codex_rate_limits(line, now).expect("parses");
+        assert!(!got.stale, "the payload parsed, so it is a live read");
+        assert_eq!(got.weekly_pct, 0.0, "and it reads as completely idle");
+        assert!(
+            !got.weekly_known(),
+            "which is exactly why the percentage must not be trusted"
+        );
+    }
+
+    /// The other side of that boundary. A window that has genuinely reset also reports 0 percent,
+    /// and it IS a known number: it keeps its real past epoch, and the provider really does have a
+    /// full week. Failing closed on this one would refuse a provider with everything available.
+    #[test]
+    fn a_reset_weekly_window_reports_no_usage_and_stays_known() {
+        let now = 1_000_000;
+        let weekly = format!(
+            r#"{{"window_minutes":10080,"used_percent":99,"resets_at":{}}}"#,
+            now - 7200
+        );
+        let got = parse_codex_rate_limits(&limits_line(&weekly, "null"), now).expect("parses");
+        assert_eq!(got.weekly_pct, 0.0);
+        assert!(got.weekly_known(), "a past reset is a reset anyone read");
+    }
+
+    /// The fail open default is unknown by construction, so a provider nobody could read at all
+    /// lands in the same bucket as one that reported no window.
+    #[test]
+    fn the_fail_open_default_is_not_a_known_weekly_number() {
+        assert!(Headroom::full().stale);
+        assert!(!Headroom::full().weekly_known());
     }
 
     #[test]

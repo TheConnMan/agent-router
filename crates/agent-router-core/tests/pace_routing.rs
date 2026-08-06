@@ -390,16 +390,25 @@ fn the_override_is_symmetric_and_measured_from_the_current_provider() {
 
 // ------------------------------------------------------------------ rule 5: unknown reset
 
-/// Rule 5. A reset epoch of 0 means "not known", so there is no elapsed fraction to compare
-/// against and the override is skipped in favour of the default, with the reason recorded.
+/// Rule 5. A reset epoch of 0 means "not known", and a weekly percentage nobody read is not
+/// headroom. The provider is ineligible, the decision records `weekly_unknown`, and the run rate
+/// override is never reached.
 ///
-/// The mutation this catches is the tempting one: treat 0 as an epoch like any other and the
-/// window reads as 100 percent elapsed, which turns an unknown Claude window into a 130 point gap
-/// and routes on a number that was never measured.
+/// The mutation this catches is the tempting one: treat 0 as an epoch like any other. The window
+/// then reads as 100 percent elapsed, the unknown provider looks 130 points colder than it is, and
+/// the task routes on a number that was never measured. The recorded pace delta stays None for
+/// exactly that reason, and is asserted here rather than only in the log's own tests.
+///
+/// `pace_unavailable` can no longer fire, and that is asserted rather than left to be noticed
+/// later. The override runs only with both providers eligible, eligibility requires a known weekly
+/// window, and a known window is precisely what gives `pace_delta` a Some. The gate stays in the
+/// enum because rows already in the log carry it.
 #[test]
-fn an_unknown_reset_skips_pace_and_keeps_the_default() {
+fn an_unknown_weekly_window_makes_a_provider_ineligible() {
     let config = Config::default();
 
+    // Claude unknown against a Codex with room. The task is already on Codex and stays there, and
+    // the only gate is the record that eligibility was decided against a missing number.
     let claude_unknown = decide(
         plain(),
         usage(unknown_window(10.0, 0.0), window(90.0, HALF_WEEK, 0.0)),
@@ -407,18 +416,47 @@ fn an_unknown_reset_skips_pace_and_keeps_the_default() {
         &config,
     );
     assert_eq!(claude_unknown.provider, Provider::Codex);
-    assert!(claude_unknown.gates.contains(&Gate::PaceUnavailable));
-    assert!(!claude_unknown.gates.contains(&Gate::PaceFlip));
+    assert_eq!(claude_unknown.gates, vec![Gate::WeeklyUnknown]);
+    assert_eq!(claude_unknown.claude_pace_delta, None);
+    assert!(!claude_unknown.gates.contains(&Gate::PaceUnavailable));
 
+    // Codex unknown, which is the exhausted Codex shape: its rollout carries no weekly window at
+    // all, so it reported 0 percent used, live, and won every comparison in this block while it
+    // was in fact hard limited. The default provider is now the ineligible one, so the task moves
+    // to the Claude that did report a number.
     let codex_unknown = decide(
         plain(),
-        usage(window(10.0, HALF_WEEK, 0.0), unknown_window(90.0, 0.0)),
+        usage(window(10.0, HALF_WEEK, 0.0), unknown_window(0.0, 0.0)),
         NOW,
         &config,
     );
-    assert_eq!(codex_unknown.provider, Provider::Codex);
-    assert!(codex_unknown.gates.contains(&Gate::PaceUnavailable));
-    assert!(!codex_unknown.gates.contains(&Gate::PaceFlip));
+    assert_eq!(codex_unknown.provider, Provider::Claude);
+    assert_eq!(
+        codex_unknown.gates,
+        vec![Gate::WeeklyUnknown, Gate::FlippedOnExhaustion]
+    );
+    assert_eq!(codex_unknown.codex_pace_delta, None);
+    assert!(!codex_unknown.gates.contains(&Gate::PaceUnavailable));
+}
+
+/// Rule 5. Failing closed must never fail to route. With neither weekly window read there is no
+/// provider with confirmed room, so the task keeps the configured default and says both why it had
+/// no better destination and that the numbers behind that were missing.
+///
+/// This is the arm that keeps the fix bounded: closing on an unknown window redirects work, and
+/// the worst case is the default provider rather than a refused dispatch.
+#[test]
+fn both_weekly_windows_unknown_still_route_to_the_default() {
+    let config = Config::default();
+    let decision = decide(
+        plain(),
+        usage(unknown_window(0.0, 0.0), unknown_window(0.0, 0.0)),
+        NOW,
+        &config,
+    );
+
+    assert_eq!(decision.provider, Provider::Codex);
+    assert_eq!(decision.gates, vec![Gate::WeeklyUnknown, Gate::OverCeiling]);
 }
 
 // ------------------------------------------------------------------ rule 6: what does not change
@@ -485,6 +523,25 @@ fn five_hour_pacing_does_not_fire_when_codex_has_no_weekly_room() {
 
     assert_eq!(decision.provider, Provider::Claude);
     assert!(decision.gates.contains(&Gate::FlippedOnExhaustion));
+    assert!(!decision.gates.contains(&Gate::FiveHourPacing));
+}
+
+/// Rule 6. "Codex has room" means the same thing here as in the arms above, so a Claude job with an
+/// exhausted five hour window is NOT paced onto a Codex whose weekly number nobody read. Pacing
+/// into an unread window is the same mistake as pacing into an exhausted one, and this is the arm
+/// where a second inline comparison would have kept the old fail open behaviour alive.
+#[test]
+fn five_hour_pacing_does_not_fire_when_codex_has_no_weekly_window() {
+    let config = Config::default();
+    let decision = decide(
+        plain(),
+        usage(window(40.0, HALF_WEEK, 100.0), unknown_window(0.0, 0.0)),
+        NOW,
+        &config,
+    );
+
+    assert_eq!(decision.provider, Provider::Claude);
+    assert!(decision.gates.contains(&Gate::WeeklyUnknown));
     assert!(!decision.gates.contains(&Gate::FiveHourPacing));
 }
 
