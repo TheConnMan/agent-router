@@ -49,13 +49,14 @@ as predating versioning, so do not delete the key to "reset" anything.
 | 1 | `classifier_timeout_secs` of `30`, the old generated default, becomes `60`. Any other value is left alone. |
 | 2 | `headroom_flip_gap` is gone and `pace_flip_gap` replaces it. Nothing is carried across: the two keys threshold different comparisons, so a number tuned for the old one means nothing under the new one. The rewrite drops the stale key from the file. |
 | 3 | `hard_ceiling_pct` of `97.0`, the old generated default, becomes `95.0`. Any other value is left alone. Every file this tool has written states the ceiling explicitly, so without this step a lower default would reach no existing box. |
+| 4 | `pace_flip_gap` is gone and `projection_overdraw_pct` replaces it. Nothing is carried across, and here that is not a convenience: the old key's value existed to clear a chronic band produced by one pair of plan sizes, so reading a `70` as a projection threshold would let a provider run to 70 percent OVER its allowance before anything moved. The rewrite drops the stale key from the file. |
 
 ## Defaults in full
 
 ```toml
-config_version = 3
+config_version = 4
 hard_ceiling_pct = 95.0
-pace_flip_gap = 70.0
+projection_overdraw_pct = 100.0
 claude_five_hour_pacing_pct = 90.0
 classifier_timeout_secs = 60
 connectors = [
@@ -130,41 +131,56 @@ the better of two providers and there is no third one; declining work outright b
 queued it. So the reserve buys headroom while both providers are not yet in it, and the last thing
 it protects against is routing a job into an exhausted provider while the other one still has room.
 
-Eligibility is judged before the run rate override, not after, and that order is load bearing. A
-provider down to its reserve reads as running COLD on run rate whenever its window is nearly
-elapsed (95 percent used against 99 percent elapsed is a negative pace), so an override allowed to
-run first would route into a provider that is out of budget.
+Eligibility is judged before the projection override, not after, and that order is load bearing. A
+provider down to its reserve projects to finish INSIDE its allowance whenever its window is nearly
+elapsed (95 percent used against 99 percent elapsed projects to 96), so an override allowed to run
+first would see nothing wrong and route into a provider that is out of budget.
 
-### `pace_flip_gap`
+### `projection_overdraw_pct`
 
-Default `70.0`. How many points a provider must be burning ahead of the other, each measured
-against its own weekly window, before a task moves off it.
+Default `100.0`. The projected weekly draw, as a percent of a provider's own allowance, above which
+a task moves off that provider.
 
-Each provider's run rate is `weekly_pct` minus its expected burn, where the expected burn is how
-much of its own weekly window has elapsed. Positive is hot: 80 percent spent with half the window
-gone is 30 points over pace. The two providers reset at different instants, so each is measured
-against its own reset and never the other's. When it fires, the decision is tagged `pace_flip`. The
-comparison is strictly greater, so a gap exactly on the threshold holds.
+A provider's projected draw is `weekly_pct` divided by the fraction of its own weekly window that
+has elapsed: what its spending so far extrapolates to by the time its window resets. 80 percent
+spent with half the window gone projects to 160, meaning it runs out with days to spare. The two
+providers reset at different instants, so each is measured against its own reset and its own
+allowance, which is what makes two providers on different sized plans comparable at all.
 
-`pace_unavailable`, which recorded a run rate that could not be computed, can no longer fire. The
-override runs only with both providers eligible, eligibility now requires a known weekly window, and
-a known window is exactly what makes a run rate computable, so the two conditions are the same
-condition. A decision that would once have carried it now carries `weekly_unknown` instead, which
-names the reason rather than the consequence. The tag stays documented because rows already in the
-log carry it.
+The override moves a task when the provider it is on projects above this threshold AND the other
+provider projects lower. Both halves matter. The first keeps it quiet: a provider finishing its week
+inside its allowance is not a problem to route around, and moving work off it would strand budget
+that was going to be spent. The second makes the destination an improvement rather than merely
+different, and it deliberately compares the two projections rather than testing the other against
+the threshold, so that when BOTH providers are overdrawing the task still goes to whichever runs out
+later and the two drain together.
 
-The default is measured rather than chosen, and it is deliberately wide enough to be rare. This box
-runs two Claude 20x Max plans against one Codex 5x plan, so identical work shows as several times
-the percentage on the smaller allowance, and over the recorded decisions Codex sat 43 to 58 points
-over pace all week from that alone. That band is a plan size artifact, not a signal, so the dead
-zone has to clear it. At a gap of 25 the override moved 27 of 39 real dispatches, 25 of them onto
-the provider with LESS absolute allowance left, which is the opposite of what it is for. At 70 it
-moves 2. Lower it and routing follows the percentages; raise it past about 80 and the rule never
-fires at all, which makes it dead config rather than a conservative setting.
+When either projection cannot be computed the override is skipped entirely and the decision is
+tagged `projection_unavailable`; when it fires, the decision is tagged `projected_overdraw`. The
+comparison is strictly greater, so a projection exactly on the threshold holds.
 
-There is no `headroom_flip_gap` alias. The key it named thresholded a comparison of raw weekly
-percentages, which is exactly the reading that misrouted, so a file still carrying it is ignored
-rather than honoured.
+In practice `projection_unavailable` means one thing only: less than a twentieth of a provider's
+window has elapsed, so dividing by that elapsed fraction would turn a couple of jobs into a four
+figure projection. A projection is also uncomputable when a reset was never read, but the override
+runs only with both providers eligible and eligibility already requires a known weekly window, so
+that decision carries `weekly_unknown` instead, which names the reason rather than the consequence.
+
+The retired `pace_unavailable` recorded the same idea under the run rate rule. Rows already in the
+log carry it, which is why it stays documented.
+
+The default is not a tuned number. A projection of 100 is precisely "finishes the week having spent
+exactly its plan", so above it is the definition of running out early, which is the whole question
+the rule asks. Raise it to let a provider run further past its pace before work moves; there is no
+reason to lower it.
+
+Neither `pace_flip_gap` nor `headroom_flip_gap` is read as an alias. Both named rules that
+thresholded a difference between two providers' numbers, and `pace_flip_gap` in particular had to be
+tuned above whatever chronic band the two plan sizes happened to produce. That made it a plan sized
+constant wearing the clothes of a policy: it was set to 70 points to clear the band a 5x Codex plan
+against 20x Claude plans produced, the Codex plan grew on 2026-08-01, the band collapsed to under 38
+points, and the configured value then sat above every reading the box could produce. The override
+stopped firing entirely and nothing reported that it had. A ratio against each provider's own
+allowance has no such dependency, which is why this key has no measured default to go stale.
 
 ### `claude_five_hour_pacing_pct`
 
@@ -172,7 +188,7 @@ Default `90.0`. Claude 5 hour percent used at or above which a task is paced awa
 
 This runs after the weekly rules, on the provider they landed on. A task still bound for Claude
 moves to Codex when Claude's 5 hour percent reaches this threshold, and the decision is tagged
-`five_hour_pacing`. It applies however the task reached Claude, the run rate override included: a
+`five_hour_pacing`. It applies however the task reached Claude, the projection override included: a
 near exhausted 5 hour window stalls a Claude dispatch rather than merely making it more expensive.
 
 Codex having room is judged by `hard_ceiling_pct`, the same threshold the exhaustion flip uses,
@@ -226,7 +242,7 @@ that stands when no usage rule moves it.
 
 The router was built so this is a one word edit. Nothing in the decision engine assumes Codex is
 the default; setting `"claude"` makes Claude the default destination and Codex the exception
-without any routing logic change. The run rate override is symmetric and measured from whichever
+without any routing logic change. The projection override is symmetric and measured from whichever
 provider the task is currently on, so it works in both directions unchanged.
 
 ### `weekly_routing`
@@ -234,7 +250,7 @@ provider the task is currently on, so it works in both directions unchanged.
 Default `true`. Whether usage is allowed to move a task off the default provider at all.
 
 Set to `false` to route purely on task shape. Decisions are then tagged `weekly_routing_disabled`,
-and neither the exhaustion flip, the run rate override, nor the 5 hour pacing rule can fire.
+and neither the exhaustion flip, the projection override, nor the 5 hour pacing rule can fire.
 Capability pins still apply, because those are not usage decisions.
 
 ## `[classifier]`

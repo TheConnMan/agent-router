@@ -9,9 +9,10 @@ use std::path::{Path, PathBuf};
 /// Weekly percent at which a provider counts as exhausted: within 5 points of the weekly limit is
 /// close enough that the provider is no longer a routing destination.
 const DEFAULT_HARD_CEILING_PCT: f64 = 95.0;
-/// Run rate gap (in points of window) that moves a task off the provider it is on. Measured, not
-/// chosen: see the field's own doc comment.
-const DEFAULT_PACE_FLIP_GAP: f64 = 70.0;
+/// Projected weekly draw, as a percent of a provider's own allowance, above which the provider is
+/// treated as overdrawing its window. 100 is the definition of overdrawing rather than a tuned
+/// number: see the field's own doc comment.
+const DEFAULT_PROJECTION_OVERDRAW_PCT: f64 = 100.0;
 /// Claude five hour percent used at or above which a task is paced away from Claude.
 const DEFAULT_CLAUDE_FIVE_HOUR_PACING_PCT: f64 = 90.0;
 /// Ceiling on the classifier call. Headroom over the measured worst case rather than a target:
@@ -26,7 +27,7 @@ const PRE_MIGRATION_HARD_CEILING_PCT: f64 = 97.0;
 
 /// The migration level a config file written by this build carries. Raise this, and add a step to
 /// `migrate`, whenever a stale generated value has to be corrected in place.
-const CURRENT_CONFIG_VERSION: u32 = 3;
+const CURRENT_CONFIG_VERSION: u32 = 4;
 
 /// The level a file that predates versioning reads as. This is deliberately NOT
 /// `CURRENT_CONFIG_VERSION`: an absent key has to be distinguishable from a stamped one, or every
@@ -258,19 +259,24 @@ pub struct Config {
     /// consulting this ceiling, so a router that spends down to the limit leaves nothing for the
     /// work a person is doing by hand.
     pub hard_ceiling_pct: f64,
-    /// How many points a provider must be burning ahead of the other, each measured against its
-    /// own weekly window, before a task moves off it. Strictly greater: a gap exactly here holds.
+    /// Projected weekly draw, as a percent of a provider's own allowance, above which a task moves
+    /// off that provider (provided the other projects lower). Strictly greater: a projection
+    /// exactly here holds.
     ///
-    /// The default of 70 is measured rather than chosen. This box runs two Claude 20x Max plans
-    /// against one Codex 5x plan, so identical work shows as several times the percentage on
-    /// Codex, and over the recorded decisions Codex sat 43 to 58 points over pace all week from
-    /// that alone. The dead zone has to clear that band or the override becomes the routing rule:
-    /// at 25 points it moved 27 of 39 real dispatches, 25 of them onto the emptier provider.
+    /// The default of 100 is not a tuned number. A projection of 100 says the provider finishes its
+    /// weekly window at exactly its allowance, so above 100 is the definition of running out early,
+    /// and that is the whole condition the rule is asking about. Raise it to let a provider run
+    /// further past its pace before work moves; there is no reason to lower it.
     ///
-    /// There is no `headroom_flip_gap` alias. The rule it named compared raw weekly percentages,
-    /// which is exactly the reading that misrouted, so a file still carrying the old key must be
-    /// ignored rather than honoured.
-    pub pace_flip_gap: f64,
+    /// This is deliberately NOT a points-based gap. The previous key, `pace_flip_gap`, compared how
+    /// far ahead of pace each provider was in points, and its value had to clear whatever chronic
+    /// band the two plan sizes happened to produce. That made it a plan-sized constant wearing the
+    /// clothes of a policy: when the Codex plan grew on 2026-08-01 the band collapsed and the
+    /// configured 70 became unreachable, so the override silently stopped existing. A ratio against
+    /// each provider's own allowance has no such dependency. Neither `pace_flip_gap` nor
+    /// `headroom_flip_gap` is read as an alias: a number tuned for either older comparison means
+    /// nothing under this one, and honouring it would restore the exact failure.
+    pub projection_overdraw_pct: f64,
     /// Claude five hour percent used at or above which a task is paced away from Claude, provided
     /// Codex has weekly room. Codex's own five hour number never influences routing. Declared here
     /// rather than below `policy`, because a scalar after a table typed field makes
@@ -295,7 +301,7 @@ impl Default for Config {
         Config {
             config_version: CURRENT_CONFIG_VERSION,
             hard_ceiling_pct: DEFAULT_HARD_CEILING_PCT,
-            pace_flip_gap: DEFAULT_PACE_FLIP_GAP,
+            projection_overdraw_pct: DEFAULT_PROJECTION_OVERDRAW_PCT,
             claude_five_hour_pacing_pct: DEFAULT_CLAUDE_FIVE_HOUR_PACING_PCT,
             classifier_timeout_secs: DEFAULT_CLASSIFIER_TIMEOUT_SECS,
             connectors: vec![
@@ -379,6 +385,13 @@ impl Config {
         if self.config_version < 3 && self.hard_ceiling_pct == PRE_MIGRATION_HARD_CEILING_PCT {
             self.hard_ceiling_pct = DEFAULT_HARD_CEILING_PCT;
         }
+        // v4: `pace_flip_gap` became `projection_overdraw_pct`, and the rule behind it changed
+        // from a points difference between two run rates to each provider's projected draw against
+        // its own allowance. As at v2 there is nothing to carry across, and here that is not a
+        // convenience: the old number's whole job was to clear a chronic band produced by one pair
+        // of plan sizes, so a file carrying 70 is carrying a fact about plans that no longer holds.
+        // Reading it as a projection threshold would set the bar at 70 percent of allowance and
+        // move nearly every task. The key is simply not read, and the rewrite below drops it.
         self.config_version = CURRENT_CONFIG_VERSION;
         true
     }
@@ -431,7 +444,7 @@ mod tests {
         // the router behaves as 60 is a config that lies about what is running.
         let text = std::fs::read_to_string(&path).expect("re-read");
         assert!(text.contains("classifier_timeout_secs = 60"), "{text}");
-        assert!(text.contains("config_version = 3"), "{text}");
+        assert!(text.contains("config_version = 4"), "{text}");
     }
 
     /// The v3 step, and the reason it has to exist at all: every config file this tool has written
@@ -451,7 +464,7 @@ mod tests {
         // provider at 95 is a config that lies about what is running.
         let text = std::fs::read_to_string(&path).expect("re-read");
         assert!(text.contains("hard_ceiling_pct = 95.0"), "{text}");
-        assert!(text.contains("config_version = 3"), "{text}");
+        assert!(text.contains("config_version = 4"), "{text}");
     }
 
     /// A ceiling the operator chose is theirs. 90 is not the value this tool generated, so the v3
@@ -551,7 +564,10 @@ mod tests {
         std::fs::write(&path, "hard_ceiling_pct = 90.0\n").expect("write");
         let config = Config::load_from(&path).expect("loads");
         assert_eq!(config.hard_ceiling_pct, 90.0);
-        assert_eq!(config.pace_flip_gap, Config::default().pace_flip_gap);
+        assert_eq!(
+            config.projection_overdraw_pct,
+            Config::default().projection_overdraw_pct
+        );
         assert_eq!(config.connectors, Config::default().connectors);
     }
 
@@ -718,7 +734,10 @@ mod tests {
             .expect("load the partial config");
         assert_eq!(config.claude_five_hour_pacing_pct, 55.0);
         assert_eq!(config.hard_ceiling_pct, Config::default().hard_ceiling_pct);
-        assert_eq!(config.pace_flip_gap, Config::default().pace_flip_gap);
+        assert_eq!(
+            config.projection_overdraw_pct,
+            Config::default().projection_overdraw_pct
+        );
         assert!(config.policy.weekly_routing);
     }
 

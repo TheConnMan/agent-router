@@ -1,17 +1,21 @@
-//! Pace based routing: a rare run rate OVERRIDE with a wide dead zone, plus the rules around it.
+//! Projection based routing: the OVERRIDE that moves a task off a provider heading for an early
+//! exhaustion of its weekly window, plus the rules around it.
 //!
 //! The engine under test is pure, so `decide` takes the instant it is deciding at rather than
 //! reading the clock: every case below fixes `NOW` and states each provider's reset as a distance
 //! from it, which is what makes the arithmetic assertable at all.
 //!
-//! Every usage number here is chosen so the expected burn is an exact decimal: half a week
-//! remaining is 50 percent elapsed, a full week remaining is 0, and a reset at `NOW` is 100.
+//! Every usage number here is chosen so the projection is an exact decimal. Half a week remaining
+//! is 50 percent elapsed, so a projected draw is simply twice the percent used: 5 percent used
+//! projects to 10, 50 percent used projects to exactly 100, and 80 percent used projects to 160.
 //!
-//! Why the flip gap is 70 and not a tighter number: this box runs two Claude 20x Max plans against
-//! a single Codex 5x plan, so Codex's allowance is about four times smaller and identical work
-//! shows up as about four times the percentage. Measured over the real dispatches, Codex sits 43 to
-//! 58 points over pace chronically, which is a plan size artifact and not a signal. The dead zone
-//! has to clear that band, or the override stops being an override and becomes the routing rule.
+//! Why the threshold is 100 and not a measured number: a projected draw is what a provider's weekly
+//! spend extrapolates to at the instant its own window resets, as a percent of its own allowance,
+//! so 100 is precisely "finishes the week having used exactly its plan" and anything above it is
+//! the provider running out early. Nothing here depends on how large either plan is, which is the
+//! property the retired `pace_flip_gap` lacked: that key had to be tuned above whatever chronic
+//! band the two plan sizes produced, and when the Codex plan grew on 2026-08-01 its configured 70
+//! became unreachable and the override silently stopped firing altogether.
 
 use agent_router_core::classify::{
     Classification, Complexity, TaskContextHorizon, parse_classification,
@@ -54,17 +58,20 @@ fn usage(claude: Headroom, codex: Headroom) -> UsageSnapshot {
     UsageSnapshot { claude, codex }
 }
 
-/// A blowout: Claude 45 points under pace against a Codex 30 points over it, a 75 point gap that
-/// clears the 70 point dead zone. This is the only usage picture in this file that moves a task on
-/// run rate alone, and every test that needs a flip uses it, so the threshold lives in one place.
+/// A blowout: Codex 80 percent through its allowance with half its window gone, so it projects to
+/// draw 160 percent of a plan it only has 100 of, against a Claude projecting 10. Every test that
+/// needs the override to fire uses this, so the picture that trips it lives in one place.
 fn blowout() -> UsageSnapshot {
     usage(window(5.0, HALF_WEEK, 0.0), window(80.0, HALF_WEEK, 0.0))
 }
 
-/// The chronic band: a 50 point gap, which is what this box's plan sizes produce all week. It is
-/// the picture the dead zone exists to ignore.
-fn chronic() -> UsageSnapshot {
-    usage(window(5.0, HALF_WEEK, 0.0), window(55.0, HALF_WEEK, 0.0))
+/// Hot, but inside its allowance: Codex 45 percent used at the half way point projects to 90, and
+/// finishes the week with 10 points to spare. Claude projects 10. This is the picture the override
+/// must ignore, and it is deliberately a WIDE separation (an 80 point projection gap, and a 40
+/// point run rate gap under the retired rule) so that "does not fire" cannot be passing merely
+/// because the two providers look alike.
+fn within_allowance() -> UsageSnapshot {
+    usage(window(5.0, HALF_WEEK, 0.0), window(45.0, HALF_WEEK, 0.0))
 }
 
 /// The whole classifier answer. The field list is exhaustive on purpose: a classifier that grows
@@ -130,8 +137,8 @@ fn an_orchestration_task_pins_to_claude_past_every_usage_rule() {
 
     assert_eq!(decision.provider, Provider::Claude);
     assert_eq!(decision.model.as_deref(), Some("opus[1m]"));
-    assert!(!decision.gates.contains(&Gate::PaceFlip));
-    assert!(!decision.gates.contains(&Gate::PaceUnavailable));
+    assert!(!decision.gates.contains(&Gate::ProjectedOverdraw));
+    assert!(!decision.gates.contains(&Gate::ProjectionUnavailable));
     assert!(!decision.gates.contains(&Gate::FiveHourPacing));
     assert!(!decision.gates.contains(&Gate::FlippedOnExhaustion));
 }
@@ -150,8 +157,8 @@ fn a_missing_connector_pins_to_claude_past_every_usage_rule() {
 
     assert_eq!(decision.provider, Provider::Claude);
     assert!(decision.gates.contains(&Gate::MissingConnector));
-    assert!(!decision.gates.contains(&Gate::PaceFlip));
-    assert!(!decision.gates.contains(&Gate::PaceUnavailable));
+    assert!(!decision.gates.contains(&Gate::ProjectedOverdraw));
+    assert!(!decision.gates.contains(&Gate::ProjectionUnavailable));
     assert!(!decision.gates.contains(&Gate::FiveHourPacing));
 }
 
@@ -176,7 +183,7 @@ fn the_override_can_never_flip_into_a_provider_at_the_hard_ceiling() {
     );
 
     assert_eq!(decision.provider, Provider::Codex);
-    assert!(!decision.gates.contains(&Gate::PaceFlip));
+    assert!(!decision.gates.contains(&Gate::ProjectedOverdraw));
 }
 
 /// Rule 3. Exactly one provider ineligible routes to the other, whatever run rate says. Here run
@@ -218,63 +225,107 @@ fn both_providers_over_the_ceiling_keep_the_default_and_flag_it() {
 
     assert_eq!(decision.provider, Provider::Codex);
     assert!(decision.gates.contains(&Gate::OverCeiling));
-    assert!(!decision.gates.contains(&Gate::PaceFlip));
+    assert!(!decision.gates.contains(&Gate::ProjectedOverdraw));
 }
 
-// ------------------------------------------------------------------ rule 4: the run rate override
+// ------------------------------------------------------------ rule 4: the projection override
 
-/// Rule 4, the override firing. Claude has burned 5 percent of its week with half the window gone
-/// (45 points under pace) while Codex has burned 80 percent of the same fraction (30 points over
-/// it). The 75 point gap clears the dead zone, so the task moves and is dispatched with Claude's
-/// tier.
+/// Rule 4, the override firing. Codex has spent 80 percent of its allowance with half its window
+/// gone, so at this rate it draws 160 percent of a plan that holds 100 and runs dry with days left.
+/// Claude projects 10. The task moves and is dispatched with Claude's tier.
 #[test]
-fn a_run_rate_gap_past_the_dead_zone_moves_the_task() {
+fn a_provider_projecting_past_its_allowance_moves_the_task() {
     let config = Config::default();
     let decision = decide(plain(), blowout(), NOW, &config);
 
     assert_eq!(decision.provider, Provider::Claude);
-    assert_eq!(decision.gates, vec![Gate::PaceFlip]);
+    assert_eq!(decision.gates, vec![Gate::ProjectedOverdraw]);
     assert_eq!(decision.model.as_deref(), Some("opus[1m]"));
     assert_eq!(decision.effort, None);
+    assert_eq!(decision.codex_projected_draw, Some(160.0));
+    assert_eq!(decision.claude_projected_draw, Some(10.0));
 }
 
-/// Rule 4, the dead zone and its boundary. A 50 point gap is the chronic reading this box produces
-/// all week from its plan sizes, and it must not move anything. A gap of exactly `pace_flip_gap`
-/// must not move anything either, because the comparison is strictly greater; one tenth of a point
-/// more is the smallest input that does.
+/// Rule 4, the threshold and its boundary. A provider that finishes its week inside its allowance
+/// is not a problem to be routed around, however far ahead of the other one it is running: moving
+/// work off it would strand allowance that was going to be spent. A projection of exactly 100 holds
+/// too, because the comparison is strictly greater, and two tenths of a point more is the smallest
+/// input that moves anything.
 ///
-/// This is the assertion that fails if anyone tunes the threshold back toward the chronic band.
+/// This is the assertion that fails if anyone reintroduces a threshold below a full allowance.
 #[test]
-fn a_gap_inside_the_dead_zone_or_exactly_on_it_does_not_flip() {
+fn a_projection_inside_the_allowance_or_exactly_on_it_does_not_move_the_task() {
     let config = Config::default();
 
-    let inside = decide(plain(), chronic(), NOW, &config);
+    let inside = decide(plain(), within_allowance(), NOW, &config);
     assert_eq!(inside.provider, Provider::Codex);
     assert!(inside.gates.is_empty(), "{:?}", inside.gates);
+    assert_eq!(inside.codex_projected_draw, Some(90.0));
 
-    // Claude at -45 against Codex at +25 is a gap of exactly 70.
+    // Half the window gone and half the allowance spent projects to exactly 100.
     let on_the_line = decide(
         plain(),
-        usage(window(5.0, HALF_WEEK, 0.0), window(75.0, HALF_WEEK, 0.0)),
+        usage(window(5.0, HALF_WEEK, 0.0), window(50.0, HALF_WEEK, 0.0)),
         NOW,
         &config,
     );
     assert_eq!(on_the_line.provider, Provider::Codex);
     assert!(on_the_line.gates.is_empty(), "{:?}", on_the_line.gates);
+    assert_eq!(on_the_line.codex_projected_draw, Some(100.0));
 
     let just_past = decide(
         plain(),
-        usage(window(5.0, HALF_WEEK, 0.0), window(75.1, HALF_WEEK, 0.0)),
+        usage(window(5.0, HALF_WEEK, 0.0), window(50.1, HALF_WEEK, 0.0)),
         NOW,
         &config,
     );
     assert_eq!(just_past.provider, Provider::Claude);
-    assert_eq!(just_past.gates, vec![Gate::PaceFlip]);
+    assert_eq!(just_past.gates, vec![Gate::ProjectedOverdraw]);
 }
 
-/// Rule 4. "Both running light defaults to Codex" is not a special case: two providers 45 points
-/// under pace have a gap of zero, which is not past the dead zone, so the default stands on its
-/// own. A rule that named this case explicitly would be dead code.
+/// Rule 4, the week that matters most. When BOTH providers are heading past their allowance there
+/// is no safe destination, and the useful question is which one runs out later. The task goes to
+/// the lighter projection so the two drain together, instead of one dying while the other still
+/// has days of headroom, which is exactly the failure this rule was rebuilt to prevent.
+///
+/// A rule phrased as "move only when the other is under the threshold" passes every other test in
+/// this file and fails here, holding all the work on the provider already furthest gone.
+#[test]
+fn both_providers_overdrawing_moves_the_task_to_whichever_runs_out_later() {
+    let config = Config::default();
+    let decision = decide(
+        plain(),
+        usage(window(60.0, HALF_WEEK, 0.0), window(80.0, HALF_WEEK, 0.0)),
+        NOW,
+        &config,
+    );
+
+    assert_eq!(decision.provider, Provider::Claude);
+    assert_eq!(decision.gates, vec![Gate::ProjectedOverdraw]);
+    assert_eq!(decision.claude_projected_draw, Some(120.0));
+    assert_eq!(decision.codex_projected_draw, Some(160.0));
+}
+
+/// Rule 4. The destination has to be an improvement. A provider overdrawing worse than the one the
+/// task is already on is not somewhere to send it, so the task holds and no gate is recorded: the
+/// override considered the move and declined it.
+#[test]
+fn an_overdrawing_provider_holds_when_the_other_projects_worse() {
+    let config = Config::default();
+    let decision = decide(
+        plain(),
+        usage(window(80.0, HALF_WEEK, 0.0), window(60.0, HALF_WEEK, 0.0)),
+        NOW,
+        &config,
+    );
+
+    assert_eq!(decision.provider, Provider::Codex);
+    assert!(decision.gates.is_empty(), "{:?}", decision.gates);
+}
+
+/// Rule 4. "Both running light defaults to Codex" is not a special case: neither provider is
+/// overdrawing, so the first half of the condition is false and the default stands on its own. A
+/// rule that named this case explicitly would be dead code.
 #[test]
 fn two_providers_running_equally_light_keep_the_default_with_no_gate() {
     let config = Config::default();
@@ -290,16 +341,16 @@ fn two_providers_running_equally_light_keep_the_default_with_no_gate() {
     assert_eq!(decision.model.as_deref(), Some("gpt-5.6-sol"));
 }
 
-/// Rule 4, the reason run rate is per provider at all: the two weekly windows reset at different
-/// times, so one provider's reset says nothing about the other's progress.
+/// Rule 4, the reason a projection is per provider at all: the two weekly windows reset at
+/// different times, so one provider's reset says nothing about how far through its window the
+/// other is.
 ///
-/// Claude has a full week left (0 percent elapsed, 10 used, delta +10). Codex has a tenth of a
-/// week left (90 percent elapsed, 85 used, delta -5). Codex is 15 points COLDER, so the task
-/// stays. Feed either provider's reset to both and the answer inverts: with Claude's reset on
-/// Codex the delta reads +85 and with Codex's reset on Claude it reads -80, and both mistakes
-/// produce a 75 point gap that clears the dead zone.
+/// Claude has a full week left and 10 percent used, which is too early to project at all. Codex has
+/// a tenth of a week left and 85 percent used, projecting to 94 and landing inside its allowance.
+/// Nothing moves. Feed Codex's nearly spent window to Claude instead and Claude reads 11 percent
+/// against a 90 percent elapsed window, and the pair would invert.
 #[test]
-fn pace_is_measured_against_each_providers_own_reset() {
+fn a_projection_is_measured_against_each_providers_own_reset() {
     let config = Config::default();
     let decision = decide(
         plain(),
@@ -309,13 +360,13 @@ fn pace_is_measured_against_each_providers_own_reset() {
     );
 
     assert_eq!(decision.provider, Provider::Codex);
-    assert!(!decision.gates.contains(&Gate::PaceFlip));
+    assert!(!decision.gates.contains(&Gate::ProjectedOverdraw));
 }
 
 /// Rule 4, arithmetic edge: a window resetting at this exact instant is fully elapsed, so 20
-/// percent used against 100 percent elapsed is 80 points under pace, and against a Codex 10 points
-/// over it that is a 90 point gap. Reading zero seconds remaining as a fresh window instead would
-/// put Claude 20 points OVER pace and lose the flip entirely.
+/// percent used projects to 20 and not to something larger. Reading zero seconds remaining as a
+/// fresh window instead makes the elapsed fraction zero, which is below the minimum to project at
+/// all, and the override would decline to run rather than move this task.
 #[test]
 fn a_window_resetting_at_this_instant_counts_as_fully_elapsed() {
     let config = Config::default();
@@ -327,47 +378,15 @@ fn a_window_resetting_at_this_instant_counts_as_fully_elapsed() {
     );
 
     assert_eq!(decision.provider, Provider::Claude);
-    assert_eq!(decision.gates, vec![Gate::PaceFlip]);
+    assert_eq!(decision.gates, vec![Gate::ProjectedOverdraw]);
+    assert_eq!(decision.claude_projected_draw, Some(20.0));
+    assert_eq!(decision.codex_projected_draw, Some(120.0));
 }
 
-/// Rule 4, arithmetic edge at both ends. Expected burn is a percentage of a window, so it is
-/// clamped to 0..=100 and each unclamped reading changes the answer:
-///
-/// - a reset two weeks out is -100 percent elapsed unclamped, which would read Codex as 110 points
-///   hot instead of 10 and produce a 115 point gap where the true one is 15;
-/// - a reset a week in the past is 200 percent elapsed unclamped, which would read Claude as 110
-///   points cold instead of 10 and produce a 120 point gap where the true one is 20.
-#[test]
-fn expected_burn_is_clamped_at_both_ends_of_the_window() {
-    let config = Config::default();
-
-    let far_future_reset = decide(
-        plain(),
-        usage(window(45.0, HALF_WEEK, 0.0), window(10.0, WEEK * 2, 0.0)),
-        NOW,
-        &config,
-    );
-    assert_eq!(far_future_reset.provider, Provider::Codex);
-    assert!(!far_future_reset.gates.contains(&Gate::PaceFlip));
-
-    let stale_past_reset = decide(
-        plain(),
-        usage(window(90.0, -WEEK, 0.0), window(60.0, HALF_WEEK, 0.0)),
-        NOW,
-        &config,
-    );
-    assert_eq!(stale_past_reset.provider, Provider::Codex);
-    assert!(!stale_past_reset.gates.contains(&Gate::PaceFlip));
-}
-
-/// Rule 4, symmetry. The gap is measured from the provider the task is currently on, not from
+/// Rule 4, symmetry. The projection is read from the provider the task is currently on, not from
 /// Codex, and the override is not special cased by direction. With Claude configured as the
-/// default, a Codex 75 points hotter is no reason to leave Claude, and a Claude 75 points hotter
-/// is reason to leave it.
-///
-/// This direction never fires on the recorded corpus: Claude's pace delta there tops out at +3.4
-/// while Codex's floor is 0.0, so the gap is never negative enough. That is a property of how this
-/// box happens to be provisioned today, not of the rule, so it is not encoded as one.
+/// default, a Codex projecting 160 is no reason to leave Claude, and a Claude projecting 160 is
+/// reason to leave it.
 #[test]
 fn the_override_is_symmetric_and_measured_from_the_current_provider() {
     let mut config = Config::default();
@@ -384,25 +403,26 @@ fn the_override_is_symmetric_and_measured_from_the_current_provider() {
         &config,
     );
     assert_eq!(leaves.provider, Provider::Codex);
-    assert_eq!(leaves.gates, vec![Gate::PaceFlip]);
+    assert_eq!(leaves.gates, vec![Gate::ProjectedOverdraw]);
     assert_eq!(leaves.model.as_deref(), Some("gpt-5.6-sol"));
 }
 
-// ------------------------------------------------------------------ rule 5: unknown reset
+// ------------------------------------------------- rule 5: unknown windows and unprojectable ones
 
 /// Rule 5. A reset epoch of 0 means "not known", and a weekly percentage nobody read is not
-/// headroom. The provider is ineligible, the decision records `weekly_unknown`, and the run rate
-/// override is never reached.
+/// headroom. The provider is ineligible, the decision records `weekly_unknown`, and the override is
+/// never reached.
 ///
 /// The mutation this catches is the tempting one: treat 0 as an epoch like any other. The window
-/// then reads as 100 percent elapsed, the unknown provider looks 130 points colder than it is, and
-/// the task routes on a number that was never measured. The recorded pace delta stays None for
-/// exactly that reason, and is asserted here rather than only in the log's own tests.
+/// then reads as fully elapsed, the unknown provider looks like a confidently measured one, and the
+/// task routes on a number that was never read. The recorded projection stays None for exactly that
+/// reason, and is asserted here rather than only in the log's own tests.
 ///
-/// `pace_unavailable` can no longer fire, and that is asserted rather than left to be noticed
-/// later. The override runs only with both providers eligible, eligibility requires a known weekly
-/// window, and a known window is precisely what gives `pace_delta` a Some. The gate stays in the
-/// enum because rows already in the log carry it.
+/// `projection_unavailable` cannot fire on this input, and that is asserted rather than left to be
+/// noticed later: the override runs only with both providers eligible, eligibility requires a known
+/// weekly window, and a known window is precisely what gives `projected_draw` something to divide
+/// into. A decision that would once have carried it carries `weekly_unknown` instead, which names
+/// the reason rather than the consequence.
 #[test]
 fn an_unknown_weekly_window_makes_a_provider_ineligible() {
     let config = Config::default();
@@ -417,8 +437,8 @@ fn an_unknown_weekly_window_makes_a_provider_ineligible() {
     );
     assert_eq!(claude_unknown.provider, Provider::Codex);
     assert_eq!(claude_unknown.gates, vec![Gate::WeeklyUnknown]);
-    assert_eq!(claude_unknown.claude_pace_delta, None);
-    assert!(!claude_unknown.gates.contains(&Gate::PaceUnavailable));
+    assert_eq!(claude_unknown.claude_projected_draw, None);
+    assert!(!claude_unknown.gates.contains(&Gate::ProjectionUnavailable));
 
     // Codex unknown, which is the exhausted Codex shape: its rollout carries no weekly window at
     // all, so it reported 0 percent used, live, and won every comparison in this block while it
@@ -435,8 +455,8 @@ fn an_unknown_weekly_window_makes_a_provider_ineligible() {
         codex_unknown.gates,
         vec![Gate::WeeklyUnknown, Gate::FlippedOnExhaustion]
     );
-    assert_eq!(codex_unknown.codex_pace_delta, None);
-    assert!(!codex_unknown.gates.contains(&Gate::PaceUnavailable));
+    assert_eq!(codex_unknown.codex_projected_draw, None);
+    assert!(!codex_unknown.gates.contains(&Gate::ProjectionUnavailable));
 }
 
 /// Rule 5. Failing closed must never fail to route. With neither weekly window read there is no
@@ -459,6 +479,92 @@ fn both_weekly_windows_unknown_still_route_to_the_default() {
     assert_eq!(decision.gates, vec![Gate::WeeklyUnknown, Gate::OverCeiling]);
 }
 
+/// Rule 5, the divide-by-almost-nothing guard. Early in a week a single job is a large fraction of
+/// everything spent so far, so the projection is not merely noisy, it is confidently wrong in the
+/// direction that moves traffic: 4 percent spent in the first twentieth of a window extrapolates to
+/// 80 percent of the whole allowance on the strength of a couple of dispatches.
+///
+/// Just under the minimum the override declines to run at all. Just past it the same shaped picture
+/// is allowed to move a task, which is what stops this guard from being a permanent off switch.
+#[test]
+fn too_little_of_the_window_elapsed_yields_no_projection() {
+    let config = Config::default();
+
+    // 4 percent elapsed: 96 percent of the window still to run.
+    let too_early = decide(
+        plain(),
+        usage(
+            window(1.0, WEEK * 96 / 100, 0.0),
+            window(4.0, WEEK * 96 / 100, 0.0),
+        ),
+        NOW,
+        &config,
+    );
+    assert_eq!(too_early.provider, Provider::Codex);
+    assert!(too_early.gates.contains(&Gate::ProjectionUnavailable));
+    assert_eq!(too_early.codex_projected_draw, None);
+    assert_eq!(too_early.claude_projected_draw, None);
+
+    // 10 percent elapsed, the same 4 percent spent: 40 percent projected, and now measurable.
+    let measurable = decide(
+        plain(),
+        usage(
+            window(1.0, WEEK * 90 / 100, 0.0),
+            window(4.0, WEEK * 90 / 100, 0.0),
+        ),
+        NOW,
+        &config,
+    );
+    assert!(!measurable.gates.contains(&Gate::ProjectionUnavailable));
+    let projected = measurable.codex_projected_draw.expect("now projects");
+    assert!(
+        (projected - 40.0).abs() < 1e-9,
+        "expected about 40, got {projected}"
+    );
+}
+
+/// Rule 5. A reset more than a full window out cannot be a window this task is inside: the elapsed
+/// fraction is negative, and dividing by it flips the projection's sign. An 11 percent draw would
+/// read as MINUS 11 percent projected, which is colder than any real provider can be and would hold
+/// a task on an exhausted one forever. It is refused rather than clamped up into a real looking
+/// number.
+#[test]
+fn a_reset_beyond_a_full_window_out_yields_no_projection() {
+    let config = Config::default();
+    let decision = decide(
+        plain(),
+        usage(window(45.0, HALF_WEEK, 0.0), window(11.0, WEEK * 2, 0.0)),
+        NOW,
+        &config,
+    );
+
+    assert_eq!(decision.provider, Provider::Codex);
+    assert!(decision.gates.contains(&Gate::ProjectionUnavailable));
+    assert_eq!(decision.codex_projected_draw, None);
+}
+
+/// Rule 5, the other end. A reset already in the past is a stale reading of a window that has run
+/// out, so the elapsed fraction is capped at one whole window and the projection is simply what has
+/// been spent. Without the cap a week-stale reset halves the number, and the log would record a
+/// provider as running half as hot as it measured.
+///
+/// This cannot change which provider a task lands on, because a percentage of an allowance never
+/// exceeds 100 and a capped projection therefore never crosses the threshold on its own. It is
+/// asserted on the recorded value, which is what a human reads back.
+#[test]
+fn a_reset_already_in_the_past_projects_at_what_was_spent() {
+    let config = Config::default();
+    let decision = decide(
+        plain(),
+        usage(window(90.0, -WEEK, 0.0), window(30.0, HALF_WEEK, 0.0)),
+        NOW,
+        &config,
+    );
+
+    assert_eq!(decision.claude_projected_draw, Some(90.0));
+    assert_eq!(decision.provider, Provider::Codex);
+}
+
 // ------------------------------------------------------------------ rule 6: what does not change
 
 /// Rule 6. Complexity picks the model tier and never the provider. The same eight tiers are
@@ -475,7 +581,12 @@ fn complexity_picks_the_tier_and_never_the_provider() {
     ];
 
     for (complexity, codex_model, claude_model) in cases {
-        let stays = decide(scored(false, false, complexity), chronic(), NOW, &config);
+        let stays = decide(
+            scored(false, false, complexity),
+            within_allowance(),
+            NOW,
+            &config,
+        );
         assert_eq!(stays.provider, Provider::Codex, "{complexity:?} on codex");
         assert_eq!(stays.model.as_deref(), Some(codex_model));
         assert_eq!(stays.effort, None);
@@ -505,7 +616,10 @@ fn an_override_to_claude_is_paced_straight_back_by_the_five_hour_window() {
     );
 
     assert_eq!(decision.provider, Provider::Codex);
-    assert_eq!(decision.gates, vec![Gate::PaceFlip, Gate::FiveHourPacing]);
+    assert_eq!(
+        decision.gates,
+        vec![Gate::ProjectedOverdraw, Gate::FiveHourPacing]
+    );
     assert_eq!(decision.model.as_deref(), Some("gpt-5.6-sol"));
 }
 
@@ -551,9 +665,11 @@ fn five_hour_pacing_does_not_fire_when_codex_has_no_weekly_window() {
 fn a_codex_five_hour_window_never_moves_a_task() {
     let config = Config::default();
 
+    // Codex projects 90, inside its allowance, so nothing but its five hour number could move
+    // this task, and nothing does.
     let stays = decide(
         plain(),
-        usage(window(5.0, HALF_WEEK, 0.0), window(55.0, HALF_WEEK, 100.0)),
+        usage(window(5.0, HALF_WEEK, 0.0), window(45.0, HALF_WEEK, 100.0)),
         NOW,
         &config,
     );
@@ -567,7 +683,7 @@ fn a_codex_five_hour_window_never_moves_a_task() {
         &config,
     );
     assert_eq!(flips.provider, Provider::Claude);
-    assert_eq!(flips.gates, vec![Gate::PaceFlip]);
+    assert_eq!(flips.gates, vec![Gate::ProjectedOverdraw]);
 }
 
 /// Rule 6. An operator who turned weekly routing off asked to route on task shape alone, and the
@@ -597,77 +713,93 @@ fn a_failed_classifier_keeps_the_default_and_stays_eligible_for_the_override() {
     );
 
     assert_eq!(decision.provider, Provider::Claude);
-    assert_eq!(decision.gates, vec![Gate::ClassifierFailed, Gate::PaceFlip]);
+    assert_eq!(
+        decision.gates,
+        vec![Gate::ClassifierFailed, Gate::ProjectedOverdraw]
+    );
     assert_eq!(decision.model.as_deref(), Some("opus[1m]"));
 }
 
 // ------------------------------------------------------------------ rule 7: the config key
 
-/// Rule 7. The old key is gone, not aliased. A file still carrying `headroom_flip_gap = 200` must
-/// route as though it said nothing at all: the gap stays at the 70 point default, so a 75 point
-/// blowout still fires the override. Under an alias the 200 would be honoured and the same task
-/// would hold.
+/// Rule 7. Both retired keys are gone, not aliased. A file still carrying `headroom_flip_gap` or
+/// `pace_flip_gap` must route as though it said nothing at all, so the threshold stays at the
+/// default 100 and a blowout still fires the override.
 ///
-/// The behavioural half is the point. Reading `pace_flip_gap` back as 70 would also pass against
-/// an alias that only wrote through to a second field.
+/// `pace_flip_gap = 200` is the case that matters. Under an alias it would set the overdraw
+/// threshold to 200 percent of allowance and this task would hold, but the subtler damage is the
+/// number every real file actually carries: honouring a `pace_flip_gap = 70` as a projection
+/// threshold would let a provider run to 70 percent OVER its allowance before anything moved.
+/// A number tuned for a difference of run rates means nothing as a ratio against an allowance.
+///
+/// The behavioural half is the point. Reading the field back as 100 would also pass against an
+/// alias that only wrote through to a second field.
 #[test]
-fn the_old_flip_gap_key_is_not_an_alias_for_the_new_one() {
+fn neither_retired_flip_gap_key_is_an_alias_for_the_new_one() {
     let config = Config::default();
     let dir = tempfile::tempdir().expect("tempdir");
 
-    let stale_path = dir.path().join("stale.toml");
-    std::fs::write(&stale_path, "headroom_flip_gap = 200.0\n").expect("write the stale config");
-    let stale = Config::load_from(&stale_path).expect("load the stale config");
-    assert_eq!(stale.pace_flip_gap, config.pace_flip_gap);
+    for (name, body) in [
+        ("headroom.toml", "headroom_flip_gap = 200.0\n"),
+        ("pace.toml", "pace_flip_gap = 200.0\n"),
+    ] {
+        let path = dir.path().join(name);
+        std::fs::write(&path, body).expect("write the stale config");
+        let stale = Config::load_from(&path).expect("load the stale config");
+        assert_eq!(
+            stale.projection_overdraw_pct, config.projection_overdraw_pct,
+            "{name} must not be read"
+        );
 
-    let ignored = decide(plain(), blowout(), NOW, &stale);
-    assert_eq!(ignored.provider, Provider::Claude);
-    assert_eq!(ignored.gates, vec![Gate::PaceFlip]);
+        let ignored = decide(plain(), blowout(), NOW, &stale);
+        assert_eq!(ignored.provider, Provider::Claude, "{name}");
+        assert_eq!(ignored.gates, vec![Gate::ProjectedOverdraw], "{name}");
+    }
 
-    // The new key does take effect, on the same 75 point gap.
+    // The new key does take effect, on the same picture.
     let tuned_path = dir.path().join("tuned.toml");
-    std::fs::write(&tuned_path, "pace_flip_gap = 200.0\n").expect("write the tuned config");
+    std::fs::write(&tuned_path, "projection_overdraw_pct = 200.0\n")
+        .expect("write the tuned config");
     let tuned = Config::load_from(&tuned_path).expect("load the tuned config");
-    assert_eq!(tuned.pace_flip_gap, 200.0);
+    assert_eq!(tuned.projection_overdraw_pct, 200.0);
     let honoured = decide(plain(), blowout(), NOW, &tuned);
     assert_eq!(honoured.provider, Provider::Codex);
     assert!(honoured.gates.is_empty(), "{:?}", honoured.gates);
 }
 
-/// Rule 7. The generated file states the new key at the new version and never mentions the old
-/// one: a file that still writes a key the router no longer reads is a config that lies about what
-/// is running. A v1 file is migrated in place and loses the stale key on the way through.
-///
-/// The 70 point default is a measured property of this box's plan mix rather than a round number,
-/// so it is pinned here as well as behaviourally: moving it silently re-tunes every route.
+/// Rule 7. The generated file states the new key at the new version and never mentions either
+/// retired one: a file that still writes a key the router no longer reads is a config that lies
+/// about what is running. An older file is migrated in place and loses the stale keys on the way
+/// through, which is the half that reaches the boxes this tool has already written a config on.
 #[test]
-fn the_written_config_carries_pace_flip_gap_at_the_current_version() {
+fn the_written_config_carries_the_overdraw_threshold_at_the_current_version() {
     let dir = tempfile::tempdir().expect("tempdir");
 
     let fresh_path = dir.path().join("fresh/config.toml");
     let created = Config::load_from(&fresh_path).expect("create the default config");
-    assert_eq!(created.config_version, 3);
-    assert_eq!(created.pace_flip_gap, 70.0);
+    assert_eq!(created.config_version, 4);
+    assert_eq!(created.projection_overdraw_pct, 100.0);
 
     let document: toml::Value =
         toml::from_str(&std::fs::read_to_string(&fresh_path).expect("read the written config"))
             .expect("parse the written config");
-    assert_eq!(document["config_version"].as_integer(), Some(3));
-    assert_eq!(document["pace_flip_gap"].as_float(), Some(70.0));
+    assert_eq!(document["config_version"].as_integer(), Some(4));
+    assert_eq!(document["projection_overdraw_pct"].as_float(), Some(100.0));
     assert!(document.get("headroom_flip_gap").is_none());
+    assert!(document.get("pace_flip_gap").is_none());
 
-    let old_path = dir.path().join("v1.toml");
-    std::fs::write(&old_path, "config_version = 1\nheadroom_flip_gap = 25.0\n")
-        .expect("write the v1 config");
-    let migrated = Config::load_from(&old_path).expect("load the v1 config");
-    assert_eq!(migrated.config_version, 3);
-    assert_eq!(migrated.pace_flip_gap, 70.0);
+    let old_path = dir.path().join("v3.toml");
+    std::fs::write(&old_path, "config_version = 3\npace_flip_gap = 70.0\n")
+        .expect("write the v3 config");
+    let migrated = Config::load_from(&old_path).expect("load the v3 config");
+    assert_eq!(migrated.config_version, 4);
+    assert_eq!(migrated.projection_overdraw_pct, 100.0);
 
     let rewritten: toml::Value =
         toml::from_str(&std::fs::read_to_string(&old_path).expect("re-read the migrated config"))
             .expect("parse the migrated config");
-    assert_eq!(rewritten["config_version"].as_integer(), Some(3));
-    assert!(rewritten.get("headroom_flip_gap").is_none());
+    assert_eq!(rewritten["config_version"].as_integer(), Some(4));
+    assert!(rewritten.get("pace_flip_gap").is_none());
 }
 
 /// Rule 7. The reserve, stated as the number rather than as `config.hard_ceiling_pct`: every other
@@ -683,10 +815,13 @@ fn a_provider_within_five_points_of_its_weekly_limit_takes_no_more_work() {
     assert_eq!(config.hard_ceiling_pct, 95.0);
 
     // Codex is the default provider, and at 95 percent used it is out. Its window is fully
-    // elapsed, so run rate reads it as 5 points COLD and argues for staying; the ceiling wins.
+    // elapsed, so it projects to exactly what it has spent and reads as comfortably inside its
+    // allowance, which argues for staying; the ceiling wins. Claude's window is half elapsed
+    // rather than untouched, so both providers are projectable and the override genuinely runs
+    // here instead of declining for want of a number.
     let refused = decide(
         plain(),
-        usage(window(40.0, WEEK, 0.0), window(95.0, 0, 0.0)),
+        usage(window(40.0, HALF_WEEK, 0.0), window(95.0, 0, 0.0)),
         NOW,
         &config,
     );
@@ -697,7 +832,7 @@ fn a_provider_within_five_points_of_its_weekly_limit_takes_no_more_work() {
     // is a boundary and not a general aversion to a busy provider.
     let allowed = decide(
         plain(),
-        usage(window(40.0, WEEK, 0.0), window(94.9, 0, 0.0)),
+        usage(window(40.0, HALF_WEEK, 0.0), window(94.9, 0, 0.0)),
         NOW,
         &config,
     );

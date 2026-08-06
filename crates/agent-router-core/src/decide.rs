@@ -16,6 +16,11 @@ const UNSCORED_COMPLEXITY: Complexity = Complexity::High;
 /// is directly comparable to this.
 const WEEKLY_WINDOW_SECS: f64 = 604_800.0;
 
+/// How much of a weekly window must have elapsed before a projection across it means anything.
+/// A twentieth of a week is about 8.4 hours. Below this the divisor is small enough that a single
+/// job projects to a blowout, and the override would move traffic on the strength of one dispatch.
+const MIN_PROJECTION_ELAPSED: f64 = 0.05;
+
 /// Everything that fired on the way to a provider, in the order it fired. These are the tuning
 /// signal in the decision log, so each one names a specific rule rather than a generic reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -44,13 +49,17 @@ pub enum Gate {
     WeeklyUnknown,
     /// Weekly usage routing is disabled by policy.
     WeeklyRoutingDisabled,
-    /// The provider the task was on is burning through its weekly window far enough ahead of the
-    /// other that the task moved. Rare by construction: see `pace_flip_gap`.
-    PaceFlip,
-    /// A weekly reset epoch was never read, so there is no elapsed fraction to measure a run rate
-    /// against and the override was skipped. Recorded rather than inferred, because a missing epoch
-    /// and a window that resets at this instant are not the same input.
-    PaceUnavailable,
+    /// The provider the task was on projects to overdraw its weekly window before the window
+    /// resets, and the other provider projects a lighter draw, so the task moved.
+    ProjectedOverdraw,
+    /// No projection could be computed for at least one provider, so the override was skipped.
+    /// In practice this means one thing: too little of a window has elapsed for a projection across
+    /// it to mean anything. A projection is also uncomputable when a reset was never read, but the
+    /// override runs only with both providers eligible and eligibility already requires a known
+    /// weekly window, so that decision carries `WeeklyUnknown` instead. Recorded rather than
+    /// inferred, because declining to measure and measuring a healthy provider are not the same
+    /// input and must not read the same in the log.
+    ProjectionUnavailable,
     /// Claude's five hour window is near exhausted and Codex has weekly room, so the task was paced
     /// away from Claude. Never fires for Codex: only Claude has a five hour window that constrains a
     /// stream of jobs on this box.
@@ -68,8 +77,8 @@ impl Gate {
             Gate::OverCeiling => "over_ceiling",
             Gate::WeeklyUnknown => "weekly_unknown",
             Gate::WeeklyRoutingDisabled => "weekly_routing_disabled",
-            Gate::PaceFlip => "pace_flip",
-            Gate::PaceUnavailable => "pace_unavailable",
+            Gate::ProjectedOverdraw => "projected_overdraw",
+            Gate::ProjectionUnavailable => "projection_unavailable",
             Gate::FiveHourPacing => "five_hour_pacing",
         }
     }
@@ -104,13 +113,14 @@ pub struct Decision {
     pub classification: Option<Classification>,
     pub gates: Vec<Gate>,
     pub usage: UsageSnapshot,
-    /// How far ahead of its own weekly window each provider was burning at the deciding instant,
-    /// in points. Positive is hot. None when that provider's reset was never read, and therefore
-    /// when the override could not run: the log records the number the rule saw, so the next
-    /// tuning pass reads why a task moved rather than only that it did. Always None on the
-    /// explicit path, which ran no usage rule to measure.
-    pub claude_pace_delta: Option<f64>,
-    pub codex_pace_delta: Option<f64>,
+    /// What each provider's weekly draw projects to at the moment its window resets, as a percent
+    /// of that provider's own weekly allowance, at the deciding instant. Over 100 means the
+    /// provider runs out before the window does. None when the projection could not be computed,
+    /// and therefore when the override could not run: the log records the number the rule saw, so
+    /// the next tuning pass reads why a task moved rather than only that it did. Always None on
+    /// the explicit path, which ran no usage rule to measure.
+    pub claude_projected_draw: Option<f64>,
+    pub codex_projected_draw: Option<f64>,
     pub rationale: String,
 }
 
@@ -132,10 +142,10 @@ impl Decision {
 ///    failed one, so a pin bypasses every usage rule below including the ceiling.
 /// 2. Eligibility, before the override: a provider at or over the hard ceiling, or carrying a
 ///    weekly number nobody read, is not a destination. Being out of weekly budget is a capacity
-///    fact, and a run rate can read a provider down to its reserve as running cold (95 percent used
-///    against 99 percent elapsed is a negative delta), so an override allowed to run first would
-///    route into an exhausted provider.
-/// 3. The run rate override, which is deliberately rare. See `pace_flip_gap`.
+///    fact, and a provider down to its reserve projects to finish INSIDE its allowance (95 percent
+///    used against 99 percent elapsed projects to 96), so an override allowed to run first would
+///    see nothing wrong and route into an exhausted provider.
+/// 3. The projection override. See `projected_draw`.
 /// 4. Claude's five hour pacing, last, on whichever provider the task landed on.
 pub fn decide(
     classification: Classification,
@@ -169,8 +179,8 @@ pub fn decide(
     let pre_usage_provider = provider;
     let complexity = classification.complexity;
     let mut model = model_for(pre_usage_provider, complexity, config);
-    let claude_pace_delta = pace_delta(&usage.claude, now_epoch_secs);
-    let codex_pace_delta = pace_delta(&usage.codex, now_epoch_secs);
+    let claude_projected_draw = projected_draw(&usage.claude, now_epoch_secs);
+    let codex_projected_draw = projected_draw(&usage.codex, now_epoch_secs);
 
     if !capability_pin {
         if !config.policy.weekly_routing {
@@ -208,12 +218,12 @@ pub fn decide(
                 // since the only provider it could move to is out of weekly budget.
                 (true, false) => {}
                 (true, true) => {
-                    pace_override(
+                    projection_override(
                         &mut provider,
                         &mut gates,
                         other,
-                        claude_pace_delta,
-                        codex_pace_delta,
+                        claude_projected_draw,
+                        codex_projected_draw,
                         config,
                     );
                 }
@@ -253,67 +263,95 @@ pub fn decide(
         classification: Some(classification),
         gates,
         usage,
-        claude_pace_delta,
-        codex_pace_delta,
+        claude_projected_draw,
+        codex_projected_draw,
         rationale,
     }
 }
 
-/// PURE: the run rate override. Moves the task to `other` when the provider it is on is burning
-/// far enough further ahead of its own weekly window, and does nothing otherwise.
+/// PURE: the projection override. Moves the task to `other` when the provider it is on projects to
+/// run out of weekly allowance before its window resets and `other` projects a lighter draw.
 ///
-/// The dead zone is wide because this box runs two Claude 20x Max plans against one Codex 5x plan,
-/// an allowance mismatch of about 8x. Identical work therefore shows up as several times the
-/// percentage on Codex, and over the recorded decisions Codex sat 43 to 58 points over pace all
-/// week purely from that. A threshold inside that band is not an override at all: at 25 points it
-/// moved 27 of 39 real dispatches, 25 of them onto the provider with LESS absolute allowance left.
-/// So the gap has to clear the chronic band, and what is left is the genuine blowout.
+/// Both conditions matter. The first is what makes the rule fire only on a real problem: a provider
+/// projecting under the threshold finishes its week with allowance to spare, and moving work off it
+/// would strand that allowance. The second is what makes the destination an improvement rather than
+/// merely a different provider; without it, two equally doomed providers would trade jobs back and
+/// forth. Comparing the two projections rather than testing `other` against the threshold keeps the
+/// rule useful when BOTH overdraw, which is the week where routing matters most: the task goes to
+/// whichever provider runs out later, and the two drain together instead of one dying first.
 ///
-/// Strictly greater, so a gap exactly on the threshold holds. Symmetric, because the rule is about
-/// the provider the task is on and not about Codex; that it only ever fires toward Claude on this
-/// box is a property of how the box is provisioned today, not of the rule.
-fn pace_override(
+/// This replaced a rule that compared how far ahead of pace each provider was in POINTS, against a
+/// configured gap. Two things were wrong with it. The gap was a tuning constant calibrated against
+/// one particular pair of plan sizes, so it silently went stale when either plan changed: it was
+/// set to 70 points to clear the chronic band that a 5x Codex plan against 20x Claude plans
+/// produced, the Codex plan grew on 2026-08-01, the chronic band collapsed to under 38 points, and
+/// the rule then could not fire at all. It never fired once, across every decision ever logged.
+/// The deeper fault is that a points difference is the wrong shape: `spent - elapsed` under-reacts
+/// early in a window, exactly when there is still time to correct. Twenty percent spent in the
+/// first tenth of a week is 10 points hot and a 200 percent projected draw. A ratio against each
+/// provider's own allowance and its own window needs no plan sizes and no calibration, which is why
+/// the threshold below is 100 rather than a number somebody measured.
+///
+/// Symmetric, because the rule is about the provider the task is on and not about Codex; that it
+/// only ever fires toward Claude on this box is a property of how the box is provisioned today.
+fn projection_override(
     provider: &mut Provider,
     gates: &mut Vec<Gate>,
     other: Provider,
-    claude_pace_delta: Option<f64>,
-    codex_pace_delta: Option<f64>,
+    claude_projected_draw: Option<f64>,
+    codex_projected_draw: Option<f64>,
     config: &Config,
 ) {
-    let (Some(claude), Some(codex)) = (claude_pace_delta, codex_pace_delta) else {
-        // An unread reset has no elapsed fraction to measure against. Treating the missing epoch
-        // as an ordinary one reads the window as fully elapsed, which turns an unknown provider
-        // into an apparently idle one and routes on a number nobody measured.
-        gates.push(Gate::PaceUnavailable);
+    let (Some(claude), Some(codex)) = (claude_projected_draw, codex_projected_draw) else {
+        // Routing on a projection nobody could compute is worse than not routing on one. Reaching
+        // here means a window barely started, which projects wildly off a handful of jobs: the
+        // unread-reset half of `projected_draw` cannot reach this point, because eligibility
+        // refused an unknown window before the override was consulted.
+        gates.push(Gate::ProjectionUnavailable);
         return;
     };
-    let delta = |candidate| match candidate {
+    let draw = |candidate| match candidate {
         Provider::Codex => codex,
         Provider::Claude | Provider::Opencode => claude,
     };
-    if delta(*provider) - delta(other) > config.pace_flip_gap {
+    let current = draw(*provider);
+    if current > config.projection_overdraw_pct && draw(other) < current {
         *provider = other;
-        gates.push(Gate::PaceFlip);
+        gates.push(Gate::ProjectedOverdraw);
     }
 }
 
-/// PURE: how far ahead of its own weekly window a provider is burning, in points. Positive is hot:
-/// 80 percent spent with half the window gone is 30 points over pace.
+/// PURE: what a provider's weekly draw projects to by the time its window resets, as a percent of
+/// that provider's own weekly allowance. Spending 20 percent in the first tenth of the week
+/// projects to 200: at this rate the allowance runs out with most of the week still to go.
 ///
-/// Each provider is measured against its OWN reset, because the two weekly windows start and end
-/// at different instants and one provider's reset says nothing about the other's progress.
+/// Each provider is measured against its OWN reset and its OWN allowance, which is what makes the
+/// two numbers comparable across providers on different plans. The percent is already normalized by
+/// allowance, so no plan sizes appear here and none need maintaining.
 ///
-/// None when the reset epoch is 0, which `usage.rs` documents as "not known" rather than as a
-/// window resetting at the epoch. The expected burn is clamped, because a reset outside the window
-/// (a stale rollout, a clock skew) would otherwise read as more than a full window elapsed or less
-/// than none, and either produces a delta larger than the scale it is measured on.
-fn pace_delta(headroom: &Headroom, now_epoch_secs: i64) -> Option<f64> {
+/// None in two cases:
+///
+/// - The reset epoch is 0, which `usage.rs` documents as "not known" rather than as a window
+///   resetting at the epoch. This one never reaches the override, which runs only once eligibility
+///   has established that both windows are known; it is here so the value RECORDED on such a
+///   decision is an honest absence rather than a number derived from a zero epoch.
+/// - Less than `MIN_PROJECTION_ELAPSED` of the window has gone. Dividing by a small elapsed
+///   fraction turns one job into a four-figure projection, so early in a window the projection is
+///   not merely noisy, it is confidently wrong in the direction that moves traffic. This is the
+///   case that actually stops the override.
+///
+/// The elapsed fraction is clamped at the top, because a reset outside the window (a stale rollout,
+/// a clock skew) would otherwise read as more than a full window elapsed.
+fn projected_draw(headroom: &Headroom, now_epoch_secs: i64) -> Option<f64> {
     if headroom.weekly_reset_epoch == 0 {
         return None;
     }
     let remaining = (headroom.weekly_reset_epoch - now_epoch_secs) as f64;
-    let expected_pct = (100.0 * (1.0 - remaining / WEEKLY_WINDOW_SECS)).clamp(0.0, 100.0);
-    Some(headroom.weekly_pct - expected_pct)
+    let elapsed = (1.0 - remaining / WEEKLY_WINDOW_SECS).min(1.0);
+    if elapsed < MIN_PROJECTION_ELAPSED {
+        return None;
+    }
+    Some(headroom.weekly_pct / elapsed)
 }
 
 /// PURE: the decision for a caller-named provider. No classification runs, but the usage
@@ -331,10 +369,10 @@ pub fn decide_explicit(
         classification: None,
         gates: vec![Gate::ExplicitProvider],
         usage,
-        // No usage rule ran, so no run rate was measured. Recording one anyway would put a number
+        // No usage rule ran, so no projection was measured. Recording one anyway would put a number
         // in the log that nothing consulted, which the next backtest would read as a rule firing.
-        claude_pace_delta: None,
-        codex_pace_delta: None,
+        claude_projected_draw: None,
+        codex_projected_draw: None,
         rationale: format!("{} requested explicitly", provider.name()),
     }
 }
@@ -452,8 +490,8 @@ mod tests {
         assert_eq!(decision.usage.claude.weekly_pct, 50.0);
         assert_eq!(decision.model, None);
         // No usage rule ran on this path, so there is no run rate to record.
-        assert_eq!(decision.claude_pace_delta, None);
-        assert_eq!(decision.codex_pace_delta, None);
+        assert_eq!(decision.claude_projected_draw, None);
+        assert_eq!(decision.codex_projected_draw, None);
 
         // An explicitly requested model overrides the per-provider default.
         let pinned = decide_explicit(
