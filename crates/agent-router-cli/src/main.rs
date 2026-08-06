@@ -663,7 +663,7 @@ fn log(
     for row in &rows {
         println!(
             "#{id} {provider}{dry} orchestration {orchestration} {complexity} \
-             pace claude {claude_pace} codex {codex_pace} \
+             proj claude {claude_pace} codex {codex_pace} \
              gates[{gates}] codex {codex:.0}% claude {claude:.0}% {job} \
              {outcome}{judgement}",
             id = row.id,
@@ -671,8 +671,8 @@ fn log(
             dry = if row.dry_run { " (dry run)" } else { "" },
             complexity = row.complexity.as_deref().unwrap_or("-"),
             orchestration = flag(row.orchestration),
-            claude_pace = pace(row.claude_pace_delta),
-            codex_pace = pace(row.codex_pace_delta),
+            claude_pace = pace(row.claude_projected_draw),
+            codex_pace = pace(row.codex_projected_draw),
             gates = row.gates,
             codex = row.codex_weekly_pct,
             claude = row.claude_weekly_pct,
@@ -907,8 +907,8 @@ fn row_json(row: &Row) -> serde_json::Value {
         "claude_signal_count": row.claude_signal_count,
         "orchestration": row.orchestration,
         "missing_connector": row.missing_connector,
-        "claude_pace_delta": row.claude_pace_delta,
-        "codex_pace_delta": row.codex_pace_delta,
+        "claude_projected_draw": row.claude_projected_draw,
+        "codex_projected_draw": row.codex_projected_draw,
         "gates": row.gates,
         "claude_weekly_pct": row.claude_weekly_pct,
         "codex_weekly_pct": row.codex_weekly_pct,
@@ -942,11 +942,13 @@ fn flag(value: Option<bool>) -> &'static str {
     }
 }
 
-/// A recorded run rate, signed so hot and cold read at a glance, or "-" when the reset behind it
-/// was never read and the override could not run.
-fn pace(delta: Option<f64>) -> String {
-    match delta {
-        Some(delta) => format!("{delta:+.0}"),
+/// A recorded projected weekly draw as a percent of that provider's own allowance, or "-" when no
+/// projection could be computed and the override did not run. Over 100 is the provider running out
+/// before its window resets, which is the whole reading, so it is printed as the percentage it is
+/// rather than signed against some baseline.
+fn pace(projected_draw: Option<f64>) -> String {
+    match projected_draw {
+        Some(projected_draw) => format!("{projected_draw:.0}%"),
         None => "-".to_string(),
     }
 }

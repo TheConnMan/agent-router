@@ -38,15 +38,15 @@ log: row 87 in /home/you/.local/state/agent-router/router.db
 2. **Apply the capability pin.** A missing connector, or a task needing several agents to exchange
    findings mid-run, pins to Claude regardless of usage. These are statements that the task cannot
    run on Codex at all, so every usage rule below is bypassed.
-3. **Apply the hard ceiling, then the run rate override, then pace on Claude's 5 hour window.** A
+3. **Apply the hard ceiling, then the projection override, then pace on Claude's 5 hour window.** A
    provider at or above `hard_ceiling_pct` is ineligible, which by default means a provider within
    5 points of its weekly limit takes no more routed work, and so is a provider whose weekly window
    nobody read (`weekly_unknown`), because an unread window reports 0 percent used and would
    otherwise read as maximum headroom: exactly one ineligible sends the task to the other
-   (`flipped_on_exhaustion`), both ineligible keeps the default (`over_ceiling`). With
-   both eligible, the task moves only when the provider it is on is burning more than
-   `pace_flip_gap` points further ahead of its own weekly window than the other is of its own
-   (`pace_flip`), which is rare on purpose. Finally a task still bound for Claude moves to Codex
+   (`flipped_on_exhaustion`), both ineligible keeps the default (`over_ceiling`). With both
+   eligible, the task moves when the provider it is on projects to draw more than
+   `projection_overdraw_pct` of its own weekly allowance by the time its own window resets, and the
+   other provider projects lower (`projected_overdraw`). Finally a task still bound for Claude moves to Codex
    when Claude's 5 hour percent is at or above `claude_five_hour_pacing_pct` and Codex is under the
    hard ceiling (`five_hour_pacing`), because an exhausted 5 hour window stalls the job rather than
    merely costing more.
@@ -248,9 +248,9 @@ Recent routing decisions, newest first.
 
 ```bash
 $ agent-router log --limit 3
-#87 codex orchestration no medium pace claude -12 codex +6 gates[] codex 23% claude 58% 019c3f2a dispatched
+#87 codex orchestration no medium proj claude 88% codex 61% gates[] codex 23% claude 58% 019c3f2a dispatched
      Port usage.sh to Rust with the same fail-open semantics
-#86 claude orchestration yes high pace claude -12 codex +6 gates[orchestration] codex 23% claude 58% 019c3f19 dispatched mark bad note routed to codex, needed connectors
+#86 claude orchestration yes high proj claude 88% codex 61% gates[orchestration] codex 23% claude 58% 019c3f19 dispatched mark bad note routed to codex, needed connectors
      Fix the flaky parity test and work out why it only fails in CI
 
 # Judge a decision: was routing it there the right call.
@@ -310,8 +310,9 @@ Reported over the window: the rows considered and their oldest and newest timest
 provider, the count per gate tag, the complexity distribution (with a row that was never scored
 counted as `unscored`), the router version distribution (with a row carrying no version counted as
 `unknown`), the number of auto routes, and three rates. The flip rate is the auto routed
-rows carrying a provider moving gate (`flipped_on_exhaustion`, `pace_flip`, `five_hour_pacing`, or
-the retired `headroom_tiebreak`, which rows already in the log still carry) over all auto routes. A
+rows carrying a provider moving gate (`flipped_on_exhaustion`, `projected_overdraw`,
+`five_hour_pacing`, or the retired `pace_flip` and `headroom_tiebreak`, which rows already in the
+log may still carry) over all auto routes. A
 row carrying more than one of them counts once, because
 the route moved once. The classifier failure rate is the auto routed rows carrying `classifier_failed` over the
 same denominator. Both are denominated on auto routes only, because a row that named its provider

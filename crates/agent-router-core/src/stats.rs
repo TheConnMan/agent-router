@@ -17,10 +17,16 @@ use std::collections::BTreeMap;
 /// `headroom_tiebreak` is retired and no decision made since carries it, but it stays in this list
 /// because 45 rows already in the log do, and a report over a window that reaches back into them
 /// must count the routes that really did move.
-const FLIP_GATES: [&str; 4] = [
+/// `pace_flip` is retired too, and unlike `headroom_tiebreak` it is not known to have ever fired:
+/// its threshold was calibrated against plan sizes that changed underneath it, and a count over
+/// every row this box has logged returns zero. It stays listed anyway, because the cost of a gate
+/// that matches nothing is nothing, and the cost of omitting one that some older database does
+/// carry is a flip rate that under reports without saying so.
+const FLIP_GATES: [&str; 5] = [
     "flipped_on_exhaustion",
     "headroom_tiebreak",
     "pace_flip",
+    "projected_overdraw",
     "five_hour_pacing",
 ];
 

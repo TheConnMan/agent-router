@@ -204,8 +204,9 @@ fn every_classifier_failure_row_replays_as_a_failure_and_still_routes() {
 }
 
 /// The blowout the override exists for. At rows 6, 7 and 8 Codex was 74 percent spent with 12
-/// percent of its window gone, a 77 point gap, and it still held 26 points of allowance against
-/// Claude's 50. Codex is below the ceiling on all three, so the ceiling cannot be what moved them.
+/// percent of its window gone, which projects to a 637 percent draw on a plan that holds 100,
+/// against a Claude projecting 78 and finishing its week inside its allowance. Codex is below the
+/// ceiling on all three, so the ceiling cannot be what moved them.
 ///
 /// Row 8 reaches Claude by a different road: it scored orchestration, so the pin takes it before
 /// any usage rule runs. Asserting that separately is the point, because "row 8 is on Claude" is
@@ -225,8 +226,8 @@ fn the_blowout_rows_route_to_claude() {
         let decision = row.replay(&config);
         assert_eq!(decision.provider, Provider::Claude, "row {id}");
         assert!(
-            decision.gates.contains(&Gate::PaceFlip),
-            "row {id} must move on run rate, not on something else: {:?}",
+            decision.gates.contains(&Gate::ProjectedOverdraw),
+            "row {id} must move on its projection, not on something else: {:?}",
             decision.gates
         );
     }
@@ -239,17 +240,16 @@ fn the_blowout_rows_route_to_claude() {
         "row 8 scored orchestration"
     );
     assert!(
-        !decision.gates.contains(&Gate::PaceFlip),
+        !decision.gates.contains(&Gate::ProjectedOverdraw),
         "the pin runs before the override, so it cannot also fire: {:?}",
         decision.gates
     );
 }
 
-/// Row 28 is the extreme: Codex 100 percent spent with 13 percent of its window elapsed, a 104
-/// point gap, against a Claude with 57 points left. Both the ceiling and the override point the
-/// same way here, so the override is deliberately switched off (by a gap wider than any real one)
-/// to prove the ceiling catches it alone. A correct route for two reasons is only one guarantee if
-/// exactly one of them is load bearing.
+/// Row 28 is the extreme: Codex 100 percent spent with 13 percent of its window elapsed. Both the
+/// ceiling and the override point the same way here, so the override is deliberately switched off
+/// (by a threshold no real projection reaches) to prove the ceiling catches it alone. A correct
+/// route for two reasons is only one guarantee if exactly one of them is load bearing.
 #[test]
 fn the_fully_spent_codex_row_is_caught_by_the_ceiling_without_the_override() {
     let config = Config::default();
@@ -261,78 +261,60 @@ fn the_fully_spent_codex_row_is_caught_by_the_ceiling_without_the_override() {
     assert_eq!(with_override.provider, Provider::Claude);
 
     let override_disabled = Config {
-        pace_flip_gap: 1000.0,
+        projection_overdraw_pct: 100_000.0,
         ..Config::default()
     };
     let decision = row.replay(&override_disabled);
     assert_eq!(decision.provider, Provider::Claude);
     assert!(decision.gates.contains(&Gate::FlippedOnExhaustion));
-    assert!(!decision.gates.contains(&Gate::PaceFlip));
+    assert!(!decision.gates.contains(&Gate::ProjectedOverdraw));
 }
 
-/// The dead zone boundary, and the most valuable rows in the set. Rows 68, 69 and 76 sit at gaps of
-/// 62 to 67, above the chronic band and below the threshold, so they must NOT move. They are what
-/// fails if anyone tunes the threshold back down toward the chronic band.
+/// Rows the OLD rule's dead zone held on Codex and this one moves, which is the whole redesign in
+/// one assertion. Rows 77 to 84 sit at run rate gaps inside the 43 to 58 point band that the
+/// retired `pace_flip_gap` was widened to ignore as a plan size artifact. Their projections are
+/// 399 to 452 percent of a Codex allowance against 92 to 99 on Claude: Codex was going to run out
+/// with most of its week left while Claude was going to finish just inside its plan.
+///
+/// The band was never an artifact to be tolerated. It was a small plan being spent at a rate that
+/// would empty it early, which is a fact about the box and not a distortion of the measurement, and
+/// a rule tuned to look past it was tuned to look past the only thing worth acting on.
 #[test]
-fn the_rows_just_under_the_threshold_stay_on_codex() {
+fn the_rows_the_old_dead_zone_ignored_now_move_on_their_projection() {
     let config = Config::default();
     let corpus = corpus();
 
-    for id in [68, 69, 76] {
+    for id in [77, 78, 79, 80, 81, 82, 83, 84] {
         let row = row(&corpus, id);
         assert!(row.dispatched(), "row {id} is a real dispatch");
-        let decision = row.replay(&config);
-        assert_eq!(decision.provider, Provider::Codex, "row {id} must not move");
         assert!(
-            !decision.gates.contains(&Gate::PaceFlip),
+            (43.0..=58.0).contains(&row.gap()),
+            "row {id} sits in the old dead zone at gap {:.1}",
+            row.gap()
+        );
+        let decision = row.replay(&config);
+        assert_eq!(decision.provider, Provider::Claude, "row {id} must move");
+        assert!(
+            decision.gates.contains(&Gate::ProjectedOverdraw),
             "row {id}: {:?}",
             decision.gates
         );
     }
 }
 
-/// The dead zone itself, over every row that lands in it rather than a hand picked few. A gap of 43
-/// to 58 is what two Claude 20x plans against one Codex 5x plan produce all week: the same work
-/// shows as about four times the percentage on the smaller allowance, so it is a plan size artifact
-/// and not a signal. Nothing in that band may move.
+/// Rows 85 to 88, where BOTH providers project past their allowance: Codex at 393 to 401 percent
+/// and Claude at 102 to 104. The task goes to Claude, because the question when neither is safe is
+/// which one runs out later, and Claude finishing a fraction over its plan at the end of its week
+/// is a different problem from Codex emptying a plan with five sixths of its window still to run.
 ///
-/// This is the assertion the whole redesign turns on. Under the first threshold the band WAS the
-/// rule: it moved 27 of 39 real dispatches, 25 of them onto the provider with less absolute
-/// allowance left.
+/// An earlier rule held these on Codex, reasoning that Codex had 29 points of allowance left
+/// against Claude's 10 to 14 and that moving them handed work to the emptier tank. That reasoning
+/// is the plan size confusion in its purest form: a point of a 5x Codex plan and a point of a 20x
+/// Claude plan are not the same quantity, so the two numbers were never comparable and the tank
+/// with more points left was in fact the smaller one. A projection is comparable, because it is
+/// each provider measured against its own plan and its own clock.
 #[test]
-fn no_row_in_the_chronic_band_is_moved_by_the_override() {
-    let config = Config::default();
-    let corpus = corpus();
-    let band: Vec<&HistoricalRow> = corpus
-        .iter()
-        .filter(|row| row.dispatched() && row.resets_known())
-        .filter(|row| (43.0..=58.0).contains(&row.gap()))
-        .collect();
-    assert!(
-        band.len() >= 15,
-        "the chronic band is the bulk of the corpus, found {}",
-        band.len()
-    );
-
-    for row in band {
-        let decision = row.replay(&config);
-        assert_eq!(
-            decision.provider,
-            Provider::Codex,
-            "row {} at gap {:.1} is chronic, not a blowout",
-            row.id,
-            row.gap()
-        );
-        assert!(!decision.gates.contains(&Gate::PaceFlip), "row {}", row.id);
-    }
-}
-
-/// Rows 85 to 88 by name, because the first version of this rule inverted them to Claude and that
-/// was the wrong answer. Their gap is 50 to 51, squarely chronic. At those rows Codex held 29
-/// points of allowance against Claude's 10 to 14, so moving them handed work to the emptier tank
-/// while the percentages said the opposite.
-#[test]
-fn the_rows_the_first_threshold_wrongly_inverted_stay_on_codex() {
+fn the_rows_where_both_providers_overdraw_go_to_the_one_that_lasts_longer() {
     let config = Config::default();
     let corpus = corpus();
 
@@ -342,27 +324,32 @@ fn the_rows_the_first_threshold_wrongly_inverted_stay_on_codex() {
             row.historical_provider, "codex",
             "row {id} was recorded on codex"
         );
-        assert!(
-            row.claude_weekly_pct > row.codex_weekly_pct,
-            "row {id}: Claude is the fuller tank by percentage, which is what misled the old rule"
-        );
         let decision = row.replay(&config);
-        assert_eq!(decision.provider, Provider::Codex, "row {id} must not move");
-        assert!(!decision.gates.contains(&Gate::PaceFlip), "row {id}");
+        let codex = decision.codex_projected_draw.expect("codex projects");
+        let claude = decision.claude_projected_draw.expect("claude projects");
+        assert!(
+            codex > config.projection_overdraw_pct && claude > config.projection_overdraw_pct,
+            "row {id}: both providers must be overdrawing, got codex {codex:.0} claude {claude:.0}"
+        );
+        assert!(claude < codex, "row {id}: claude must be the lighter draw");
+        assert_eq!(decision.provider, Provider::Claude, "row {id}");
+        assert!(
+            decision.gates.contains(&Gate::ProjectedOverdraw),
+            "row {id}"
+        );
     }
 }
 
-/// The quiet band, right after a Codex reset: gaps of 6 to 9, nowhere near the threshold. Rows 89,
-/// 91, 93 and 94 were historically routed to Claude by the retired two-signal pin, so they DO
-/// invert, just in the direction that spends less.
+/// The quiet band, right after a Codex reset. Rows 89 to 94 were historically routed to Claude by
+/// the retired two-signal pin, and they route to Codex now, but NOT because a projection said so:
+/// Codex's window had barely started on each, so there is nothing to extrapolate and the override
+/// declines to run. This is the guard rail earning its keep, not the rule choosing.
 ///
-/// Rows 93 and 94 land on Codex for a different reason than the other four, and the split is
-/// asserted rather than left implicit. Claude sits at 95 percent on both, which is exactly the
-/// reserve, so those two take the one-eligible-provider arm and the run rate gap is never consulted
-/// at all. Neither arm records a gate, so the gate vector cannot tell them apart, which is why the
-/// eligibility of each row is stated here directly.
+/// Rows 93 and 94 land on Codex for a third reason again, and the split is asserted rather than
+/// left implicit. Claude sits at 95 percent on both, which is exactly the reserve, so those two
+/// take the one-eligible-provider arm before the override is reached at all.
 #[test]
-fn the_quiet_band_rows_route_to_codex() {
+fn the_quiet_band_rows_route_to_codex_with_nothing_to_project() {
     let config = Config::default();
     let corpus = corpus();
 
@@ -371,9 +358,13 @@ fn the_quiet_band_rows_route_to_codex() {
         let decision = historical.replay(&config);
         assert_eq!(decision.provider, Provider::Codex, "row {id}");
         assert!(
-            !decision.gates.contains(&Gate::PaceFlip),
+            !decision.gates.contains(&Gate::ProjectedOverdraw),
             "row {id}: {:?}",
             decision.gates
+        );
+        assert_eq!(
+            decision.codex_projected_draw, None,
+            "row {id}: codex's window is too fresh to project across"
         );
 
         let claude_eligible = historical.claude_weekly_pct < config.hard_ceiling_pct;
@@ -387,16 +378,15 @@ fn the_quiet_band_rows_route_to_codex() {
 }
 
 /// Row 94 is the shape that makes the ceiling load bearing: 95 percent used against 99 percent
-/// elapsed is a NEGATIVE pace delta, so run rate reads Claude as running cold while exactly the
-/// reserve remains. Replayed with Codex hot enough to clear the dead zone, the task must still not
-/// land on a provider that is out of weekly budget.
+/// elapsed projects to 96, comfortably inside its allowance, so the projection reads Claude as fine
+/// while exactly the reserve remains. Replayed with Codex overdrawing hard enough to fire the
+/// override, the task must still not land on a provider that is out of weekly budget.
 ///
 /// The row is on the ceiling as recorded, so the assignment below changes nothing at the current
 /// default and is kept for what it states: the case under test is a Claude sitting on the ceiling,
-/// whatever the ceiling is set to. A build that raises the ceiling back above 95 gets the same
-/// coverage from this test rather than silently losing it.
+/// whatever the ceiling is set to.
 #[test]
-fn a_cold_pace_delta_never_routes_into_a_provider_at_the_ceiling() {
+fn a_healthy_projection_never_routes_into_a_provider_at_the_ceiling() {
     let config = Config::default();
     let corpus = corpus();
     let row = row(&corpus, 94);
@@ -406,13 +396,13 @@ fn a_cold_pace_delta_never_routes_into_a_provider_at_the_ceiling() {
 
     let mut exhausted = row.usage();
     exhausted.claude.weekly_pct = config.hard_ceiling_pct;
-    // Codex at 90 percent used with almost none of its window elapsed is about 90 points over
-    // pace, a gap past the dead zone, against a Claude that reads as colder still.
+    // Codex at 90 percent used with almost none of its window elapsed projects far past its
+    // allowance, against a Claude projecting inside its own.
     exhausted.codex.weekly_pct = 90.0;
 
     let decision = decide(row.classification(), exhausted, row.now(), &config);
     assert_eq!(decision.provider, Provider::Codex);
-    assert!(!decision.gates.contains(&Gate::PaceFlip));
+    assert!(!decision.gates.contains(&Gate::ProjectedOverdraw));
 }
 
 /// The one recorded dispatch whose Codex reset was never read, and the row the fail closed rule was
@@ -439,48 +429,69 @@ fn the_row_with_an_unread_reset_routes_to_the_provider_that_reported() {
     assert_eq!(decision.provider, Provider::Claude);
     assert!(decision.gates.contains(&Gate::WeeklyUnknown));
     assert!(decision.gates.contains(&Gate::FlippedOnExhaustion));
-    assert!(!decision.gates.contains(&Gate::PaceFlip));
+    assert!(!decision.gates.contains(&Gate::ProjectedOverdraw));
+    assert!(!decision.gates.contains(&Gate::ProjectionUnavailable));
     assert_eq!(row.historical_provider, "claude");
 }
 
-/// The threshold is a property of how this box is provisioned, not of the algorithm, so it has to
-/// come from config on every decision. Rows 68, 69 and 76 sit between the two values, so the SAME
-/// usage inputs must route differently under 60 and under 70. A `decide` that hardcoded either
-/// number would answer identically for both and fail one half of this.
+/// The threshold has to come from config on every decision rather than be baked into `decide`.
+/// Rows 85 to 88 project Claude at 102 to 104, so a threshold of 110 puts Claude back inside its
+/// allowance and, since the destination must be an improvement on an overdrawing provider, the
+/// SAME usage inputs must still move: what changes is that a threshold above every projection in
+/// the corpus stops the override entirely. Both halves are asserted, because a `decide` that
+/// hardcoded 100 would pass the first alone.
 #[test]
-fn the_flip_gap_is_read_from_config_and_never_hardcoded() {
+fn the_overdraw_threshold_is_read_from_config_and_never_hardcoded() {
     let corpus = corpus();
     let shipped = Config::default();
-    let tighter = Config {
-        pace_flip_gap: 60.0,
+    let unreachable = Config {
+        projection_overdraw_pct: 100_000.0,
         ..Config::default()
     };
 
-    for id in [68, 69, 76] {
+    for id in [85, 86, 87, 88] {
         let row = row(&corpus, id);
-        let held = row.replay(&shipped);
-        assert_eq!(held.provider, Provider::Codex, "row {id} at gap 70");
+        let moved = row.replay(&shipped);
+        assert_eq!(moved.provider, Provider::Claude, "row {id} at 100");
+        assert!(moved.gates.contains(&Gate::ProjectedOverdraw), "row {id}");
 
-        let moved = row.replay(&tighter);
-        assert_eq!(moved.provider, Provider::Claude, "row {id} at gap 60");
+        let held = row.replay(&unreachable);
+        assert_eq!(
+            held.provider,
+            Provider::Codex,
+            "row {id} at an unreachable threshold"
+        );
         assert!(
-            moved.gates.contains(&Gate::PaceFlip),
-            "row {id} at gap 60: {:?}",
-            moved.gates
+            !held.gates.contains(&Gate::ProjectedOverdraw),
+            "row {id}: {:?}",
+            held.gates
         );
     }
 }
 
-/// The replay summary, over the 39 real dispatches whose resets were both read: 5 on
-/// Claude and 34 on Codex, with the override itself firing exactly twice.
+/// What the rule does to the 39 real dispatches whose resets were both read, pinned as a golden
+/// number because it is the outcome the redesign was for: 17 on Claude and 22 on Codex, with the
+/// override itself firing 14 times.
 ///
-/// This one IS pinned to a golden number, unlike the corpus wide split below, because it is the
-/// result the threshold was chosen to produce. The sweep behind it, on these same 39 rows: a gap of
-/// 25 gives 30 Claude and 9 Codex with the override firing 27 times, which is not an override at
-/// all; 60 gives 8 and 31; 70 gives 5 and 34; 80 gives 3 and 36 with the override never firing, so
-/// the run rate signal would be dead config.
+/// The retired rule produced 5 Claude and 34 Codex on these same rows with its own override firing
+/// twice, so the 12 rows that changed hands are exactly rows 77 to 88, every one of which had a
+/// Codex projecting between 393 and 452 percent of its allowance. It declined to act on those
+/// because their run rate gap fell inside a dead zone widened to tolerate the plan size mismatch.
+/// The override is no longer rare, and that is the correction rather than a regression: a rule
+/// that fires twice where the provider is heading off a cliff fourteen times is not a conservative
+/// version of this one, it was not measuring the right thing.
+///
+/// The two rows that overdraw and do NOT count as override fires are asserted by exclusion, since
+/// "14 fires" alone would pass if the wrong 14 fired: row 8 reaches Claude on the orchestration pin
+/// and row 28 on the ceiling, both of which run before the override and neither of which may also
+/// record it.
+///
+/// The blind spot this corpus cannot cover: it contains no row where a computable Codex projection
+/// lands INSIDE its allowance, so "does not fire when the provider is fine" is proven in
+/// `pace_routing.rs` against constructed inputs and not here. The assertion below fails if a future
+/// corpus gains such a row, which is the signal to bring that coverage back to real data.
 #[test]
-fn the_real_dispatches_replay_to_five_claude_and_thirty_four_codex() {
+fn the_real_dispatches_replay_to_seventeen_claude_and_twenty_two_codex() {
     let config = Config::default();
     let corpus = corpus();
     let dispatched: Vec<&HistoricalRow> = corpus
@@ -491,6 +502,7 @@ fn the_real_dispatches_replay_to_five_claude_and_thirty_four_codex() {
 
     let (mut claude, mut codex) = (0, 0);
     let mut fired = Vec::new();
+    let mut inside_allowance = Vec::new();
     for row in &dispatched {
         let decision = row.replay(&config);
         match decision.provider {
@@ -498,13 +510,32 @@ fn the_real_dispatches_replay_to_five_claude_and_thirty_four_codex() {
             Provider::Codex => codex += 1,
             Provider::Opencode => panic!("row {} routed to opencode", row.id),
         }
-        if decision.gates.contains(&Gate::PaceFlip) {
+        if decision.gates.contains(&Gate::ProjectedOverdraw) {
             fired.push(row.id);
+        }
+        if decision
+            .codex_projected_draw
+            .is_some_and(|draw| draw <= config.projection_overdraw_pct)
+        {
+            inside_allowance.push(row.id);
         }
     }
 
-    assert_eq!((claude, codex), (5, 34));
-    assert_eq!(fired, vec![6, 7], "the override is rare by construction");
+    assert_eq!((claude, codex), (17, 22));
+    assert_eq!(
+        fired,
+        vec![6, 7, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88],
+        "the override must fire on the overdrawing rows and only those"
+    );
+    assert!(
+        !fired.contains(&8) && !fired.contains(&28),
+        "the pin and the ceiling run before the override and cannot also record it"
+    );
+    assert!(
+        inside_allowance.is_empty(),
+        "the corpus gained a healthy Codex projection at rows {inside_allowance:?}: this file can \
+         now cover the does-not-fire case that pace_routing.rs carries alone"
+    );
 }
 
 /// The corpus wide shift, printed rather than asserted: a golden count over all 100 auto routed
@@ -517,7 +548,7 @@ fn the_corpus_replays_and_reports_its_before_and_after_split() {
 
     let (mut was_claude, mut was_codex, mut now_claude, mut now_codex) = (0, 0, 0, 0);
     let (mut real_was_claude, mut real_now_claude, mut real_total) = (0, 0, 0);
-    let (mut pace_flips, mut pace_unavailable, mut pinned) = (0, 0, 0);
+    let (mut overdraws, mut unavailable, mut pinned) = (0, 0, 0);
     for row in corpus.iter().filter(|row| row.requested == "auto") {
         let decision = row.replay(&config);
         match row.historical_provider.as_str() {
@@ -539,11 +570,11 @@ fn the_corpus_replays_and_reports_its_before_and_after_split() {
                 real_now_claude += 1;
             }
         }
-        if decision.gates.contains(&Gate::PaceFlip) {
-            pace_flips += 1;
+        if decision.gates.contains(&Gate::ProjectedOverdraw) {
+            overdraws += 1;
         }
-        if decision.gates.contains(&Gate::PaceUnavailable) {
-            pace_unavailable += 1;
+        if decision.gates.contains(&Gate::ProjectionUnavailable) {
+            unavailable += 1;
         }
         if decision.gates.contains(&Gate::MissingConnector) || row.classification().orchestration {
             pinned += 1;
@@ -568,5 +599,7 @@ fn the_corpus_replays_and_reports_its_before_and_after_split() {
         100.0 * f64::from(real_was_claude) / f64::from(real_total),
         100.0 * f64::from(real_now_claude) / f64::from(real_total),
     );
-    println!("  pace flips {pace_flips}, pace unavailable {pace_unavailable}, pinned {pinned}");
+    println!(
+        "  projected overdraws {overdraws}, projection unavailable {unavailable}, pins {pinned}"
+    );
 }

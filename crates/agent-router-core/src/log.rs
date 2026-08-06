@@ -59,11 +59,14 @@ pub struct Row {
     /// on an explicit provider.
     pub orchestration: Option<bool>,
     pub missing_connector: Option<bool>,
-    /// How far ahead of its own weekly window each provider was burning when this decision was
-    /// made, in points. None on a row written before the override, on an explicit provider, and on
-    /// a row whose reset was never read.
-    pub claude_pace_delta: Option<f64>,
-    pub codex_pace_delta: Option<f64>,
+    /// What each provider's weekly draw projected to at its own window's reset when this decision
+    /// was made, as a percent of that provider's own allowance. None on a row written before the
+    /// projection override, on an explicit provider, and on a row whose projection could not be
+    /// computed. Rows written before router 0.5.0 instead carry a run rate difference in the
+    /// retired `claude_pace_delta`/`codex_pace_delta` columns, which are a different measurement on
+    /// a different scale; the two series must not be read as one.
+    pub claude_projected_draw: Option<f64>,
+    pub codex_projected_draw: Option<f64>,
     pub gates: String,
     pub claude_weekly_pct: f64,
     pub codex_weekly_pct: f64,
@@ -201,8 +204,8 @@ CREATE TABLE IF NOT EXISTS decisions (
     claude_signal_count INTEGER,
     orchestration       INTEGER,
     missing_connector   INTEGER,
-    claude_pace_delta   REAL,
-    codex_pace_delta    REAL,
+    claude_projected_draw REAL,
+    codex_projected_draw  REAL,
     gates               TEXT    NOT NULL,
     rationale           TEXT    NOT NULL,
     claude_five_hour_pct   REAL NOT NULL,
@@ -235,7 +238,7 @@ id, created_at_ms, task, dir, requested, provider, model, effort, verdict, confi
 codex_ready_count, claude_signal_count, missing_connector, gates, claude_weekly_pct, \
 codex_weekly_pct, dry_run, job_id, job_name, outcome, rationale, complexity, \
 task_context_horizon, claude_usage_stale, codex_usage_stale, orchestration, \
-claude_pace_delta, codex_pace_delta, \
+claude_projected_draw, codex_projected_draw, \
 reconciled_at_ms, mark, note, effective_effort, router_version";
 
 /// The narrower list the stats reader needs, so a report never pays for columns it drops.
@@ -321,7 +324,7 @@ impl DecisionLog {
                 claude_weekly_reset, codex_five_hour_pct, codex_five_hour_reset,
                 codex_weekly_pct, codex_weekly_reset, dry_run, job_id, job_name, outcome,
                 complexity, task_context_horizon, claude_usage_stale, codex_usage_stale,
-                claude_pace_delta, codex_pace_delta, effective_effort, router_version
+                claude_projected_draw, codex_projected_draw, effective_effort, router_version
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
                 ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30,
@@ -355,8 +358,8 @@ impl DecisionLog {
                 classification.map(|c| c.task_context_horizon.tag()),
                 usage.claude.stale,
                 usage.codex.stale,
-                decision.claude_pace_delta,
-                decision.codex_pace_delta,
+                decision.claude_projected_draw,
+                decision.codex_projected_draw,
                 entry.effective_effort,
                 ROUTER_VERSION,
             ],
@@ -540,8 +543,8 @@ impl DecisionLog {
                     claude_usage_stale: row.get(23)?,
                     codex_usage_stale: row.get(24)?,
                     orchestration: row.get(25)?,
-                    claude_pace_delta: row.get(26)?,
-                    codex_pace_delta: row.get(27)?,
+                    claude_projected_draw: row.get(26)?,
+                    codex_projected_draw: row.get(27)?,
                     reconciled_at_ms: row.get(28)?,
                     mark: row.get(29)?,
                     note: row.get(30)?,
@@ -567,8 +570,8 @@ const MISSING_COLUMNS: [(&str, &str); 12] = [
     ("claude_usage_stale", "INTEGER"),
     ("codex_usage_stale", "INTEGER"),
     ("orchestration", "INTEGER"),
-    ("claude_pace_delta", "REAL"),
-    ("codex_pace_delta", "REAL"),
+    ("claude_projected_draw", "REAL"),
+    ("codex_projected_draw", "REAL"),
     ("reconciled_at_ms", "INTEGER"),
     ("mark", "TEXT"),
     ("note", "TEXT"),
@@ -653,7 +656,10 @@ mod tests {
                 stale: false,
             },
             codex: Headroom {
-                weekly_pct: 71.0,
+                // Chosen so neither provider projects past its allowance and no gate fires: this
+                // fixture is about what the log stores, so a routing rule firing inside it would
+                // make the empty gate vector below assert something other than what it says.
+                weekly_pct: 10.0,
                 weekly_reset_epoch: 1_785_908_348,
                 ..Headroom::full()
             },
@@ -690,10 +696,10 @@ mod tests {
         assert_eq!(row.orchestration, Some(false));
         assert_eq!(row.missing_connector, Some(false));
         assert_eq!(row.claude_weekly_pct, 60.0);
-        assert_eq!(row.codex_weekly_pct, 71.0);
-        // Both resets were read, so both run rates travel with the row.
-        assert!(row.claude_pace_delta.is_some());
-        assert!(row.codex_pace_delta.is_some());
+        assert_eq!(row.codex_weekly_pct, 10.0);
+        // Both resets were read, so both projections travel with the row.
+        assert!(row.claude_projected_draw.is_some());
+        assert!(row.codex_projected_draw.is_some());
         assert_eq!(row.job_id.as_deref(), Some("thread-abc"));
         assert_eq!(row.outcome, "dispatched");
         assert!(!row.dry_run);
@@ -759,8 +765,8 @@ mod tests {
         assert_eq!(row.orchestration, None);
         assert_eq!(row.missing_connector, None);
         assert_eq!(row.complexity, None);
-        assert_eq!(row.claude_pace_delta, None);
-        assert_eq!(row.codex_pace_delta, None);
+        assert_eq!(row.claude_projected_draw, None);
+        assert_eq!(row.codex_projected_draw, None);
         assert_eq!(row.gates, "explicit_provider");
     }
 

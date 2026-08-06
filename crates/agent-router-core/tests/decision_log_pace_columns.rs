@@ -1,4 +1,4 @@
-//! What the decision log records once routing is decided on pace.
+//! What the decision log records once routing is decided on projected weekly draw.
 //!
 //! The migration is additive because the 108 rows already in the database are the backtest corpus:
 //! they have to stay readable and stay queryable by the column names the corpus was captured from,
@@ -63,14 +63,14 @@ fn record(log: &DecisionLog, decision: &Decision) {
     .expect("records the decision");
 }
 
-/// Both pace numbers travel with the decision that used them. Without them the log says a task was
-/// flipped but not by how much, which is the number the next tuning pass needs.
+/// Both projections travel with the decision that used them. Without them the log says a task was
+/// moved but not on what reading, which is the number the next tuning pass needs.
 ///
-/// Claude at 5 percent used with half its window elapsed is 45 points under pace; Codex at 80
-/// percent used over the same fraction is 30 points over it, a 75 point gap that clears the dead
-/// zone and moves the task.
+/// Claude at 5 percent used with half its window elapsed projects to a 10 percent draw; Codex at
+/// 80 percent used over the same fraction projects to 160 percent of an allowance that holds 100,
+/// so the task moves.
 #[test]
-fn a_recorded_decision_writes_the_orchestration_score_and_both_pace_deltas() {
+fn a_recorded_decision_writes_the_orchestration_score_and_both_projections() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("state/router.db");
     let log = DecisionLog::open_at(&path).expect("opens");
@@ -99,27 +99,28 @@ fn a_recorded_decision_writes_the_orchestration_score_and_both_pace_deltas() {
     let conn = rusqlite::Connection::open(&path).expect("reopen");
     let mut statement = conn
         .prepare(
-            "SELECT orchestration, claude_pace_delta, codex_pace_delta FROM decisions ORDER BY id",
+            "SELECT orchestration, claude_projected_draw, codex_projected_draw \
+             FROM decisions ORDER BY id",
         )
-        .expect("the pace columns exist");
+        .expect("the projection columns exist");
     let rows: Vec<(bool, Option<f64>, Option<f64>)> = statement
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
         .expect("query")
         .collect::<rusqlite::Result<Vec<_>>>()
-        .expect("read the pace columns");
+        .expect("read the projection columns");
 
     assert_eq!(rows.len(), 2);
     assert!(!rows[0].0, "the flipped row scored no orchestration");
-    assert_eq!(rows[0].1, Some(-45.0));
-    assert_eq!(rows[0].2, Some(30.0));
+    assert_eq!(rows[0].1, Some(10.0));
+    assert_eq!(rows[0].2, Some(160.0));
     assert!(rows[1].0, "the pinned row scored orchestration");
 }
 
-/// A reset that was never read has no pace delta, and the column says so rather than carrying a
-/// number derived from a zero epoch. A row recording -100 against an unknown window would look
-/// exactly like a genuinely idle provider to the next backtest.
+/// A reset that was never read has no projection, and the column says so rather than carrying a
+/// number derived from a zero epoch. A row recording a projection against an unknown window would
+/// look exactly like a genuinely measured one to the next backtest.
 #[test]
-fn an_unread_reset_records_no_pace_delta_for_that_provider() {
+fn an_unread_reset_records_no_projection_for_that_provider() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("router.db");
     let log = DecisionLog::open_at(&path).expect("opens");
@@ -139,12 +140,12 @@ fn an_unread_reset_records_no_pace_delta_for_that_provider() {
     record(&log, &decision);
 
     let conn = rusqlite::Connection::open(&path).expect("reopen");
-    let claude_delta: Option<f64> = conn
-        .query_row("SELECT claude_pace_delta FROM decisions", [], |row| {
+    let claude_projection: Option<f64> = conn
+        .query_row("SELECT claude_projected_draw FROM decisions", [], |row| {
             row.get(0)
         })
         .expect("query");
-    assert_eq!(claude_delta, None);
+    assert_eq!(claude_projection, None);
 }
 
 /// The columns the classifier no longer scores stay in the table and stop being written. Dropping
@@ -370,8 +371,8 @@ fn a_database_written_before_pace_gains_the_columns_and_keeps_its_rows() {
         Option<f64>,
     ) = conn
         .query_row(
-            "SELECT claude_signals, claude_weekly_pct, orchestration, claude_pace_delta, \
-             codex_pace_delta FROM decisions",
+            "SELECT claude_signals, claude_weekly_pct, orchestration, claude_projected_draw, \
+             codex_projected_draw FROM decisions",
             [],
             |row| {
                 Ok((
