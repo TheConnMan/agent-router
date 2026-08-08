@@ -279,7 +279,9 @@ regardless of which engine is in force, so flipping `engine` is a one word edit 
 re-pick of the model.
 
 Both want the cheapest model that reliably holds the output contract, since the classifier runs on
-every automatically routed task and emits the routing scores plus a concise job title.
+every automatically routed task and emits the routing scores plus a concise job title. The same
+model is called on a run that names its provider, for the title alone, so the engine choice sets
+which weekly budget every dispatch draws one small call from, not only the automatic ones.
 
 ## `[models.codex]` and `[models.claude]`
 
