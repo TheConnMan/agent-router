@@ -27,13 +27,15 @@ enum Command {
         /// Working directory for the job (defaults to the current directory).
         #[arg(long)]
         dir: Option<PathBuf>,
-        /// auto (classify), or codex/claude/opencode to skip classification.
+        /// auto (classify), or codex/claude/opencode to skip scoring. Every route still has the
+        /// classifier model title the job.
         #[arg(long, default_value = "auto")]
         provider: String,
         /// Model override, requires an explicit --provider.
         #[arg(long)]
         model: Option<String>,
-        /// Job name (defaults to a short, ticket-prefixed title derived from the task).
+        /// Job name. Defaults to a title the classifier model writes, and supplying one skips that
+        /// call.
         #[arg(long)]
         name: Option<String>,
         /// Decide and log without dispatching.
