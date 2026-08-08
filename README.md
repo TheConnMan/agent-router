@@ -34,7 +34,11 @@ log: row 87 in /home/you/.local/state/agent-router/router.db
    nothing to reach for. If the call fails or times out, the configured default provider stays in
    force and the decision is tagged `classifier_failed`. The same classifier model also generates
    the job title. A ticket ID leads the title, followed by two to six concise Title Case words, such
-   as `GH-123 Sprint 2 Bug Fixes` or `RS-123 Input Box Searching`.
+   as `GH-123 Sprint 2 Bug Fixes` or `RS-123 Input Box Searching`. A run that names its provider is
+   scored against none of this, but it is still titled: it makes one title-only call to the same
+   model, carrying the title instruction and no rubric. Both routes fall back to a title derived
+   from the task alone when the model answers nothing usable, and neither makes the call when
+   `--name` already named the job or when `--dry-run` means nothing is dispatched.
 2. **Apply the capability pin.** A missing connector, or a task needing several agents to exchange
    findings mid-run, pins to Claude regardless of usage. These are statements that the task cannot
    run on Codex at all, so every usage rule below is bypassed.
@@ -149,9 +153,9 @@ agent-router run "Fix the failing test" --dir ~/git/other-project
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `--dir <PATH>` | current directory | Working directory for the dispatched job. |
-| `--provider <NAME>` | `auto` | `auto` classifies. `codex`, `claude`, or `opencode` skips classification. |
+| `--provider <NAME>` | `auto` | `auto` classifies. `codex`, `claude`, or `opencode` skips scoring, but still has the classifier model title the job. |
 | `--model <NAME>` | tier table | Model override. Requires an explicit `--provider`. Pairing it with `--provider auto` is rejected: the router exits nonzero naming both flags rather than dropping the override, because the auto path chooses its own model from the tier table. |
-| `--name <NAME>` | first 40 characters of the task | Name for the dispatched job. It reaches the `claude --bg --name` argv verbatim, names the Codex thread, and is recorded as `job_name` in the decision log for every provider, so callers that reconcile inflight jobs by exact name depend on it. An empty or whitespace only name is rejected. |
+| `--name <NAME>` | the model's title, or three to five words derived from the task | Name for the dispatched job. Supplying it skips the naming call. It reaches the `claude --bg --name` argv verbatim, names the Codex thread, and is recorded as `job_name` in the decision log for every provider, so callers that reconcile inflight jobs by exact name depend on it. An empty or whitespace only name is rejected. |
 | `--dry-run` | off | Decide and log, dispatch nothing, and project the weekly draw the job is likely to cost on the provider it landed on. |
 | `--mcp-config <PATH>` | none | MCP config file for the dispatched Claude job. Repeatable. Rejected for any other provider, and the check runs after routing, so pairing it with `--provider auto` fails whenever classification lands on a provider other than Claude. |
 | `--strict-mcp-config` | off | Use only the `--mcp-config` files and drop every inherited MCP server. See the warning below before using it. |

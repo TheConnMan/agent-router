@@ -90,9 +90,17 @@ pub fn run(request: &Request, config: &Config) -> Result<Outcome> {
     }
     let usage = UsageSnapshot::read();
     let (decision, generated_name) = match request.provider {
+        // A named provider needs nothing scored, but it still gets a generated title. Without one
+        // the job falls back to `short_job_name`, which is the first few words of the task title
+        // cased, and every job dispatched with a provider named was findable only by that.
+        //
+        // Two cases skip the call rather than waste it: a caller that supplied `--name` has
+        // already decided the name, and a dry run dispatches nothing, so there is nothing to name.
         Some(provider) => (
             decide_explicit(provider, request.model.clone(), usage, config),
-            None,
+            (request.name.is_none() && !request.dry_run)
+                .then(|| crate::classify::job_name(request.task, config))
+                .flatten(),
         ),
         // `decide` is pure and takes the instant it decides at, so the clock is read here, on the
         // impure side, and after the usage snapshot the run rate rules measure against it.

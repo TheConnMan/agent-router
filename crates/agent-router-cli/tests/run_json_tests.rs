@@ -53,9 +53,30 @@ fn shell_quote(value: &str) -> String {
 struct CliFixture {
     root: TempDir,
     task: String,
+    /// The name derived from the task alone, with no model involved. Every dispatch used to carry
+    /// this; one that still does is a dispatch whose naming call was skipped or came back unusable.
     name: String,
+    /// The title the fake classifier answers with, which both routes now name a job by.
+    classifier_name: String,
     cwd: PathBuf,
     spawn_log: PathBuf,
+    /// One line per `claude -p` invocation, so a test can assert the naming call happened, or that
+    /// it was skipped, rather than inferring either from the name that came out.
+    classifier_log: PathBuf,
+    /// What the fake `claude -p` answers, replaceable per test.
+    classifier_answer_file: PathBuf,
+}
+
+/// The envelope `claude -p --output-format json` wraps the model's text in.
+#[cfg(unix)]
+fn claude_result(text: &str) -> String {
+    json!({
+        "type": "result",
+        "subtype": "success",
+        "is_error": false,
+        "result": text,
+    })
+    .to_string()
 }
 
 #[cfg(unix)]
@@ -96,7 +117,10 @@ impl CliFixture {
         let name = short_job_name(&task);
         let classifier_name = "RS-123 Input Box Searching";
         let spawn_log = root.path.join("claude.argv");
-        let listed = listed.unwrap_or(&name);
+        let classifier_log = root.path.join("claude.-p.calls");
+        // The model titles a job on both routes now, so that is the name the listing advertises
+        // and the name the router matches its own spawn against to resolve a short id.
+        let listed = listed.unwrap_or(classifier_name);
         let classifier_answer = json!({
             "orchestration": orchestration,
             "missing_connector": false,
@@ -106,13 +130,11 @@ impl CliFixture {
             "job_name": classifier_name,
         })
         .to_string();
-        let classifier_result = json!({
-            "type": "result",
-            "subtype": "success",
-            "is_error": false,
-            "result": classifier_answer,
-        })
-        .to_string();
+        // Held in a file the stub cats rather than baked into the stub body, so a test can replace
+        // what the model answers without a second stub or a second constructor.
+        let classifier_answer_file = root.path.join("classifier.answer");
+        fs::write(&classifier_answer_file, claude_result(&classifier_answer))
+            .expect("write the classifier answer");
         let agents = json!([{
             "id": "claude exact id",
             "sessionId": "claude full id",
@@ -131,12 +153,14 @@ impl CliFixture {
                exit 0\n\
              fi\n\
              if [ \"$1\" = \"-p\" ]; then\n\
-               printf '%s\\n' {}\n\
+               printf 'called\\n' >> {}\n\
+               cat {}\n\
                exit 0\n\
              fi\n\
              printf '%s\\n' \"$@\" > {}\n",
             shell_quote(&agents),
-            shell_quote(&classifier_result),
+            shell_quote(&classifier_log.to_string_lossy()),
+            shell_quote(&classifier_answer_file.to_string_lossy()),
             shell_quote(&spawn_log.to_string_lossy())
         );
         let fake_claude = bin.join("claude");
@@ -145,9 +169,26 @@ impl CliFixture {
             root,
             task,
             name,
+            classifier_name: classifier_name.to_string(),
             cwd,
             spawn_log,
+            classifier_log,
+            classifier_answer_file,
         }
+    }
+
+    /// Replace what the fake `claude -p` answers with, so a test can drive the naming call's
+    /// failure paths.
+    fn answers_with(&self, text: &str) {
+        fs::write(&self.classifier_answer_file, claude_result(text))
+            .expect("rewrite the classifier answer");
+    }
+
+    /// How many times the fake claude was asked to answer a prompt.
+    fn classifier_calls(&self) -> usize {
+        fs::read_to_string(&self.classifier_log)
+            .map(|log| log.lines().count())
+            .unwrap_or(0)
     }
 
     /// The router binary against this fixture's fake PATH, home, and decision log.
@@ -231,7 +272,7 @@ fn run_json_preserves_provider_decision_and_dispatched_job_identity() {
             .is_some_and(|text| !text.is_empty())
     );
     assert_eq!(value["dispatch"]["job_id"], "claude exact id");
-    assert_eq!(value["dispatch"]["job_name"], fixture.name);
+    assert_eq!(value["dispatch"]["job_name"], fixture.classifier_name);
     assert_eq!(value["dry_run"], false);
     assert!(value["log_id"].is_number());
     assert_eq!(value["log_error"], Value::Null);
@@ -249,10 +290,94 @@ fn run_json_preserves_provider_decision_and_dispatched_job_identity() {
             "--model",
             "opus[1m]",
             "--name",
-            &fixture.name,
+            &fixture.classifier_name,
             &fixture.task
         ]
     );
+}
+
+/// A named provider skips scoring, but not naming: the job it dispatches carries the model's title
+/// rather than the first words of the task. Every explicit dispatch used to be named the derived
+/// way, which is the whole reason bg jobs read as "The Names Of Jobs Through".
+#[cfg(unix)]
+#[test]
+fn an_explicit_provider_still_names_its_job_with_the_model() {
+    let fixture = CliFixture::new("explicit-job-name");
+    let output = fixture.run(true);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("router json");
+
+    assert_ne!(
+        fixture.classifier_name, fixture.name,
+        "the derived name must differ, or this proves nothing"
+    );
+    assert_eq!(value["dispatch"]["job_name"], fixture.classifier_name);
+    assert_eq!(
+        fixture.classifier_calls(),
+        1,
+        "one naming call, and no second one"
+    );
+    // Naming is not scoring: the explicit route still reports no classification and routes on the
+    // provider it was handed.
+    assert_eq!(value["classification"], Value::Null);
+    assert_eq!(value["provider"], "claude");
+    assert_eq!(value["gates"], json!(["explicit_provider"]));
+}
+
+/// The title is cosmetic, so a naming call that answers nothing usable must cost the job nothing:
+/// it dispatches under the derived name instead of failing or going unnamed.
+#[cfg(unix)]
+#[test]
+fn an_unusable_title_leaves_an_explicit_job_on_its_derived_name() {
+    for answer in [
+        "I cannot name this task.",
+        r#"{"job_name":"Renaming: background, sessions!"}"#,
+        r#"{"job_name":"Rename Background Sessions"}"#,
+    ] {
+        let fixture = CliFixture::listing_agent_named("unusable-title", None);
+        fixture.answers_with(answer);
+        let output = fixture
+            .run_command()
+            .arg("--provider")
+            .arg("claude")
+            .arg("--json")
+            .output()
+            .expect("run router");
+        assert!(
+            output.status.success(),
+            "answer {answer:?} stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: Value = serde_json::from_slice(&output.stdout).expect("router json");
+        assert_eq!(
+            value["dispatch"]["job_name"], fixture.name,
+            "answer {answer:?} must leave the derived name in place"
+        );
+    }
+}
+
+/// A dry run dispatches nothing, so there is no job to name and no call to pay for.
+#[cfg(unix)]
+#[test]
+fn an_explicit_dry_run_skips_the_naming_call() {
+    let dry = CliFixture::new("skip-naming-dry-run");
+    let output = dry
+        .run_command()
+        .arg("--provider")
+        .arg("claude")
+        .arg("--dry-run")
+        .output()
+        .expect("run router");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(dry.classifier_calls(), 0);
 }
 
 #[cfg(unix)]
@@ -392,7 +517,7 @@ fn human_output_reports_the_job_without_a_viewer_instruction() {
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
 
     assert!(stdout.contains("claude exact id"), "{stdout}");
-    assert!(stdout.contains(&fixture.name), "{stdout}");
+    assert!(stdout.contains(&fixture.classifier_name), "{stdout}");
     assert!(!stdout.contains("agent-viewer"), "{stdout}");
     assert!(!stdout.contains("watch:"), "{stdout}");
 }
@@ -443,6 +568,10 @@ fn a_supplied_name_reaches_the_spawned_job_and_the_decision_log_verbatim() {
     );
     let rows: Value = serde_json::from_slice(&logged.stdout).expect("log json");
     assert_eq!(rows[0]["job_name"], name);
+
+    // A caller that named the job has already decided; asking the model for a title it would then
+    // discard is a call spent on nothing.
+    assert_eq!(fixture.classifier_calls(), 0);
 }
 
 /// Claude's CLI exposes no effective reasoning effort anywhere: it accepts `--effort`, prints a
@@ -586,7 +715,7 @@ fn explicit_provider_with_an_explicit_model_succeeds_and_forwards_the_model() {
             "--model",
             "sonnet",
             "--name",
-            &fixture.name,
+            &fixture.classifier_name,
             &fixture.task
         ]
     );
