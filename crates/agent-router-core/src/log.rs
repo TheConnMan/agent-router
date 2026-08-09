@@ -653,6 +653,7 @@ mod tests {
                 five_hour_reset_epoch: 1_785_375_600,
                 weekly_pct: 60.0,
                 weekly_reset_epoch: 1_785_589_200,
+                weekly_capacity_known: true,
                 stale: false,
             },
             codex: Headroom {
@@ -661,6 +662,7 @@ mod tests {
                 // make the empty gate vector below assert something other than what it says.
                 weekly_pct: 10.0,
                 weekly_reset_epoch: 1_785_908_348,
+                weekly_capacity_known: true,
                 ..Headroom::full()
             },
         };
