@@ -290,9 +290,9 @@ capability pins, and the resulting tier picks the model the job is spawned with.
 
 | Tier | When the rubric assigns it |
 | --- | --- |
-| `low` | Conversational, one step, mechanical, or a single file with an obvious answer. |
+| `low` | Conversational, one step, mechanical, or a single file with an obvious answer. Direct definition, location, transcription, or single fact retrieval also stays low, even when labeled research or analysis or requiring preliminary search, if no synthesis or evaluation is requested. |
 | `medium` | A normal well scoped implementation or investigation. |
-| `high` | Spans several files, or subtle enough to need heavy reasoning or design judgement. Also the fallback for an unscored or unparseable answer. |
+| `high` | Spans several files, or subtle enough to need heavy reasoning or design judgement. Substantive synthesis, comparison against criteria, tradeoff evaluation, prioritization, recommendations, strategic interpretation, or choosing among options is also high. Also the fallback for an unscored or unparseable answer. |
 | `ultra` | The rare hardest work, where a wrong call is expensive and hard to reverse. Architecture or plan review, a root cause hunt that has already defeated ordinary debugging, or a direction setting design decision. |
 
 Two deliberate choices are worth knowing before tuning these.
