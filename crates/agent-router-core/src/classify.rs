@@ -302,7 +302,7 @@ Degenerate input scores false on both booleans: an empty task, a greeting, a sin
 
 The connector inventory is authoritative: Codex on this box can reach {inventory}. Set missing_connector true ONLY when the task must reach a named system absent from that list. Never set it because you cannot see a connector yourself.
 
-Separately, and independently of both booleans, judge how much reasoning the task needs. complexity is "low" when it is conversational, one step, mechanical, or a single file with an obvious answer; "medium" for a normal well scoped implementation or investigation; "high" when it spans several files or is subtle enough to need heavy reasoning or design judgment; "ultra" only for the rare hardest work, where a wrong call is expensive and hard to reverse: architecture or plan review, a root cause hunt that has already defeated ordinary debugging, or a design decision that sets a direction. Ultra is not "large" or "long running", and it is not "important to the user": when torn between high and ultra, answer high. Complexity is orthogonal to the provider: a low task can run on either provider, and so can an ultra one. Never let complexity change orchestration or missing_connector, and never let either of them change complexity.
+Separately, and independently of both booleans, judge how much reasoning the task needs. complexity is "low" when it is conversational, one step, mechanical, or a single file with an obvious answer; "medium" for a normal well scoped implementation or investigation; "high" when it spans several files or is subtle enough to need heavy reasoning or design judgment. Classify work as high when its requested outcome requires substantive judgment: synthesizing evidence, comparing options against criteria, evaluating tradeoffs, prioritizing, making a recommendation, strategically interpreting evidence, or choosing among options. Classify direct definition, location, transcription, or single fact retrieval as low when the answer is direct, even if the request labels the work research or analysis or locating the answer first requires searching a repository or corpus; this low rule applies only when the requested output is the direct location or fact and requires no synthesis or evaluation. Judge the work required by the requested outcome, not labels or isolated terms in the request. complexity is "ultra" only for the rare hardest work, where a wrong call is expensive and hard to reverse: architecture or plan review, a root cause hunt that has already defeated ordinary debugging, or a design decision that sets a direction. Ultra is not "large" or "long running", and it is not "important to the user": when torn between high and ultra, answer high. Complexity is orthogonal to the provider: a low task can run on either provider, and so can an ultra one. Never let complexity change orchestration or missing_connector, and never let either of them change complexity.
 
 Separately, task_context_horizon is "extended" only when the task explicitly requires processing a large corpus, resuming or continuing work whose prior history must remain available, or sustained synthesis across many artifacts or steps. Otherwise "ordinary" is the default. This horizon is independent from complexity, orchestration, duration, importance, file count, provider or model capacity, and routing. Difficult or long running bounded work is ordinary.
 
@@ -733,6 +733,19 @@ mod tests {
         // trivial conversational task from being scored hard because it looks like Claude work.
         assert!(prompt.contains("conversational, one step, mechanical, or a single file"));
         assert!(prompt.contains("a normal well scoped implementation or investigation"));
+        assert!(prompt.contains(
+            "Classify work as high when its requested outcome requires substantive judgment: \
+             synthesizing evidence, comparing options against criteria, evaluating tradeoffs, \
+             prioritizing, making a recommendation, strategically interpreting evidence, or \
+             choosing among options."
+        ));
+        assert!(prompt.contains(
+            "Classify direct definition, location, transcription, or single fact retrieval as low \
+             when the answer is direct, even if the request labels the work research or analysis \
+             or locating the answer first requires searching a repository or corpus; this low rule \
+             applies only when the requested output is the direct location or fact and requires no \
+             synthesis or evaluation."
+        ));
         assert!(prompt.contains("Complexity is orthogonal to the provider"));
         assert!(prompt.contains(
             "Never let complexity change orchestration or missing_connector, and never let either \
