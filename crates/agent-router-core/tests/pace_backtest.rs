@@ -54,12 +54,14 @@ impl HistoricalRow {
             claude: Headroom {
                 weekly_pct: self.claude_weekly_pct,
                 weekly_reset_epoch: self.claude_weekly_reset,
+                weekly_capacity_known: self.claude_weekly_reset != 0,
                 five_hour_pct: self.claude_five_hour_pct,
                 ..Headroom::full()
             },
             codex: Headroom {
                 weekly_pct: self.codex_weekly_pct,
                 weekly_reset_epoch: self.codex_weekly_reset,
+                weekly_capacity_known: self.codex_weekly_reset != 0,
                 five_hour_pct: self.codex_five_hour_pct,
                 ..Headroom::full()
             },
