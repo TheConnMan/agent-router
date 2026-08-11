@@ -96,16 +96,21 @@ pub struct Classification {
 
 /// PURE: does this task dispatch the `/implement` skill?
 ///
-/// Matches a line whose first non-whitespace token is `/implement`, which is the shape every
-/// dispatcher writes (`CLAUDE.md` requires the invocation and the `BACKGROUND_RUN=1` marker on
-/// their own lines). Deliberately narrow: a task that merely discusses `/implement`, or asks for a
-/// report about it, is not an implement run and must not be pinned like one.
+/// The invocation must be in the DISPATCHER POSITION: the first line of the task that is neither
+/// blank nor the `BACKGROUND_RUN=1` marker. Both orderings of that marker occur in the recorded
+/// dispatches, so it is skipped rather than assumed to trail.
+///
+/// Position is what separates a dispatch from a mention. Scanning every line instead matched a
+/// kickoff task that merely LISTED the `/implement` commands it wanted issued for a ticket set,
+/// which is orchestration rather than an implement run, and pinning it here would bypass the usage
+/// rules for a job that never needed the window. Measured over the 283 recorded dispatches,
+/// position costs nothing: it keeps all 47 real runs and drops exactly that one.
 pub fn invokes_implement(task: &str) -> bool {
-    task.lines().any(|line| {
-        let line = line.trim_start();
-        line.strip_prefix("/implement")
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
-    })
+    task.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && *line != "BACKGROUND_RUN=1")
+        .and_then(|line| line.strip_prefix("/implement"))
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
 }
 
 impl Classification {
@@ -1095,5 +1100,50 @@ mod tests {
         // The failure sentence lands in the decision log, so it must name the engine that
         // actually ran rather than always blaming claude.
         assert!(err.contains("codex"), "got {err:?}");
+    }
+}
+
+#[cfg(test)]
+mod implement_detection_tests {
+    use super::invokes_implement;
+
+    /// The shapes every dispatcher actually writes, both orderings of the background marker.
+    #[test]
+    fn a_dispatch_in_the_first_position_is_an_implement_run() {
+        assert!(invokes_implement("/implement RS-493"));
+        assert!(invokes_implement("/implement RS-493\nBACKGROUND_RUN=1"));
+        assert!(invokes_implement(
+            "BACKGROUND_RUN=1\n/implement Build the MVP."
+        ));
+        assert!(invokes_implement(
+            "\n  /implement RS-494\n\nSIZING: small.\n"
+        ));
+        // No argument at all is still the command.
+        assert!(invokes_implement("/implement"));
+    }
+
+    /// A mention is not a dispatch. The kickoff case is the one that was actually misrouted: a
+    /// task that lists the implement commands it wants issued is orchestration, not a build.
+    #[test]
+    fn a_mention_below_the_first_position_is_not_a_dispatch() {
+        assert!(!invokes_implement(
+            "Kickoff for the ticket set.\n\nCONTEXT. Dispatch these:\n/implement RS-401\n/implement RS-402"
+        ));
+        assert!(!invokes_implement(
+            "Review how the /implement changes are performing and report back."
+        ));
+        assert!(!invokes_implement("Document what /implement does."));
+    }
+
+    /// The prefix is a whole command, not a substring: a longer word that merely starts with it
+    /// is a different thing entirely.
+    #[test]
+    fn a_longer_command_sharing_the_prefix_is_not_implement() {
+        assert!(!invokes_implement("/implementation-notes RS-1"));
+        assert!(!invokes_implement("/implement-plan RS-1"));
+        assert!(!invokes_implement(""));
+        assert!(!invokes_implement("   \n\n  "));
+        // The marker alone leaves nothing in the dispatcher position.
+        assert!(!invokes_implement("BACKGROUND_RUN=1"));
     }
 }
