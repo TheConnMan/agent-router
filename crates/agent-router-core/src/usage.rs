@@ -246,8 +246,9 @@ pub fn codex_sessions_dir() -> PathBuf {
 }
 
 /// The Codex snapshot from `sessions_dir`, scanning the `scan_n` newest rollouts newest-first.
-/// Credits are authoritative when their object is present. Without credits, a weekly window keeps
-/// its existing semantics. Neither verdict closes Codex capacity.
+/// A weekly window is authoritative when one is present. Credits are the capacity verdict only
+/// when no weekly window was published at all. Capacity closes only when the payload supplies
+/// neither a weekly window with a real reset nor a boolean credits verdict.
 pub fn codex_headroom_in(sessions_dir: &Path, now: i64, scan_n: usize) -> Headroom {
     let Some(line) = newest_capacity_rate_limits_line(sessions_dir, scan_n) else {
         return Headroom::closed();
@@ -330,9 +331,29 @@ fn collect_rollouts(dir: &Path, found: &mut Vec<(SystemTime, PathBuf)>) {
 /// `secondary: null`, so position-based parsing reads a weekly number as a 5h one. A window
 /// whose `resets_at` has already passed reports 0 percent (its stored number belongs to a past
 /// window) while keeping the reset epoch.
+///
+/// A weekly window WINS over the `credits` object whenever one is present. `has_credits: false`
+/// means no pay-as-you-go top-up balance and states nothing about the plan's included weekly
+/// quota, so credits are the capacity verdict only when no weekly window was published at all.
 pub fn parse_codex_rate_limits(line: &str, now: i64) -> Option<Headroom> {
     let value: serde_json::Value = serde_json::from_str(line).ok()?;
     let limits = value.pointer("/payload/rate_limits")?;
+    if let Some(weekly) = window_with_minutes(limits, WINDOW_WEEKLY) {
+        let five_hour = window_with_minutes(limits, WINDOW_FIVE_HOUR);
+        let (five_hour_pct, five_hour_reset_epoch) = expire(five_hour, now);
+        let (weekly_pct, weekly_reset_epoch) = expire(Some(weekly), now);
+        if weekly_reset_epoch == 0 {
+            return Some(Headroom::closed());
+        }
+        return Some(Headroom {
+            five_hour_pct,
+            five_hour_reset_epoch,
+            weekly_pct,
+            weekly_reset_epoch,
+            weekly_capacity_known: true,
+            stale: false,
+        });
+    }
     if let Some(credits) = limits.get("credits").filter(|credits| credits.is_object()) {
         return Some(
             match credits
@@ -359,24 +380,7 @@ pub fn parse_codex_rate_limits(line: &str, now: i64) -> Option<Headroom> {
             },
         );
     }
-    let five_hour = window_with_minutes(limits, WINDOW_FIVE_HOUR);
-    let weekly = window_with_minutes(limits, WINDOW_WEEKLY);
-    let Some(weekly) = weekly else {
-        return Some(Headroom::closed());
-    };
-    let (five_hour_pct, five_hour_reset_epoch) = expire(five_hour, now);
-    let (weekly_pct, weekly_reset_epoch) = expire(Some(weekly), now);
-    if weekly_reset_epoch == 0 {
-        return Some(Headroom::closed());
-    }
-    Some(Headroom {
-        five_hour_pct,
-        five_hour_reset_epoch,
-        weekly_pct,
-        weekly_reset_epoch,
-        weekly_capacity_known: true,
-        stale: false,
-    })
+    Some(Headroom::closed())
 }
 
 /// PURE: the `primary`/`secondary` window whose `window_minutes` is `minutes`, if either is.
@@ -733,13 +737,28 @@ mod tests {
         assert_eq!(got.weekly_pct, 43.0);
     }
 
+    /// The live payload on this box: a real weekly window at 2 percent with a future reset, and a
+    /// `has_credits: false` credits object beside it. On a Pro plan that flag means no
+    /// pay-as-you-go top-up balance, which says nothing about the plan's included weekly quota, so
+    /// the window wins and the credits object is ignored.
+    #[test]
+    fn a_real_weekly_window_beats_a_no_credits_verdict() {
+        let line = r#"{"payload":{"rate_limits":{"limit_id":"codex","plan_type":"pro","primary":{"used_percent":2.0,"window_minutes":10080,"resets_at":1787040562},"secondary":null,"credits":{"has_credits":false,"unlimited":false,"balance":"0"}}}}"#;
+
+        let got = parse_codex_rate_limits(line, 1_787_000_000).expect("parses");
+        assert_eq!(got.weekly_pct, 2.0);
+        assert_eq!(got.weekly_reset_epoch, 1_787_040_562);
+        assert!(got.weekly_known());
+    }
+
     #[test]
     fn codex_full_live_token_count_event_parses() {
-        // The whole event as written by codex-cli, not just the rate_limits object.
+        // The whole event as written by codex-cli, not just the rate_limits object. It carries a
+        // real weekly window alongside `has_credits: false`, and the window wins over credits.
         let line = r#"{"timestamp":"2026-07-30T00:49:04.903Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":8346462}},"rate_limits":{"limit_id":"codex","limit_name":null,"primary":{"used_percent":69.0,"window_minutes":10080,"resets_at":1785908348},"secondary":null,"credits":{"has_credits":false},"plan_type":"prolite"}}}"#;
         let got = parse_codex_rate_limits(line, 1_785_000_000).expect("parses");
-        assert_eq!(got.weekly_pct, 100.0);
-        assert_eq!(got.weekly_reset_epoch, 0);
+        assert_eq!(got.weekly_pct, 69.0);
+        assert_eq!(got.weekly_reset_epoch, 1_785_908_348);
         assert!(got.weekly_known());
         assert_eq!(got.five_hour_pct, 0.0);
     }
