@@ -84,6 +84,28 @@ pub struct Classification {
     /// True when this is the fallback rather than a real score. Not part of the model's JSON.
     #[serde(default)]
     pub classifier_failed: bool,
+    /// True when the task dispatches the `/implement` skill. Read from the task text rather than
+    /// scored, so it is not part of the model's JSON, and defaulted for old log rows.
+    ///
+    /// Deterministic on purpose. The pin it feeds in `decide` is a capability fact about the
+    /// destination, not a judgement about the work, and asking a small model to re-derive a
+    /// substring it can already see would put a capability pin behind a coin flip.
+    #[serde(default)]
+    pub invokes_implement: bool,
+}
+
+/// PURE: does this task dispatch the `/implement` skill?
+///
+/// Matches a line whose first non-whitespace token is `/implement`, which is the shape every
+/// dispatcher writes (`CLAUDE.md` requires the invocation and the `BACKGROUND_RUN=1` marker on
+/// their own lines). Deliberately narrow: a task that merely discusses `/implement`, or asks for a
+/// report about it, is not an implement run and must not be pinned like one.
+pub fn invokes_implement(task: &str) -> bool {
+    task.lines().any(|line| {
+        let line = line.trim_start();
+        line.strip_prefix("/implement")
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+    })
 }
 
 impl Classification {
@@ -101,6 +123,7 @@ impl Classification {
             task_context_horizon: TaskContextHorizon::Unknown,
             rationale: format!("classifier failed ({why}), defaulting to {provider_name}"),
             classifier_failed: true,
+            invokes_implement: false,
         }
     }
 }
@@ -125,7 +148,7 @@ pub fn classify_with_name(task: &str, config: &Config) -> ClassifiedTask {
     let timeout = Duration::from_secs(config.classifier_timeout_secs);
     let engine = config.classifier.engine;
     let cmd = classifier_command(&prompt, &config.classifier);
-    match capture(cmd, engine.name(), timeout) {
+    let mut scored = match capture(cmd, engine.name(), timeout) {
         Ok(stdout) => match parse_classifier_output_with_name(&stdout, engine) {
             Some((classification, job_name)) => ClassifiedTask {
                 classification,
@@ -143,7 +166,12 @@ pub fn classify_with_name(task: &str, config: &Config) -> ClassifiedTask {
             classification: Classification::fallback(&why, config.policy.default_provider),
             job_name: None,
         },
-    }
+    };
+    // Stamped once, after every branch, rather than inside each. The fallback paths need it as
+    // much as the scored one: a classifier that timed out on a build-tier implement run is exactly
+    // when routing it into the smaller window is most expensive.
+    scored.classification.invokes_implement = invokes_implement(task);
+    scored
 }
 
 /// PURE builder: the classifier invocation for the configured engine.

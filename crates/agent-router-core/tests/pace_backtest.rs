@@ -118,6 +118,7 @@ impl HistoricalRow {
             task_context_horizon: TaskContextHorizon::Ordinary,
             rationale: "replayed".to_string(),
             classifier_failed: false,
+            invokes_implement: false,
         }
     }
 

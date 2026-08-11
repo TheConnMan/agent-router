@@ -45,6 +45,7 @@ fn scored(orchestration: bool, task_context_horizon: TaskContextHorizon) -> Clas
         task_context_horizon,
         rationale: "fixture".to_string(),
         classifier_failed: false,
+        invokes_implement: false,
     }
 }
 

@@ -35,6 +35,9 @@ pub enum Gate {
     /// The task needs several agents exchanging findings mid-run, which Codex cannot do: an
     /// automatic Claude decision regardless of usage.
     Orchestration,
+    /// A build-tier `/implement` run, which does not fit Codex's context window: an automatic
+    /// Claude decision regardless of usage. See `implement_exceeds_codex_window`.
+    ImplementContextWindow,
     /// The provider the task was on is ineligible and the other is not, so it moved. Ineligible is
     /// either at or over the hard ceiling, or carrying a weekly number nobody read: see
     /// `WeeklyUnknown`, which is recorded alongside this one to tell the two apart.
@@ -73,6 +76,7 @@ impl Gate {
             Gate::ClassifierFailed => "classifier_failed",
             Gate::MissingConnector => "missing_connector",
             Gate::Orchestration => "orchestration",
+            Gate::ImplementContextWindow => "implement_context_window",
             Gate::FlippedOnExhaustion => "flipped_on_exhaustion",
             Gate::OverCeiling => "over_ceiling",
             Gate::WeeklyUnknown => "weekly_unknown",
@@ -130,6 +134,37 @@ impl Decision {
     }
 }
 
+/// PURE: is this a `/implement` run whose working set does not fit Codex's context window?
+///
+/// A capability pin, in the same sense as `orchestration`: the task is not cheaper on Codex, it is
+/// failed there. Codex's window is 258,400 tokens. Measured 2026-08-11 across 37 Claude and 13
+/// Codex `/implement` runs, the median Claude run peaks at 262,017 tokens of resident context and
+/// 51 percent of runs peak above the whole Codex window, so a build-tier run routed to Codex
+/// compacts by construction. All four of the heaviest recorded Codex runs compacted 2 to 5 times;
+/// one ground for four days across 222M input tokens, and another stalled unfinished at 100M.
+///
+/// Two conditions, both required.
+///
+/// The task must actually dispatch `/implement`, read from the text rather than scored, because
+/// this is a fact about the destination rather than a judgement about the work.
+///
+/// And it must be the build-tier shape, for which `complexity` is the available proxy: `high` and
+/// `ultra` are "spans several files" and "architecture or design judgement", which is what triage
+/// routes to `build`. Every one of the four heavy runs scored `high` or `ultra`; the runs that
+/// finished cleanly on Codex scored `medium` or `low`. An unscored task reads as `high` by
+/// `Complexity`'s default, so a classifier failure on an implement run pins rather than gambles.
+///
+/// `low` and `medium` implement runs stay on automatic routing. Those are the `direct` and `quick`
+/// tiers, they fit the window comfortably, and pinning them would hand Codex's whole share of this
+/// workload back to Claude for no measured gain.
+fn implement_exceeds_codex_window(classification: &Classification) -> bool {
+    classification.invokes_implement
+        && matches!(
+            classification.complexity,
+            Complexity::High | Complexity::Ultra
+        )
+}
+
 /// PURE: the routing decision for a scored task, at the instant `now_epoch_secs`.
 ///
 /// The instant is a parameter rather than a clock read, because the run rate rules below are a
@@ -161,6 +196,10 @@ pub fn decide(
     }
     if classification.orchestration {
         gates.push(Gate::Orchestration);
+        capability_pin = true;
+    }
+    if implement_exceeds_codex_window(&classification) {
+        gates.push(Gate::ImplementContextWindow);
         capability_pin = true;
     }
 
@@ -516,6 +555,7 @@ mod tests {
                 task_context_horizon: TaskContextHorizon::Ordinary,
                 rationale: "fixture".to_string(),
                 classifier_failed: false,
+                invokes_implement: false,
             },
             usage(71.0, 50.0),
             1_785_400_000,

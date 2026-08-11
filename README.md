@@ -39,9 +39,17 @@ log: row 87 in /home/you/.local/state/agent-router/router.db
    model, carrying the title instruction and no rubric. Both routes fall back to a title derived
    from the task alone when the model answers nothing usable, and neither makes the call when
    `--name` already named the job or when `--dry-run` means nothing is dispatched.
-2. **Apply the capability pin.** A missing connector, or a task needing several agents to exchange
-   findings mid-run, pins to Claude regardless of usage. These are statements that the task cannot
-   run on Codex at all, so every usage rule below is bypassed.
+2. **Apply the capability pin.** A missing connector, a task needing several agents to exchange
+   findings mid-run, or a build-tier `/implement` run (`implement_context_window`), pins to Claude
+   regardless of usage. These are statements that the task cannot run on Codex at all, so every
+   usage rule below is bypassed. The third one is a context-window fact rather than a feature gap:
+   Codex's window is 258,400 tokens, and measured 2026-08-11 across 37 Claude and 13 Codex
+   `/implement` runs, the median Claude run peaks at 262,017 tokens of resident context with 51
+   percent of runs peaking above the whole Codex window. It fires only when the task text actually
+   dispatches `/implement` (read literally, never scored) **and** complexity is `high` or `ultra`,
+   which is the build tier; `low` and `medium` implement runs are the direct and quick tiers, they
+   fit comfortably, and they stay on ordinary routing. An unscored task reads as `high`, so a
+   classifier failure on an implement run pins rather than gambles.
 3. **Apply the hard ceiling, then the projection override, then pace on Claude's 5 hour window.** A
    provider at or above `hard_ceiling_pct` is ineligible, which by default means a provider within
    5 points of its weekly limit takes no more routed work, and so is a provider whose weekly window
