@@ -1,13 +1,12 @@
 //! Weekly and 5h usage readers for both providers, Rust ports of bonus-drain's `usage.sh`
 //! (Claude) and `codex-usage.sh` (Codex) with the same semantics.
 //!
-//! Both readers FAIL OPEN: any missing file, network failure, or unparseable payload reads as
-//! full headroom, because a usage read must never be the thing that blocks a dispatch.
+//! Claude fails open, but Codex fails closed: an unreadable Codex capacity source must not become
+//! a dispatch target.
 //!
-//! Every fail open value carries `stale = true`, and only a parsed payload carries `stale = false`.
-//! Numerically a fail open read and a genuinely idle provider are the same two zeroes, so the flag
-//! is the only thing that separates them. `agent-router doctor` reports it as `live` or
-//! `fail-open`, and the decision log records it per provider on every row.
+//! Every unreadable value carries `stale = true`, while a usable parsed payload carries
+//! `stale = false`. `agent-router doctor` reports that provenance and the decision log records it
+//! per provider on every row.
 //!
 //! The flag reads freshness but means provenance, and there is one path where the two diverge:
 //! `claude_headroom`'s last resort reads the shared cache regardless of its age, and a cache that
@@ -53,6 +52,9 @@ pub struct Headroom {
     pub five_hour_reset_epoch: i64,
     pub weekly_pct: f64,
     pub weekly_reset_epoch: i64,
+    /// Whether the source supplied a verdict on weekly capacity. Credits can provide that verdict
+    /// without a reset timestamp, so this is distinct from `weekly_reset_epoch != 0`.
+    pub weekly_capacity_known: bool,
     /// True when this is the fail open default rather than a live read. A fail open read is
     /// indistinguishable from a genuinely idle provider by its numbers alone, and an idle looking
     /// provider wins every headroom tiebreak, so the distinction is recorded rather than inferred.
@@ -69,6 +71,19 @@ impl Headroom {
             five_hour_reset_epoch: 0,
             weekly_pct: 0.0,
             weekly_reset_epoch: 0,
+            weekly_capacity_known: false,
+            stale: true,
+        }
+    }
+
+    /// The fail-closed Codex value: no capacity verdict means no capacity is assumed.
+    pub const fn closed() -> Headroom {
+        Headroom {
+            five_hour_pct: 0.0,
+            five_hour_reset_epoch: 0,
+            weekly_pct: 100.0,
+            weekly_reset_epoch: 0,
+            weekly_capacity_known: false,
             stale: true,
         }
     }
@@ -79,21 +94,11 @@ impl Headroom {
         100.0 - self.weekly_pct
     }
 
-    /// Whether `weekly_pct` is a number anyone read. A reset epoch of 0 is this module's documented
-    /// "not known", and it is the only thing that separates an unread weekly window from an idle
-    /// one: both report 0 percent used.
-    ///
-    /// Three inputs land here. The fail open default has no epoch by construction. A Codex rollout
-    /// whose `rate_limits` payload carries no 10080 minute window parses to the same two zeroes
-    /// with `stale = false`, so the freshness flag does NOT catch it: that is a live read of a
-    /// payload that never stated a weekly number. And a window whose `resets_at` is absent or
-    /// unparseable reads the same way. In every case the percentage is a default rather than a
-    /// reading, which is why routing may not treat it as headroom.
-    ///
-    /// A window that has genuinely reset is a different thing and stays known: it reports 0 percent
-    /// against its real past epoch, which is a provider that really does have a full week.
+    /// Whether the source supplied a weekly capacity verdict. A reset epoch of 0 remains "not
+    /// known" as a timestamp, but Codex credits can state that capacity is available or exhausted
+    /// without publishing one.
     pub fn weekly_known(&self) -> bool {
-        self.weekly_reset_epoch != 0
+        self.weekly_capacity_known
     }
 }
 
@@ -178,11 +183,14 @@ pub fn parse_claude_usage(body: &str) -> Option<Headroom> {
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
     let seven_day = value.get("seven_day")?;
     let five_hour = value.get("five_hour");
+    let weekly_pct = utilization(seven_day).unwrap_or(0.0);
+    let weekly_reset_epoch = resets_at_epoch(seven_day).unwrap_or(0);
     Some(Headroom {
         five_hour_pct: five_hour.and_then(utilization).unwrap_or(0.0),
         five_hour_reset_epoch: five_hour.and_then(resets_at_epoch).unwrap_or(0),
-        weekly_pct: utilization(seven_day).unwrap_or(0.0),
-        weekly_reset_epoch: resets_at_epoch(seven_day).unwrap_or(0),
+        weekly_pct,
+        weekly_reset_epoch,
+        weekly_capacity_known: weekly_reset_epoch != 0,
         stale: false,
     })
 }
@@ -238,39 +246,18 @@ pub fn codex_sessions_dir() -> PathBuf {
 }
 
 /// The Codex snapshot from `sessions_dir`, scanning the `scan_n` newest rollouts newest-first.
-///
-/// The scan looks for a `rate_limits` event that CARRIES A WEEKLY WINDOW, not merely for one that
-/// exists. Codex emits at least two shapes under the same key, and only one of them is about the
-/// plan:
-///
-/// ```text
-/// {"limit_id":"codex",   "plan_type":"pro", "primary":{"window_minutes":10080,...}, ...}
-/// {"limit_id":"premium", "plan_type":null,  "primary":null, "secondary":null,       ...}
-/// ```
-///
-/// The second shape is a different limit bucket and states nothing about weekly headroom. Taking
-/// it at face value put both windows through `expire(None, ..)`, which reports zero percent used
-/// with a zero reset, so an untouched second bucket read as a completely fresh plan. On 2026-08-06
-/// the five newest rollouts on this box all ended on that shape while the plan itself was at 100
-/// percent one rollout further back, and the router dispatched into the exhausted provider on a
-/// number no window had produced. The shape is rare (8 events in 25,307 recorded here) and the
-/// weekly-bearing shape has never once been window-less, which is what makes "keep scanning" the
-/// right response rather than "trust the newest".
-///
-/// Exhausting the scan without finding a weekly window still fails open to `Headroom::full`, whose
-/// `stale = true` marks the zeroes as unmeasured. That is the pre-existing contract and it is the
-/// honest answer here: no weekly window was read, so no weekly number is known.
+/// Credits are authoritative when their object is present. Without credits, a weekly window keeps
+/// its existing semantics. Neither verdict closes Codex capacity.
 pub fn codex_headroom_in(sessions_dir: &Path, now: i64, scan_n: usize) -> Headroom {
-    let Some(line) = newest_weekly_rate_limits_line(sessions_dir, scan_n) else {
-        return Headroom::full();
+    let Some(line) = newest_capacity_rate_limits_line(sessions_dir, scan_n) else {
+        return Headroom::closed();
     };
-    parse_codex_rate_limits(&line, now).unwrap_or_else(Headroom::full)
+    parse_codex_rate_limits(&line, now).unwrap_or_else(Headroom::closed)
 }
 
-/// IMPURE: the newest `rate_limits` line that carries a weekly window, scanning rollouts
-/// newest-first and each rollout's own lines last-first. A rollout whose `rate_limits` events are
-/// all window-less is passed over entirely rather than ending the search.
-fn newest_weekly_rate_limits_line(sessions_dir: &Path, scan_n: usize) -> Option<String> {
+/// IMPURE: the newest `rate_limits` line with a credits object or weekly window, scanning rollouts
+/// newest-first and each rollout's own lines last-first.
+fn newest_capacity_rate_limits_line(sessions_dir: &Path, scan_n: usize) -> Option<String> {
     for path in newest_rollouts(sessions_dir, scan_n) {
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
@@ -279,7 +266,7 @@ fn newest_weekly_rate_limits_line(sessions_dir: &Path, scan_n: usize) -> Option<
         let found = text
             .lines()
             .rev()
-            .find(|line| line.contains("\"rate_limits\"") && carries_weekly_window(line));
+            .find(|line| line.contains("\"rate_limits\"") && carries_capacity_verdict(line));
         if let Some(line) = found {
             return Some(line.to_string());
         }
@@ -287,17 +274,20 @@ fn newest_weekly_rate_limits_line(sessions_dir: &Path, scan_n: usize) -> Option<
     None
 }
 
-/// PURE: whether a rollout line's `rate_limits` payload states a weekly window at all. Parsing the
-/// line twice (here, then in `parse_codex_rate_limits`) is deliberate: the alternative is a
+/// PURE: whether a rollout line's `rate_limits` payload can supply a capacity verdict. Parsing
+/// the line twice (here, then in `parse_codex_rate_limits`) is deliberate: the alternative is a
 /// half-parsed value threaded through the scan, and this runs at most `scan_n` times per read.
-fn carries_weekly_window(line: &str) -> bool {
+fn carries_capacity_verdict(line: &str) -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
         return false;
     };
     let Some(limits) = value.pointer("/payload/rate_limits") else {
         return false;
     };
-    window_with_minutes(limits, WINDOW_WEEKLY).is_some()
+    limits
+        .get("credits")
+        .is_some_and(serde_json::Value::is_object)
+        || window_with_minutes(limits, WINDOW_WEEKLY).is_some()
 }
 
 /// IMPURE: up to `scan_n` `*.jsonl` paths under `sessions_dir`, newest mtime first.
@@ -343,15 +333,48 @@ fn collect_rollouts(dir: &Path, found: &mut Vec<(SystemTime, PathBuf)>) {
 pub fn parse_codex_rate_limits(line: &str, now: i64) -> Option<Headroom> {
     let value: serde_json::Value = serde_json::from_str(line).ok()?;
     let limits = value.pointer("/payload/rate_limits")?;
+    if let Some(credits) = limits.get("credits").filter(|credits| credits.is_object()) {
+        return Some(
+            match credits
+                .get("has_credits")
+                .and_then(serde_json::Value::as_bool)
+            {
+                Some(false) => Headroom {
+                    five_hour_pct: 0.0,
+                    five_hour_reset_epoch: 0,
+                    weekly_pct: 100.0,
+                    weekly_reset_epoch: 0,
+                    weekly_capacity_known: true,
+                    stale: false,
+                },
+                Some(true) => Headroom {
+                    five_hour_pct: 0.0,
+                    five_hour_reset_epoch: 0,
+                    weekly_pct: 0.0,
+                    weekly_reset_epoch: 0,
+                    weekly_capacity_known: true,
+                    stale: false,
+                },
+                None => Headroom::closed(),
+            },
+        );
+    }
     let five_hour = window_with_minutes(limits, WINDOW_FIVE_HOUR);
     let weekly = window_with_minutes(limits, WINDOW_WEEKLY);
+    let Some(weekly) = weekly else {
+        return Some(Headroom::closed());
+    };
     let (five_hour_pct, five_hour_reset_epoch) = expire(five_hour, now);
-    let (weekly_pct, weekly_reset_epoch) = expire(weekly, now);
+    let (weekly_pct, weekly_reset_epoch) = expire(Some(weekly), now);
+    if weekly_reset_epoch == 0 {
+        return Some(Headroom::closed());
+    }
     Some(Headroom {
         five_hour_pct,
         five_hour_reset_epoch,
         weekly_pct,
         weekly_reset_epoch,
+        weekly_capacity_known: true,
         stale: false,
     })
 }
@@ -599,22 +622,55 @@ mod tests {
     }
 
     /// The payload a hard limited Codex actually writes, verbatim in shape: `limit_id` set,
-    /// both window slots null, no credits left. It parses, so `stale` is false, and it reports 0
-    /// percent of a weekly window it never mentioned. `weekly_known` is the only thing that
-    /// separates it from a genuinely idle provider, and routing reads that rather than the
-    /// percentage.
+    /// both window slots null, no credits left. Credits are the weekly capacity verdict when
+    /// present, even though Codex publishes no reset alongside this exhausted state.
     #[test]
-    fn a_codex_payload_with_no_windows_is_not_a_known_weekly_number() {
+    fn exhausted_credits_close_codex_without_claiming_a_reset() {
         let now = 1_000_000;
         let line = r#"{"payload":{"rate_limits":{"limit_id":"premium","limit_name":null,"primary":null,"secondary":null,"credits":{"has_credits":false,"unlimited":false,"balance":"0"},"individual_limit":null,"spend_control_reached":null,"plan_type":null,"rate_limit_reached_type":null}}}"#;
 
         let got = parse_codex_rate_limits(line, now).expect("parses");
-        assert!(!got.stale, "the payload parsed, so it is a live read");
-        assert_eq!(got.weekly_pct, 0.0, "and it reads as completely idle");
-        assert!(
-            !got.weekly_known(),
-            "which is exactly why the percentage must not be trusted"
+        assert_eq!(got.weekly_pct, 100.0);
+        assert_eq!(got.weekly_reset_epoch, 0);
+        assert!(got.weekly_known());
+        assert_ne!(got, Headroom::full());
+    }
+
+    #[test]
+    fn available_credits_report_room_without_a_window_reset() {
+        let now = 1_000_000;
+        let line = r#"{"payload":{"rate_limits":{"primary":null,"secondary":null,"credits":{"has_credits":true,"unlimited":false,"balance":"12"}}}}"#;
+
+        let got = parse_codex_rate_limits(line, now).expect("parses");
+        assert_eq!(got.weekly_pct, 0.0);
+        assert_eq!(got.weekly_remaining(), 100.0);
+        assert_eq!(got.weekly_reset_epoch, 0);
+        assert!(got.weekly_known());
+    }
+
+    #[test]
+    fn a_window_payload_without_credits_keeps_its_weekly_capacity() {
+        let now = 1_000_000;
+        let weekly = format!(
+            r#"{{"window_minutes":10080,"used_percent":37,"resets_at":{}}}"#,
+            now + 7200
         );
+
+        let got = parse_codex_rate_limits(&limits_line(&weekly, "null"), now).expect("parses");
+        assert_eq!(got.weekly_pct, 37.0);
+        assert_eq!(got.weekly_reset_epoch, now + 7200);
+        assert!(got.weekly_known());
+    }
+
+    #[test]
+    fn a_rate_limits_payload_without_windows_or_credits_closes_capacity() {
+        let now = 1_000_000;
+        let line = r#"{"payload":{"rate_limits":{"primary":null,"secondary":null}}}"#;
+
+        let got = parse_codex_rate_limits(line, now).expect("parses");
+        assert_eq!(got.weekly_pct, 100.0);
+        assert!(!got.weekly_known());
+        assert_ne!(got, Headroom::full());
     }
 
     /// The other side of that boundary. A window that has genuinely reset also reports 0 percent,
@@ -629,13 +685,16 @@ mod tests {
         );
         let got = parse_codex_rate_limits(&limits_line(&weekly, "null"), now).expect("parses");
         assert_eq!(got.weekly_pct, 0.0);
-        assert!(got.weekly_known(), "a past reset is a reset anyone read");
+        assert!(
+            got.weekly_known(),
+            "a past reset is a capacity reading anyone read"
+        );
     }
 
     /// The fail open default is unknown by construction, so a provider nobody could read at all
     /// lands in the same bucket as one that reported no window.
     #[test]
-    fn the_fail_open_default_is_not_a_known_weekly_number() {
+    fn the_fail_open_default_is_not_a_known_weekly_capacity() {
         assert!(Headroom::full().stale);
         assert!(!Headroom::full().weekly_known());
     }
@@ -679,8 +738,9 @@ mod tests {
         // The whole event as written by codex-cli, not just the rate_limits object.
         let line = r#"{"timestamp":"2026-07-30T00:49:04.903Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":8346462}},"rate_limits":{"limit_id":"codex","limit_name":null,"primary":{"used_percent":69.0,"window_minutes":10080,"resets_at":1785908348},"secondary":null,"credits":{"has_credits":false},"plan_type":"prolite"}}}"#;
         let got = parse_codex_rate_limits(line, 1_785_000_000).expect("parses");
-        assert_eq!(got.weekly_pct, 69.0);
-        assert_eq!(got.weekly_reset_epoch, 1_785_908_348);
+        assert_eq!(got.weekly_pct, 100.0);
+        assert_eq!(got.weekly_reset_epoch, 0);
+        assert!(got.weekly_known());
         assert_eq!(got.five_hour_pct, 0.0);
     }
 
@@ -725,12 +785,9 @@ mod tests {
     /// Both windows null, so it states nothing about the weekly plan.
     const PREMIUM_NO_WINDOWS: &str = r#"{"timestamp":"2026-08-06T09:36:39.958Z","type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"limit_id":"premium","limit_name":null,"primary":null,"secondary":null,"credits":{"has_credits":false,"unlimited":false,"balance":"0"},"individual_limit":null,"spend_control_reached":null,"plan_type":null,"rate_limit_reached_type":null}}}"#;
 
-    /// The regression this whole scan change exists for. On 2026-08-06 the five newest rollouts
-    /// all ended on a window-less `premium` event while the plan sat at 100 percent one rollout
-    /// further back. Reading the newest event that merely HAS `rate_limits` reported 0 percent
-    /// used, so an exhausted provider looked completely fresh and kept taking dispatches.
+    /// Credits are newer than the old plan window and are the authoritative capacity verdict.
     #[test]
-    fn a_window_less_limits_event_does_not_blank_an_exhausted_weekly_reading() {
+    fn a_newer_credits_verdict_overrides_an_older_window() {
         let now = 1_000_000;
         let dir = tempfile::tempdir().expect("tempdir");
         let exhausted = format!(
@@ -747,15 +804,18 @@ mod tests {
             );
         }
         let got = codex_headroom_in(dir.path(), now, 20);
-        assert_eq!(got.weekly_pct, 100.0, "the plan window is what is reported");
-        assert_eq!(got.weekly_reset_epoch, now + 3600);
-        assert!(!got.stale, "a weekly window was genuinely read");
+        assert_eq!(
+            got.weekly_pct, 100.0,
+            "the credits verdict is what is reported"
+        );
+        assert_eq!(got.weekly_reset_epoch, 0);
+        assert!(got.weekly_known());
     }
 
     /// The same shape one level down: the window-less event is the LAST line of the very rollout
     /// that also carries the plan reading, which is how codex-cli appends them in a live thread.
     #[test]
-    fn a_window_less_event_later_in_the_same_rollout_does_not_win() {
+    fn a_credits_verdict_later_in_the_same_rollout_wins() {
         let now = 1_000_000;
         let dir = tempfile::tempdir().expect("tempdir");
         let body = format!(
@@ -764,26 +824,28 @@ mod tests {
             now + 3600
         );
         rollout(dir.path(), "mixed.jsonl", &body, 100);
-        assert_eq!(codex_headroom_in(dir.path(), now, 20).weekly_pct, 88.0);
+        let got = codex_headroom_in(dir.path(), now, 20);
+        assert_eq!(got.weekly_pct, 100.0);
+        assert_eq!(got.weekly_reset_epoch, 0);
     }
 
-    /// Exhausting the scan without a single weekly window is not knowledge of an idle plan. The
-    /// zeroes still come back, but flagged, which is the contract the whole module documents.
+    /// Exhausted credits close capacity even when no weekly window is published.
     #[test]
-    fn only_window_less_events_fails_open_rather_than_reporting_an_idle_plan() {
+    fn only_exhausted_credits_events_close_capacity() {
         let now = 1_000_000;
         let dir = tempfile::tempdir().expect("tempdir");
         rollout(dir.path(), "premium.jsonl", PREMIUM_NO_WINDOWS, 100);
         let got = codex_headroom_in(dir.path(), now, 20);
-        assert_eq!(got, Headroom::full());
-        assert!(got.stale, "unmeasured zeroes must never read as live");
+        assert_eq!(got.weekly_pct, 100.0);
+        assert!(got.weekly_known());
+        assert_ne!(got, Headroom::full());
     }
 
     #[test]
-    fn codex_reader_fails_open_on_a_missing_directory_and_on_malformed_limits() {
+    fn codex_reader_closes_on_a_missing_directory_and_on_malformed_limits() {
         let now = 1_000_000;
         let missing = Path::new("/definitely/not/a/sessions/dir");
-        assert_eq!(codex_headroom_in(missing, now, 20), Headroom::full());
+        assert_eq!(codex_headroom_in(missing, now, 20), Headroom::closed());
 
         let dir = tempfile::tempdir().expect("tempdir");
         rollout(
@@ -792,7 +854,7 @@ mod tests {
             "{\"payload\":{\"rate_limits\":",
             100,
         );
-        assert_eq!(codex_headroom_in(dir.path(), now, 20), Headroom::full());
+        assert_eq!(codex_headroom_in(dir.path(), now, 20), Headroom::closed());
     }
 
     #[test]
@@ -813,7 +875,7 @@ mod tests {
             );
         }
         assert_eq!(codex_headroom_in(dir.path(), now, 20).weekly_pct, 42.0);
-        // Only the newest two are scanned, and neither carries limits: fail open.
-        assert_eq!(codex_headroom_in(dir.path(), now, 2), Headroom::full());
+        // Only the newest two are scanned, and neither carries capacity: closed.
+        assert_eq!(codex_headroom_in(dir.path(), now, 2), Headroom::closed());
     }
 }

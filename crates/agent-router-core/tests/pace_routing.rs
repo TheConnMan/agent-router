@@ -38,6 +38,7 @@ fn window(weekly_pct: f64, weekly_remaining_secs: i64, five_hour_pct: f64) -> He
     Headroom {
         weekly_pct,
         weekly_reset_epoch: NOW + weekly_remaining_secs,
+        weekly_capacity_known: true,
         five_hour_pct,
         ..Headroom::full()
     }
