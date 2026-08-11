@@ -646,6 +646,7 @@ mod tests {
             task_context_horizon: TaskContextHorizon::Ordinary,
             rationale: "bounded contract".to_string(),
             classifier_failed: false,
+            invokes_implement: false,
         };
         let usage = UsageSnapshot {
             claude: Headroom {

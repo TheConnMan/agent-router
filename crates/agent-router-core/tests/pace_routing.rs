@@ -85,12 +85,22 @@ fn scored(orchestration: bool, missing_connector: bool, complexity: Complexity) 
         task_context_horizon: TaskContextHorizon::Ordinary,
         rationale: "fixture".to_string(),
         classifier_failed: false,
+        invokes_implement: false,
     }
 }
 
 /// A plain task: nothing pinned, so it is decided entirely by usage.
 fn plain() -> Classification {
     scored(false, false, Complexity::High)
+}
+
+/// An `/implement` dispatch at the given tier. `invokes_implement` is read from the task text by
+/// `classify`, never scored, so a routing test sets it directly.
+fn implement(complexity: Complexity) -> Classification {
+    Classification {
+        invokes_implement: true,
+        ..scored(false, false, complexity)
+    }
 }
 
 // ------------------------------------------------------------------ rule 1: the scored fields
@@ -839,4 +849,91 @@ fn a_provider_within_five_points_of_its_weekly_limit_takes_no_more_work() {
     );
     assert_eq!(allowed.provider, Provider::Codex);
     assert!(allowed.gates.is_empty(), "{:?}", allowed.gates);
+}
+
+// ------------------------------------------- the implement context window pin (capability pin 3)
+
+/// An implement run scored `high` or `ultra` is the build tier, and the build tier does not fit
+/// Codex's 258,400 token window. Like the other two capability pins, it bypasses every usage rule
+/// below it: routing a job into a window it cannot fit is not a cheaper job, it is a failed one.
+///
+/// The blowout picture is deliberate. Codex projects to draw 160 percent of its allowance and
+/// Claude 10, so every usage rule in the engine argues for moving work ONTO Claude anyway; the
+/// case that proves a pin is the reverse, below.
+#[test]
+fn a_build_tier_implement_run_pins_to_claude_over_every_usage_rule() {
+    let config = Config::default();
+    for complexity in [Complexity::High, Complexity::Ultra] {
+        // Codex idle, Claude nearly out: usage says Codex, loudly. The pin still wins.
+        let decision = decide(
+            implement(complexity),
+            usage(window(97.0, HALF_WEEK, 0.0), window(1.0, HALF_WEEK, 0.0)),
+            NOW,
+            &config,
+        );
+        assert_eq!(
+            decision.provider,
+            Provider::Claude,
+            "{complexity:?} implement run must pin to claude"
+        );
+        assert!(decision.gates.contains(&Gate::ImplementContextWindow));
+        // A capability pin runs no usage rule, so no usage gate may appear beside it.
+        assert!(
+            !decision.gates.contains(&Gate::FlippedOnExhaustion)
+                && !decision.gates.contains(&Gate::ProjectedOverdraw)
+                && !decision.gates.contains(&Gate::FiveHourPacing),
+            "{:?}",
+            decision.gates
+        );
+    }
+}
+
+/// The pin is narrow on both of its conditions, and each half is checked against the other's
+/// opposite so neither can be passing on the wrong one.
+#[test]
+fn the_implement_pin_needs_both_the_invocation_and_the_build_tier() {
+    let config = Config::default();
+
+    // Right tier, not an implement run: no pin. This is the guard against pinning every
+    // high-complexity task on the box to Claude.
+    for complexity in [Complexity::High, Complexity::Ultra] {
+        let decision = decide(
+            scored(false, false, complexity),
+            within_allowance(),
+            NOW,
+            &config,
+        );
+        assert!(
+            !decision.gates.contains(&Gate::ImplementContextWindow),
+            "non-implement {complexity:?} must not pin: {:?}",
+            decision.gates
+        );
+    }
+
+    // An implement run, but the direct and quick tiers, which fit the window comfortably and are
+    // the share of this workload Codex handles well. Codex is the default provider and this usage
+    // picture trips no rule, so they stay there.
+    for complexity in [Complexity::Low, Complexity::Medium] {
+        let decision = decide(implement(complexity), within_allowance(), NOW, &config);
+        assert!(
+            !decision.gates.contains(&Gate::ImplementContextWindow),
+            "{complexity:?} implement run must not pin: {:?}",
+            decision.gates
+        );
+        assert_eq!(decision.provider, Provider::Codex);
+    }
+}
+
+/// A classifier failure on an implement run pins rather than gambles: `Complexity`'s default is
+/// `High`, so an unscored implement run reads as the build tier and lands where it fits. This is
+/// the one place the fallback is deliberately NOT neutral, and it is the shape that costs most
+/// when it goes wrong.
+#[test]
+fn an_unscored_implement_run_pins_to_claude() {
+    let config = Config::default();
+    let mut unscored = Classification::fallback("timeout", DefaultProvider::Codex);
+    unscored.invokes_implement = true;
+    let decision = decide(unscored, within_allowance(), NOW, &config);
+    assert_eq!(decision.provider, Provider::Claude);
+    assert!(decision.gates.contains(&Gate::ImplementContextWindow));
 }
