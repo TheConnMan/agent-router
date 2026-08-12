@@ -51,10 +51,10 @@ log: row 87 in /home/you/.local/state/agent-router/router.db
    fit comfortably, and they stay on ordinary routing. An unscored task reads as `high`, so a
    classifier failure on an implement run pins rather than gambles.
 3. **Apply the hard ceiling, then the projection override, then pace on Claude's 5 hour window.** A
-   provider at or above `hard_ceiling_pct` is ineligible, which by default means a provider within
-   5 points of its weekly limit takes no more routed work, and so is a provider whose weekly window
-   nobody read (`weekly_unknown`), because an unread window reports 0 percent used and would
-   otherwise read as maximum headroom: exactly one ineligible sends the task to the other
+   provider at or above `hard_ceiling_pct` is ineligible. Its fresh default is 98 percent used, so
+   a provider within 2 points of its weekly limit takes no more routed work, and so is a provider
+   whose weekly window nobody read (`weekly_unknown`), because an unread window reports 0 percent
+   used and would otherwise read as maximum headroom: exactly one ineligible sends the task to the other
    (`flipped_on_exhaustion`), both ineligible keeps the default (`over_ceiling`). With both
    eligible, the task moves when the provider it is on projects to draw more than
    `projection_overdraw_pct` of its own weekly allowance by the time its own window resets, and the
@@ -121,14 +121,12 @@ strict JSON answer either model can produce, so `[classifier].engine` selects wh
 the per task call is drawn from. Set it to `codex` to keep the Claude weekly budget for dispatched
 work.
 
-Usage reading fails open by design. A missing credential file, an unreachable API, or an
-unparseable payload all read as full headroom, because a usage read must never be the thing that
-blocks a dispatch. The consequence is worth knowing: if Claude credentials cannot be read, Claude
-looks completely unused and will win every headroom tiebreak. A fail open read and a genuinely idle
-provider report the same numbers, so the router records which one it got rather than leaving it to
-be inferred: `agent-router doctor` reports every read as `live` or `fail-open` and exits nonzero on a
-fail open one, `agent-router usage` names the same source per provider, and every decision row
-records `claude_usage_stale` and `codex_usage_stale`. Routing itself is unchanged by the marker.
+Usage source failures never block a dispatch. An unavailable Claude source fails open as full
+headroom. An unavailable or malformed Codex sessions source reports stale closed capacity, so
+Codex has no known weekly capacity and is ineligible for automatic routing. If neither provider
+has known capacity, the router still dispatches to the configured default. `agent-router doctor`
+reports the source status and exits nonzero for a stale read, `agent-router usage` names the source
+per provider, and every decision row records `claude_usage_stale` and `codex_usage_stale`.
 
 Usage comes from:
 
@@ -193,15 +191,14 @@ claude     12.4%    58.1%  live       in 41h07m
 codex       0.0%  unknown  fail-open  -
 ```
 
-The weekly column reads `unknown` when no reset epoch came back, because an unread window reports 0
-percent used and printing that as `0.0%` states a reading nobody took. Routing refuses such a
-provider, so the table says so too. It is also how a genuinely idle provider is told apart from one
-nobody could read: both would otherwise print the same number.
+The weekly column reads `unknown` when `weekly_known` is false, meaning no usable capacity verdict
+was read. An unread window reports 0 percent used, and printing that as `0.0%` states a reading
+nobody took. A live Codex credits verdict can be known without a reset epoch, so it prints its
+weekly percentage with a reset dash. Routing refuses a provider with an unknown weekly verdict.
 
-`source` is where the numbers came from: `live` for a parsed payload, `fail-open` for a read that
-found nothing and defaulted to full headroom. Those two zeroes above are the fail open default, not
-a measurement, and they are exactly what a genuinely idle provider also reports, so the source
-column is the only thing on the line that separates them.
+`source` is where the numbers came from: `live` for a parsed payload and `fail-open` when no usable
+capacity verdict was read. That source label means full headroom for Claude but closed capacity for
+Codex; `weekly` prints `unknown` for either unread window rather than claiming a measurement.
 
 The weekly window is what places a single job: it decides which provider has room for the task in
 front of the router. Claude's 5 hour window is what paces a stream of them, moving work away from

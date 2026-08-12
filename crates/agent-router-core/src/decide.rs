@@ -177,8 +177,8 @@ fn implement_exceeds_codex_window(classification: &Classification) -> bool {
 ///    failed one, so a pin bypasses every usage rule below including the ceiling.
 /// 2. Eligibility, before the override: a provider at or over the hard ceiling, or carrying a
 ///    weekly number nobody read, is not a destination. Being out of weekly budget is a capacity
-///    fact, and a provider down to its reserve projects to finish INSIDE its allowance (95 percent
-///    used against 99 percent elapsed projects to 96), so an override allowed to run first would
+///    fact, and a provider down to its reserve projects to finish INSIDE its allowance (98 percent
+///    used against 99 percent elapsed projects to 99), so an override allowed to run first would
 ///    see nothing wrong and route into an exhausted provider.
 /// 3. The projection override. See `projected_draw`.
 /// 4. Claude's five hour pacing, last, on whichever provider the task landed on.
@@ -488,7 +488,7 @@ fn rationale(
 mod tests {
     use super::*;
     use crate::classify::TaskContextHorizon;
-    use crate::usage::Headroom;
+    use crate::usage::{parse_codex_rate_limits, Headroom};
 
     /// The rules the engine routes by live in `tests/pace_routing.rs`, against the public API.
     /// What is left here is the explicit path, which no rule touches, and the rationale string.
@@ -569,5 +569,36 @@ mod tests {
         assert!(decision.rationale.contains("missing_connector"));
         assert!(decision.rationale.contains("codex weekly 71%"));
         assert!(decision.rationale.contains("claude weekly 50%"));
+    }
+
+    #[test]
+    fn exhausted_credits_are_ineligible_for_codex_routing() {
+        let codex = parse_codex_rate_limits(
+            r#"{"timestamp":"2026-08-06T09:36:39.958Z","type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"limit_id":"premium","limit_name":null,"primary":null,"secondary":null,"credits":{"has_credits":false,"unlimited":false,"balance":"0"},"individual_limit":null,"spend_control_reached":null,"plan_type":null,"rate_limit_reached_type":null}}}"#,
+            1_785_400_000,
+        )
+        .expect("the live credits payload parses");
+        assert_eq!(codex.weekly_pct, 100.0);
+        assert!(codex.weekly_known());
+        assert!(!codex.stale);
+
+        let decision = decide(
+            Classification::fallback("fixture", DefaultProvider::Codex),
+            UsageSnapshot {
+                codex,
+                claude: Headroom {
+                    five_hour_pct: 0.0,
+                    five_hour_reset_epoch: 0,
+                    weekly_pct: 10.0,
+                    weekly_reset_epoch: 1_786_004_800,
+                    weekly_capacity_known: true,
+                    stale: false,
+                },
+            },
+            1_785_400_000,
+            &Config::default(),
+        );
+        assert_eq!(decision.provider, Provider::Claude);
+        assert!(decision.gates.contains(&Gate::FlippedOnExhaustion));
     }
 }

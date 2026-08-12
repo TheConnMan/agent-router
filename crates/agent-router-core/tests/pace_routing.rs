@@ -175,11 +175,9 @@ fn a_missing_connector_pins_to_claude_past_every_usage_rule() {
 
 // ------------------------------------------------------------------ rule 3: the hard ceiling
 
-/// Rule 3, the case the whole backstop exists for. Claude sits exactly ON the ceiling with its
-/// window fully elapsed, so run rate reads it as 3 points COLD while 3 points of real allowance
-/// remain, and Codex is 80 points over pace. That is an 83 point gap, past the dead zone, so the
-/// override alone would move the task onto a provider that is out of budget. Eligibility is
-/// evaluated first, so it does not.
+/// Rule 3, the case the whole backstop exists for. Claude sits exactly on the configured ceiling
+/// with its window fully elapsed, while Codex projects to a heavier weekly draw. Eligibility is
+/// evaluated before that projection, so the override cannot move the task onto Claude.
 #[test]
 fn the_override_can_never_flip_into_a_provider_at_the_hard_ceiling() {
     let config = Config::default();
@@ -203,7 +201,7 @@ fn the_override_can_never_flip_into_a_provider_at_the_hard_ceiling() {
 #[test]
 fn the_one_eligible_provider_takes_the_task_even_when_pace_prefers_the_other() {
     let config = Config::default();
-    // Codex: 97 used with the window fully elapsed, a pace delta of -3.
+    // Codex: exactly the configured ceiling used with the window fully elapsed.
     // Claude: 40 used with a full week left, a pace delta of +40.
     let decision = decide(
         plain(),
@@ -815,24 +813,24 @@ fn the_written_config_carries_the_overdraw_threshold_at_the_current_version() {
 
 /// Rule 7. The reserve, stated as the number rather than as `config.hard_ceiling_pct`: every other
 /// ceiling case in this file reads the threshold off the config, so all of them would follow the
-/// default silently wherever it moved. This one is the assertion that a provider inside the last 5
+/// default silently wherever it moved. This one is the assertion that a provider inside the last 2
 /// points of its weekly limit is not a routing destination.
 ///
-/// Both sides of the boundary, because "95 is refused" is also true of a rule that refuses
-/// everything, and the comparison is at-or-above, so 94.9 must still route.
+/// Both sides of the boundary, because "98 is refused" is also true of a rule that refuses
+/// everything, and the comparison is at-or-above, so 97.9 must still route.
 #[test]
-fn a_provider_within_five_points_of_its_weekly_limit_takes_no_more_work() {
+fn a_provider_within_two_points_of_its_weekly_limit_takes_no_more_work() {
     let config = Config::default();
-    assert_eq!(config.hard_ceiling_pct, 95.0);
+    assert_eq!(config.hard_ceiling_pct, 98.0);
 
-    // Codex is the default provider, and at 95 percent used it is out. Its window is fully
+    // Codex is the default provider, and at 98 percent used it is out. Its window is fully
     // elapsed, so it projects to exactly what it has spent and reads as comfortably inside its
     // allowance, which argues for staying; the ceiling wins. Claude's window is half elapsed
     // rather than untouched, so both providers are projectable and the override genuinely runs
     // here instead of declining for want of a number.
     let refused = decide(
         plain(),
-        usage(window(40.0, HALF_WEEK, 0.0), window(95.0, 0, 0.0)),
+        usage(window(40.0, HALF_WEEK, 0.0), window(98.0, 0, 0.0)),
         NOW,
         &config,
     );
@@ -843,7 +841,7 @@ fn a_provider_within_five_points_of_its_weekly_limit_takes_no_more_work() {
     // is a boundary and not a general aversion to a busy provider.
     let allowed = decide(
         plain(),
-        usage(window(40.0, HALF_WEEK, 0.0), window(94.9, 0, 0.0)),
+        usage(window(40.0, HALF_WEEK, 0.0), window(97.9, 0, 0.0)),
         NOW,
         &config,
     );

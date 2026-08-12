@@ -48,14 +48,16 @@ as predating versioning, so do not delete the key to "reset" anything.
 | --- | --- |
 | 1 | `classifier_timeout_secs` of `30`, the old generated default, becomes `60`. Any other value is left alone. |
 | 2 | `headroom_flip_gap` is gone and `pace_flip_gap` replaces it. Nothing is carried across: the two keys threshold different comparisons, so a number tuned for the old one means nothing under the new one. The rewrite drops the stale key from the file. |
-| 3 | `hard_ceiling_pct` of `97.0`, the old generated default, becomes `95.0`. Any other value is left alone. Every file this tool has written states the ceiling explicitly, so without this step a lower default would reach no existing box. |
+| 3 | A file stamped below version 3 with `hard_ceiling_pct = 97.0`, the old generated default, is corrected to `98.0`. Any other value is left alone. |
 | 4 | `pace_flip_gap` is gone and `projection_overdraw_pct` replaces it. Nothing is carried across, and here that is not a convenience: the old key's value existed to clear a chronic band produced by one pair of plan sizes, so reading a `70` as a projection threshold would let a provider run to 70 percent OVER its allowance before anything moved. The rewrite drops the stale key from the file. |
+
+A file already stamped `config_version = 4` is not migrated, so its chosen ceiling remains in force.
 
 ## Defaults in full
 
 ```toml
 config_version = 4
-hard_ceiling_pct = 95.0
+hard_ceiling_pct = 98.0
 projection_overdraw_pct = 100.0
 claude_five_hour_pacing_pct = 90.0
 classifier_timeout_secs = 60
@@ -96,31 +98,28 @@ exceptions = []
 
 ### `hard_ceiling_pct`
 
-Default `95.0`. Weekly percent used at or above which a provider counts as exhausted.
+Default `98.0`. Weekly percent used at or above which a provider counts as exhausted.
 
 A provider at or over this ceiling is ineligible, and so is a provider whose weekly window nobody
 read. Exactly one ineligible sends the task to the other and tags the decision
 `flipped_on_exhaustion`. Both ineligible keeps the default provider and tags it `over_ceiling`,
 because at that point there is no better destination to move to.
 
-An unread weekly window is ineligible because it reports 0 percent used, which is the same reading
-as a completely idle provider, so trusting it hands every job to whichever provider failed to
-report. That is not hypothetical: a Codex that has hit its limit writes a `rate_limits` payload with
-both window slots null, which parses cleanly and reads as maximum headroom, so a hard limited Codex
-won every comparison in this block while `agent-router usage` showed it at `0.0%`, live. Any
-decision whose eligibility was judged against a missing number is tagged `weekly_unknown`, whether
-or not it changed the destination, and `usage` now prints that column as `unknown` rather than as a
-percentage nobody read.
+An unread weekly window is ineligible because it reports no capacity verdict, so trusting it would
+hand every job to whichever provider failed to report. A Codex Premium credits event is different:
+its `rate_limits` payload has `limit_id = "premium"`, both window slots null, and
+`credits.has_credits = false`. It parses as a live, known 100 percent weekly reading, so Codex is
+ineligible and a decision flips to Claude when Claude has confirmed room.
 
 A window that has genuinely reset is a different input and stays eligible: it reports 0 percent
 against a real past reset epoch, which is a provider that does have a full week.
 
-Failing closed here cannot fail to route. With neither window read there is no provider with
-confirmed room, so the decision falls through to `over_ceiling` and the default provider takes the
-job, tagged with both reasons. The usage readers themselves still fail open, unchanged; what
-changed is that routing no longer reads their default as headroom.
+Missing, unreadable, or malformed Codex sources return stale closed capacity with no known weekly
+verdict. Claude sources still fail open when unavailable. Both are ineligible for automatic
+routing, but they cannot stop a dispatch: with neither provider reporting capacity, the decision
+falls through to `over_ceiling` and the default provider takes the job, tagged with both reasons.
 
-The default keeps a 5 point reserve, so a provider within 5 points of its weekly limit takes no
+The default keeps a 2 point reserve, so a provider within 2 points of its weekly limit takes no
 more routed work. The reserve is what the last points are for, because the router is not the only
 thing spending them: an interactive session, the classifier's own per task call, and an explicit
 `--provider` dispatch all draw on the same weekly window without consulting this ceiling. A router
@@ -133,7 +132,7 @@ it protects against is routing a job into an exhausted provider while the other 
 
 Eligibility is judged before the projection override, not after, and that order is load bearing. A
 provider down to its reserve projects to finish INSIDE its allowance whenever its window is nearly
-elapsed (95 percent used against 99 percent elapsed projects to 96), so an override allowed to run
+elapsed (98 percent used against 99 percent elapsed projects to 99), so an override allowed to run
 first would see nothing wrong and route into a provider that is out of budget.
 
 ### `projection_overdraw_pct`
