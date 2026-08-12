@@ -348,9 +348,9 @@ fn the_rows_where_both_providers_overdraw_go_to_the_one_that_lasts_longer() {
 /// Codex's window had barely started on each, so there is nothing to extrapolate and the override
 /// declines to run. This is the guard rail earning its keep, not the rule choosing.
 ///
-/// Rows 93 and 94 land on Codex for a third reason again, and the split is asserted rather than
-/// left implicit. Claude sits at 95 percent on both, which is exactly the reserve, so those two
-/// take the one-eligible-provider arm before the override is reached at all.
+/// Claude remains eligible in every row at the 98 percent default ceiling, including rows 93 and
+/// 94 at 95 percent. Codex therefore holds the configured default while the unavailable projection
+/// rules out an override.
 #[test]
 fn the_quiet_band_rows_route_to_codex_with_nothing_to_project() {
     let config = Config::default();
@@ -371,23 +371,24 @@ fn the_quiet_band_rows_route_to_codex_with_nothing_to_project() {
         );
 
         let claude_eligible = historical.claude_weekly_pct < config.hard_ceiling_pct;
-        assert_eq!(
+        assert!(
             claude_eligible,
-            !matches!(id, 93 | 94),
-            "row {id}: only 93 and 94 reach Codex by Claude being inside the reserve, at {} percent",
+            "row {id}: Claude at {} percent remains eligible below the 98 percent default ceiling",
             historical.claude_weekly_pct
         );
+        if matches!(id, 93 | 94) {
+            assert!(
+                decision.gates.contains(&Gate::ProjectionUnavailable),
+                "row {id}: the unavailable Codex projection keeps the default route"
+            );
+        }
     }
 }
 
-/// Row 94 is the shape that makes the ceiling load bearing: 95 percent used against 99 percent
-/// elapsed projects to 96, comfortably inside its allowance, so the projection reads Claude as fine
-/// while exactly the reserve remains. Replayed with Codex overdrawing hard enough to fire the
-/// override, the task must still not land on a provider that is out of weekly budget.
-///
-/// The row is on the ceiling as recorded, so the assignment below changes nothing at the current
-/// default and is kept for what it states: the case under test is a Claude sitting on the ceiling,
-/// whatever the ceiling is set to.
+/// Row 94 records Claude at 95 percent used against 99 percent elapsed, which projects to 96 and
+/// remains below the 98 percent default ceiling. The mutation below puts Claude on the ceiling and
+/// makes Codex overdraw, proving an otherwise healthy projection cannot route into an exhausted
+/// provider.
 #[test]
 fn a_healthy_projection_never_routes_into_a_provider_at_the_ceiling() {
     let config = Config::default();

@@ -6,9 +6,9 @@ use crate::error::Result;
 use crate::runtime::home_dir;
 use std::path::{Path, PathBuf};
 
-/// Weekly percent at which a provider counts as exhausted: within 5 points of the weekly limit is
+/// Weekly percent at which a provider counts as exhausted: within 2 points of the weekly limit is
 /// close enough that the provider is no longer a routing destination.
-const DEFAULT_HARD_CEILING_PCT: f64 = 95.0;
+const DEFAULT_HARD_CEILING_PCT: f64 = 98.0;
 /// Projected weekly draw, as a percent of a provider's own allowance, above which the provider is
 /// treated as overdrawing its window. 100 is the definition of overdrawing rather than a tuned
 /// number: see the field's own doc comment.
@@ -252,7 +252,7 @@ pub struct Config {
     pub config_version: u32,
     /// Weekly percent used at or above which a provider is treated as exhausted.
     ///
-    /// The default of 95 keeps a 5 point reserve: a provider within 5 points of its weekly limit
+    /// The default of 98 keeps a 2 point reserve: a provider within 2 points of its weekly limit
     /// is no longer a routing destination. The reserve is what the last points are for, since the
     /// router is not the only thing spending them. Interactive sessions, the classifier's own
     /// per-task call, and a `--provider` dispatch all draw on the same weekly window without
@@ -378,10 +378,8 @@ impl Config {
         // no longer read and the rewrite below is what drops it from the file. Leaving it on disk
         // would be a config that names a key the router ignores.
         //
-        // v3: the ceiling was generated as 97, which left a provider eligible until it was within
-        // 3 points of its weekly limit; the reserve is 5 points now. The generated value is on
-        // every file this tool has ever written, so lowering the constant alone would reach none
-        // of them and the router would keep routing into the last 5 points on every real box.
+        // v3: a file written before version 3 can carry the generated 97 ceiling. Correct that
+        // value to this build's default; any other ceiling belongs to the operator.
         if self.config_version < 3 && self.hard_ceiling_pct == PRE_MIGRATION_HARD_CEILING_PCT {
             self.hard_ceiling_pct = DEFAULT_HARD_CEILING_PCT;
         }
@@ -447,9 +445,7 @@ mod tests {
         assert!(text.contains("config_version = 4"), "{text}");
     }
 
-    /// The v3 step, and the reason it has to exist at all: every config file this tool has written
-    /// states the ceiling explicitly, so lowering the constant would leave every real box still
-    /// routing into the last 5 points of its weekly limit.
+    /// The v3 step recognizes its former generated ceiling and writes this build's default once.
     #[test]
     fn a_file_carrying_the_old_generated_ceiling_is_migrated_on_disk() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -461,9 +457,9 @@ mod tests {
         assert_eq!(config.config_version, CURRENT_CONFIG_VERSION);
 
         // On disk, not merely in memory: a file that still reads 97 while the router refuses a
-        // provider at 95 is a config that lies about what is running.
+        // provider at 98 is a config that lies about what is running.
         let text = std::fs::read_to_string(&path).expect("re-read");
-        assert!(text.contains("hard_ceiling_pct = 95.0"), "{text}");
+        assert!(text.contains("hard_ceiling_pct = 98.0"), "{text}");
         assert!(text.contains("config_version = 4"), "{text}");
     }
 
@@ -492,7 +488,7 @@ mod tests {
         let migrated = std::fs::read_to_string(&path).expect("read");
         std::fs::write(
             &path,
-            migrated.replace("hard_ceiling_pct = 95.0", "hard_ceiling_pct = 97.0"),
+            migrated.replace("hard_ceiling_pct = 98.0", "hard_ceiling_pct = 97.0"),
         )
         .expect("write");
 
@@ -551,6 +547,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         let created = Config::load_from(&path).expect("creates");
         assert_eq!(created.config_version, CURRENT_CONFIG_VERSION);
+        assert_eq!(created.hard_ceiling_pct, 98.0);
 
         let mut again = created.clone();
         assert!(!again.migrate(), "a current file has nothing to migrate");
