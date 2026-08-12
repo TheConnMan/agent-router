@@ -488,7 +488,7 @@ fn rationale(
 mod tests {
     use super::*;
     use crate::classify::TaskContextHorizon;
-    use crate::usage::{parse_codex_rate_limits, Headroom};
+    use crate::usage::{Headroom, parse_codex_rate_limits};
 
     /// The rules the engine routes by live in `tests/pace_routing.rs`, against the public API.
     /// What is left here is the explicit path, which no rule touches, and the rationale string.
