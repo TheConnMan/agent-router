@@ -1,8 +1,7 @@
-//! The retroactive backtest: every real logged decision replayed through the new engine.
+//! The retroactive backtest: every captured decision replayed through the new engine.
 //!
-//! The corpus is the 108 rows the router actually wrote, captured as a fixture. Nothing here reads
-//! the live database: a backtest that depended on the operator state directory would answer differently
-//! on every run and could not fail in CI.
+//! The corpus is 108 captured rows with synthetic task excerpts. Nothing here reads a live
+//! database, so the backtest is deterministic and safe to publish.
 //!
 //! Each row carries both providers' weekly percent AND both resets at the instant it was decided,
 //! which is what makes a run rate replay possible at all: the row is replayed at its own

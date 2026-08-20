@@ -13,14 +13,10 @@ idea is not re-proposed without new evidence.
 
 ## Evidence set
 
-98 cases, each carrying the classifier's own recorded verdict from the decision log rather than a
-human assigned label. 79 cases are observed real traffic. 19 are task texts authored to cover both
-directions and the near miss cases, then labelled by running the live classifier over them, so each
-still has a decision log row id as provenance. The decision log holds 113 rows in total. 9 rows
-requested as `--provider auto` are excluded because the classifier call failed and fell back, and a
-fallback carries no classifier judgment; a further 6 rows are excluded because the caller named a
-provider explicitly, so no classification ran and the verdict is null. The remaining 98 rows, all
-requested as `--provider auto` and all carrying a real classifier verdict, are the evidence set.
+98 cases, each carrying a preserved classifier verdict rather than a human assigned label. The
+task text is synthetic, while the cohort labels and verdicts preserve the original evaluation
+shape. The fixture deliberately excludes rows where the classifier fell back or where the caller
+named a provider, because neither carries a classifier judgment.
 
 | Split | Count |
 | --- | --- |

@@ -1,0 +1,688 @@
+[
+  {
+    "log_id": 2,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "codex",
+    "missing_connector": false
+  },
+  {
+    "log_id": 3,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "codex",
+    "missing_connector": false
+  },
+  {
+    "log_id": 4,
+    "origin": "observed_traffic",
+    "task": "Connect to Slack to retrieve the current status.",
+    "verdict": "claude",
+    "missing_connector": false
+  },
+  {
+    "log_id": 5,
+    "origin": "observed_traffic",
+    "task": "Connect to Slack to retrieve the current status.",
+    "verdict": "claude",
+    "missing_connector": true
+  },
+  {
+    "log_id": 6,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "codex",
+    "missing_connector": false
+  },
+  {
+    "log_id": 7,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "codex",
+    "missing_connector": false
+  },
+  {
+    "log_id": 8,
+    "origin": "observed_traffic",
+    "task": "Connect to Slack to retrieve the current status.",
+    "verdict": "claude",
+    "missing_connector": false
+  },
+  {
+    "log_id": 12,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "codex",
+    "missing_connector": false
+  },
+  {
+    "log_id": 13,
+    "origin": "observed_traffic",
+    "task": "Connect to Slack to retrieve the current status.",
+    "verdict": "claude",
+    "missing_connector": false
+  },
+  {
+    "log_id": 14,
+    "origin": "observed_traffic",
+    "task": "Connect to Slack to retrieve the current status.",
+    "verdict": "claude",
+    "missing_connector": false
+  },
+  {
+    "log_id": 15,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "claude",
+    "missing_connector": true
+  },
+  {
+    "log_id": 16,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "codex",
+    "missing_connector": false
+  },
+  {
+    "log_id": 17,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "claude",
+    "missing_connector": false
+  },
+  {
+    "log_id": 18,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "codex",
+    "missing_connector": false
+  },
+  {
+    "log_id": 19,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "codex",
+    "missing_connector": false
+  },
+  {
+    "log_id": 20,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "codex",
+    "missing_connector": false
+  },
+  {
+    "log_id": 21,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "codex",
+    "missing_connector": false
+  },
+  {
+    "log_id": 22,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "claude",
+    "missing_connector": false
+  },
+  {
+    "log_id": 23,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "claude",
+    "missing_connector": true
+  },
+  {
+    "log_id": 25,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "codex",
+    "missing_connector": false
+  },
+  {
+    "log_id": 28,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "claude",
+    "missing_connector": false
+  },
+  {
+    "log_id": 29,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "claude",
+    "missing_connector": false
+  },
+  {
+    "log_id": 30,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "codex",
+    "missing_connector": false
+  },
+  {
+    "log_id": 31,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "claude",
+    "missing_connector": false
+  },
+  {
+    "log_id": 32,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "claude",
+    "missing_connector": false
+  },
+  {
+    "log_id": 33,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "codex",
+    "missing_connector": false
+  },
+  {
+    "log_id": 34,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "claude",
+    "missing_connector": false
+  },
+  {
+    "log_id": 35,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "codex",
+    "missing_connector": false
+  },
+  {
+    "log_id": 36,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "claude",
+    "missing_connector": false
+  },
+  {
+    "log_id": 37,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "claude",
+    "missing_connector": false
+  },
+  {
+    "log_id": 38,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "claude",
+    "missing_connector": false
+  },
+  {
+    "log_id": 39,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "claude",
+    "missing_connector": false
+  },
+  {
+    "log_id": 40,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "codex",
+    "missing_connector": false
+  },
+  {
+    "log_id": 41,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "claude",
+    "missing_connector": false
+  },
+  {
+    "log_id": 42,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "claude",
+    "missing_connector": false
+  },
+  {
+    "log_id": 44,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "claude",
+    "missing_connector": false
+  },
+  {
+    "log_id": 45,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "claude",
+    "missing_connector": false
+  },
+  {
+    "log_id": 47,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "claude",
+    "missing_connector": false
+  },
+  {
+    "log_id": 48,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "claude",
+    "missing_connector": false
+  },
+  {
+    "log_id": 49,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "claude",
+    "missing_connector": false
+  },
+  {
+    "log_id": 50,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "codex",
+    "missing_connector": false
+  },
+  {
+    "log_id": 51,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "claude",
+    "missing_connector": false
+  },
+  {
+    "log_id": 52,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "claude",
+    "missing_connector": false
+  },
+  {
+    "log_id": 53,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "claude",
+    "missing_connector": false
+  },
+  {
+    "log_id": 54,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "claude",
+    "missing_connector": false
+  },
+  {
+    "log_id": 55,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "claude",
+    "missing_connector": false
+  },
+  {
+    "log_id": 56,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "codex",
+    "missing_connector": false
+  },
+  {
+    "log_id": 57,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "codex",
+    "missing_connector": false
+  },
+  {
+    "log_id": 59,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "claude",
+    "missing_connector": false
+  },
+  {
+    "log_id": 61,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "claude",
+    "missing_connector": false
+  },
+  {
+    "log_id": 62,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "claude",
+    "missing_connector": false
+  },
+  {
+    "log_id": 63,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "claude",
+    "missing_connector": false
+  },
+  {
+    "log_id": 64,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "claude",
+    "missing_connector": false
+  },
+  {
+    "log_id": 65,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "codex",
+    "missing_connector": false
+  },
+  {
+    "log_id": 66,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "claude",
+    "missing_connector": false
+  },
+  {
+    "log_id": 69,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "claude",
+    "missing_connector": false
+  },
+  {
+    "log_id": 70,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "codex",
+    "missing_connector": false
+  },
+  {
+    "log_id": 71,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "claude",
+    "missing_connector": true
+  },
+  {
+    "log_id": 72,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "codex",
+    "missing_connector": false
+  },
+  {
+    "log_id": 73,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "codex",
+    "missing_connector": false
+  },
+  {
+    "log_id": 74,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "claude",
+    "missing_connector": true
+  },
+  {
+    "log_id": 75,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "codex",
+    "missing_connector": false
+  },
+  {
+    "log_id": 76,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "claude",
+    "missing_connector": false
+  },
+  {
+    "log_id": 77,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "codex",
+    "missing_connector": false
+  },
+  {
+    "log_id": 78,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "codex",
+    "missing_connector": false
+  },
+  {
+    "log_id": 79,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "claude",
+    "missing_connector": false
+  },
+  {
+    "log_id": 80,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "claude",
+    "missing_connector": false
+  },
+  {
+    "log_id": 82,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "claude",
+    "missing_connector": false
+  },
+  {
+    "log_id": 83,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "claude",
+    "missing_connector": false
+  },
+  {
+    "log_id": 84,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "claude",
+    "missing_connector": false
+  },
+  {
+    "log_id": 85,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "codex",
+    "missing_connector": false
+  },
+  {
+    "log_id": 86,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "codex",
+    "missing_connector": false
+  },
+  {
+    "log_id": 87,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "codex",
+    "missing_connector": false
+  },
+  {
+    "log_id": 88,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "codex",
+    "missing_connector": false
+  },
+  {
+    "log_id": 89,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "claude",
+    "missing_connector": false
+  },
+  {
+    "log_id": 91,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "claude",
+    "missing_connector": false
+  },
+  {
+    "log_id": 92,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "codex",
+    "missing_connector": false
+  },
+  {
+    "log_id": 93,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "claude",
+    "missing_connector": false
+  },
+  {
+    "log_id": 94,
+    "origin": "observed_traffic",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "claude",
+    "missing_connector": false
+  },
+  {
+    "log_id": 95,
+    "origin": "authored_probe",
+    "task": "Connect to Slack to retrieve the current status.",
+    "verdict": "codex",
+    "missing_connector": false
+  },
+  {
+    "log_id": 96,
+    "origin": "authored_probe",
+    "task": "Connect to Slack to retrieve the current status.",
+    "verdict": "claude",
+    "missing_connector": true
+  },
+  {
+    "log_id": 97,
+    "origin": "authored_probe",
+    "task": "Connect to Slack to retrieve the current status.",
+    "verdict": "claude",
+    "missing_connector": true
+  },
+  {
+    "log_id": 98,
+    "origin": "authored_probe",
+    "task": "Connect to Slack to retrieve the current status.",
+    "verdict": "claude",
+    "missing_connector": true
+  },
+  {
+    "log_id": 99,
+    "origin": "authored_probe",
+    "task": "Connect to Slack to retrieve the current status.",
+    "verdict": "claude",
+    "missing_connector": true
+  },
+  {
+    "log_id": 100,
+    "origin": "authored_probe",
+    "task": "Connect to Slack to retrieve the current status.",
+    "verdict": "claude",
+    "missing_connector": true
+  },
+  {
+    "log_id": 101,
+    "origin": "authored_probe",
+    "task": "Connect to Slack to retrieve the current status.",
+    "verdict": "claude",
+    "missing_connector": true
+  },
+  {
+    "log_id": 102,
+    "origin": "authored_probe",
+    "task": "Connect to Slack to retrieve the current status.",
+    "verdict": "claude",
+    "missing_connector": true
+  },
+  {
+    "log_id": 103,
+    "origin": "authored_probe",
+    "task": "Connect to Slack to retrieve the current status.",
+    "verdict": "claude",
+    "missing_connector": true
+  },
+  {
+    "log_id": 104,
+    "origin": "authored_probe",
+    "task": "Connect to Slack to retrieve the current status.",
+    "verdict": "codex",
+    "missing_connector": false
+  },
+  {
+    "log_id": 105,
+    "origin": "authored_probe",
+    "task": "Connect to Slack to retrieve the current status.",
+    "verdict": "codex",
+    "missing_connector": false
+  },
+  {
+    "log_id": 106,
+    "origin": "authored_probe",
+    "task": "Connect to Slack to retrieve the current status.",
+    "verdict": "codex",
+    "missing_connector": false
+  },
+  {
+    "log_id": 107,
+    "origin": "authored_probe",
+    "task": "Connect to Slack to retrieve the current status.",
+    "verdict": "codex",
+    "missing_connector": false
+  },
+  {
+    "log_id": 108,
+    "origin": "authored_probe",
+    "task": "Connect to Slack to retrieve the current status.",
+    "verdict": "codex",
+    "missing_connector": false
+  },
+  {
+    "log_id": 109,
+    "origin": "authored_probe",
+    "task": "Connect to Slack to retrieve the current status.",
+    "verdict": "codex",
+    "missing_connector": false
+  },
+  {
+    "log_id": 110,
+    "origin": "authored_probe",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "codex",
+    "missing_connector": false
+  },
+  {
+    "log_id": 111,
+    "origin": "authored_probe",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "codex",
+    "missing_connector": false
+  },
+  {
+    "log_id": 112,
+    "origin": "authored_probe",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "codex",
+    "missing_connector": false
+  },
+  {
+    "log_id": 113,
+    "origin": "authored_probe",
+    "task": "Perform a routine code maintenance task.",
+    "verdict": "codex",
+    "missing_connector": false
+  }
+]

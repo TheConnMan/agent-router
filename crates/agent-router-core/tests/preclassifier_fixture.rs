@@ -1,16 +1,14 @@
 //! Integrity checks for the labelled pre classifier evidence set.
 //!
-//! `tests/fixtures/preclassifier_cases.json` is the ground truth used to evaluate whether a cheap
-//! deterministic pre classifier rule could pin some tasks to Claude without paying for the
-//! classifier call. Every case carries the decision log row id it came from, so each label is
-//! traceable back to a real recorded routing decision.
+//! `tests/fixtures/preclassifier_cases.json` is an anonymized corpus used to evaluate whether a
+//! cheap deterministic pre classifier rule could pin some tasks to Claude without paying for the
+//! classifier call. Every case carries a stable surrogate identifier and a preserved classifier
+//! label, while its task text is synthetic and safe to publish.
 //!
-//! Where the labels came from: each case is a `--provider auto` decision log row that carries a
-//! real classifier verdict. Rows whose classifier call failed and fell back are excluded, because
-//! a fallback verdict records the configured default rather than any classifier judgment. Cases
-//! marked `observed_traffic` are decisions from real routing runs. Cases marked `authored_probe`
-//! have hand authored task text, written to cover the near miss cases around connector inventory,
-//! and were then labelled by running the live classifier on them on 2026-08-01.
+//! The labels were captured from automatic routing decisions before the task text was replaced.
+//! Rows whose classifier call failed and fell back are excluded, because a fallback verdict records
+//! the configured default rather than any classifier judgment. `observed_traffic` and
+//! `authored_probe` preserve the original cohort membership without exposing source prompts.
 //!
 //! A label is therefore the classifier's own recorded verdict, not a human judgment about where
 //! the task should have gone. A candidate gate is measured against what the classifier actually
