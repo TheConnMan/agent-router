@@ -210,6 +210,7 @@ impl StatsFixture {
         let mut command = Command::new(env!("CARGO_BIN_EXE_agent-router"));
         command
             .env("HOME", self.root.path.join("home"))
+            .env("GROK_HOME", self.root.path.join("grok-home"))
             .env("CODEX_SESSIONS_DIR", self.root.path.join(sessions))
             .env("PATH", path);
         command

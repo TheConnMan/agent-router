@@ -109,7 +109,9 @@ impl MarkFixture {
 
     fn router(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_agent-router"));
-        command.env("HOME", self.home());
+        command
+            .env("HOME", self.home())
+            .env("GROK_HOME", self.root.path.join("grok-home"));
         command
     }
 

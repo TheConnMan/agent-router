@@ -225,6 +225,7 @@ impl CliFixture {
         let mut command = Command::new(env!("CARGO_BIN_EXE_agent-router"));
         command
             .env("HOME", home)
+            .env("GROK_HOME", self.root.path.join("grok-home"))
             .env("CODEX_SESSIONS_DIR", sessions)
             .env("PATH", path);
         command
@@ -924,6 +925,7 @@ fn mcp_scoping_with_an_explicit_non_claude_provider_exits_nonzero() {
             .arg(provider)
             .args(flags)
             .env("HOME", &home)
+            .env("GROK_HOME", root.path.join("grok-home"))
             .env("PATH", &path)
             .output()
             .expect("run router")
@@ -1012,6 +1014,7 @@ fn explicit_grok_rejects_reasoning_effort_instead_of_logging_an_ignored_value() 
         .arg("--dry-run")
         .arg("--json")
         .env("HOME", root.path.join("home"))
+        .env("GROK_HOME", root.path.join("grok-home"))
         .output()
         .expect("run explicit Grok effort rejection");
 
@@ -1185,6 +1188,7 @@ fn managed_opencode_security_failure_does_not_run_the_detached_cli() {
         .arg("--provider")
         .arg("opencode")
         .env("HOME", home)
+        .env("GROK_HOME", root.path.join("grok-home"))
         .env("PATH", path)
         .env("OPENCODE_SERVER_USERNAME", "router test")
         .env("OPENCODE_SERVER_PASSWORD", "wrong for existing servers")
@@ -1308,6 +1312,7 @@ fn router_terminates_a_server_that_fails_authenticated_readiness() {
         .arg("--provider")
         .arg("opencode")
         .env("HOME", home)
+        .env("GROK_HOME", root.path.join("grok-home"))
         .env("PATH", path)
         .env("OPENCODE_CONFIG_CONTENT", "{}")
         .env("AGENT_ROUTER_FIXTURE_PID_FILE", &pid_file)

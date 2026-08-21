@@ -194,6 +194,10 @@ impl ReviewFixture {
         }
     }
 
+    fn grok_home(&self) -> PathBuf {
+        self.root.path.join("grok-home")
+    }
+
     fn command(&self) -> Command {
         self.command_for("codex", &self.cwd)
     }
@@ -215,6 +219,7 @@ impl ReviewFixture {
             .arg("--dir")
             .arg(dir)
             .env("HOME", home)
+            .env("GROK_HOME", self.grok_home())
             .env("XDG_CONFIG_HOME", self.root.path.join("home/.config"))
             .env("CODEX_SESSIONS_DIR", &self.sessions)
             .env("CLAUDE_USAGE_CACHE", &self.usage_cache)
@@ -376,7 +381,7 @@ fn registered_reviewer_provenance_includes_grok_and_excludes_grok_primary() {
 #[test]
 fn registered_grok_reviewer_requires_an_authoritative_live_leader() {
     let fixture = ReviewFixture::new("grok leader unavailable", Some(23.0));
-    write_grok_usage(&fixture.root.path.join("home/.grok"), 1.0);
+    write_grok_usage(&fixture.grok_home(), 1.0);
 
     let output = fixture.run_json();
     assert_exit(&output, 0);
