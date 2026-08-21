@@ -8,6 +8,7 @@ use agent_router_core::run::parse_provider;
 use agent_router_core::usage::{Headroom, UsageSnapshot, grok_headroom_in};
 use agent_router_core::{Provider, Result};
 use std::path::Path;
+use std::{fs, io::Write as _};
 
 const NOW: i64 = 1_787_313_600;
 const RESET: i64 = 1_787_356_800;
@@ -81,6 +82,33 @@ fn official_grok_billing_log_reads_the_newest_plus_weekly_usage() {
     assert!(headroom.weekly_capacity_known);
     assert!(!headroom.stale);
     assert_eq!(headroom.five_hour_reset_epoch, 0);
+}
+
+#[test]
+fn grok_billing_ignores_events_outside_its_bounded_log_tail() {
+    let directory = tempfile::tempdir().expect("temporary Grok log");
+    let path = directory.path().join("unified.jsonl");
+    let mut log = fs::File::create(&path).expect("create Grok log");
+    writeln!(
+        log,
+        "{}",
+        fs::read_to_string(fixture("grok-billing-known.jsonl"))
+            .expect("read billing fixture")
+            .lines()
+            .last()
+            .expect("billing fixture event")
+    )
+    .expect("write old billing event");
+    log.write_all(&vec![b'x'; 1_048_577])
+        .expect("write oversized newer suffix");
+    writeln!(log).expect("terminate oversized suffix");
+    drop(log);
+
+    assert_eq!(
+        grok_headroom_in(&path, NOW),
+        Headroom::closed(),
+        "an old event outside the bounded tail must not keep Grok eligible"
+    );
 }
 
 #[test]
