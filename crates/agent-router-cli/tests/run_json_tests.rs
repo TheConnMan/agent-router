@@ -184,6 +184,26 @@ impl CliFixture {
             .expect("rewrite the classifier answer");
     }
 
+    fn answers_with_complexity(&self, complexity: &str) {
+        self.answers_with(
+            &json!({
+                "orchestration": false,
+                "missing_connector": false,
+                "complexity": complexity,
+                "task_context_horizon": "ordinary",
+                "rationale": "fixture complexity",
+                "job_name": self.classifier_name,
+            })
+            .to_string(),
+        );
+    }
+
+    fn with_task(mut self, task: &str) -> Self {
+        self.task = task.to_string();
+        self.name = short_job_name(task);
+        self
+    }
+
     /// How many times the fake claude was asked to answer a prompt.
     fn classifier_calls(&self) -> usize {
         fs::read_to_string(&self.classifier_log)
@@ -260,10 +280,9 @@ fn run_json_preserves_provider_decision_and_dispatched_job_identity() {
 
     assert_eq!(value["provider"], "claude");
     assert_eq!(value["model"], "opus[1m]");
-    // The router forces no effort: the backend resolves its own.
-    assert_eq!(value["effort"], Value::Null);
+    assert_eq!(value["effort"], "medium");
     assert_eq!(value["gates"], json!(["explicit_provider"]));
-    assert_eq!(value["classification"], Value::Null);
+    assert_eq!(value["classification"]["complexity"], "medium");
     assert!(value["usage"]["claude"].is_object());
     assert!(value["usage"]["codex"].is_object());
     assert!(
@@ -289,6 +308,8 @@ fn run_json_preserves_provider_decision_and_dispatched_job_identity() {
             "--bg",
             "--model",
             "opus[1m]",
+            "--effort",
+            "medium",
             "--name",
             &fixture.classifier_name,
             &fixture.task
@@ -296,9 +317,8 @@ fn run_json_preserves_provider_decision_and_dispatched_job_identity() {
     );
 }
 
-/// A named provider skips scoring, but not naming: the job it dispatches carries the model's title
-/// rather than the first words of the task. Every explicit dispatch used to be named the derived
-/// way, which is the whole reason bg jobs read as "The Names Of Jobs Through".
+/// A named provider still classifies its downstream model and effort. The same classifier answer
+/// supplies the job title, so one call handles both decisions.
 #[cfg(unix)]
 #[test]
 fn an_explicit_provider_still_names_its_job_with_the_model() {
@@ -321,9 +341,7 @@ fn an_explicit_provider_still_names_its_job_with_the_model() {
         1,
         "one naming call, and no second one"
     );
-    // Naming is not scoring: the explicit route still reports no classification and routes on the
-    // provider it was handed.
-    assert_eq!(value["classification"], Value::Null);
+    assert_eq!(value["classification"]["complexity"], "medium");
     assert_eq!(value["provider"], "claude");
     assert_eq!(value["gates"], json!(["explicit_provider"]));
 }
@@ -360,10 +378,11 @@ fn an_unusable_title_leaves_an_explicit_job_on_its_derived_name() {
     }
 }
 
-/// A dry run dispatches nothing, so there is no job to name and no call to pay for.
+/// A dry run dispatches nothing, but a provider only pin still needs classification for its model
+/// and effort.
 #[cfg(unix)]
 #[test]
-fn an_explicit_dry_run_skips_the_naming_call() {
+fn a_provider_only_dry_run_still_classifies_downstream_values() {
     let dry = CliFixture::new("skip-naming-dry-run");
     let output = dry
         .run_command()
@@ -377,7 +396,7 @@ fn an_explicit_dry_run_skips_the_naming_call() {
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(dry.classifier_calls(), 0);
+    assert_eq!(dry.classifier_calls(), 1);
 }
 
 #[cfg(unix)]
@@ -497,6 +516,8 @@ fn auto_route_uses_the_classifier_generated_job_name() {
             "--bg",
             "--model",
             "opus[1m]",
+            "--effort",
+            "medium",
             "--name",
             "RS-123 Input Box Searching",
             &fixture.task
@@ -550,7 +571,16 @@ fn a_supplied_name_reaches_the_spawned_job_and_the_decision_log_verbatim() {
     assert_eq!(value["dispatch"]["job_name"], name);
     assert_eq!(value["dispatch"]["job_id"], "claude exact id");
     let argv = wait_for_text(&fixture.spawn_log);
-    let expected = ["--bg", "--model", "opus[1m]", "--name", name, &fixture.task];
+    let expected = [
+        "--bg",
+        "--model",
+        "opus[1m]",
+        "--effort",
+        "medium",
+        "--name",
+        name,
+        &fixture.task,
+    ];
     assert_eq!(argv.lines().collect::<Vec<_>>(), expected);
 
     let logged = fixture
@@ -569,9 +599,7 @@ fn a_supplied_name_reaches_the_spawned_job_and_the_decision_log_verbatim() {
     let rows: Value = serde_json::from_slice(&logged.stdout).expect("log json");
     assert_eq!(rows[0]["job_name"], name);
 
-    // A caller that named the job has already decided; asking the model for a title it would then
-    // discard is a call spent on nothing.
-    assert_eq!(fixture.classifier_calls(), 0);
+    assert_eq!(fixture.classifier_calls(), 1);
 }
 
 /// Claude's CLI exposes no effective reasoning effort anywhere: it accepts `--effort`, prints a
@@ -607,10 +635,8 @@ fn a_claude_dispatch_records_no_effective_effort() {
         Value::Null,
         "claude reported no effort, so the router must record none"
     );
-    // Both of the values an inference would most plausibly be built from, sitting in the same
-    // payload as the null the router is required to report.
     assert_eq!(value["model"], "opus[1m]");
-    assert_eq!(value["effort"], Value::Null);
+    assert_eq!(value["effort"], "medium");
 
     let logged = fixture
         .router()
@@ -636,8 +662,8 @@ fn a_claude_dispatch_records_no_effective_effort() {
     );
     assert_eq!(
         row["effort"],
-        Value::Null,
-        "the router decided no effort, which is what this column has always recorded"
+        "medium",
+        "the log must retain the effort the router decided"
     );
     assert_eq!(
         row["effective_effort"],
@@ -650,9 +676,80 @@ fn a_claude_dispatch_records_no_effective_effort() {
     );
     assert_eq!(
         row["task_context_horizon"],
-        Value::Null,
-        "an explicit provider skips classification and therefore records SQL null"
+        "extended",
+        "a provider only pin still records its routing classification"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn pinned_codex_maps_low_and_high_without_moving_provider() {
+    for (label, task, complexity, model, effort) in [
+        ("codex-low", "say hi", "low", "gpt-5.6-luna", "low"),
+        (
+            "codex-high",
+            "/implement redesign the router architecture",
+            "high",
+            "gpt-5.6-sol",
+            "high",
+        ),
+    ] {
+        let fixture = CliFixture::new(label).with_task(task);
+        fixture.answers_with_complexity(complexity);
+
+        let output = fixture
+            .run_command()
+            .arg("--provider")
+            .arg("codex")
+            .arg("--dry-run")
+            .arg("--json")
+            .output()
+            .expect("run router");
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: Value = serde_json::from_slice(&output.stdout).expect("router json");
+
+        assert_eq!(value["provider"], "codex", "task {task:?}");
+        assert_eq!(value["model"], model, "task {task:?}");
+        assert_eq!(value["effort"], effort, "task {task:?}");
+        assert_eq!(
+            value["classification"]["complexity"], complexity,
+            "task {task:?}"
+        );
+        assert_eq!(fixture.classifier_calls(), 1, "task {task:?}");
+        assert!(!fixture.spawn_log.exists(), "dry run dispatched {task:?}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn pinned_claude_classifies_but_stays_on_claude() {
+    let fixture = CliFixture::new("claude-low").with_task("say hi");
+    fixture.answers_with_complexity("low");
+
+    let output = fixture
+        .run_command()
+        .arg("--provider")
+        .arg("claude")
+        .arg("--dry-run")
+        .arg("--json")
+        .output()
+        .expect("run router");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("router json");
+
+    assert_eq!(value["provider"], "claude");
+    assert_eq!(value["model"], "sonnet");
+    assert_eq!(value["effort"], "low");
+    assert_eq!(value["classification"]["complexity"], "low");
+    assert_eq!(fixture.classifier_calls(), 1);
 }
 
 /// The auto path picks its model from the complexity tiers, so a `--model` alongside it can only be
@@ -682,21 +779,23 @@ fn auto_provider_with_an_explicit_model_fails_naming_both_flags() {
     assert!(!fixture.spawn_log.exists(), "the rejected pair ran claude");
 }
 
-/// Complementary half of the auto-plus-model guard: an explicit provider paired with an explicit
-/// model must be allowed through, and the model must actually reach the spawned claude argv. Do
-/// not delete this as redundant with the auto-provider rejection test above; that test only
-/// covers the reject branch of the guard, this one covers the accept branch.
+/// A provider and model pin keeps the supplied model exact while classification derives effort.
 #[cfg(unix)]
 #[test]
-fn explicit_provider_with_an_explicit_model_succeeds_and_forwards_the_model() {
-    let fixture = CliFixture::new("explicit-plus-model");
+fn provider_and_model_pins_preserve_model_and_derive_only_effort() {
+    let name = "Pinned Model Job";
+    let fixture = CliFixture::listing_agent_named("explicit-plus-model", Some(name));
+    fixture.answers_with_complexity("high");
 
     let output = fixture
         .run_command()
         .arg("--provider")
         .arg("claude")
         .arg("--model")
-        .arg("sonnet")
+        .arg("claude-custom-model")
+        .arg("--name")
+        .arg(name)
+        .arg("--json")
         .output()
         .expect("run router");
 
@@ -705,6 +804,13 @@ fn explicit_provider_with_an_explicit_model_succeeds_and_forwards_the_model() {
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("router json");
+
+    assert_eq!(value["provider"], "claude");
+    assert_eq!(value["model"], "claude-custom-model");
+    assert_eq!(value["effort"], "high");
+    assert_eq!(value["classification"]["complexity"], "high");
+    assert_eq!(fixture.classifier_calls(), 1);
 
     assert_eq!(
         wait_for_text(&fixture.spawn_log)
@@ -713,9 +819,11 @@ fn explicit_provider_with_an_explicit_model_succeeds_and_forwards_the_model() {
         vec![
             "--bg",
             "--model",
-            "sonnet",
+            "claude-custom-model",
+            "--effort",
+            "high",
             "--name",
-            &fixture.classifier_name,
+            name,
             &fixture.task
         ]
     );
