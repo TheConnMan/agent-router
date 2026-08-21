@@ -94,6 +94,11 @@ pub fn run(request: &Request, config: &Config) -> Result<Outcome> {
             ));
         }
     }
+    if request.provider == Some(Provider::Grok) && request.effort.is_some() {
+        return Err(Error::Command(
+            "Grok does not support --effort; omit it".to_string(),
+        ));
+    }
     // An empty or whitespace only name beats the derived default because it is Some, so it would
     // reach the spawned job and orphan it. A loud error is correct, since a caller passing an
     // empty name believes it set a specific one.

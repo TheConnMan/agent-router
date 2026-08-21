@@ -17,6 +17,7 @@
 
 use crate::runtime::{default_codex_home, home_dir};
 use std::ffi::OsStr;
+use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -43,6 +44,7 @@ const CODEX_SCAN_N: usize = 20;
 const WINDOW_FIVE_HOUR: i64 = 300;
 /// `window_minutes` of the weekly window.
 const WINDOW_WEEKLY: i64 = 10080;
+const GROK_LOG_TAIL_MAX_BYTES: u64 = 1_048_576;
 
 /// One provider's usage snapshot: percent of each window consumed, plus when it resets.
 /// Percentages are 0-100; a reset epoch of 0 means "not known".
@@ -133,12 +135,15 @@ impl UsageSnapshot {
 
 /// IMPURE: the Grok snapshot from the official CLI billing log.
 pub fn grok_headroom() -> Headroom {
-    grok_headroom_in(&home_dir().join(".grok/logs/unified.jsonl"), now_epoch())
+    grok_headroom_in(
+        &crate::dispatch::grok::grok_home().join("logs/unified.jsonl"),
+        now_epoch(),
+    )
 }
 
 /// PURE except for reading `path`: the newest official weekly SuperGrok Plus billing event.
 pub fn grok_headroom_in(path: &Path, now: i64) -> Headroom {
-    let Ok(text) = std::fs::read_to_string(path) else {
+    let Some(text) = bounded_log_tail(path) else {
         return Headroom::closed();
     };
     let Some(value) = text.lines().rev().find_map(|line| {
@@ -180,6 +185,22 @@ pub fn grok_headroom_in(path: &Path, now: i64) -> Headroom {
         weekly_capacity_known: usage.is_some(),
         stale: false,
     }
+}
+
+fn bounded_log_tail(path: &Path) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let length = file.metadata().ok()?.len();
+    let offset = length.saturating_sub(GROK_LOG_TAIL_MAX_BYTES);
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    let mut bytes = Vec::with_capacity((length - offset) as usize);
+    file.take(GROK_LOG_TAIL_MAX_BYTES)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if offset > 0 {
+        let first_complete = bytes.iter().position(|byte| *byte == b'\n')? + 1;
+        bytes.drain(..first_complete);
+    }
+    String::from_utf8(bytes).ok()
 }
 
 // ---------------------------------------------------------------- Claude

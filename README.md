@@ -35,10 +35,11 @@ log: row 87 in /home/you/.local/state/agent-router/router.db
    force and the decision is tagged `classifier_failed`. The same classifier model also generates
    the job title. A ticket ID leads the title, followed by two to six concise Title Case words, such
    as `GH-123 Sprint 2 Bug Fixes` or `RS-123 Input Box Searching`. A run that names its provider is
-   The routing classifier runs whenever provider, model, or effort is omitted. An explicit provider
-   therefore pins only the provider: omitted model and effort values still come from classification.
-   A fully exact provider, model, and effort pin skips routing classification. Job naming remains a
-   separate title call when a name was not supplied and dispatch is not a dry run.
+   The routing classifier runs whenever provider, model, or effort is omitted for Claude or Codex.
+   An explicit Claude or Codex provider therefore pins only the provider: omitted model and effort
+   values still come from classification. Grok and OpenCode skip cross-provider classification;
+   job naming remains a separate title call when a name was not supplied and dispatch is not a dry
+   run.
 2. **Apply the capability pin.** A missing connector, a task needing several agents to exchange
    findings mid-run, or a build-tier `/implement` run (`implement_context_window`), pins to Claude
    regardless of usage. These are statements that the task cannot run on Codex at all, so every
@@ -63,16 +64,16 @@ log: row 87 in /home/you/.local/state/agent-router/router.db
    hard ceiling (`five_hour_pacing`), because an exhausted 5 hour window stalls the job rather than
    merely costing more. Automatic task routing considers Codex and Claude only. Grok is never
    selected by `--provider auto`, including when its capacity is known. An unavailable Grok
-   capacity reading records the `grok_unavailable` gate as observability only and cannot cause task
-   selection to move to Grok.
+   capacity reading records the `grok_unavailable` gate on an explicit Grok route as observability
+   only and cannot cause automatic task selection to move to Grok.
 4. **Complete the provider, model, and effort pins.** With no pins, classification chooses the
    provider through usage routing, then complexity chooses the Codex or Claude model from its tier
    table and maps low to low, medium to medium, and high or ultra to high effort. An explicit
-   provider preserves that provider while classification fills omitted model and effort. An
-   explicit provider and model preserves both while classification fills effort. Three explicit
-   values are exact and skip routing classification. Grok and OpenCode are explicit only. Grok
-   accepts an explicit model but never receives reasoning effort; OpenCode has no derived model and
-   receives no derived effort.
+   Claude or Codex provider preserves that provider while classification fills omitted model and
+   effort. An explicit Claude or Codex provider and model preserves both while classification fills
+   effort. Three explicit values are exact and skip routing classification. Grok and OpenCode are
+   explicit only. Grok accepts an explicit model and rejects `--effort`; OpenCode has no derived
+   model and receives no derived effort.
 5. **Dispatch and log.** The job is spawned detached, its backend job id is resolved, and the whole
    decision lands in a SQLite decision log.
 

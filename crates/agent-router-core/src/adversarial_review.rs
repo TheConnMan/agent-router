@@ -67,6 +67,10 @@ pub trait ReviewProvider {
     fn usage(&self) -> Option<Headroom>;
     fn review(&self, request: &ReviewRequest<'_>) -> Result<String>;
 
+    fn authoritative_availability(&self) -> std::result::Result<(), String> {
+        Ok(())
+    }
+
     fn review_with_identity(
         &self,
         request: &ReviewRequest<'_>,
@@ -243,6 +247,18 @@ fn select_provider<'a>(
                 stale: true,
                 eligible: false,
                 rejection_reason: Some("primary provider excluded".to_string()),
+            });
+            continue;
+        }
+
+        if let Err(reason) = provider.authoritative_availability() {
+            rationale.push(format!("{name} rejected because {reason}"));
+            usage_provenance.push(CandidateUsage {
+                provider: name.to_string(),
+                weekly_pct: None,
+                stale: true,
+                eligible: false,
+                rejection_reason: Some(reason),
             });
             continue;
         }
@@ -458,6 +474,20 @@ impl ReviewProvider for GrokReviewProvider {
 
     fn usage(&self) -> Option<Headroom> {
         Some(grok_headroom())
+    }
+
+    fn authoritative_availability(&self) -> std::result::Result<(), String> {
+        let lifecycle = GrokLifecycle::new("grok", grok_home());
+        let diagnostics = lifecycle
+            .diagnostics()
+            .map_err(|error| format!("authoritative Grok leader diagnostics failed: {error}"))?;
+        if !diagnostics.binary_available {
+            return Err("Grok binary is unavailable".to_string());
+        }
+        if !diagnostics.registered {
+            return Err("authoritative Grok leader is unavailable".to_string());
+        }
+        Ok(())
     }
 
     fn review(&self, request: &ReviewRequest<'_>) -> Result<String> {
