@@ -716,11 +716,19 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("router.db");
         let log = DecisionLog::open_at(&path).expect("opens");
-        let decision = decision();
+        let automatic = decision();
+        let decision = crate::decide::decide_explicit(
+            crate::Provider::Grok,
+            None,
+            None,
+            automatic.classification,
+            automatic.usage,
+            &Config::default(),
+        );
         log.record(&Entry {
             task: "t",
             dir: Path::new("/tmp"),
-            requested: "auto",
+            requested: "grok",
             decision: &decision,
             dry_run: true,
             job_id: None,
@@ -737,7 +745,7 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .expect("query");
-        assert_eq!(gates, "grok_unavailable");
+        assert_eq!(gates, "explicit_provider,grok_unavailable");
         assert_eq!(five_hour, 11.0);
         assert_eq!(weekly_reset, 1_785_908_348);
     }
