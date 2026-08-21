@@ -105,6 +105,28 @@ fn write_codex_usage(path: &Path, weekly_pct: i64) {
     );
 }
 
+fn write_grok_usage(path: &Path, weekly_pct: f64) {
+    write_file(
+        &path.join("logs/unified.jsonl"),
+        &format!(
+            "{}\n",
+            json!({
+                "msg": "billing: fetched credits config",
+                "ctx": {
+                    "subscriptionTier": "SuperGrok Plus",
+                    "config": {
+                        "creditUsagePercent": weekly_pct,
+                        "currentPeriod": {
+                            "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                            "end": "2099-01-07T00:00:00Z",
+                        },
+                    },
+                },
+            })
+        ),
+    );
+}
+
 struct ReviewFixture {
     root: TempDir,
     cwd: PathBuf,
@@ -349,6 +371,27 @@ fn registered_reviewer_provenance_includes_grok_and_excludes_grok_primary() {
     assert_ne!(value["reviewer_provider"], "grok");
     let grok = candidate_provenance(&value, "grok");
     assert_eq!(grok["eligible"], false);
+}
+
+#[test]
+fn registered_grok_reviewer_requires_an_authoritative_live_leader() {
+    let fixture = ReviewFixture::new("grok leader unavailable", Some(23.0));
+    write_grok_usage(&fixture.root.path.join("home/.grok"), 1.0);
+
+    let output = fixture.run_json();
+    assert_exit(&output, 0);
+    let value = parse_json(&output);
+
+    assert_eq!(value["reviewer_provider"], "claude");
+    let grok = candidate_provenance(&value, "grok");
+    assert_eq!(grok["weekly_pct"], Value::Null);
+    assert_eq!(grok["eligible"], false);
+    assert!(
+        grok["rejection_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("leader")),
+        "unexpected Grok rejection: {grok}"
+    );
 }
 
 #[test]

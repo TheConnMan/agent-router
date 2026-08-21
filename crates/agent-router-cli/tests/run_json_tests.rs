@@ -989,6 +989,100 @@ fn mcp_scoping_with_an_explicit_non_claude_provider_exits_nonzero() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn explicit_grok_rejects_reasoning_effort_instead_of_logging_an_ignored_value() {
+    let root = TempDir::new("grok-effort");
+    let cwd = root.path.join("working");
+    fs::create_dir_all(&cwd).expect("create cwd");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agent-router"))
+        .arg("run")
+        .arg("review the router")
+        .arg("--dir")
+        .arg(&cwd)
+        .arg("--provider")
+        .arg("grok")
+        .arg("--model")
+        .arg("grok-4")
+        .arg("--effort")
+        .arg("high")
+        .arg("--name")
+        .arg("Grok Effort Rejection")
+        .arg("--dry-run")
+        .arg("--json")
+        .env("HOME", root.path.join("home"))
+        .output()
+        .expect("run explicit Grok effort rejection");
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Grok does not support --effort"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_grok_usage_honors_the_same_grok_home_as_its_lifecycle() {
+    let root = TempDir::new("grok-home-usage");
+    let home = root.path.join("home");
+    let grok_home = root.path.join("custom-grok-home");
+    let cwd = root.path.join("working");
+    fs::create_dir_all(&home).expect("create home");
+    fs::create_dir_all(grok_home.join("logs")).expect("create Grok logs");
+    fs::create_dir_all(&cwd).expect("create cwd");
+    fs::write(
+        grok_home.join("logs/unified.jsonl"),
+        format!(
+            "{}\n",
+            json!({
+                "msg": "billing: fetched credits config",
+                "ctx": {
+                    "subscriptionTier": "SuperGrok Plus",
+                    "config": {
+                        "creditUsagePercent": 37.5,
+                        "currentPeriod": {
+                            "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                            "end": "2099-01-07T00:00:00Z",
+                        },
+                    },
+                },
+            })
+        ),
+    )
+    .expect("write Grok billing log");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agent-router"))
+        .arg("run")
+        .arg("review the router")
+        .arg("--dir")
+        .arg(&cwd)
+        .arg("--provider")
+        .arg("grok")
+        .arg("--model")
+        .arg("grok-4")
+        .arg("--name")
+        .arg("Grok Home Usage")
+        .arg("--dry-run")
+        .arg("--json")
+        .env("HOME", &home)
+        .env("GROK_HOME", &grok_home)
+        .output()
+        .expect("run explicit Grok dry run");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("router json");
+    assert_eq!(value["usage"]["grok"]["weekly_pct"], 37.5);
+    assert_eq!(value["usage"]["grok"]["weekly_capacity_known"], true);
+    assert_eq!(value["usage"]["grok"]["stale"], false);
+}
+
 /// An empty `--name` is `Some("")`, which beats the derived default name and would spawn a job with
 /// an empty name. `resolve_short_id` matches agent rows by name, so that job becomes unresolvable and
 /// silently orphaned, which is exactly what the flag exists to prevent.
