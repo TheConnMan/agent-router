@@ -52,6 +52,19 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Run a synchronous read only review on an eligible alternative provider.
+    AdversarialReview {
+        /// The review request.
+        request: String,
+        /// The provider running the calling thread. This provider is excluded.
+        #[arg(long)]
+        primary: String,
+        /// Working directory for the review. Defaults to the current directory.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Weekly and 5h headroom for both providers.
     Usage {
         #[arg(long)]
@@ -111,6 +124,12 @@ fn main() -> std::process::ExitCode {
         Command::Doctor => doctor_exit(),
         Command::Parity { roots, json } => parity_exit(roots, json),
         Command::Status { limit, since, json } => status_exit(limit, since, json),
+        Command::AdversarialReview {
+            request,
+            primary,
+            dir,
+            json,
+        } => adversarial_review_exit(request, primary, dir, json),
         command => match run(Cli { command }) {
             Ok(()) => std::process::ExitCode::SUCCESS,
             Err(e) => {
@@ -118,6 +137,108 @@ fn main() -> std::process::ExitCode {
                 std::process::ExitCode::FAILURE
             }
         },
+    }
+}
+
+fn adversarial_review_exit(
+    body: String,
+    primary: String,
+    dir: Option<PathBuf>,
+    json: bool,
+) -> std::process::ExitCode {
+    let primary_provider = match agent_router_core::run::parse_provider(&primary) {
+        Ok(Some(provider)) => provider.name(),
+        Ok(None) => {
+            return print_adversarial_review(
+                &agent_router_core::adversarial_review::failed_outcome(
+                    &primary,
+                    "primary provider must be codex, claude, or opencode",
+                ),
+                json,
+            );
+        }
+        Err(error) => {
+            return print_adversarial_review(
+                &agent_router_core::adversarial_review::failed_outcome(&primary, error.to_string()),
+                json,
+            );
+        }
+    };
+    let dir = match dir {
+        Some(dir) => dir,
+        None => match std::env::current_dir() {
+            Ok(dir) => dir,
+            Err(error) => {
+                return print_adversarial_review(
+                    &agent_router_core::adversarial_review::failed_outcome(
+                        primary_provider,
+                        error.to_string(),
+                    ),
+                    json,
+                );
+            }
+        },
+    };
+    let config = match agent_router_core::Config::load() {
+        Ok(config) => config,
+        Err(error) => {
+            return print_adversarial_review(
+                &agent_router_core::adversarial_review::failed_outcome(
+                    primary_provider,
+                    error.to_string(),
+                ),
+                json,
+            );
+        }
+    };
+    let request = agent_router_core::adversarial_review::ReviewRequest {
+        primary_provider,
+        body: &body,
+        dir: &dir,
+    };
+    let outcome = agent_router_core::adversarial_review::review_registered(&request, &config);
+    print_adversarial_review(&outcome, json)
+}
+
+fn print_adversarial_review(
+    outcome: &agent_router_core::adversarial_review::ReviewOutcome,
+    json: bool,
+) -> std::process::ExitCode {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(outcome)
+                .expect("serializing an adversarial review outcome cannot fail")
+        );
+    } else {
+        match outcome.status {
+            agent_router_core::adversarial_review::ReviewStatus::Completed => {
+                let result = outcome.result.as_deref().unwrap_or_default();
+                print!("{result}");
+                if !result.ends_with('\n') {
+                    println!();
+                }
+            }
+            agent_router_core::adversarial_review::ReviewStatus::Skipped
+            | agent_router_core::adversarial_review::ReviewStatus::Failed => {
+                eprintln!(
+                    "{}",
+                    escape_terminal_controls(outcome.reason.as_deref().unwrap_or("review failed"))
+                );
+            }
+        }
+    }
+
+    match outcome.status {
+        agent_router_core::adversarial_review::ReviewStatus::Completed => {
+            std::process::ExitCode::SUCCESS
+        }
+        agent_router_core::adversarial_review::ReviewStatus::Skipped => {
+            std::process::ExitCode::from(3)
+        }
+        agent_router_core::adversarial_review::ReviewStatus::Failed => {
+            std::process::ExitCode::FAILURE
+        }
     }
 }
 
@@ -317,6 +438,9 @@ fn run(cli: Cli) -> agent_router_core::Result<()> {
             json,
         } => log(limit, &mark, note.as_deref(), json),
         Command::Stats { limit, since, json } => stats(limit, since, json),
+        Command::AdversarialReview { .. } => {
+            unreachable!("adversarial review has a command specific exit path")
+        }
         Command::Doctor => unreachable!("doctor has a command specific exit path"),
         Command::Parity { .. } => unreachable!("parity has a command specific exit path"),
         Command::Status { .. } => unreachable!("status has a command specific exit path"),

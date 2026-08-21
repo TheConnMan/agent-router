@@ -1,6 +1,7 @@
 //! Routing machinery for `agent-router`: usage readers, the decision engine, the decision log,
 //! and provider dispatch.
 
+pub mod adversarial_review;
 pub mod classify;
 pub mod config;
 pub mod decide;
