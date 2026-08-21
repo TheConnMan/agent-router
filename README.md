@@ -180,6 +180,28 @@ them. That interacts badly with routing: a task sent to Claude precisely because
 a connector can lose the very connector it was routed for. Pass it only when the job genuinely
 needs nothing beyond the files given.
 
+### `adversarial-review`
+
+Run a review synchronously with an eligible provider other than the provider that initiated the
+request. The primary provider is always excluded. Candidate providers must be registered as
+review capable, have a known and fresh weekly capacity reading, and be below 90 percent usage.
+The command does not classify the request or start a detached background job. It waits for the
+review to reach a terminal result, then prints the review body.
+
+```bash
+# Have a provider other than Codex review the request and wait for the result.
+agent-router adversarial-review --primary codex "Review the proposed authentication change"
+
+# Return the decision and review body as machine-readable JSON.
+agent-router adversarial-review --primary codex --json "Review the proposed authentication change"
+```
+
+Text mode prints the completed review body. JSON reports `status`, `primary_provider`,
+`reviewer_provider`, `reviewer_model`, usage provenance, the selection rationale, and `result` when
+the review completes. When no eligible alternative exists, it reports the reason and exits `3`.
+A completed review exits `0`; an invocation or infrastructure failure exits `1`. Review execution
+uses the provider's sealed read-only review contract and is never routed through an ordinary task.
+
 ### `usage`
 
 Weekly and 5 hour headroom for both providers.
