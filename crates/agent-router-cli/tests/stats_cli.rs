@@ -434,9 +434,8 @@ fn stats_json_reconciles_with_the_log_json_it_summarises() {
     // - Claude's window is not (no cache and no credentials, which is every CI runner), so claude
     //   is ineligible too and the pair falls through to the default with the reason recorded.
     //
-    // Grok is unavailable without authoritative capacity, so its gate always records first. Both
-    // vectors prove the usage plumbing reached the decision, which is all this assertion is for;
-    // the flip rate is not pinned to a number here and `tests/stats.rs` owns the gate semantics.
+    // Both prove the usage plumbing reached the decision, which is all this assertion is for; the
+    // flip rate is not pinned to a number here and `tests/stats.rs` owns the gate semantics.
     //
     // Asserting a single gate here passed on any developer box and failed only in CI, because the
     // second vector needs a machine with no Claude usage to read.
@@ -446,8 +445,7 @@ fn stats_json_reconciles_with_the_log_json_it_summarises() {
         .expect("the row decided against an exhausted codex");
     let fired = gate_tags(exhausted);
     assert!(
-        fired == ["grok_unavailable", "flipped_on_exhaustion"]
-            || fired == ["grok_unavailable", "weekly_unknown", "over_ceiling"],
+        fired == ["flipped_on_exhaustion"] || fired == ["weekly_unknown", "over_ceiling"],
         "an exhausted codex must fire a weekly gate, got {fired:?}"
     );
 

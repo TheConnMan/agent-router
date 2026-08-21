@@ -3,7 +3,7 @@ use agent_router_core::adversarial_review::{
 };
 use agent_router_core::classify::{Classification, Complexity, TaskContextHorizon};
 use agent_router_core::config::Config;
-use agent_router_core::decide::{Gate, decide};
+use agent_router_core::decide::{Gate, decide, decide_explicit};
 use agent_router_core::run::parse_provider;
 use agent_router_core::usage::{Headroom, UsageSnapshot, grok_headroom_in};
 use agent_router_core::{Provider, Result};
@@ -111,7 +111,26 @@ fn missing_grok_percentage_keeps_grok_out_of_automatic_candidates() {
         Provider::Codex,
         "Codex is the only eligible provider; unknown Grok must not look empty"
     );
-    assert!(decision.gates.contains(&Gate::GrokUnavailable));
+    assert!(
+        !decision.gates.contains(&Gate::GrokUnavailable),
+        "automatic routing must not record a gate for an explicit only provider"
+    );
+
+    let explicit = decide_explicit(
+        Provider::Grok,
+        None,
+        None,
+        Some(plain_task()),
+        UsageSnapshot {
+            claude: known(99.0),
+            codex: known(80.0),
+            grok,
+        },
+        &Config::default(),
+    );
+
+    assert_eq!(explicit.provider, Provider::Grok);
+    assert!(explicit.gates.contains(&Gate::GrokUnavailable));
 }
 
 #[test]

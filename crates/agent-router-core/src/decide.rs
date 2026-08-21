@@ -219,9 +219,6 @@ pub fn decide(
         if !config.policy.weekly_routing {
             gates.push(Gate::WeeklyRoutingDisabled);
         } else {
-            if !usage.grok.weekly_known() || usage.grok.weekly_reset_epoch == 0 {
-                gates.push(Gate::GrokUnavailable);
-            }
             let other = other_provider(provider);
             // Fail closed on a weekly number nobody read. The percentage of an unread window is 0,
             // which is the same reading as a genuinely idle provider, so trusting it hands every
@@ -415,12 +412,18 @@ pub fn decide_explicit(
             )
         })
         .unwrap_or_else(|| format!("{} requested explicitly", provider.name()));
+    let mut gates = vec![Gate::ExplicitProvider];
+    if provider == Provider::Grok
+        && (!usage.grok.weekly_known() || usage.grok.weekly_reset_epoch == 0)
+    {
+        gates.push(Gate::GrokUnavailable);
+    }
     Decision {
         provider,
         model,
         effort,
         classification,
-        gates: vec![Gate::ExplicitProvider],
+        gates,
         usage,
         // No usage rule ran, so no projection was measured. Recording one anyway would put a number
         // in the log that nothing consulted, which the next backtest would read as a rule firing.
