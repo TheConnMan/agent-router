@@ -328,6 +328,30 @@ fn completed_human_output_is_the_review_body() {
 }
 
 #[test]
+fn registered_reviewer_provenance_includes_grok_and_excludes_grok_primary() {
+    let fixture = ReviewFixture::new("grok reviewer provenance", Some(23.0));
+
+    let output = fixture.run_json();
+    assert_exit(&output, 0);
+    let value = parse_json(&output);
+    let grok = candidate_provenance(&value, "grok");
+    assert_eq!(grok["provider"], "grok");
+
+    let output = fixture
+        .command_for("grok", &fixture.cwd)
+        .arg("--json")
+        .output()
+        .expect("run Grok-primary adversarial review");
+
+    assert_exit(&output, 0);
+    let value = parse_json(&output);
+    assert_eq!(value["primary_provider"], "grok");
+    assert_ne!(value["reviewer_provider"], "grok");
+    let grok = candidate_provenance(&value, "grok");
+    assert_eq!(grok["eligible"], false);
+}
+
+#[test]
 fn stale_or_over_limit_alternative_returns_json_skip_and_exit_three() {
     for (label, weekly_pct, expected_rationale) in
         [("stale", None, "stale"), ("ceiling", Some(90.0), "90")]

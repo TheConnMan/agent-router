@@ -394,6 +394,29 @@ fn doctor_does_not_create_a_config_file_it_was_asked_to_check() {
     );
 }
 
+/// Grok is an explicit provider, but its lifecycle still depends on both the public binary and an
+/// authoritative registered leader. Doctor must expose those prerequisites without attempting a
+/// dispatch, writing configuration, or reading credentials into its output.
+#[test]
+fn doctor_reports_grok_binary_and_authoritative_leader_registration() {
+    let fixture = DoctorFixture::new("grok-lifecycle-diagnostics");
+    let config = fixture.home().join(".config/agent-router/config.toml");
+    assert!(
+        !config.exists(),
+        "the fixture home starts without a config file"
+    );
+
+    let stdout = fixture.doctor_stdout(LIVE_SESSIONS, false);
+
+    check_line(&stdout, "grok_binary");
+    check_line(&stdout, "grok_leader_registration");
+    assert!(
+        !config.exists(),
+        "a Grok diagnostic created the state it was diagnosing: {}",
+        config.display()
+    );
+}
+
 /// A fail open claude printing `0.0%  0.0%` with nothing else on the line is exactly the
 /// indistinguishable case the marker exists to kill, so the row says where its numbers came from.
 #[test]

@@ -97,7 +97,7 @@ impl StatusFixture {
     /// every job out, and whose codex refuses every invocation, so the daemon probe answers None.
     fn new(label: &str) -> Self {
         let root = TempDir::new(label);
-        for child in ["home", "bin"] {
+        for child in ["home", "bin", "grok-home"] {
             fs::create_dir_all(root.path.join(child)).expect("create fixture directory");
         }
         // The helper writes the interpreter line, so the body starts at the first real command.
@@ -185,6 +185,7 @@ impl StatusFixture {
         let mut command = Command::new(env!("CARGO_BIN_EXE_agent-router"));
         command
             .env("HOME", self.home())
+            .env("GROK_HOME", self.root.path.join("grok-home"))
             .env("PATH", self.root.path.join("bin"));
         command
     }
@@ -664,6 +665,59 @@ fn an_opencode_row_keeps_its_outcome_because_the_reconciler_cannot_ask() {
         Value::Null,
         "nothing was read for this row, so nothing may claim it was: {logged}"
     );
+}
+
+/// Grok has a lifecycle to inspect, even when an isolated home carries no session data. Its
+/// absence or temporary unavailability is an unknown fresh observation, and must not replace
+/// terminal facts a prior lifecycle observation already proved.
+#[test]
+fn a_grok_lifecycle_observation_preserves_proven_terminal_outcomes() {
+    let fixture = StatusFixture::new("grok-empty-home");
+    let completed = fixture.seed(
+        Provider::Grok,
+        Some("grok-session-completed"),
+        Some("a routed job"),
+        false,
+        "dispatched",
+    );
+    let failed = fixture.seed(
+        Provider::Grok,
+        Some("grok-session-failed"),
+        Some("a routed job"),
+        false,
+        "dispatched",
+    );
+
+    let log = DecisionLog::open_at(&fixture.db_path()).expect("open the fixture log");
+    log.reconcile(completed, "completed")
+        .expect("record the proven completion");
+    log.reconcile(failed, "failed")
+        .expect("record the proven failure");
+    drop(log);
+
+    let output = fixture
+        .router()
+        .args(["status", "--json"])
+        .output()
+        .expect("run the router");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a persisted failed outcome remains a finding, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status: Value = serde_json::from_slice(&output.stdout).expect("status json");
+    for id in [completed, failed] {
+        let row = reported_row(&status, id);
+        assert!(
+            matches!(row["observation"].as_str(), Some("absent" | "unavailable")),
+            "an empty GROK_HOME must be observed through Grok lifecycle rather than treated as unsupported: {row}"
+        );
+        assert_eq!(row["state"], "unknown", "the reported row: {row}");
+    }
+
+    assert_eq!(fixture.logged(completed)["outcome"], "completed");
+    assert_eq!(fixture.logged(failed)["outcome"], "failed");
 }
 
 /// An empty window prints its header and exits zero, in the same shape `stats` reports a window
