@@ -867,6 +867,14 @@ fn mcp_scoping_with_an_explicit_non_claude_provider_exits_nonzero() {
     fs::create_dir_all(&cwd).expect("create cwd");
     let config = root.path.join("scoped.mcp.json");
     fs::write(&config, r#"{"mcpServers":{}}"#).expect("write config");
+    let classifier_log = root.path.join("classifier.argv");
+    common::write_stub(
+        &bin.join("claude"),
+        &format!(
+            "printf '%s\\n' \"$@\" >> {}\nexit 1\n",
+            shell_quote(&classifier_log.to_string_lossy())
+        ),
+    );
     let grok_log = root.path.join("grok.argv");
     common::write_stub(
         &bin.join("grok"),
@@ -911,6 +919,10 @@ fn mcp_scoping_with_an_explicit_non_claude_provider_exits_nonzero() {
             !stderr.contains("unexpected argument"),
             "{provider} does not accept --mcp-config at all: {stderr}"
         );
+        assert!(
+            !classifier_log.exists(),
+            "{provider} disclosed the rejected task to the classifier"
+        );
         if provider == "grok" {
             assert!(
                 !grok_log.exists(),
@@ -934,6 +946,10 @@ fn mcp_scoping_with_an_explicit_non_claude_provider_exits_nonzero() {
         assert!(
             !stderr.contains("unexpected argument"),
             "{provider} does not accept --strict-mcp-config at all: {stderr}"
+        );
+        assert!(
+            !classifier_log.exists(),
+            "{provider} disclosed the rejected task to the classifier"
         );
         if provider == "grok" {
             assert!(
