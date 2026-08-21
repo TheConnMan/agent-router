@@ -4,9 +4,11 @@ use agent_router_core::adversarial_review::{
 use agent_router_core::classify::{Classification, Complexity, TaskContextHorizon};
 use agent_router_core::config::Config;
 use agent_router_core::decide::{Gate, decide, decide_explicit};
+use agent_router_core::dispatch::grok::dispatch_with_lifecycle;
 use agent_router_core::run::parse_provider;
 use agent_router_core::usage::{Headroom, UsageSnapshot, grok_headroom_in};
 use agent_router_core::{Provider, Result};
+use agent_viewer_core::SpawnResult;
 use std::path::Path;
 use std::{fs, io::Write as _};
 
@@ -71,6 +73,31 @@ fn explicit_grok_provider_parses_to_its_own_backend() {
         serde_json::to_string(&Provider::Grok).expect("serialize provider"),
         r#""grok""#
     );
+}
+
+#[test]
+fn grok_dispatch_returns_the_exact_official_lifecycle_identity() {
+    let official_identity = "8e058c03-1058-4d53-a10f-635abc3460a9";
+    let dispatch = dispatch_with_lifecycle(
+        Path::new("/tmp"),
+        "Review the router",
+        "Exact Grok Identity",
+        Some("grok-4"),
+        |cwd, task, model| {
+            assert_eq!(cwd, Path::new("/tmp"));
+            assert_eq!(task, "Review the router");
+            assert_eq!(model, Some("grok-4"));
+            Ok(SpawnResult {
+                pid: None,
+                session_id: Some(official_identity.to_string()),
+            })
+        },
+    )
+    .expect("Grok lifecycle dispatch");
+
+    assert_eq!(dispatch.job_id.as_deref(), Some(official_identity));
+    assert_eq!(dispatch.job_name, "Exact Grok Identity");
+    assert_eq!(dispatch.effective_effort, None);
 }
 
 #[test]

@@ -11,6 +11,7 @@
 use agent_router_core::dispatch::codex::{CodexRpc, thread_states_on_rpc};
 use agent_router_core::status::{Observation, State, classify, settle};
 use agent_router_core::{Error, Result};
+use agent_viewer_core::Status as GrokStatus;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
 
@@ -133,6 +134,17 @@ fn a_pure_classifier_maps_every_known_backend_state_and_refuses_the_unknown_ones
         ),
         (Observation::Unavailable, State::Unknown),
         (Observation::Unsupported, State::Unknown),
+        (Observation::GrokStatus(GrokStatus::Working), State::Running),
+        (Observation::GrokStatus(GrokStatus::Done), State::Completed),
+        (Observation::GrokStatus(GrokStatus::Error), State::Failed),
+        (Observation::GrokStatus(GrokStatus::Idle), State::Unknown),
+        (Observation::GrokStatus(GrokStatus::Unknown), State::Unknown),
+        (
+            Observation::GrokStatus(GrokStatus::NeedsInput {
+                reason: Some("approval required".to_string()),
+            }),
+            State::Unknown,
+        ),
     ];
 
     for (observation, want) in cases {

@@ -176,8 +176,8 @@ agent-router run "Fix the failing test" --dir ~/git/other-project
 | --- | --- | --- |
 | `--dir <PATH>` | current directory | Working directory for the dispatched job. |
 | `--provider <NAME>` | `auto` | `auto` classifies provider, model, and effort between Codex and Claude. An explicit `codex`, `claude`, `grok`, or `opencode` pins the provider. Grok and OpenCode are explicit only. |
-| `--model <NAME>` | tier table | Model pin. Requires an explicit `--provider`. With an explicit provider and no effort, classification fills effort. Pairing it with `--provider auto` is rejected. An explicit Grok model reaches the public lifecycle unchanged. OpenCode does not derive a model. |
-| `--effort <NAME>` | complexity mapping | Effort pin. Requires an explicit provider and model. Low maps to low, medium to medium, and high or ultra maps to high for Codex and Claude. Grok and OpenCode do not receive derived effort. |
+| `--model <NAME>` | tier table | Model pin. Requires an explicit `--provider`. With explicit Claude or Codex and no effort, classification fills effort. Pairing it with `--provider auto` is rejected. An explicit Grok model reaches the public lifecycle unchanged. OpenCode does not derive a model. |
+| `--effort <NAME>` | complexity mapping | Effort pin. Requires an explicit provider and model. Low maps to low, medium to medium, and high or ultra maps to high for Codex and Claude. Grok rejects this flag; OpenCode does not receive derived effort. |
 | `--name <NAME>` | the model's title, or three to five words derived from the task | Name for the dispatched job. Supplying it skips the naming call. It reaches the `claude --bg --name` argv verbatim, names the Codex thread, and is recorded as `job_name` in the decision log for every provider, so callers that reconcile inflight jobs by exact name depend on it. An empty or whitespace only name is rejected. |
 | `--dry-run` | off | Decide and log, dispatch nothing, and project the weekly draw the job is likely to cost on the provider it landed on. |
 | `--mcp-config <PATH>` | none | MCP config file for the dispatched Claude job. Repeatable. Rejected for every other provider, including Grok, and the check runs after routing, so pairing it with `--provider auto` fails whenever classification lands on a provider other than Claude. |
@@ -229,11 +229,14 @@ Text mode prints the completed review body. JSON reports `status`, `primary_prov
 `reviewer_provider`, `reviewer_model`, usage provenance, the selection rationale, and `result` when
 the review completes. When no eligible alternative exists, it reports the reason and exits `3`.
 A completed review exits `0`; an invocation or infrastructure failure exits `1`. Review execution
-uses the provider's sealed read only review contract and is never routed through an ordinary task.
-For Grok, the result also carries the exact official lifecycle session identity. Grok reviewer
-sessions are disposable: after Router reads the final review text, it uses the same public
-lifecycle to remove only the session it created. A failed cleanup is reported rather than silently
-leaving a reviewer session behind.
+uses the provider's review contract and is never routed through an ordinary task. Claude and Codex
+are launched with enforced read only restrictions. Grok's persistent lifecycle currently registers
+in YOLO mode: its prompt asks for read only review behavior and supplies no MCP servers, but Grok's
+server side tools are not sandboxed. Selecting Grok therefore trusts it not to mutate the working
+tree or execute side effects. For Grok, the result also carries the exact official lifecycle
+session identity. Grok reviewer sessions are disposable: after Router reads the final review text,
+it uses the same public lifecycle to remove only the session it created. A failed cleanup is
+reported rather than silently leaving a reviewer session behind.
 
 ### `usage`
 
