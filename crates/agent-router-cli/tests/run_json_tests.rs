@@ -445,6 +445,10 @@ fn auto_runs_log_context_horizon_without_changing_provider_or_model() {
     );
     assert_eq!(ordinary["provider"], extended["provider"]);
     assert_eq!(ordinary["model"], extended["model"]);
+    assert!(
+        matches!(ordinary["provider"].as_str(), Some("codex" | "claude")),
+        "automatic routing must select only a capacity backed provider: {ordinary}"
+    );
 
     let ordinary_logged = ordinary_fixture
         .router()
@@ -487,6 +491,27 @@ fn auto_runs_log_context_horizon_without_changing_provider_or_model() {
         "row: {extended_row:?}"
     );
     assert_eq!(extended_row["task_context_horizon"], "extended");
+}
+
+/// Provider names in help are a public contract. Omitting Grok here leaves an otherwise supported
+/// explicit dispatch undiscoverable from the CLI itself.
+#[cfg(unix)]
+#[test]
+fn run_help_lists_grok_as_an_explicit_provider() {
+    let output = Command::new(env!("CARGO_BIN_EXE_agent-router"))
+        .args(["run", "--help"])
+        .output()
+        .expect("run router help");
+    assert!(
+        output.status.success(),
+        "run --help failed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("grok"),
+        "run --help must list the Grok provider: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
 }
 
 #[cfg(unix)]
@@ -842,6 +867,14 @@ fn mcp_scoping_with_an_explicit_non_claude_provider_exits_nonzero() {
     fs::create_dir_all(&cwd).expect("create cwd");
     let config = root.path.join("scoped.mcp.json");
     fs::write(&config, r#"{"mcpServers":{}}"#).expect("write config");
+    let grok_log = root.path.join("grok.argv");
+    common::write_stub(
+        &bin.join("grok"),
+        &format!(
+            "printf '%s\\n' \"$@\" > {}\n",
+            shell_quote(&grok_log.to_string_lossy())
+        ),
+    );
     // A sandbox PATH holding no provider binaries, so nothing real can be dispatched.
     let path = bin.display().to_string();
     let route = |provider: &str, flags: &[&str]| -> Output {
@@ -860,7 +893,7 @@ fn mcp_scoping_with_an_explicit_non_claude_provider_exits_nonzero() {
     };
 
     let config_arg = config.to_string_lossy().to_string();
-    for provider in ["codex", "opencode"] {
+    for provider in ["codex", "grok", "opencode"] {
         let output = route(provider, &["--mcp-config", &config_arg]);
         let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -878,23 +911,37 @@ fn mcp_scoping_with_an_explicit_non_claude_provider_exits_nonzero() {
             !stderr.contains("unexpected argument"),
             "{provider} does not accept --mcp-config at all: {stderr}"
         );
+        if provider == "grok" {
+            assert!(
+                !grok_log.exists(),
+                "Grok was invoked before --mcp-config was refused"
+            );
+        }
     }
 
-    let output = route("opencode", &["--strict-mcp-config"]);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        !output.status.success(),
-        "opencode accepted --strict-mcp-config: {}",
-        String::from_utf8_lossy(&output.stdout)
-    );
-    assert!(
-        stderr.contains("--strict-mcp-config"),
-        "opencode did not name the rejected flag: {stderr}"
-    );
-    assert!(
-        !stderr.contains("unexpected argument"),
-        "opencode does not accept --strict-mcp-config at all: {stderr}"
-    );
+    for provider in ["grok", "opencode"] {
+        let output = route(provider, &["--strict-mcp-config"]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "{provider} accepted --strict-mcp-config: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            stderr.contains("--strict-mcp-config"),
+            "{provider} did not name the rejected flag: {stderr}"
+        );
+        assert!(
+            !stderr.contains("unexpected argument"),
+            "{provider} does not accept --strict-mcp-config at all: {stderr}"
+        );
+        if provider == "grok" {
+            assert!(
+                !grok_log.exists(),
+                "Grok was invoked before --strict-mcp-config was refused"
+            );
+        }
+    }
 }
 
 /// An empty `--name` is `Some("")`, which beats the derived default name and would spawn a job with

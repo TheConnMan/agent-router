@@ -42,25 +42,35 @@ use std::{
 mod common;
 
 #[test]
-fn router_build_inputs_are_independent_of_the_sibling_viewer() {
+fn grok_uses_the_public_viewer_lifecycle_without_owning_its_protocol() {
     let core = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let workspace = core
-        .parent()
-        .and_then(Path::parent)
-        .expect("workspace root");
-    let inputs = [
-        workspace.join("Cargo.toml"),
-        workspace.join("Cargo.lock"),
-        core.join("Cargo.toml"),
-        workspace.join("crates/agent-router-cli/Cargo.toml"),
-    ];
+    let manifest = fs::read_to_string(core.join("Cargo.toml")).expect("read core manifest");
+    let grok_dispatch =
+        fs::read_to_string(core.join("src/dispatch/grok.rs")).expect("read Grok dispatch");
 
-    for input in inputs {
-        let text = fs::read_to_string(&input).expect("read build input");
+    assert!(
+        manifest.contains("agent-viewer-core"),
+        "Grok dispatch must depend on agent-viewer-core's public lifecycle"
+    );
+    assert!(
+        grok_dispatch.contains("agent_viewer_core") && grok_dispatch.contains("GrokLifecycle"),
+        "Grok dispatch must import the public GrokLifecycle"
+    );
+    for owned_protocol_detail in [
+        "UnixStream",
+        "TcpStream",
+        "WebSocket",
+        "tungstenite",
+        "session/new",
+        "session/prompt",
+        "serde_json::from_str",
+        "serde_json::Value",
+        "spawn_detached",
+        ".arg(\"-p\")",
+    ] {
         assert!(
-            !text.contains("agent-viewer"),
-            "{} still couples the standalone router to agent-viewer",
-            input.display()
+            !grok_dispatch.contains(owned_protocol_detail),
+            "Grok dispatch must delegate {owned_protocol_detail} to agent-viewer-core"
         );
     }
 }

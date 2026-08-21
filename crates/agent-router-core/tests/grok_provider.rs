@@ -1,9 +1,12 @@
+use agent_router_core::adversarial_review::{
+    ReviewProvider, ReviewRequest, ReviewStatus, review_with_providers,
+};
 use agent_router_core::classify::{Classification, Complexity, TaskContextHorizon};
 use agent_router_core::config::Config;
 use agent_router_core::decide::{Gate, decide};
 use agent_router_core::run::parse_provider;
 use agent_router_core::usage::{Headroom, UsageSnapshot, grok_headroom_in};
-use agent_router_core::Provider;
+use agent_router_core::{Provider, Result};
 use std::path::Path;
 
 const NOW: i64 = 1_787_313_600;
@@ -34,6 +37,26 @@ fn plain_task() -> Classification {
         rationale: "portable fixture".to_string(),
         classifier_failed: false,
         invokes_implement: false,
+    }
+}
+
+struct EligibleGrokReviewer;
+
+impl ReviewProvider for EligibleGrokReviewer {
+    fn provider_name(&self) -> &str {
+        "grok"
+    }
+
+    fn reviewer_model(&self) -> &str {
+        "grok-review"
+    }
+
+    fn usage(&self) -> Option<Headroom> {
+        Some(known(20.0))
+    }
+
+    fn review(&self, _: &ReviewRequest<'_>) -> Result<String> {
+        Ok("completed Grok adversarial review".to_string())
     }
 }
 
@@ -86,4 +109,60 @@ fn missing_grok_percentage_keeps_grok_out_of_automatic_candidates() {
         "Codex is the only eligible provider; unknown Grok must not look empty"
     );
     assert!(decision.gates.contains(&Gate::GrokUnavailable));
+}
+
+#[test]
+fn automatic_routing_never_selects_grok_regardless_of_its_reported_capacity() {
+    let unknown_grok = Headroom {
+        weekly_pct: 0.0,
+        weekly_reset_epoch: RESET,
+        weekly_capacity_known: false,
+        stale: false,
+        ..Headroom::full()
+    };
+    let scenarios = [
+        (known(95.0), known(10.0), known(0.0)),
+        (known(10.0), known(95.0), known(0.0)),
+        (known(95.0), known(10.0), unknown_grok.clone()),
+        (known(10.0), known(95.0), unknown_grok),
+    ];
+
+    for (claude, codex, grok) in scenarios {
+        let decision = decide(
+            plain_task(),
+            UsageSnapshot {
+                claude,
+                codex,
+                grok,
+            },
+            NOW,
+            &Config::default(),
+        );
+
+        assert!(
+            matches!(decision.provider, Provider::Codex | Provider::Claude),
+            "automatic routing selected {:?} instead of one of its two authorized providers",
+            decision.provider
+        );
+    }
+}
+
+#[test]
+fn grok_can_be_an_eligible_adversarial_reviewer_without_joining_automatic_routing() {
+    let grok = EligibleGrokReviewer;
+    let request = ReviewRequest {
+        primary_provider: "codex",
+        body: "Review this change for regressions",
+        dir: Path::new("/tmp"),
+    };
+
+    let outcome = review_with_providers(&request, &[&grok]).expect("eligible reviewer completes");
+
+    assert_eq!(outcome.status, ReviewStatus::Completed);
+    assert_eq!(outcome.reviewer_provider.as_deref(), Some("grok"));
+    assert_eq!(outcome.reviewer_model.as_deref(), Some("grok-review"));
+    assert_eq!(outcome.result.as_deref(), Some("completed Grok adversarial review"));
+    assert_eq!(outcome.usage_provenance.len(), 1);
+    assert_eq!(outcome.usage_provenance[0].provider, "grok");
+    assert!(outcome.usage_provenance[0].eligible);
 }
