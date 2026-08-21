@@ -110,13 +110,23 @@ pub fn run(request: &Request, config: &Config) -> Result<Outcome> {
             request.dir.display()
         )));
     }
+    // A named provider is already known before classification. Reject Claude only scoping here so
+    // a request that cannot run never discloses its task to the configured classifier first.
+    if let Some(provider) = request.provider {
+        crate::dispatch::reject_mcp_scoping(request, provider)?;
+    }
     let usage = UsageSnapshot::read();
-    let needs_classification =
-        request.provider.is_none() || request.model.is_none() || request.effort.is_none();
+    let derives_routing_values = matches!(
+        request.provider,
+        None | Some(Provider::Codex | Provider::Claude)
+    );
+    let needs_classification = request.provider.is_none()
+        || (derives_routing_values && (request.model.is_none() || request.effort.is_none()));
     let classified = needs_classification.then(|| classify_with_name(request.task, config));
     let generated_name = if request.name.is_none() && !request.dry_run {
         match &classified {
             Some(classified) => classified.job_name.clone(),
+            None if !derives_routing_values => None,
             None => crate::classify::job_name(request.task, config),
         }
     } else {

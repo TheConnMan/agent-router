@@ -201,6 +201,11 @@ implement an ACP client or durable Grok session parser. The lifecycle's nonempty
 identity is copied unchanged into the dispatch result and decision log as `job_id`; use that exact
 identity with `agent-router status`.
 
+The lifecycle connects only to the persistent user leader. Install and enable the reference
+`grok-agent-leader.service` shipped by `agent-viewer-core` before dispatching. Router never starts
+or owns the leader and never runs `grok --single`. Interactive attachment remains Viewer owned and
+uses `grok --leader --resume <session-id>` so attaching cannot replace the shared leader.
+
 ### `adversarial-review`
 
 Run a review synchronously with an eligible provider other than the provider that initiated the
@@ -271,7 +276,7 @@ pass codex_app_server    the app-server daemon answers
 pass codex_rate_limits   live, read from the provider's own source
 warn opencode_on_path    no executable opencode on PATH, so any dispatch to it will error
 warn grok_binary         no executable grok on PATH, so explicit Grok dispatch will error
-warn grok_leader_registration  no authoritative Grok leader is registered, so Grok review is unavailable
+warn grok_leader_registration  no authoritative persistent Grok leader is registered, so Grok dispatch and review are unavailable
 pass config_parses       absent, defaults apply (/home/you/.config/agent-router/config.toml)
 pass log_writable        /home/you/.local/state/agent-router/router.db takes a write
 ```
@@ -286,7 +291,7 @@ pass log_writable        /home/you/.local/state/agent-router/router.db takes a w
 | `codex_rate_limits` | Whether the Codex usage read was live or fell open. |
 | `opencode_on_path` | An executable `opencode` on `PATH`. |
 | `grok_binary` | An executable `grok` on `PATH`. Doctor only observes it and does not create Grok configuration. |
-| `grok_leader_registration` | Whether the public Grok lifecycle reports an authoritative registered leader. This is separate from the binary check and is required for Grok reviewer selection. |
+| `grok_leader_registration` | Whether the public Grok lifecycle reports an authoritative persistent leader. This is separate from the binary check and is required for explicit Grok dispatch and Grok reviewer selection. |
 | `config_parses` | The config file parses, read directly so a diagnostic never creates the file it was asked to report on. An absent file is a pass: the router runs on the same defaults. |
 | `log_writable` | The decision log opens and takes an actual write. Opening alone proves nothing, because the schema batch is all `IF NOT EXISTS` and can succeed on a database the next dispatch cannot write to. |
 

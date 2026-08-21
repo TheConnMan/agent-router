@@ -7,7 +7,7 @@ description = "Routing machinery for agent-router: usage readers, classifier, de
 repository = "https://github.com/TheConnMan/agent-router"
 
 [dependencies]
-agent-viewer-core = { git = "https://github.com/TheConnMan/agent-viewer", rev = "94b1639110d2a219519dab5f3e0ce3456499a4a9" }
+agent-viewer-core = { git = "https://github.com/TheConnMan/agent-viewer", rev = "13c1e5e357afd1f4fef420b855e980bfd0ad33bc" }
 base64 = "0.22.1"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }

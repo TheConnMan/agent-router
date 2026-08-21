@@ -37,7 +37,7 @@ dependencies = [
 [[package]]
 name = "agent-viewer-core"
 version = "1.0.0"
-source = "git+https://github.com/TheConnMan/agent-viewer?rev=94b1639110d2a219519dab5f3e0ce3456499a4a9#94b1639110d2a219519dab5f3e0ce3456499a4a9"
+source = "git+https://github.com/TheConnMan/agent-viewer?rev=13c1e5e357afd1f4fef420b855e980bfd0ad33bc#13c1e5e357afd1f4fef420b855e980bfd0ad33bc"
 dependencies = [
  "libc",
  "portable-pty",
@@ -309,7 +309,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -740,7 +740,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -963,7 +963,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
