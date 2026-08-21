@@ -126,7 +126,7 @@ fn automatic_routing_never_selects_grok_regardless_of_its_reported_capacity() {
     let scenarios = [
         (known(95.0), known(10.0), known(0.0)),
         (known(10.0), known(95.0), known(0.0)),
-        (known(95.0), known(10.0), unknown_grok.clone()),
+        (known(95.0), known(10.0), unknown_grok),
         (known(10.0), known(95.0), unknown_grok),
     ];
 
