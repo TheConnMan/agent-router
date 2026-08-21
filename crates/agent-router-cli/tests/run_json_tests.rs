@@ -399,6 +399,35 @@ fn a_provider_only_dry_run_still_classifies_downstream_values() {
     assert_eq!(dry.classifier_calls(), 1);
 }
 
+/// Grok and OpenCode have no derived model or effort, so naming either provider must not disclose
+/// the task to a different provider merely to compute values that will be discarded.
+#[cfg(unix)]
+#[test]
+fn explicit_providers_without_derived_values_skip_classification() {
+    for provider in ["grok", "opencode"] {
+        let fixture = CliFixture::new(&format!("{provider}-no-classifier"));
+        let output = fixture
+            .run_command()
+            .arg("--provider")
+            .arg(provider)
+            .arg("--dry-run")
+            .arg("--json")
+            .output()
+            .expect("run router");
+        assert!(
+            output.status.success(),
+            "{provider} stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: Value = serde_json::from_slice(&output.stdout).expect("router json");
+        assert_eq!(value["provider"], provider);
+        assert_eq!(value["model"], Value::Null);
+        assert_eq!(value["effort"], Value::Null);
+        assert_eq!(value["classification"], Value::Null);
+        assert_eq!(fixture.classifier_calls(), 0, "provider {provider}");
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn auto_runs_log_context_horizon_without_changing_provider_or_model() {
