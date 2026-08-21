@@ -560,13 +560,14 @@ fn stats_json_emits_a_bad_rate_by_gate_that_reconciles_against_the_marked_rows()
 
     // The counts a reader can check by hand. Two rows named their provider, so both carry
     // `explicit_provider` and both are judged, one bad: 1 of 2. One row could not be classified,
-    // it is judged bad, and no other row carries that tag: 1 of 1. Explicit providers still run
-    // classification to derive omitted downstream settings, so both explicit rows read medium.
+    // it is judged bad, and no other row carries that tag: 1 of 1. Claude derives its omitted
+    // downstream settings and reads medium. OpenCode derives nothing and remains unscored.
     let by_gate = rate_map(&stats, "bad_rate_by_gate");
     assert_eq!(by_gate.get("explicit_provider").copied(), Some((1, 2)));
     assert_eq!(by_gate.get("classifier_failed").copied(), Some((1, 1)));
     let by_complexity = rate_map(&stats, "bad_rate_by_complexity");
-    assert_eq!(by_complexity.get("medium").copied(), Some((1, 2)));
+    assert_eq!(by_complexity.get("medium").copied(), Some((1, 1)));
+    assert_eq!(by_complexity.get("unscored").copied(), Some((0, 1)));
     assert_eq!(by_complexity.get("high").copied(), Some((1, 1)));
     assert_eq!(by_complexity.get("low").copied(), Some((0, 1)));
     // The ultra row is the only one at its tier and is not judged, so it has no bad rate at all.
