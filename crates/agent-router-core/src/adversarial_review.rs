@@ -481,9 +481,6 @@ impl ReviewProvider for GrokReviewProvider {
         let diagnostics = lifecycle
             .diagnostics()
             .map_err(|error| format!("authoritative Grok leader diagnostics failed: {error}"))?;
-        if !diagnostics.binary_available {
-            return Err("Grok binary is unavailable".to_string());
-        }
         if !diagnostics.registered {
             return Err("authoritative Grok leader is unavailable".to_string());
         }
