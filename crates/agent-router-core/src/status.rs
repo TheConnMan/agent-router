@@ -11,7 +11,9 @@ use crate::error::Result;
 use crate::log::{DecisionLog, StatusRow};
 use crate::runtime::home_dir;
 use crate::stats::Window;
+use agent_viewer_core::{GrokLifecycle, Status as GrokStatus};
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// The claude job list is one process, and the reconciler has no reason to wait longer for it than
@@ -32,6 +34,10 @@ pub enum Observation {
     CodexTurn(String),
     /// The thread's own status, read only when the thread carries no turn record at all.
     CodexThread(String),
+    /// The status returned by the public Grok lifecycle for one exact session identity.
+    GrokStatus(GrokStatus),
+    /// More than one Grok lifecycle row carried the requested exact session identity.
+    Ambiguous,
     /// We could not ask: no daemon answered, `claude` is not on PATH, or the call errored.
     Unavailable,
     /// We have no way to ask. Opencode exposes no status API.
@@ -47,6 +53,15 @@ impl Observation {
             Observation::Absent => "absent".to_string(),
             Observation::CodexTurn(status) => format!("turn {status}"),
             Observation::CodexThread(status) => format!("thread {status}"),
+            Observation::GrokStatus(status) => match status {
+                GrokStatus::Working => "working".to_string(),
+                GrokStatus::NeedsInput { .. } => "needs input".to_string(),
+                GrokStatus::Idle => "idle".to_string(),
+                GrokStatus::Done => "done".to_string(),
+                GrokStatus::Error => "error".to_string(),
+                GrokStatus::Unknown => "unknown".to_string(),
+            },
+            Observation::Ambiguous => "ambiguous".to_string(),
             Observation::Unavailable => "unavailable".to_string(),
             Observation::Unsupported => "unsupported".to_string(),
         }
@@ -150,7 +165,18 @@ pub fn classify(observation: Observation) -> State {
             "systemError" => State::Failed,
             _ => State::Unknown,
         },
-        Observation::Absent | Observation::Unavailable | Observation::Unsupported => State::Unknown,
+        Observation::GrokStatus(status) => match status {
+            GrokStatus::Working => State::Running,
+            GrokStatus::Done => State::Completed,
+            GrokStatus::Error => State::Failed,
+            GrokStatus::NeedsInput { .. } | GrokStatus::Idle | GrokStatus::Unknown => {
+                State::Unknown
+            }
+        },
+        Observation::Absent
+        | Observation::Ambiguous
+        | Observation::Unavailable
+        | Observation::Unsupported => State::Unknown,
     }
 }
 
@@ -206,6 +232,7 @@ pub fn reconcile(log: &DecisionLog, window: Window) -> Result<Report> {
     let rows = log.status_rows(window.limit, window.since_ms)?;
     let claude = claude_states(&rows);
     let codex = codex_states(&rows);
+    let grok = grok_states(&rows);
 
     let mut reported = Vec::with_capacity(rows.len());
     for row in &rows {
@@ -221,6 +248,13 @@ pub fn reconcile(log: &DecisionLog, window: Window) -> Result<Report> {
                 .get(&row.job_id)
                 .cloned()
                 .unwrap_or(Observation::Unavailable),
+            "grok" => match &grok {
+                Some(states) => states
+                    .get(&row.job_id)
+                    .cloned()
+                    .unwrap_or(Observation::Absent),
+                None => Observation::Unavailable,
+            },
             _ => Observation::Unsupported,
         };
         // Selected by the row's own provider column, never by the shape of the id string, so a
@@ -271,6 +305,35 @@ fn codex_states(rows: &[StatusRow]) -> BTreeMap<String, Observation> {
         return BTreeMap::new();
     }
     crate::dispatch::codex::thread_states(&thread_ids)
+}
+
+/// IMPURE: one public lifecycle listing serves every Grok row in the window. Exact duplicate
+/// identities are ambiguous rather than whichever row happened to be listed last.
+fn grok_states(rows: &[StatusRow]) -> Option<BTreeMap<String, Observation>> {
+    if !rows.iter().any(|row| row.provider == "grok") {
+        return None;
+    }
+    let sessions = GrokLifecycle::new("grok", grok_home()).list().ok()?;
+    let mut states = BTreeMap::new();
+    for session in sessions {
+        use std::collections::btree_map::Entry;
+        match states.entry(session.id) {
+            Entry::Vacant(entry) => {
+                entry.insert(Observation::GrokStatus(session.status));
+            }
+            Entry::Occupied(mut entry) => {
+                entry.insert(Observation::Ambiguous);
+            }
+        }
+    }
+    Some(states)
+}
+
+fn grok_home() -> PathBuf {
+    std::env::var_os("GROK_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().join(".grok"))
 }
 
 /// IMPURE: whether a claude session left a transcript on disk, which answers whether there is

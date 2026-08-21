@@ -11,6 +11,7 @@ use crate::error::Error;
 use crate::log::DecisionLog;
 use crate::runtime::home_dir;
 use crate::usage::UsageSnapshot;
+use agent_viewer_core::GrokLifecycle;
 use std::path::{Path, PathBuf};
 
 /// How one check landed.
@@ -50,19 +51,85 @@ pub fn run() -> Report {
     let usage = UsageSnapshot::read();
     let claude_installed = on_path("claude").is_some();
     let codex_installed = on_path("codex").is_some();
-    Report {
-        checks: vec![
-            required_binary("claude_on_path", "claude"),
-            claude_credentials(),
-            usage_source("claude_usage", usage.claude.stale, claude_installed),
-            optional_binary("codex_on_path", "codex"),
-            codex_app_server(),
-            usage_source("codex_rate_limits", usage.codex.stale, codex_installed),
-            optional_binary("opencode_on_path", "opencode"),
-            config_parses(),
-            log_writable(),
-        ],
+    let mut checks = vec![
+        required_binary("claude_on_path", "claude"),
+        claude_credentials(),
+        usage_source("claude_usage", usage.claude.stale, claude_installed),
+        optional_binary("codex_on_path", "codex"),
+        codex_app_server(),
+        usage_source("codex_rate_limits", usage.codex.stale, codex_installed),
+    ];
+    checks.extend(grok_checks());
+    checks.extend([
+        optional_binary("opencode_on_path", "opencode"),
+        config_parses(),
+        log_writable(),
+    ]);
+    Report { checks }
+}
+
+/// Observe both Grok lifecycle prerequisites without starting a leader or creating configuration.
+/// Grok is explicit only, so an unavailable path warns rather than failing the whole router.
+fn grok_checks() -> [Check; 2] {
+    let lifecycle = GrokLifecycle::new("grok", grok_home());
+    match lifecycle.diagnostics() {
+        Ok(diagnostics) => {
+            let binary = if diagnostics.binary_available {
+                pass(
+                    "grok_binary",
+                    format!("grok is available through {}", diagnostics.binary.display()),
+                )
+            } else {
+                warn(
+                    "grok_binary",
+                    format!(
+                        "no executable {} is available, so explicit Grok dispatch will error",
+                        diagnostics.binary.display()
+                    ),
+                )
+            };
+            let leader = if diagnostics.registered {
+                pass(
+                    "grok_leader_registration",
+                    format!(
+                        "an authoritative leader is registered among {} candidate(s)",
+                        diagnostics.leader_count
+                    ),
+                )
+            } else {
+                warn(
+                    "grok_leader_registration",
+                    format!(
+                        "no authoritative leader is registered among {} candidate(s), and doctor does not start one",
+                        diagnostics.leader_count
+                    ),
+                )
+            };
+            [binary, leader]
+        }
+        Err(error) => {
+            let detail = one_line(&error);
+            [
+                warn(
+                    "grok_binary",
+                    format!("Grok lifecycle diagnostics were unavailable: {detail}"),
+                ),
+                warn(
+                    "grok_leader_registration",
+                    format!(
+                        "Grok lifecycle diagnostics were unavailable and doctor did not start a leader: {detail}"
+                    ),
+                ),
+            ]
+        }
     }
+}
+
+fn grok_home() -> PathBuf {
+    std::env::var_os("GROK_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().join(".grok"))
 }
 
 /// A binary the router cannot work without. The classifier runs on every auto route, and a

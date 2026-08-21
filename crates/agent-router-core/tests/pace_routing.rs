@@ -56,7 +56,11 @@ fn unknown_window(weekly_pct: f64, five_hour_pct: f64) -> Headroom {
 }
 
 fn usage(claude: Headroom, codex: Headroom) -> UsageSnapshot {
-    UsageSnapshot { claude, codex }
+    UsageSnapshot {
+        claude,
+        codex,
+        grok: Headroom::closed(),
+    }
 }
 
 /// A blowout: Codex 80 percent through its allowance with half its window gone, so it projects to

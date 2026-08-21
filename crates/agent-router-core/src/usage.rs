@@ -107,6 +107,7 @@ impl Headroom {
 pub struct UsageSnapshot {
     pub claude: Headroom,
     pub codex: Headroom,
+    pub grok: Headroom,
 }
 
 impl UsageSnapshot {
@@ -115,6 +116,7 @@ impl UsageSnapshot {
         UsageSnapshot {
             claude: claude_headroom(),
             codex: codex_headroom(),
+            grok: grok_headroom(),
         }
     }
 
@@ -122,7 +124,61 @@ impl UsageSnapshot {
         UsageSnapshot {
             claude: Headroom::full(),
             codex: Headroom::full(),
+            grok: Headroom::closed(),
         }
+    }
+}
+
+// ---------------------------------------------------------------- Grok
+
+/// IMPURE: the Grok snapshot from the official CLI billing log.
+pub fn grok_headroom() -> Headroom {
+    grok_headroom_in(&home_dir().join(".grok/logs/unified.jsonl"), now_epoch())
+}
+
+/// PURE except for reading `path`: the newest official weekly SuperGrok Plus billing event.
+pub fn grok_headroom_in(path: &Path, now: i64) -> Headroom {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Headroom::closed();
+    };
+    let Some(value) = text.lines().rev().find_map(|line| {
+        let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
+        (value.get("msg").and_then(serde_json::Value::as_str)
+            == Some("billing: fetched credits config"))
+        .then_some(value)
+    }) else {
+        return Headroom::closed();
+    };
+    if value
+        .pointer("/ctx/subscriptionTier")
+        .and_then(serde_json::Value::as_str)
+        != Some("SuperGrok Plus")
+        || value
+            .pointer("/ctx/config/currentPeriod/type")
+            .and_then(serde_json::Value::as_str)
+            != Some("USAGE_PERIOD_TYPE_WEEKLY")
+    {
+        return Headroom::closed();
+    }
+    let Some(reset) = value
+        .pointer("/ctx/config/currentPeriod/end")
+        .and_then(serde_json::Value::as_str)
+        .and_then(parse_rfc3339_epoch)
+        .filter(|reset| *reset > now)
+    else {
+        return Headroom::closed();
+    };
+    let usage = value
+        .pointer("/ctx/config/creditUsagePercent")
+        .and_then(serde_json::Value::as_f64)
+        .filter(|usage| usage.is_finite() && (0.0..=100.0).contains(usage));
+    Headroom {
+        five_hour_pct: 0.0,
+        five_hour_reset_epoch: 0,
+        weekly_pct: usage.unwrap_or(0.0),
+        weekly_reset_epoch: reset,
+        weekly_capacity_known: usage.is_some(),
+        stale: false,
     }
 }
 

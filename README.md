@@ -1,9 +1,9 @@
 # agent-router
 
-Route one task to Codex, Claude, or OpenCode by task shape and weekly usage headroom, dispatch it
-as a detached background job, and record why the decision was made.
+Route one task automatically to Codex or Claude by task shape and weekly usage headroom, or
+dispatch explicitly to Grok or OpenCode, then record why the decision was made.
 
-The problem it solves: two coding agents with separate weekly quotas, and a running judgement call
+The problem it solves: two automatic routing providers with separate weekly quotas, and a running judgement call
 about which one a given task belongs to. `agent-router` makes that call explicitly, from a fixed
 rubric plus live usage, and logs every decision so the routing policy can be tuned against real
 data instead of memory.
@@ -61,14 +61,18 @@ log: row 87 in /home/you/.local/state/agent-router/router.db
    other provider projects lower (`projected_overdraw`). Finally a task still bound for Claude moves to Codex
    when Claude's 5 hour percent is at or above `claude_five_hour_pacing_pct` and Codex is under the
    hard ceiling (`five_hour_pacing`), because an exhausted 5 hour window stalls the job rather than
-   merely costing more.
+   merely costing more. Automatic task routing considers Codex and Claude only. Grok is never
+   selected by `--provider auto`, including when its capacity is known. An unavailable Grok
+   capacity reading records the `grok_unavailable` gate as observability only and cannot cause task
+   selection to move to Grok.
 4. **Complete the provider, model, and effort pins.** With no pins, classification chooses the
    provider through usage routing, then complexity chooses the Codex or Claude model from its tier
    table and maps low to low, medium to medium, and high or ultra to high effort. An explicit
    provider preserves that provider while classification fills omitted model and effort. An
    explicit provider and model preserves both while classification fills effort. Three explicit
-   values are exact and skip routing classification. OpenCode keeps its existing dispatch contract:
-   it is explicit only, has no derived model, and receives no derived effort.
+   values are exact and skip routing classification. Grok and OpenCode are explicit only. Grok
+   accepts an explicit model but never receives reasoning effort; OpenCode has no derived model and
+   receives no derived effort.
 5. **Dispatch and log.** The job is spawned detached, its backend job id is resolved, and the whole
    decision lands in a SQLite decision log.
 
@@ -116,6 +120,7 @@ cargo install --path crates/agent-router-cli
 | --- | --- | --- |
 | `claude` | Claude dispatch, Claude usage, and classification on the default engine | Must be on `PATH` and logged in. With the default `engine = "claude"` the classifier runs on every `--provider auto` call, so `claude` is exercised even when every task ends up on Codex. |
 | `codex` | Codex dispatch, Codex usage, and classification when `engine = "codex"` | Dispatch goes through `codex app-server daemon`, which the router starts on demand. |
+| `grok` | Explicit Grok dispatch and an eligible Grok adversarial review | Optional. Router reuses Agent Viewer's public lifecycle and never configures Grok itself. |
 | `opencode` | OpenCode dispatch | Optional. Only reached via an explicit `--provider opencode`. |
 
 The classifier engine is a budget decision rather than a quality one: scoring is a single small
@@ -129,6 +134,9 @@ Codex has no known weekly capacity and is ineligible for automatic routing. If n
 has known capacity, the router still dispatches to the configured default. `agent-router doctor`
 reports the source status and exits nonzero for a stale read, `agent-router usage` names the source
 per provider, and every decision row records `claude_usage_stale` and `codex_usage_stale`.
+Grok capacity is observed for adversarial review eligibility only. It never participates in
+ordinary automatic task routing, and an unavailable or nonauthoritative reading makes Grok
+ineligible as a reviewer.
 
 Usage comes from:
 
@@ -137,6 +145,8 @@ Usage comes from:
   that shared cache, which the statusline and other tooling also read.
 - **Codex**: the newest rollout under `$CODEX_HOME/sessions` (default `~/.codex/sessions`) that
   carries a `rate_limits` event. Override the scan root with `$CODEX_SESSIONS_DIR`.
+- **Grok**: the official CLI billing log under `~/.grok/logs/unified.jsonl`. It is used only to
+  decide whether a registered Grok reviewer has authoritative capacity.
 
 ## Usage
 
@@ -154,6 +164,9 @@ agent-router run "Refactor the parity scanner" --dry-run
 # Pin the provider while classification fills omitted values.
 agent-router run "Bump the lockfile" --provider codex --model gpt-5.6-luna
 
+# Dispatch a Grok task explicitly. Grok is never selected by auto routing.
+agent-router run "Review this migration plan" --provider grok --model grok-4
+
 # Route work in another directory.
 agent-router run "Fix the failing test" --dir ~/git/other-project
 ```
@@ -161,12 +174,12 @@ agent-router run "Fix the failing test" --dir ~/git/other-project
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `--dir <PATH>` | current directory | Working directory for the dispatched job. |
-| `--provider <NAME>` | `auto` | `auto` classifies provider, model, and effort. An explicit `codex`, `claude`, or `opencode` pins only the provider unless model and effort are also supplied. |
-| `--model <NAME>` | tier table | Model pin. Requires an explicit `--provider`. With an explicit provider and no effort, classification fills effort. Pairing it with `--provider auto` is rejected. OpenCode preserves its existing dispatch contract and does not derive a model. |
-| `--effort <NAME>` | complexity mapping | Effort pin. Requires an explicit provider and model. Low maps to low, medium to medium, and high or ultra maps to high for Codex and Claude. OpenCode does not receive derived effort. |
+| `--provider <NAME>` | `auto` | `auto` classifies provider, model, and effort between Codex and Claude. An explicit `codex`, `claude`, `grok`, or `opencode` pins the provider. Grok and OpenCode are explicit only. |
+| `--model <NAME>` | tier table | Model pin. Requires an explicit `--provider`. With an explicit provider and no effort, classification fills effort. Pairing it with `--provider auto` is rejected. An explicit Grok model reaches the public lifecycle unchanged. OpenCode does not derive a model. |
+| `--effort <NAME>` | complexity mapping | Effort pin. Requires an explicit provider and model. Low maps to low, medium to medium, and high or ultra maps to high for Codex and Claude. Grok and OpenCode do not receive derived effort. |
 | `--name <NAME>` | the model's title, or three to five words derived from the task | Name for the dispatched job. Supplying it skips the naming call. It reaches the `claude --bg --name` argv verbatim, names the Codex thread, and is recorded as `job_name` in the decision log for every provider, so callers that reconcile inflight jobs by exact name depend on it. An empty or whitespace only name is rejected. |
 | `--dry-run` | off | Decide and log, dispatch nothing, and project the weekly draw the job is likely to cost on the provider it landed on. |
-| `--mcp-config <PATH>` | none | MCP config file for the dispatched Claude job. Repeatable. Rejected for any other provider, and the check runs after routing, so pairing it with `--provider auto` fails whenever classification lands on a provider other than Claude. |
+| `--mcp-config <PATH>` | none | MCP config file for the dispatched Claude job. Repeatable. Rejected for every other provider, including Grok, and the check runs after routing, so pairing it with `--provider auto` fails whenever classification lands on a provider other than Claude. |
 | `--strict-mcp-config` | off | Use only the `--mcp-config` files and drop every inherited MCP server. See the warning below before using it. |
 | `--json` | off | Emit the full decision, including gates, classification, and usage. |
 
@@ -183,11 +196,18 @@ them. That interacts badly with routing: a task sent to Claude precisely because
 a connector can lose the very connector it was routed for. Pass it only when the job genuinely
 needs nothing beyond the files given.
 
+An explicit Grok dispatch reuses `agent-viewer-core`'s public `GrokLifecycle`. Router does not
+implement an ACP client or durable Grok session parser. The lifecycle's nonempty official session
+identity is copied unchanged into the dispatch result and decision log as `job_id`; use that exact
+identity with `agent-router status`.
+
 ### `adversarial-review`
 
 Run a review synchronously with an eligible provider other than the provider that initiated the
-request. The primary provider is always excluded. Candidate providers must be registered as
-review capable, have a known and fresh weekly capacity reading, and be below 90 percent usage.
+request. The primary provider is always excluded, including Grok. Candidate providers must be
+registered as review capable, have an authoritative known and fresh weekly capacity reading, and
+be below 90 percent usage. Grok is a registered alternative only when its public lifecycle reports
+an authoritative leader and capacity is available. It is never an ordinary automatic task route.
 The command does not classify the request or start a detached background job. It waits for the
 review to reach a terminal result, then prints the review body.
 
@@ -203,17 +223,22 @@ Text mode prints the completed review body. JSON reports `status`, `primary_prov
 `reviewer_provider`, `reviewer_model`, usage provenance, the selection rationale, and `result` when
 the review completes. When no eligible alternative exists, it reports the reason and exits `3`.
 A completed review exits `0`; an invocation or infrastructure failure exits `1`. Review execution
-uses the provider's sealed read-only review contract and is never routed through an ordinary task.
+uses the provider's sealed read only review contract and is never routed through an ordinary task.
+For Grok, the result also carries the exact official lifecycle session identity. Grok reviewer
+sessions are disposable: after Router reads the final review text, it uses the same public
+lifecycle to remove only the session it created. A failed cleanup is reported rather than silently
+leaving a reviewer session behind.
 
 ### `usage`
 
-Weekly and 5 hour headroom for both providers.
+Weekly and 5 hour headroom for Codex and Claude, plus observed Grok capacity.
 
 ```bash
 $ agent-router usage
 provider  5h       weekly  source     weekly reset
 claude     12.4%    58.1%  live       in 41h07m
 codex       0.0%  unknown  fail-open  -
+grok        0.0%  unknown  fail-open  -
 ```
 
 The weekly column reads `unknown` when `weekly_known` is false, meaning no usable capacity verdict
@@ -224,6 +249,8 @@ weekly percentage with a reset dash. Routing refuses a provider with an unknown 
 `source` is where the numbers came from: `live` for a parsed payload and `fail-open` when no usable
 capacity verdict was read. That source label means full headroom for Claude but closed capacity for
 Codex; `weekly` prints `unknown` for either unread window rather than claiming a measurement.
+Grok's source is observational and never changes automatic task routing. It can make Grok an
+eligible adversarial reviewer only when the lifecycle also reports an authoritative leader.
 
 The weekly window is what places a single job: it decides which provider has room for the task in
 front of the router. Claude's 5 hour window is what paces a stream of them, moving work away from
@@ -243,6 +270,8 @@ pass codex_on_path       codex at /home/you/.local/bin/codex
 pass codex_app_server    the app-server daemon answers
 pass codex_rate_limits   live, read from the provider's own source
 warn opencode_on_path    no executable opencode on PATH, so any dispatch to it will error
+warn grok_binary         no executable grok on PATH, so explicit Grok dispatch will error
+warn grok_leader_registration  no authoritative Grok leader is registered, so Grok review is unavailable
 pass config_parses       absent, defaults apply (/home/you/.config/agent-router/config.toml)
 pass log_writable        /home/you/.local/state/agent-router/router.db takes a write
 ```
@@ -256,6 +285,8 @@ pass log_writable        /home/you/.local/state/agent-router/router.db takes a w
 | `codex_app_server` | Whether the app-server daemon answers, which is the transport every Codex dispatch goes through. Observed only: doctor does not start a daemon, so an absent one is reported rather than created. |
 | `codex_rate_limits` | Whether the Codex usage read was live or fell open. |
 | `opencode_on_path` | An executable `opencode` on `PATH`. |
+| `grok_binary` | An executable `grok` on `PATH`. Doctor only observes it and does not create Grok configuration. |
+| `grok_leader_registration` | Whether the public Grok lifecycle reports an authoritative registered leader. This is separate from the binary check and is required for Grok reviewer selection. |
 | `config_parses` | The config file parses, read directly so a diagnostic never creates the file it was asked to report on. An absent file is a pass: the router runs on the same defaults. |
 | `log_writable` | The decision log opens and takes an actual write. Opening alone proves nothing, because the schema batch is all `IF NOT EXISTS` and can succeed on a database the next dispatch cannot write to. |
 
@@ -272,6 +303,10 @@ contention, and the next dispatch takes the lock on its own.
 Exit code is `0` when every check is pass or warn, `1` when any check fails. A missing `opencode` is
 never a failure: it is a provider the router can route to on request, not one it needs, so
 installing it or not never moves the exit code.
+
+A missing Grok binary or authoritative leader is also a warning. Grok is explicit only for tasks
+and optional for adversarial review, so these checks describe why that path is unavailable without
+changing ordinary routing.
 
 Both usage checks come from a single usage read, so doctor asks each provider once and its two
 lines cannot disagree about the same read.
@@ -415,6 +450,11 @@ healthy job is not a routing failure.
 Codex jobs resolve through the app-server `thread/read` call with `includeTurns` set, and the state
 comes from the first turn record, since the router starts exactly one turn per thread. Turn history
 is read from disk, so a codex job still resolves even when the daemon has not loaded the thread.
+
+Grok rows resolve through one public lifecycle read and an exact lookup of the stored official
+session identity. Known lifecycle states map only where their meanings are proven. A missing,
+ambiguous, unavailable, or unrecognized result remains `unknown` and never overwrites a proven
+terminal outcome.
 
 Every row settles into one of four states written to `outcome`: `running`, `completed`, `failed`,
 or `unknown`. `unknown` never overwrites an already proven `completed` or `failed`: once a job is

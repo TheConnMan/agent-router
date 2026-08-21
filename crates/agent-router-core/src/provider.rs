@@ -4,6 +4,7 @@
 pub enum Provider {
     Codex,
     Claude,
+    Grok,
     Opencode,
 }
 
@@ -12,6 +13,7 @@ impl Provider {
         match self {
             Provider::Codex => "codex",
             Provider::Claude => "claude",
+            Provider::Grok => "grok",
             Provider::Opencode => "opencode",
         }
     }

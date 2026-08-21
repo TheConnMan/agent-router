@@ -79,6 +79,7 @@ fn a_recorded_decision_writes_the_orchestration_score_and_both_projections() {
     let usage = UsageSnapshot {
         claude: window(5.0, HALF_WEEK),
         codex: window(80.0, HALF_WEEK),
+        grok: Headroom::closed(),
     };
 
     let flipped = decide(
@@ -135,6 +136,7 @@ fn an_unread_reset_records_no_projection_for_that_provider() {
                 ..Headroom::full()
             },
             codex: window(90.0, HALF_WEEK),
+            grok: Headroom::closed(),
         },
         NOW,
         &Config::default(),
@@ -163,6 +165,7 @@ fn the_scores_the_classifier_no_longer_produces_are_left_null() {
         UsageSnapshot {
             claude: window(5.0, HALF_WEEK),
             codex: window(80.0, HALF_WEEK),
+            grok: Headroom::closed(),
         },
         NOW,
         &Config::default(),

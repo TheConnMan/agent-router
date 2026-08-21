@@ -46,6 +46,8 @@ pub enum Gate {
     /// what an exhausted Codex looked like before this gate existed. Recorded whenever eligibility
     /// was decided against a missing number, whether or not it changed the destination.
     WeeklyUnknown,
+    /// Grok is excluded from automatic routing because its official weekly telemetry is unknown.
+    GrokUnavailable,
     /// Weekly usage routing is disabled by policy.
     WeeklyRoutingDisabled,
     /// The provider the task was on projects to overdraw its weekly window before the window
@@ -76,6 +78,7 @@ impl Gate {
             Gate::FlippedOnExhaustion => "flipped_on_exhaustion",
             Gate::OverCeiling => "over_ceiling",
             Gate::WeeklyUnknown => "weekly_unknown",
+            Gate::GrokUnavailable => "grok_unavailable",
             Gate::WeeklyRoutingDisabled => "weekly_routing_disabled",
             Gate::ProjectedOverdraw => "projected_overdraw",
             Gate::ProjectionUnavailable => "projection_unavailable",
@@ -216,6 +219,9 @@ pub fn decide(
         if !config.policy.weekly_routing {
             gates.push(Gate::WeeklyRoutingDisabled);
         } else {
+            if !usage.grok.weekly_known() || usage.grok.weekly_reset_epoch == 0 {
+                gates.push(Gate::GrokUnavailable);
+            }
             let other = other_provider(provider);
             // Fail closed on a weekly number nobody read. The percentage of an unread window is 0,
             // which is the same reading as a genuinely idle provider, so trusting it hands every
@@ -342,7 +348,7 @@ fn projection_override(
     };
     let draw = |candidate| match candidate {
         Provider::Codex => codex,
-        Provider::Claude | Provider::Opencode => claude,
+        Provider::Claude | Provider::Grok | Provider::Opencode => claude,
     };
     let current = draw(*provider);
     if current > config.projection_overdraw_pct && draw(other) < current {
@@ -430,7 +436,7 @@ fn model_for(provider: Provider, complexity: Complexity, config: &Config) -> Opt
     match provider {
         Provider::Codex => Some(config.models.codex.pick(complexity).to_string()),
         Provider::Claude => Some(config.models.claude.pick(complexity).to_string()),
-        Provider::Opencode => None,
+        Provider::Grok | Provider::Opencode => None,
     }
 }
 
@@ -445,7 +451,7 @@ fn effort_for(provider: Provider, complexity: Complexity) -> Option<String> {
             }
             .to_string(),
         ),
-        Provider::Opencode => None,
+        Provider::Grok | Provider::Opencode => None,
     }
 }
 
@@ -454,7 +460,7 @@ fn effort_for(provider: Provider, complexity: Complexity) -> Option<String> {
 fn other_provider(provider: Provider) -> Provider {
     match provider {
         Provider::Codex => Provider::Claude,
-        Provider::Claude | Provider::Opencode => Provider::Codex,
+        Provider::Claude | Provider::Grok | Provider::Opencode => Provider::Codex,
     }
 }
 
@@ -463,7 +469,9 @@ fn other_provider(provider: Provider) -> Provider {
 fn headroom(usage: &UsageSnapshot, provider: Provider) -> &Headroom {
     match provider {
         Provider::Codex => &usage.codex,
-        Provider::Claude | Provider::Opencode => &usage.claude,
+        Provider::Claude => &usage.claude,
+        Provider::Grok => &usage.grok,
+        Provider::Opencode => &usage.claude,
     }
 }
 
@@ -523,6 +531,7 @@ mod tests {
                 weekly_pct: claude_weekly,
                 ..Headroom::full()
             },
+            grok: Headroom::closed(),
         }
     }
 
@@ -652,6 +661,7 @@ mod tests {
                     weekly_capacity_known: true,
                     stale: false,
                 },
+                grok: Headroom::closed(),
             },
             1_785_400_000,
             &Config::default(),

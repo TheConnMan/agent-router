@@ -64,6 +64,7 @@ impl HistoricalRow {
                 five_hour_pct: self.codex_five_hour_pct,
                 ..Headroom::full()
             },
+            grok: Headroom::closed(),
         }
     }
 
@@ -511,6 +512,7 @@ fn the_real_dispatches_replay_to_seventeen_claude_and_twenty_two_codex() {
         match decision.provider {
             Provider::Claude => claude += 1,
             Provider::Codex => codex += 1,
+            Provider::Grok => panic!("row {} routed to grok", row.id),
             Provider::Opencode => panic!("row {} routed to opencode", row.id),
         }
         if decision.gates.contains(&Gate::ProjectedOverdraw) {
@@ -562,6 +564,7 @@ fn the_corpus_replays_and_reports_its_before_and_after_split() {
         match decision.provider {
             Provider::Claude => now_claude += 1,
             Provider::Codex => now_codex += 1,
+            Provider::Grok => panic!("row {} routed to grok", row.id),
             Provider::Opencode => panic!("row {} routed to opencode", row.id),
         }
         if row.dry_run == 0 {

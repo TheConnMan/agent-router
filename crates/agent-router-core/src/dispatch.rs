@@ -4,6 +4,7 @@ use crate::run::{Dispatch, Request};
 
 pub mod claude;
 pub mod codex;
+pub mod grok;
 pub mod opencode;
 
 pub fn dispatch(decision: &crate::decide::Decision, request: &Request) -> Result<Dispatch> {
@@ -35,6 +36,9 @@ pub fn dispatch(decision: &crate::decide::Decision, request: &Request) -> Result
             request.mcp_configs,
             request.strict_mcp_config,
         ),
+        Provider::Grok => {
+            grok::dispatch(request.dir, request.task, &name, decision.model.as_deref())
+        }
         Provider::Opencode => opencode::dispatch(
             request.dir,
             request.task,

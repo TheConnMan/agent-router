@@ -666,6 +666,7 @@ mod tests {
                 weekly_capacity_known: true,
                 ..Headroom::full()
             },
+            grok: Headroom::closed(),
         };
         crate::decide::decide(classification, usage, NOW, &Config::default())
     }
@@ -736,7 +737,7 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .expect("query");
-        assert_eq!(gates, "");
+        assert_eq!(gates, "grok_unavailable");
         assert_eq!(five_hour, 11.0);
         assert_eq!(weekly_reset, 1_785_908_348);
     }

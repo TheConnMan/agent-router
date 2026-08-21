@@ -49,6 +49,7 @@ fn live_snapshot() -> UsageSnapshot {
         claude: parse_claude_usage(CLAUDE_LIVE).expect("the live claude payload parses"),
         codex: parse_codex_rate_limits(&codex_live_line(), NOW)
             .expect("the live codex event parses"),
+        grok: Headroom::closed(),
     }
 }
 

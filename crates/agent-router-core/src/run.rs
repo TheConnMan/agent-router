@@ -242,9 +242,10 @@ pub fn parse_provider(value: &str) -> Result<Option<Provider>> {
         "auto" => Ok(None),
         "codex" => Ok(Some(Provider::Codex)),
         "claude" => Ok(Some(Provider::Claude)),
+        "grok" => Ok(Some(Provider::Grok)),
         "opencode" => Ok(Some(Provider::Opencode)),
         other => Err(Error::Command(format!(
-            "unknown provider {other:?}: expected auto, codex, claude, or opencode"
+            "unknown provider {other:?}: expected auto, codex, claude, grok, or opencode"
         ))),
     }
 }

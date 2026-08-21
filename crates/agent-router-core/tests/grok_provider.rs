@@ -86,7 +86,10 @@ fn official_grok_billing_log_reads_the_newest_plus_weekly_usage() {
 #[test]
 fn missing_grok_percentage_keeps_grok_out_of_automatic_candidates() {
     let grok = grok_headroom_in(&fixture("grok-billing-missing-usage.jsonl"), NOW);
-    assert_eq!(grok.weekly_reset_epoch, RESET, "the weekly reset is still known");
+    assert_eq!(
+        grok.weekly_reset_epoch, RESET,
+        "the weekly reset is still known"
+    );
     assert!(
         !grok.weekly_capacity_known,
         "missing creditUsagePercent is unknown capacity, not zero usage"
@@ -161,7 +164,10 @@ fn grok_can_be_an_eligible_adversarial_reviewer_without_joining_automatic_routin
     assert_eq!(outcome.status, ReviewStatus::Completed);
     assert_eq!(outcome.reviewer_provider.as_deref(), Some("grok"));
     assert_eq!(outcome.reviewer_model.as_deref(), Some("grok-review"));
-    assert_eq!(outcome.result.as_deref(), Some("completed Grok adversarial review"));
+    assert_eq!(
+        outcome.result.as_deref(),
+        Some("completed Grok adversarial review")
+    );
     assert_eq!(outcome.usage_provenance.len(), 1);
     assert_eq!(outcome.usage_provenance[0].provider, "grok");
     assert!(outcome.usage_provenance[0].eligible);

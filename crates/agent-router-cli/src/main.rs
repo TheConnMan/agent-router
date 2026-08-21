@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 #[derive(Parser)]
 #[command(
     name = "agent-router",
-    about = "Route a task to codex, claude, or opencode by task shape and weekly usage headroom"
+    about = "Route a task automatically to codex or claude, or dispatch explicitly to grok or opencode"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -27,7 +27,8 @@ enum Command {
         /// Working directory for the job (defaults to the current directory).
         #[arg(long)]
         dir: Option<PathBuf>,
-        /// auto, or codex/claude/opencode to pin the provider while omitted values are classified.
+        /// auto, or codex, claude, grok, or opencode to pin the provider while omitted values are
+        /// classified. Grok and opencode are explicit only.
         #[arg(long, default_value = "auto")]
         provider: String,
         /// Model override, requires an explicit --provider.
@@ -43,7 +44,8 @@ enum Command {
         /// Decide and log without dispatching.
         #[arg(long)]
         dry_run: bool,
-        /// MCP config file for the claude job, repeatable. Rejected for other providers.
+        /// MCP config file for the claude job, repeatable. Rejected for every other provider,
+        /// including grok.
         #[arg(long = "mcp-config")]
         mcp_configs: Vec<PathBuf>,
         /// Use only the --mcp-config files, dropping every inherited MCP server. This also strips
@@ -58,7 +60,7 @@ enum Command {
     AdversarialReview {
         /// The review request.
         request: String,
-        /// The provider running the calling thread. This provider is excluded.
+        /// The provider running the calling thread. This provider, including grok, is excluded.
         #[arg(long)]
         primary: String,
         /// Working directory for the review. Defaults to the current directory.
@@ -67,7 +69,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Weekly and 5h headroom for both providers.
+    /// Weekly and 5h headroom for Codex and Claude, plus observed Grok capacity.
     Usage {
         #[arg(long)]
         json: bool,
@@ -154,7 +156,7 @@ fn adversarial_review_exit(
             return print_adversarial_review(
                 &agent_router_core::adversarial_review::failed_outcome(
                     &primary,
-                    "primary provider must be codex, claude, or opencode",
+                    "primary provider must be codex, claude, grok, or opencode",
                 ),
                 json,
             );
@@ -737,7 +739,11 @@ fn usage(json: bool) -> agent_router_core::Result<()> {
         return Ok(());
     }
     println!("provider  5h       weekly  source     weekly reset");
-    for (name, headroom) in [("claude", snapshot.claude), ("codex", snapshot.codex)] {
+    for (name, headroom) in [
+        ("claude", snapshot.claude),
+        ("codex", snapshot.codex),
+        ("grok", snapshot.grok),
+    ] {
         println!(
             "{name:<9} {:>5.1}%  {:>7}  {:<9}  {}",
             headroom.five_hour_pct,
