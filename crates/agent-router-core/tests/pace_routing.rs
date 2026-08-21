@@ -250,7 +250,7 @@ fn a_provider_projecting_past_its_allowance_moves_the_task() {
     assert_eq!(decision.provider, Provider::Claude);
     assert_eq!(decision.gates, vec![Gate::ProjectedOverdraw]);
     assert_eq!(decision.model.as_deref(), Some("opus[1m]"));
-    assert_eq!(decision.effort, None);
+    assert_eq!(decision.effort.as_deref(), Some("high"));
     assert_eq!(decision.codex_projected_draw, Some(160.0));
     assert_eq!(decision.claude_projected_draw, Some(10.0));
 }
@@ -583,13 +583,13 @@ fn a_reset_already_in_the_past_projects_at_what_was_spent() {
 fn complexity_picks_the_tier_and_never_the_provider() {
     let config = Config::default();
     let cases = [
-        (Complexity::Low, "gpt-5.6-luna", "sonnet"),
-        (Complexity::Medium, "gpt-5.6-terra", "opus[1m]"),
-        (Complexity::High, "gpt-5.6-sol", "opus[1m]"),
-        (Complexity::Ultra, "gpt-5.6-sol", "fable"),
+        (Complexity::Low, "gpt-5.6-luna", "sonnet", "low"),
+        (Complexity::Medium, "gpt-5.6-terra", "opus[1m]", "medium"),
+        (Complexity::High, "gpt-5.6-sol", "opus[1m]", "high"),
+        (Complexity::Ultra, "gpt-5.6-sol", "fable", "high"),
     ];
 
-    for (complexity, codex_model, claude_model) in cases {
+    for (complexity, codex_model, claude_model, effort) in cases {
         let stays = decide(
             scored(false, false, complexity),
             within_allowance(),
@@ -598,12 +598,12 @@ fn complexity_picks_the_tier_and_never_the_provider() {
         );
         assert_eq!(stays.provider, Provider::Codex, "{complexity:?} on codex");
         assert_eq!(stays.model.as_deref(), Some(codex_model));
-        assert_eq!(stays.effort, None);
+        assert_eq!(stays.effort.as_deref(), Some(effort));
 
         let flips = decide(scored(false, false, complexity), blowout(), NOW, &config);
         assert_eq!(flips.provider, Provider::Claude, "{complexity:?} on claude");
         assert_eq!(flips.model.as_deref(), Some(claude_model));
-        assert_eq!(flips.effort, None);
+        assert_eq!(flips.effort.as_deref(), Some(effort));
     }
 }
 

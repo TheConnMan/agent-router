@@ -84,7 +84,14 @@ impl MarkFixture {
     /// One logged decision, written through the same writer a dispatch uses, so the row under test
     /// is shaped exactly like a real one. Returns its row id.
     fn seed(&self, provider: Provider, dry_run: bool, outcome: &str) -> i64 {
-        let decision = decide_explicit(provider, None, UsageSnapshot::full(), &Config::default());
+        let decision = decide_explicit(
+            provider,
+            None,
+            None,
+            None,
+            UsageSnapshot::full(),
+            &Config::default(),
+        );
         let log = DecisionLog::open_at(&self.db_path()).expect("open the fixture log");
         log.record(&Entry {
             task: SEEDED_TASK,

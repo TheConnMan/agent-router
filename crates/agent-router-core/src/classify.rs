@@ -9,9 +9,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// How much reasoning the task needs. Orthogonal to the provider: either provider can take a
-/// simple task. This picks the model the job runs on, and nothing else: the reasoning effort is
-/// left to the backend to resolve, because the model is the better toggle. See `Decision::effort`
-/// for what each backend then resolves it to.
+/// simple task. This picks the model and, for supported providers, the reasoning effort.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Complexity {

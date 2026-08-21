@@ -112,9 +112,7 @@ impl Classifier {
 
 /// The per-provider model tiers, one model per task complexity. Each table is optional in the
 /// file and each key within it is optional, so an omitted section is exactly the defaults below.
-/// There is no effort table on purpose: the model is the toggle, and the reasoning effort is left
-/// to the backend to resolve. What each backend resolves it to differs, and on codex it is not the
-/// model's default. See `Decision::effort` and docs/configuration.md.
+/// There is no effort table. Effort uses a fixed complexity mapping in the decision engine.
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Models {

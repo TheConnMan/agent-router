@@ -22,6 +22,8 @@ fn record(log: &DecisionLog, task: &str) -> i64 {
     let decision = decide_explicit(
         Provider::Codex,
         None,
+        None,
+        None,
         UsageSnapshot::full(),
         &Config::default(),
     );

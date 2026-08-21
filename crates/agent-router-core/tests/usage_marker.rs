@@ -53,7 +53,7 @@ fn live_snapshot() -> UsageSnapshot {
 }
 
 fn decision(usage: UsageSnapshot) -> agent_router_core::Decision {
-    decide_explicit(Provider::Codex, None, usage, &Config::default())
+    decide_explicit(Provider::Codex, None, None, None, usage, &Config::default())
 }
 
 fn entry<'a>(task: &'a str, decision: &'a agent_router_core::Decision) -> Entry<'a> {

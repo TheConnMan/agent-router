@@ -15,7 +15,14 @@ use agent_router_core::usage::UsageSnapshot;
 use std::path::Path;
 
 fn decision(provider: Provider) -> agent_router_core::Decision {
-    decide_explicit(provider, None, UsageSnapshot::full(), &Config::default())
+    decide_explicit(
+        provider,
+        None,
+        None,
+        None,
+        UsageSnapshot::full(),
+        &Config::default(),
+    )
 }
 
 fn entry<'a>(

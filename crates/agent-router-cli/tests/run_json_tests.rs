@@ -661,8 +661,7 @@ fn a_claude_dispatch_records_no_effective_effort() {
          {row:?}"
     );
     assert_eq!(
-        row["effort"],
-        "medium",
+        row["effort"], "medium",
         "the log must retain the effort the router decided"
     );
     assert_eq!(
@@ -675,8 +674,7 @@ fn a_claude_dispatch_records_no_effective_effort() {
         "the log must distinguish an explicit route from a missing JSON key: {row:?}"
     );
     assert_eq!(
-        row["task_context_horizon"],
-        "extended",
+        row["task_context_horizon"], "extended",
         "a provider only pin still records its routing classification"
     );
 }

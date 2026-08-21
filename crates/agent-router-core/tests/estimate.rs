@@ -62,6 +62,8 @@ fn codex_decision(model: &str) -> agent_router_core::Decision {
     decide_explicit(
         Provider::Codex,
         Some(model.to_string()),
+        Some("high".to_string()),
+        None,
         UsageSnapshot::full(),
         &Config::default(),
     )

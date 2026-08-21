@@ -40,8 +40,8 @@ pub struct Row {
     pub requested: String,
     pub provider: String,
     pub model: Option<String>,
-    /// The reasoning effort the router decided, which nothing currently sets. Not the effort the
-    /// job ran at: that is `effective_effort` below.
+    /// The reasoning effort the router decided. Not the effort the job ran at: that is
+    /// `effective_effort` below.
     pub effort: Option<String>,
     /// The four scores the classifier no longer produces. Kept on the read model because the rows
     /// already in the database carry them and are the corpus every backtest replays; None on
@@ -50,7 +50,7 @@ pub struct Row {
     pub confidence: Option<String>,
     pub codex_ready_count: Option<i64>,
     pub claude_signal_count: Option<i64>,
-    /// None for a row written before complexity scaling, and for an explicit provider.
+    /// None for a row written before complexity scaling, and for a fully pinned route.
     pub complexity: Option<String>,
     /// The classifier predicted working context horizon. None on a historical row and on an
     /// explicit provider row.
@@ -747,6 +747,8 @@ mod tests {
         let log = DecisionLog::open_at(&dir.path().join("router.db")).expect("opens");
         let decision = crate::decide::decide_explicit(
             crate::Provider::Opencode,
+            None,
+            None,
             None,
             UsageSnapshot::full(),
             &Config::default(),

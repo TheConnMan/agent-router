@@ -238,6 +238,8 @@ fn explicit_provider_rows_keep_context_horizon_null() {
     let decision = agent_router_core::decide::decide_explicit(
         Provider::Claude,
         None,
+        None,
+        None,
         UsageSnapshot::full(),
         &Config::default(),
     );

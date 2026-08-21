@@ -27,13 +27,15 @@ enum Command {
         /// Working directory for the job (defaults to the current directory).
         #[arg(long)]
         dir: Option<PathBuf>,
-        /// auto (classify), or codex/claude/opencode to skip scoring. Every route still has the
-        /// classifier model title the job.
+        /// auto, or codex/claude/opencode to pin the provider while omitted values are classified.
         #[arg(long, default_value = "auto")]
         provider: String,
         /// Model override, requires an explicit --provider.
         #[arg(long)]
         model: Option<String>,
+        /// Reasoning effort override. Requires explicit provider and model values.
+        #[arg(long)]
+        effort: Option<String>,
         /// Job name. Defaults to a title the classifier model writes, and supplying one skips that
         /// call.
         #[arg(long)]
@@ -414,6 +416,7 @@ fn run(cli: Cli) -> agent_router_core::Result<()> {
             dir,
             provider,
             model,
+            effort,
             name,
             dry_run,
             mcp_configs,
@@ -424,6 +427,7 @@ fn run(cli: Cli) -> agent_router_core::Result<()> {
             dir,
             provider,
             model,
+            effort,
             name,
             dry_run,
             &mcp_configs,
@@ -616,6 +620,7 @@ fn route(
     dir: Option<PathBuf>,
     provider: String,
     model: Option<String>,
+    effort: Option<String>,
     name: Option<String>,
     dry_run: bool,
     mcp_configs: &[PathBuf],
@@ -632,6 +637,7 @@ fn route(
         dir: &dir,
         provider: agent_router_core::run::parse_provider(&provider)?,
         model,
+        effort,
         name,
         dry_run,
         mcp_configs,

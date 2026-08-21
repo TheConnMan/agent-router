@@ -1125,19 +1125,22 @@ fn codex_decision_effort_reaches_turn_start_at_the_dispatch_boundary() {
 
     let decision = decide_explicit(
         Provider::Codex,
+        Some("gpt-5.6-sol".to_string()),
+        Some("high".to_string()),
         None,
         UsageSnapshot::full(),
         &agent_router_core::Config::default(),
     );
-    // An explicit provider is unscored, so it runs at the high tier, and the router forces no
-    // reasoning effort at all.
+    // A fully pinned route must reach the provider unchanged, without classification supplying
+    // another model or effort.
     assert_eq!(decision.model.as_deref(), Some("gpt-5.6-sol"));
-    assert_eq!(decision.effort, None);
+    assert_eq!(decision.effort.as_deref(), Some("high"));
     let request = Request {
         task: "exercise the real dispatch seam",
         dir: &root.path,
         provider: Some(Provider::Codex),
-        model: None,
+        model: Some("gpt-5.6-sol".to_string()),
+        effort: Some("high".to_string()),
         name: None,
         dry_run: false,
         mcp_configs: &[],
@@ -1163,10 +1166,7 @@ fn codex_decision_effort_reaches_turn_start_at_the_dispatch_boundary() {
         "the job name the caller sees must be the name the thread carries"
     );
     assert_eq!(requests[3]["method"], "turn/start");
-    assert!(
-        requests[3]["params"].get("effort").is_none(),
-        "the router must force no effort, leaving the daemon to resolve its own"
-    );
+    assert_eq!(requests[3]["params"]["effort"], "high");
     assert_eq!(requests[1]["params"]["model"], "gpt-5.6-sol");
     // The task reaches Codex verbatim. The router prepends nothing: an execution-mode preamble
     // here fought the repo's own AGENTS.md and showed up as boilerplate on every routed session.
@@ -1295,6 +1295,8 @@ fn mcp_scoping_on_a_non_claude_decision_fails_before_any_provider_work() {
     let decision = decide_explicit(
         Provider::Codex,
         None,
+        None,
+        None,
         UsageSnapshot::full(),
         &agent_router_core::Config::default(),
     );
@@ -1312,6 +1314,7 @@ fn mcp_scoping_on_a_non_claude_decision_fails_before_any_provider_work() {
             // Auto: the caller named no provider, so only the decision knows it is codex.
             provider: None,
             model: None,
+            effort: None,
             name: None,
             dry_run: false,
             mcp_configs,

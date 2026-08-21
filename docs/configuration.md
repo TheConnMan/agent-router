@@ -296,10 +296,21 @@ capability pins, and the resulting tier picks the model the job is spawned with.
 
 Two deliberate choices are worth knowing before tuning these.
 
-There is no effort table, on purpose. The model is the toggle, and the reasoning effort is left to
-the backend to resolve. Forcing an effort on top of a model choice was tried and removed, because
-both tables read the same complexity value, so the second one carried no signal the first did not
-and only multiplied the cost of a misscored task.
+The routing inputs form a contiguous hierarchy. These four forms are valid:
+
+1. No provider, model, or effort: classify the task, route the provider using task shape and usage,
+   then derive model and effort.
+2. Provider only: preserve the provider and classify omitted model and effort.
+3. Provider plus model: preserve both pins and classify only the omitted effort.
+4. Provider plus model plus effort: preserve all three pins and skip routing classification.
+
+Any noncontiguous combination is rejected. A model requires a provider, and an effort requires both
+provider and model. This keeps every omitted value downstream of the values before it.
+
+For Codex and Claude, classified complexity maps to fixed effort: `low` to `low`, `medium` to
+`medium`, and both `high` and `ultra` to `high`. The model tier table remains separate because
+complexity chooses the model while the fixed mapping chooses effort. OpenCode is explicit only and
+preserves its existing dispatch contract: it has no derived model and receives no derived effort.
 
 Complexity never changes which provider a task routes to, and the provider never changes
 complexity. A low complexity task can run on either provider, and so can an ultra one.
@@ -310,28 +321,31 @@ to keep `ultra` deliberately hard to earn.
 
 ### What reasoning effort a dispatched job actually runs at
 
-The router decides none, so this is the backend's own resolution, and it is not the same on both.
-The router does not control it on either backend. It records it on the one backend that reports it.
+The router's `effort` value is the requested effort, not necessarily the effort a job reports after
+dispatch. For classified Codex and Claude work it is the fixed complexity mapping above. A fully
+pinned request keeps the supplied value. OpenCode receives no effort and keeps its existing
+dispatch contract.
 
-On Claude it is the model's own default. The router passes no `--effort` unless a decision carries
-one, and nothing else sets it. Claude reports the value it settled on nowhere, so there is nothing
-to record: `effective_effort` on a Claude row is null, permanently. It is null on an OpenCode row
-too, because OpenCode discards effort in both directions.
+On Claude the router passes the requested value as `--effort`. Claude reports the value it settled on
+nowhere, so there is nothing to record: `effective_effort` on a Claude row is null, permanently. It
+is null on an OpenCode row too, because OpenCode discards effort in both directions.
 
 On Codex it is whatever your own `~/.codex/config.toml` resolves. Dispatch goes through
 `codex app-server daemon`, and the daemon loads user config, unlike the classifier, which passes
 `--ignore-user-config`. So a `model_reasoning_effort` in that file applies to every routed Codex
 job at every tier. The daemon reports the value it resolved on the `thread/start` reply, and the
 router records that reading in the decision log's `effective_effort` column, so a Codex row says
-what the job will actually run at and follows that file when you change it.
+what the job will actually run at and follows that file when you change it. A pinned effort is sent
+to the turn, while the daemon still reports the effective value it resolved.
 
 The two effort columns are different facts and the log keeps them apart on purpose. `effort` is what
-the router decided, which is nothing; `effective_effort` is what the backend reported. Null in the
+the router requested, either from the fixed complexity mapping or an explicit pin; `effective_effort`
+is what the backend reported. Null in the
 second one means nobody observed an effort, which is not the same as a job running at no effort: it
 covers a Claude or OpenCode row, a dry run, and a row written before the column existed.
 
-Only when that file names no `model_reasoning_effort` does a Codex job fall through to the model's
-own catalogue default, and those defaults are not ordered the way the tier table is. Read them from
+When no pinned effort or `model_reasoning_effort` is present, a Codex job falls through to the
+model's catalogue default, and those defaults are not ordered the way the tier table is. Read them from
 the running daemon rather than assuming:
 
 ```bash

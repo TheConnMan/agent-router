@@ -35,10 +35,10 @@ log: row 87 in /home/you/.local/state/agent-router/router.db
    force and the decision is tagged `classifier_failed`. The same classifier model also generates
    the job title. A ticket ID leads the title, followed by two to six concise Title Case words, such
    as `GH-123 Sprint 2 Bug Fixes` or `RS-123 Input Box Searching`. A run that names its provider is
-   scored against none of this, but it is still titled: it makes one title-only call to the same
-   model, carrying the title instruction and no rubric. Both routes fall back to a title derived
-   from the task alone when the model answers nothing usable, and neither makes the call when
-   `--name` already named the job or when `--dry-run` means nothing is dispatched.
+   The routing classifier runs whenever provider, model, or effort is omitted. An explicit provider
+   therefore pins only the provider: omitted model and effort values still come from classification.
+   A fully exact provider, model, and effort pin skips routing classification. Job naming remains a
+   separate title call when a name was not supplied and dispatch is not a dry run.
 2. **Apply the capability pin.** A missing connector, a task needing several agents to exchange
    findings mid-run, or a build-tier `/implement` run (`implement_context_window`), pins to Claude
    regardless of usage. These are statements that the task cannot run on Codex at all, so every
@@ -62,11 +62,13 @@ log: row 87 in /home/you/.local/state/agent-router/router.db
    when Claude's 5 hour percent is at or above `claude_five_hour_pacing_pct` and Codex is under the
    hard ceiling (`five_hour_pacing`), because an exhausted 5 hour window stalls the job rather than
    merely costing more.
-4. **Pick the model from complexity.** The complexity tier selects the model from the per provider
-   tier table. Reasoning effort is deliberately not decided: the router forces none and each
-   backend resolves its own, and the log records that resolution wherever the backend reports one.
-   See [docs/configuration.md](docs/configuration.md#modelscodex-and-modelsclaude)
-   for what that actually means per backend, because it is not the model default on Codex.
+4. **Complete the provider, model, and effort pins.** With no pins, classification chooses the
+   provider through usage routing, then complexity chooses the Codex or Claude model from its tier
+   table and maps low to low, medium to medium, and high or ultra to high effort. An explicit
+   provider preserves that provider while classification fills omitted model and effort. An
+   explicit provider and model preserves both while classification fills effort. Three explicit
+   values are exact and skip routing classification. OpenCode keeps its existing dispatch contract:
+   it is explicit only, has no derived model, and receives no derived effort.
 5. **Dispatch and log.** The job is spawned detached, its backend job id is resolved, and the whole
    decision lands in a SQLite decision log.
 
@@ -149,7 +151,7 @@ agent-router run "Add a --json flag to the log command"
 # Decide and log without dispatching. The fastest way to see what the router would do.
 agent-router run "Refactor the parity scanner" --dry-run
 
-# Skip classification entirely and name the provider.
+# Pin the provider while classification fills omitted values.
 agent-router run "Bump the lockfile" --provider codex --model gpt-5.6-luna
 
 # Route work in another directory.
@@ -159,8 +161,9 @@ agent-router run "Fix the failing test" --dir ~/git/other-project
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `--dir <PATH>` | current directory | Working directory for the dispatched job. |
-| `--provider <NAME>` | `auto` | `auto` classifies. `codex`, `claude`, or `opencode` skips scoring, but still has the classifier model title the job. |
-| `--model <NAME>` | tier table | Model override. Requires an explicit `--provider`. Pairing it with `--provider auto` is rejected: the router exits nonzero naming both flags rather than dropping the override, because the auto path chooses its own model from the tier table. |
+| `--provider <NAME>` | `auto` | `auto` classifies provider, model, and effort. An explicit `codex`, `claude`, or `opencode` pins only the provider unless model and effort are also supplied. |
+| `--model <NAME>` | tier table | Model pin. Requires an explicit `--provider`. With an explicit provider and no effort, classification fills effort. Pairing it with `--provider auto` is rejected. OpenCode preserves its existing dispatch contract and does not derive a model. |
+| `--effort <NAME>` | complexity mapping | Effort pin. Requires an explicit provider and model. Low maps to low, medium to medium, and high or ultra maps to high for Codex and Claude. OpenCode does not receive derived effort. |
 | `--name <NAME>` | the model's title, or three to five words derived from the task | Name for the dispatched job. Supplying it skips the naming call. It reaches the `claude --bg --name` argv verbatim, names the Codex thread, and is recorded as `job_name` in the decision log for every provider, so callers that reconcile inflight jobs by exact name depend on it. An empty or whitespace only name is rejected. |
 | `--dry-run` | off | Decide and log, dispatch nothing, and project the weekly draw the job is likely to cost on the provider it landed on. |
 | `--mcp-config <PATH>` | none | MCP config file for the dispatched Claude job. Repeatable. Rejected for any other provider, and the check runs after routing, so pairing it with `--provider auto` fails whenever classification lands on a provider other than Claude. |
@@ -305,14 +308,14 @@ rather than absent. The log is the tuning surface: each gate tag names a specifi
 so routing behaviour can be audited against outcomes rather than recalled.
 
 Two of those columns are about reasoning effort and they are not the same fact. `effort` is what the
-router decided, which is nothing, because the model tier is the toggle. `effective_effort` is what
-the backend reported the job will actually run at, and it is recorded only where a backend genuinely
-says: Codex reports its resolved effort on the `thread/start` reply, so a Codex row carries it, and
-it moves when your `~/.codex/config.toml` moves. Claude exposes no effective effort anywhere and
-OpenCode discards effort entirely, so both stay null rather than being filled in from the model, the
-decision, or a config file. Null also covers a dry run, which dispatched nothing, and a row written
-before the column existed. In every case null means nobody observed an effort, which is not the same
-as a job running at no effort. See
+router requested. For classified Codex and Claude work, low maps to low, medium to medium, and high
+or ultra to high. `effective_effort` is what the backend reported the job will actually run at, and
+it is recorded only where a backend genuinely says: Codex reports its resolved effort on the
+`thread/start` reply, so a Codex row carries it, and it moves when your `~/.codex/config.toml` moves.
+Claude exposes no effective effort anywhere and OpenCode discards effort entirely, so both stay null
+rather than being filled in from the model, the decision, or a config file. Null also covers a dry
+run, which dispatched nothing, and a row written before the column existed. In every case null means
+nobody observed an effort, which is not the same as a job running at no effort. See
 [docs/configuration.md](docs/configuration.md#what-reasoning-effort-a-dispatched-job-actually-runs-at).
 
 Marking a row is the human half of the loop: `status` can only say whether a job ran, never whether
@@ -347,7 +350,7 @@ log may still carry) over all auto routes. A
 row carrying more than one of them counts once, because
 the route moved once. The classifier failure rate is the auto routed rows carrying `classifier_failed` over the
 same denominator. Both are denominated on auto routes only, because a row that named its provider
-never ran a usage rule and never ran the classifier. The dry run share is denominated on every
+never ran a usage rule, and only a fully pinned row skips routing classification. The dry run share is denominated on every
 row instead, since any row can be a dry run. Each rate carries its numerator and denominator so it
 can be checked by hand, and a rate with no denominator reads `-` rather than a percentage.
 

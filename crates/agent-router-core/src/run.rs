@@ -1,5 +1,5 @@
-//! One routed task end to end: read usage, classify (unless the caller named a provider),
-//! decide, dispatch, log.
+//! One routed task end to end: read usage, classify any omitted routing values, decide, dispatch,
+//! and log.
 
 use crate::classify::classify_with_name;
 use crate::config::Config;
@@ -21,6 +21,8 @@ pub struct Request<'a> {
     /// An explicit model override. Requires an explicit provider: pairing it with auto is
     /// rejected rather than silently dropped.
     pub model: Option<String>,
+    /// An explicit reasoning effort. Requires an explicit provider and model.
+    pub effort: Option<String>,
     /// The job name. None derives it from the task.
     pub name: Option<String>,
     /// Decide and log without dispatching.
@@ -64,13 +66,33 @@ pub struct Outcome {
 
 /// IMPURE: run one task through the router.
 pub fn run(request: &Request, config: &Config) -> Result<Outcome> {
-    // The auto path picks its model from the complexity tiers, so an override there could only be
-    // dropped. Rejecting the pair is the only way the caller hears about it.
-    if request.provider.is_none() && request.model.is_some() {
-        return Err(Error::Command(
-            "--model requires an explicit --provider: the auto path chooses its own model"
-                .to_string(),
-        ));
+    match (
+        request.provider.is_some(),
+        request.model.is_some(),
+        request.effort.is_some(),
+    ) {
+        (false, false, false) | (true, false, false) | (true, true, false) | (true, true, true) => {
+        }
+        (false, true, false) => {
+            return Err(Error::Command(
+                "--model requires an explicit --provider".to_string(),
+            ));
+        }
+        (false, false, true) => {
+            return Err(Error::Command(
+                "--effort requires explicit --provider and --model".to_string(),
+            ));
+        }
+        (false, true, true) => {
+            return Err(Error::Command(
+                "--model and --effort require an explicit --provider".to_string(),
+            ));
+        }
+        (true, false, true) => {
+            return Err(Error::Command(
+                "--effort requires --model when --provider is explicit".to_string(),
+            ));
+        }
     }
     // An empty or whitespace only name beats the derived default because it is Some, so it would
     // reach the spawned job and orphan it. A loud error is correct, since a caller passing an
@@ -89,33 +111,34 @@ pub fn run(request: &Request, config: &Config) -> Result<Outcome> {
         )));
     }
     let usage = UsageSnapshot::read();
-    let (decision, generated_name) = match request.provider {
-        // A named provider needs nothing scored, but it still gets a generated title. Without one
-        // the job falls back to `short_job_name`, which is the first few words of the task title
-        // cased, and every job dispatched with a provider named was findable only by that.
-        //
-        // Two cases skip the call rather than waste it: a caller that supplied `--name` has
-        // already decided the name, and a dry run dispatches nothing, so there is nothing to name.
-        Some(provider) => (
-            decide_explicit(provider, request.model.clone(), usage, config),
-            (request.name.is_none() && !request.dry_run)
-                .then(|| crate::classify::job_name(request.task, config))
-                .flatten(),
-        ),
-        // `decide` is pure and takes the instant it decides at, so the clock is read here, on the
-        // impure side, and after the usage snapshot the run rate rules measure against it.
-        None => {
-            let classified = classify_with_name(request.task, config);
-            (
-                decide(
-                    classified.classification,
-                    usage,
-                    crate::usage::now_epoch(),
-                    config,
-                ),
-                classified.job_name,
-            )
+    let needs_classification =
+        request.provider.is_none() || request.model.is_none() || request.effort.is_none();
+    let classified = needs_classification.then(|| classify_with_name(request.task, config));
+    let generated_name = if request.name.is_none() && !request.dry_run {
+        match &classified {
+            Some(classified) => classified.job_name.clone(),
+            None => crate::classify::job_name(request.task, config),
         }
+    } else {
+        None
+    };
+    let decision = match request.provider {
+        Some(provider) => decide_explicit(
+            provider,
+            request.model.clone(),
+            request.effort.clone(),
+            classified.map(|classified| classified.classification),
+            usage,
+            config,
+        ),
+        None => decide(
+            classified
+                .expect("an automatic route always requires classification")
+                .classification,
+            usage,
+            crate::usage::now_epoch(),
+            config,
+        ),
     };
     let requested = request
         .provider
@@ -157,6 +180,7 @@ pub fn run(request: &Request, config: &Config) -> Result<Outcome> {
         dir: request.dir,
         provider: request.provider,
         model: request.model.clone(),
+        effort: request.effort.clone(),
         name: request.name.clone().or(generated_name),
         dry_run: request.dry_run,
         mcp_configs: request.mcp_configs,

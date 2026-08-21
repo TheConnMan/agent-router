@@ -7,10 +7,6 @@ use crate::config::{Config, DefaultProvider};
 use crate::provider::Provider;
 use crate::usage::{Headroom, UsageSnapshot};
 
-/// The complexity an unscored task runs at: an explicitly named provider skips classification, so
-/// there is no judgement to scale from, and unscored work errs toward capability.
-const UNSCORED_COMPLEXITY: Complexity = Complexity::High;
-
 /// The weekly window, in seconds. 10080 minutes, the same window `usage.rs` identifies a weekly
 /// rate limit by. Reset epochs are recorded in SECONDS on both providers, so a distance to a reset
 /// is directly comparable to this.
@@ -26,7 +22,7 @@ const MIN_PROJECTION_ELAPSED: f64 = 0.05;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Gate {
-    /// The caller named a provider, so no classification ran.
+    /// The caller pinned a provider, so provider routing was bypassed.
     ExplicitProvider,
     /// The classifier could not answer, so the configured default remains in force.
     ClassifierFailed,
@@ -95,12 +91,7 @@ pub struct Decision {
     /// The model to spawn with. None means the backend resolves its own default.
     pub model: Option<String>,
     /// The reasoning effort the router asks the backend to run at. Dispatch honours it on codex
-    /// (`turn/start` `effort`) and on claude (`--effort`), and opencode discards it. Nothing
-    /// currently sets it: the model tier is the toggle, so the router decides no effort at all and
-    /// each backend resolves its own. The field is kept because that dispatch path is live and
-    /// proven by `claude_argv_carries_the_decided_effort_and_omits_the_flag_without_one` and
-    /// `codex_requests_pin_security_posture_and_put_effort_on_the_turn`, which pin backend argv and
-    /// param shapes that drift on the backends' schedule rather than ours.
+    /// (`turn/start` `effort`) and on claude (`--effort`), and opencode discards it.
     ///
     /// What the backends then resolve is not the same on both. Claude runs at the model's own
     /// default, because nothing else sets one, and it reports that value nowhere. Codex runs at
@@ -113,7 +104,7 @@ pub struct Decision {
     /// separately in the log's `effective_effort` column. Claude and opencode record nothing there,
     /// because neither exposes one to read.
     pub effort: Option<String>,
-    /// None when the caller named a provider and no classification ran.
+    /// None when provider, model, and effort were all pinned.
     pub classification: Option<Classification>,
     pub gates: Vec<Gate>,
     pub usage: UsageSnapshot,
@@ -298,7 +289,7 @@ pub fn decide(
     Decision {
         provider,
         model,
-        effort: None,
+        effort: effort_for(provider, complexity),
         classification: Some(classification),
         gates,
         usage,
@@ -393,37 +384,67 @@ fn projected_draw(headroom: &Headroom, now_epoch_secs: i64) -> Option<f64> {
     Some(headroom.weekly_pct / elapsed)
 }
 
-/// PURE: the decision for a caller-named provider. No classification runs, but the usage
-/// snapshot is still recorded, because the log is the tuning data for the auto path.
+/// PURE: the decision for a caller pinned provider. The provider stays exact while classification
+/// supplies any omitted downstream values.
 pub fn decide_explicit(
     provider: Provider,
     model: Option<String>,
+    effort: Option<String>,
+    classification: Option<Classification>,
     usage: UsageSnapshot,
     config: &Config,
 ) -> Decision {
+    let complexity = classification
+        .as_ref()
+        .map(|classification| classification.complexity);
+    let model = model.or_else(|| complexity.and_then(|value| model_for(provider, value, config)));
+    let effort = effort.or_else(|| complexity.and_then(|value| effort_for(provider, value)));
+    let rationale = classification
+        .as_ref()
+        .map(|classification| {
+            format!(
+                "{} requested explicitly: {}",
+                provider.name(),
+                classification.rationale
+            )
+        })
+        .unwrap_or_else(|| format!("{} requested explicitly", provider.name()));
     Decision {
         provider,
-        model: model.or_else(|| model_for(provider, UNSCORED_COMPLEXITY, config)),
-        effort: None,
-        classification: None,
+        model,
+        effort,
+        classification,
         gates: vec![Gate::ExplicitProvider],
         usage,
         // No usage rule ran, so no projection was measured. Recording one anyway would put a number
         // in the log that nothing consulted, which the next backtest would read as a rule firing.
         claude_projected_draw: None,
         codex_projected_draw: None,
-        rationale: format!("{} requested explicitly", provider.name()),
+        rationale,
     }
 }
 
-/// PURE: the model the job runs on, scaled by how much reasoning the task needs. This is the only
-/// tier lever: no reasoning effort is decided at all, so each backend resolves its own. See the
-/// `effort` field on `Decision` for what each one resolves it to, which is not the model default
-/// on codex. Opencode has no tiers in the MVP, so it resolves its own default.
+/// PURE: the model the job runs on, scaled by how much reasoning the task needs. Opencode has no
+/// tiers in the MVP, so it resolves its own default.
 fn model_for(provider: Provider, complexity: Complexity, config: &Config) -> Option<String> {
     match provider {
         Provider::Codex => Some(config.models.codex.pick(complexity).to_string()),
         Provider::Claude => Some(config.models.claude.pick(complexity).to_string()),
+        Provider::Opencode => None,
+    }
+}
+
+/// PURE: the fixed effort policy for providers that accept an effort value.
+fn effort_for(provider: Provider, complexity: Complexity) -> Option<String> {
+    match provider {
+        Provider::Codex | Provider::Claude => Some(
+            match complexity {
+                Complexity::Low => "low",
+                Complexity::Medium => "medium",
+                Complexity::High | Complexity::Ultra => "high",
+            }
+            .to_string(),
+        ),
         Provider::Opencode => None,
     }
 }
@@ -505,23 +526,57 @@ mod tests {
         }
     }
 
-    /// An unscored task has no complexity to read, so it runs at the high tier.
-    #[test]
-    fn an_explicit_provider_runs_at_the_high_tier() {
-        let config = Config::default();
-        let codex = decide_explicit(Provider::Codex, None, usage(0.0, 0.0), &config);
-        assert_eq!(codex.model.as_deref(), Some("gpt-5.6-sol"));
-        assert_eq!(codex.effort, None);
+    fn classification(complexity: Complexity) -> Classification {
+        Classification {
+            orchestration: false,
+            missing_connector: false,
+            complexity,
+            task_context_horizon: TaskContextHorizon::Ordinary,
+            rationale: "classified for explicit route".to_string(),
+            classifier_failed: false,
+            invokes_implement: false,
+        }
+    }
 
-        let claude = decide_explicit(Provider::Claude, None, usage(0.0, 0.0), &config);
+    /// A named provider keeps its provider pin while classification supplies omitted model and
+    /// effort values.
+    #[test]
+    fn an_explicit_provider_uses_the_classified_model_and_effort() {
+        let config = Config::default();
+        let codex = decide_explicit(
+            Provider::Codex,
+            None,
+            None,
+            Some(classification(Complexity::High)),
+            usage(0.0, 0.0),
+            &config,
+        );
+        assert_eq!(codex.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(codex.effort.as_deref(), Some("high"));
+
+        let claude = decide_explicit(
+            Provider::Claude,
+            None,
+            None,
+            Some(classification(Complexity::High)),
+            usage(0.0, 0.0),
+            &config,
+        );
         assert_eq!(claude.model.as_deref(), Some("opus[1m]"));
-        assert_eq!(claude.effort, None);
+        assert_eq!(claude.effort.as_deref(), Some("high"));
     }
 
     #[test]
     fn an_explicit_provider_skips_classification_but_keeps_the_usage_snapshot() {
         let config = Config::default();
-        let decision = decide_explicit(Provider::Opencode, None, usage(71.0, 50.0), &config);
+        let decision = decide_explicit(
+            Provider::Opencode,
+            None,
+            None,
+            None,
+            usage(71.0, 50.0),
+            &config,
+        );
         assert_eq!(decision.provider, Provider::Opencode);
         assert!(decision.classification.is_none());
         assert_eq!(decision.gate_tags(), vec!["explicit_provider"]);
@@ -532,14 +587,17 @@ mod tests {
         assert_eq!(decision.claude_projected_draw, None);
         assert_eq!(decision.codex_projected_draw, None);
 
-        // An explicitly requested model overrides the per-provider default.
+        // Fully pinned inputs stay exact when classification is absent.
         let pinned = decide_explicit(
             Provider::Claude,
             Some("sonnet".to_string()),
+            Some("low".to_string()),
+            None,
             usage(0.0, 0.0),
             &config,
         );
         assert_eq!(pinned.model.as_deref(), Some("sonnet"));
+        assert_eq!(pinned.effort.as_deref(), Some("low"));
     }
 
     /// The rationale is the one line the CLI prints and the viewer shows, so it names the provider,
