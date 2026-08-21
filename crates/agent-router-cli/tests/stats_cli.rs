@@ -434,8 +434,9 @@ fn stats_json_reconciles_with_the_log_json_it_summarises() {
     // - Claude's window is not (no cache and no credentials, which is every CI runner), so claude
     //   is ineligible too and the pair falls through to the default with the reason recorded.
     //
-    // Both prove the usage plumbing reached the decision, which is all this assertion is for; the
-    // flip rate is not pinned to a number here and `tests/stats.rs` owns the gate semantics.
+    // Grok is unavailable without authoritative capacity, so its gate always records first. Both
+    // vectors prove the usage plumbing reached the decision, which is all this assertion is for;
+    // the flip rate is not pinned to a number here and `tests/stats.rs` owns the gate semantics.
     //
     // Asserting a single gate here passed on any developer box and failed only in CI, because the
     // second vector needs a machine with no Claude usage to read.
@@ -445,7 +446,8 @@ fn stats_json_reconciles_with_the_log_json_it_summarises() {
         .expect("the row decided against an exhausted codex");
     let fired = gate_tags(exhausted);
     assert!(
-        fired == ["flipped_on_exhaustion"] || fired == ["weekly_unknown", "over_ceiling"],
+        fired == ["grok_unavailable", "flipped_on_exhaustion"]
+            || fired == ["grok_unavailable", "weekly_unknown", "over_ceiling"],
         "an exhausted codex must fire a weekly gate, got {fired:?}"
     );
 
@@ -560,19 +562,18 @@ fn stats_json_emits_a_bad_rate_by_gate_that_reconciles_against_the_marked_rows()
 
     // The counts a reader can check by hand. Two rows named their provider, so both carry
     // `explicit_provider` and both are judged, one bad: 1 of 2. One row could not be classified,
-    // it is judged bad, and no other row carries that tag: 1 of 1. Complexity is the classifier's
-    // own answer, so the two explicit rows are unscored and the unclassifiable one reads high.
+    // it is judged bad, and no other row carries that tag: 1 of 1. Explicit providers still run
+    // classification to derive omitted downstream settings, so both explicit rows read medium.
     let by_gate = rate_map(&stats, "bad_rate_by_gate");
     assert_eq!(by_gate.get("explicit_provider").copied(), Some((1, 2)));
     assert_eq!(by_gate.get("classifier_failed").copied(), Some((1, 1)));
     let by_complexity = rate_map(&stats, "bad_rate_by_complexity");
-    assert_eq!(by_complexity.get("unscored").copied(), Some((1, 2)));
+    assert_eq!(by_complexity.get("medium").copied(), Some((1, 2)));
     assert_eq!(by_complexity.get("high").copied(), Some((1, 1)));
     assert_eq!(by_complexity.get("low").copied(), Some((0, 1)));
-    // The ultra and medium rows are the only ones at their tier and neither is judged, so neither
-    // tier has a bad rate at all. Counting an unjudged row as good would report 0 of 1 here.
+    // The ultra row is the only one at its tier and is not judged, so it has no bad rate at all.
+    // Counting an unjudged row as good would report 0 of 1 here.
     assert_eq!(by_complexity.get("ultra").copied(), Some((0, 0)));
-    assert_eq!(by_complexity.get("medium").copied(), Some((0, 0)));
     assert_eq!(
         stats["bad_rate_by_complexity"]["ultra"]["share"],
         Value::Null
