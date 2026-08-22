@@ -184,6 +184,27 @@ fn write_exhausted_rollout(sessions: &Path) {
         .expect("write the codex rollout");
 }
 
+/// A measured Grok weekly window makes the exhausted-Codex row deterministic: ordinary work can
+/// fail closed onto the healthy workhorse without consulting machine-local Claude telemetry.
+fn write_healthy_grok_rollout(grok_home: &Path) {
+    let line = json!({
+        "msg": "billing: fetched credits config",
+        "ctx": {
+            "subscriptionTier": "SuperGrok Plus",
+            "config": {
+                "creditUsagePercent": 10.0,
+                "currentPeriod": {
+                    "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                    "end": "2099-01-07T00:00:00Z",
+                },
+            },
+        },
+    })
+    .to_string();
+    fs::write(grok_home.join("logs/unified.jsonl"), format!("{line}\n"))
+        .expect("write the Grok billing rollout");
+}
+
 struct StatsFixture {
     root: TempDir,
 }
@@ -191,11 +212,19 @@ struct StatsFixture {
 impl StatsFixture {
     fn new(label: &str) -> Self {
         let root = TempDir::new(label);
-        for child in ["home", "bin", "working directory", IDLE, EXHAUSTED] {
+        for child in [
+            "home",
+            "bin",
+            "working directory",
+            "grok-home/logs",
+            IDLE,
+            EXHAUSTED,
+        ] {
             fs::create_dir_all(root.path.join(child)).expect("create fixture directory");
         }
         write_fake_claude(&root.path.join("bin"));
         write_exhausted_rollout(&root.path.join(EXHAUSTED));
+        write_healthy_grok_rollout(&root.path.join("grok-home"));
         Self { root }
     }
 
@@ -426,29 +455,14 @@ fn stats_json_reconciles_with_the_log_json_it_summarises() {
     assert_eq!(gates.get("explicit_provider").copied(), Some(2));
     assert_eq!(gates.get("classifier_failed").copied(), Some(1));
 
-    // The one usage driven row: codex reads 99 percent weekly from this fixture's rollout, so a
-    // weekly gate must have fired on it. WHICH gates depends on whether claude's own weekly window
-    // could be read, and that comes from a machine wide cache no fixture can set, so exactly two
-    // vectors are legitimate and both are pinned rather than loosened into a containment check:
-    //
-    // - Claude's window is readable, so claude is the eligible provider and the task flips onto it.
-    // - Claude's window is not (no cache and no credentials, which is every CI runner), so claude
-    //   is ineligible too and the pair falls through to the default with the reason recorded.
-    //
-    // Both prove the usage plumbing reached the decision, which is all this assertion is for; the
-    // flip rate is not pinned to a number here and `tests/stats.rs` owns the gate semantics.
-    //
-    // Asserting a single gate here passed on any developer box and failed only in CI, because the
-    // second vector needs a machine with no Claude usage to read.
+    // The exhausted Codex row has a measured healthy Grok peer, so it always records the single
+    // fail-closed workhorse flip regardless of machine-local Claude telemetry.
     let exhausted = rows
         .iter()
         .find(|row| text(row, "task") == ON_EXHAUSTED_CODEX)
         .expect("the row decided against an exhausted codex");
     let fired = gate_tags(exhausted);
-    assert!(
-        fired == ["flipped_on_exhaustion"] || fired == ["weekly_unknown", "over_ceiling"],
-        "an exhausted codex must fire a weekly gate, got {fired:?}"
-    );
+    assert_eq!(fired, ["flipped_on_exhaustion"]);
 
     assert_eq!(
         object_counts(&stats, "routes"),

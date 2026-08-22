@@ -1,9 +1,9 @@
 # agent-router
 
-Route one task automatically to Codex or Claude by task shape and weekly usage headroom, or
-dispatch explicitly to Grok or OpenCode, then record why the decision was made.
+Route ordinary work automatically between Codex and Grok using authoritative weekly usage, pin
+capability-heavy work to premium Claude, or dispatch explicitly to any provider, then record why.
 
-The problem it solves: two automatic routing providers with separate weekly quotas, and a running judgement call
+The problem it solves: workhorse providers with separate weekly quotas, and a running judgement call
 about which one a given task belongs to. `agent-router` makes that call explicitly, from a fixed
 rubric plus live usage, and logs every decision so the routing policy can be tuned against real
 data instead of memory.
@@ -51,28 +51,21 @@ log: row 87 in /home/you/.local/state/agent-router/router.db
    which is the build tier; `low` and `medium` implement runs are the direct and quick tiers, they
    fit comfortably, and they stay on ordinary routing. An unscored task reads as `high`, so a
    classifier failure on an implement run pins rather than gambles.
-3. **Apply the hard ceiling, then the projection override, then pace on Claude's 5 hour window.** A
-   provider at or above `hard_ceiling_pct` is ineligible. Its fresh default is 98 percent used, so
-   a provider within 2 points of its weekly limit takes no more routed work, and so is a provider
-   whose weekly window nobody read (`weekly_unknown`), because an unread window reports 0 percent
-   used and would otherwise read as maximum headroom: exactly one ineligible sends the task to the other
-   (`flipped_on_exhaustion`), both ineligible keeps the default (`over_ceiling`). With both
-   eligible, the task moves when the provider it is on projects to draw more than
-   `projection_overdraw_pct` of its own weekly allowance by the time its own window resets, and the
-   other provider projects lower (`projected_overdraw`). Finally a task still bound for Claude moves to Codex
-   when Claude's 5 hour percent is at or above `claude_five_hour_pacing_pct` and Codex is under the
-   hard ceiling (`five_hour_pacing`), because an exhausted 5 hour window stalls the job rather than
-   merely costing more. Automatic task routing considers Codex and Claude only. Grok is never
-   selected by `--provider auto`, including when its capacity is known. An unavailable Grok
-   capacity reading records the `grok_unavailable` gate on an explicit Grok route as observability
-   only and cannot cause automatic task selection to move to Grok.
+3. **Balance the workhorses by weekly usage.** Auto normal work considers Codex and Grok only. A
+   provider at or above `hard_ceiling_pct`, or whose weekly usage is unknown or non-authoritative,
+   is excluded. When both are available, the lower weekly percentage wins; ties go to Codex.
+   If neither has usable capacity, the configured default (Codex by default) is used and the
+   decision visibly records the all-unavailable fallback. Claude's 5-hour window does not pace
+   automatic routing; Claude is reserved for the capability pins above. Grok remains available for
+   explicit dispatch with `--provider grok`.
 4. **Complete the provider, model, and effort pins.** With no pins, classification chooses the
-   provider through usage routing, then complexity chooses the Codex or Claude model from its tier
-   table and maps low to low, medium to medium, and high or ultra to high effort. An explicit
+   provider through usage routing, then complexity chooses the Codex model from its tier table and
+   maps low to low, medium to medium, and high or ultra to high effort. Grok uses its lifecycle
+   default model and effort. An explicit
    Claude or Codex provider preserves that provider while classification fills omitted model and
    effort. An explicit Claude or Codex provider and model preserves both while classification fills
-   effort. Three explicit values are exact and skip routing classification. Grok and OpenCode are
-   explicit only. Grok accepts an explicit model and rejects `--effort`; OpenCode has no derived
+   effort. Three explicit values are exact and skip routing classification. Grok accepts an explicit
+   model and rejects `--effort`; OpenCode has no derived
    model and receives no derived effort.
 5. **Dispatch and log.** The job is spawned detached, its backend job id is resolved, and the whole
    decision lands in a SQLite decision log.
@@ -121,7 +114,7 @@ cargo install --path crates/agent-router-cli
 | --- | --- | --- |
 | `claude` | Claude dispatch, Claude usage, and classification on the default engine | Must be on `PATH` and logged in. With the default `engine = "claude"` the classifier runs on every `--provider auto` call, so `claude` is exercised even when every task ends up on Codex. |
 | `codex` | Codex dispatch, Codex usage, and classification when `engine = "codex"` | Dispatch goes through `codex app-server daemon`, which the router starts on demand. |
-| `grok` | Explicit Grok dispatch and an eligible Grok adversarial review | Optional. Router reuses Agent Viewer's public lifecycle and never configures Grok itself. |
+| `grok` | Grok dispatch, automatic workhorse routing, and an eligible Grok adversarial review | Optional. Router reuses Agent Viewer's public lifecycle and never configures Grok itself. |
 | `opencode` | OpenCode dispatch | Optional. Only reached via an explicit `--provider opencode`. |
 
 The classifier engine is a budget decision rather than a quality one: scoring is a single small
@@ -135,9 +128,8 @@ Codex has no known weekly capacity and is ineligible for automatic routing. If n
 has known capacity, the router still dispatches to the configured default. `agent-router doctor`
 reports the source status and exits nonzero for a stale read, `agent-router usage` names the source
 per provider, and every decision row records `claude_usage_stale` and `codex_usage_stale`.
-Grok capacity is observed for adversarial review eligibility only. It never participates in
-ordinary automatic task routing, and an unavailable or nonauthoritative reading makes Grok
-ineligible as a reviewer.
+Grok capacity participates in ordinary automatic task routing and adversarial review eligibility.
+An unavailable or nonauthoritative weekly reading makes Grok ineligible for both paths.
 
 Usage comes from:
 
@@ -146,8 +138,7 @@ Usage comes from:
   that shared cache, which the statusline and other tooling also read.
 - **Codex**: the newest rollout under `$CODEX_HOME/sessions` (default `~/.codex/sessions`) that
   carries a `rate_limits` event. Override the scan root with `$CODEX_SESSIONS_DIR`.
-- **Grok**: the official CLI billing log under `~/.grok/logs/unified.jsonl`. It is used only to
-  decide whether a registered Grok reviewer has authoritative capacity.
+- **Grok**: the official CLI billing log under `~/.grok/logs/unified.jsonl`.
 
 ## Usage
 
@@ -165,7 +156,7 @@ agent-router run "Refactor the parity scanner" --dry-run
 # Pin the provider while classification fills omitted values.
 agent-router run "Bump the lockfile" --provider codex --model gpt-5.6-luna
 
-# Dispatch a Grok task explicitly. Grok is never selected by auto routing.
+# Dispatch a Grok task explicitly (auto routing may also select it for ordinary work).
 agent-router run "Review this migration plan" --provider grok --model grok-4
 
 # Route work in another directory.
@@ -175,7 +166,7 @@ agent-router run "Fix the failing test" --dir ~/git/other-project
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `--dir <PATH>` | current directory | Working directory for the dispatched job. |
-| `--provider <NAME>` | `auto` | `auto` classifies provider, model, and effort between Codex and Claude. An explicit `codex`, `claude`, `grok`, or `opencode` pins the provider. Grok and OpenCode are explicit only. |
+| `--provider <NAME>` | `auto` | `auto` classifies the task, balances ordinary work between Codex and Grok, and pins Claude for capability needs. An explicit provider pins it. |
 | `--model <NAME>` | tier table | Model pin. Requires an explicit `--provider`. With explicit Claude or Codex and no effort, classification fills effort. Pairing it with `--provider auto` is rejected. An explicit Grok model reaches the public lifecycle unchanged. OpenCode does not derive a model. |
 | `--effort <NAME>` | complexity mapping | Effort pin. Requires an explicit provider and model. Low maps to low, medium to medium, and high or ultra maps to high for Codex and Claude. Grok rejects this flag; OpenCode does not receive derived effort. |
 | `--name <NAME>` | the model's title, or three to five words derived from the task | Name for the dispatched job. Supplying it skips the naming call. It reaches the `claude --bg --name` argv verbatim, names the Codex thread, and is recorded as `job_name` in the decision log for every provider, so callers that reconcile inflight jobs by exact name depend on it. An empty or whitespace only name is rejected. |
@@ -212,8 +203,8 @@ uses `grok --leader --resume <session-id>` so attaching cannot replace the share
 Run a review synchronously with an eligible provider other than the provider that initiated the
 request. The primary provider is always excluded, including Grok. Candidate providers must be
 registered as review capable, have an authoritative known and fresh weekly capacity reading, and
-be below 90 percent usage. Grok is a registered alternative only when its public lifecycle reports
-an authoritative leader and capacity is available. It is never an ordinary automatic task route.
+be below 90 percent usage. Grok is a registered alternative when its public lifecycle reports an
+authoritative leader and capacity is available.
 The command does not classify the request or start a detached background job. It waits for the
 review to reach a terminal result, then prints the review body.
 
@@ -240,7 +231,7 @@ reported rather than silently leaving a reviewer session behind.
 
 ### `usage`
 
-Weekly and 5 hour headroom for Codex and Claude, plus observed Grok capacity.
+Weekly headroom for the Codex/Grok workhorse pair, plus 5-hour observations where providers expose them.
 
 ```bash
 $ agent-router usage
@@ -256,15 +247,12 @@ nobody took. A live Codex credits verdict can be known without a reset epoch, so
 weekly percentage with a reset dash. Routing refuses a provider with an unknown weekly verdict.
 
 `source` is where the numbers came from: `live` for a parsed payload and `fail-open` when no usable
-capacity verdict was read. That source label means full headroom for Claude but closed capacity for
-Codex; `weekly` prints `unknown` for either unread window rather than claiming a measurement.
-Grok's source is observational and never changes automatic task routing. It can make Grok an
-eligible adversarial reviewer only when the lifecycle also reports an authoritative leader.
+capacity verdict was read. `weekly` prints `unknown` for either unread workhorse window rather than
+claiming a measurement; unknown or ceiling capacity is excluded from auto selection.
 
-The weekly window is what places a single job: it decides which provider has room for the task in
-front of the router. Claude's 5 hour window is what paces a stream of them, moving work away from
-Claude once its 5 hour percent reaches `claude_five_hour_pacing_pct` and Codex still has weekly
-room. Codex's own 5 hour number is reported here for the operator and never influences routing.
+The weekly window places ordinary work: the lower known percentage wins, with Codex as the tie
+break. If neither workhorse has usable capacity, the default provider is used and the fallback is
+recorded. Claude's 5-hour window is informational and does not pace auto routing.
 
 ### `doctor`
 
@@ -313,9 +301,8 @@ Exit code is `0` when every check is pass or warn, `1` when any check fails. A m
 never a failure: it is a provider the router can route to on request, not one it needs, so
 installing it or not never moves the exit code.
 
-A missing Grok binary or authoritative leader is also a warning. Grok is explicit only for tasks
-and optional for adversarial review, so these checks describe why that path is unavailable without
-changing ordinary routing.
+A missing Grok binary or authoritative leader is also a warning. These checks describe why Grok is
+unavailable without hiding the automatic capacity decision.
 
 Both usage checks come from a single usage read, so doctor asks each provider once and its two
 lines cannot disagree about the same read.

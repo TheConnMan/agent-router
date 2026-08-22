@@ -58,8 +58,6 @@ A file already stamped `config_version = 4` is not migrated, so its chosen ceili
 ```toml
 config_version = 4
 hard_ceiling_pct = 98.0
-projection_overdraw_pct = 100.0
-claude_five_hour_pacing_pct = 90.0
 classifier_timeout_secs = 60
 connectors = [
     "local shell",
@@ -101,9 +99,9 @@ exceptions = []
 Default `98.0`. Weekly percent used at or above which a provider counts as exhausted.
 
 A provider at or over this ceiling is ineligible, and so is a provider whose weekly window nobody
-read. Exactly one ineligible sends the task to the other and tags the decision
-`flipped_on_exhaustion`. Both ineligible keeps the default provider and tags it `over_ceiling`,
-because at that point there is no better destination to move to.
+read. The lower weekly percentage wins when both workhorse providers are eligible; ties go to Codex.
+Exactly one ineligible sends the task to the other. Both ineligible keeps the default provider and
+records the all-unavailable fallback visibly.
 
 An unread weekly window is ineligible because it reports no capacity verdict, so trusting it would
 hand every job to whichever provider failed to report. A Codex Premium credits event is different:
@@ -114,10 +112,10 @@ ineligible and a decision flips to Claude when Claude has confirmed room.
 A window that has genuinely reset is a different input and stays eligible: it reports 0 percent
 against a real past reset epoch, which is a provider that does have a full week.
 
-Missing, unreadable, or malformed Codex sources return stale closed capacity with no known weekly
-verdict. Claude sources still fail open when unavailable. Both are ineligible for automatic
-routing, but they cannot stop a dispatch: with neither provider reporting capacity, the decision
-falls through to `over_ceiling` and the default provider takes the job, tagged with both reasons.
+Missing, unreadable, or malformed weekly sources are unknown and therefore ineligible for automatic
+routing. This applies to both Codex and Grok. If neither has authoritative capacity, the default
+provider still dispatches and the decision records that fallback rather than silently pretending
+one provider had headroom.
 
 The default keeps a 2 point reserve, so a provider within 2 points of its weekly limit takes no
 more routed work. The reserve is what the last points are for, because the router is not the only
@@ -181,14 +179,13 @@ points, and the configured value then sat above every reading the box could prod
 stopped firing entirely and nothing reported that it had. A ratio against each provider's own
 allowance has no such dependency, which is why this key has no measured default to go stale.
 
-### `claude_five_hour_pacing_pct`
+### `claude_five_hour_pacing_pct` (observational)
 
-Default `90.0`. Claude 5 hour percent used at or above which a task is paced away from Claude.
+Default `90.0`. Retained for compatibility and reporting; Claude's 5-hour usage does not pace
+automatic routing.
 
-This runs after the weekly rules, on the provider they landed on. A task still bound for Claude
-moves to Codex when Claude's 5 hour percent reaches this threshold, and the decision is tagged
-`five_hour_pacing`. It applies however the task reached Claude, the projection override included: a
-near exhausted 5 hour window stalls a Claude dispatch rather than merely making it more expensive.
+No automatic decision uses this threshold. Normal work balances Codex and Grok by authoritative
+weekly usage; Claude is selected only by capability/context pins.
 
 Codex having room is judged by `hard_ceiling_pct`, the same threshold the exhaustion flip uses,
 rather than by a second key that could drift away from it. Codex sitting exactly on that ceiling has
@@ -198,9 +195,7 @@ A capability pin overrides this entirely. A task that needs a connector Codex ca
 needs several agents exchanging findings mid-run, stays on Claude however exhausted its 5 hour
 window is, because a paced job that cannot do the work is a failed job rather than a cheaper one.
 
-Setting `weekly_routing = false` disables pacing along with every other usage driven rule. An
-operator who turned weekly routing off asked to route purely on task shape, and a usage driven flip
-would contradict that, so there is no second flag to leave on by accident.
+Setting `weekly_routing = false` disables weekly balancing along with every other usage-driven rule.
 
 Codex's own 5 hour number is deliberately ignored, in both directions: it never paces a task away
 from Codex and it never keeps one on Claude. Only Claude has a 5 hour window that constrains a
@@ -236,13 +231,10 @@ there.
 
 ### `default_provider`
 
-Default `"codex"`. Either `"codex"` or `"claude"`. The provider every task starts on, and the one
-that stands when no usage rule moves it.
+Default `"codex"`. Either `"codex"` or `"grok"` for the workhorse fallback. The provider used when
+both workhorses are unavailable (Codex by default).
 
-The router was built so this is a one word edit. Nothing in the decision engine assumes Codex is
-the default; setting `"claude"` makes Claude the default destination and Codex the exception
-without any routing logic change. The projection override is symmetric and measured from whichever
-provider the task is currently on, so it works in both directions unchanged.
+Claude is selected by capability/context pins and is not a workhorse usage-routing destination.
 
 ### `weekly_routing`
 

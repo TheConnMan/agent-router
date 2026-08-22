@@ -1,9 +1,8 @@
-//! The decision engine: the capability pin first, then the hard ceiling, then a rare run rate
-//! override, then Claude's five hour window pacing a stream of jobs away from Claude. Pure given
-//! its inputs, the deciding instant included.
+//! The decision engine: capability pins select Claude; ordinary work selects the eligible Codex or
+//! Grok provider with the lower authoritative weekly usage. Pure given its inputs.
 
 use crate::classify::{Classification, Complexity};
-use crate::config::{Config, DefaultProvider};
+use crate::config::Config;
 use crate::provider::Provider;
 use crate::usage::{Headroom, UsageSnapshot};
 
@@ -12,9 +11,8 @@ use crate::usage::{Headroom, UsageSnapshot};
 /// is directly comparable to this.
 const WEEKLY_WINDOW_SECS: f64 = 604_800.0;
 
-/// How much of a weekly window must have elapsed before a projection across it means anything.
-/// A twentieth of a week is about 8.4 hours. Below this the divisor is small enough that a single
-/// job projects to a blowout, and the override would move traffic on the strength of one dispatch.
+/// How much of a weekly window must have elapsed before a projected-draw diagnostic is useful.
+/// A twentieth of a week is about 8.4 hours; below this, one dispatch gives a misleading rate.
 const MIN_PROJECTION_ELAPSED: f64 = 0.05;
 
 /// Everything that fired on the way to a provider, in the order it fired. These are the tuning
@@ -24,7 +22,7 @@ const MIN_PROJECTION_ELAPSED: f64 = 0.05;
 pub enum Gate {
     /// The caller pinned a provider, so provider routing was bypassed.
     ExplicitProvider,
-    /// The classifier could not answer, so the configured default remains in force.
+    /// The classifier could not answer; automatic capacity routing still applies.
     ClassifierFailed,
     /// A required connector is missing: an automatic Claude decision regardless of shape.
     MissingConnector,
@@ -38,7 +36,7 @@ pub enum Gate {
     /// either at or over the hard ceiling, or carrying a weekly number nobody read: see
     /// `WeeklyUnknown`, which is recorded alongside this one to tell the two apart.
     FlippedOnExhaustion,
-    /// Both providers are ineligible; the default provider was used anyway.
+    /// Both workhorse providers are ineligible, so Codex was used anyway.
     OverCeiling,
     /// At least one provider's weekly window was never read, so its percentage is a default rather
     /// than a reading. Such a provider is ineligible: an unread window reports 0 percent used, and
@@ -50,20 +48,11 @@ pub enum Gate {
     GrokUnavailable,
     /// Weekly usage routing is disabled by policy.
     WeeklyRoutingDisabled,
-    /// The provider the task was on projects to overdraw its weekly window before the window
-    /// resets, and the other provider projects a lighter draw, so the task moved.
+    /// Retained for compatibility with legacy decision logs.
     ProjectedOverdraw,
-    /// No projection could be computed for at least one provider, so the override was skipped.
-    /// In practice this means one thing: too little of a window has elapsed for a projection across
-    /// it to mean anything. A projection is also uncomputable when a reset was never read, but the
-    /// override runs only with both providers eligible and eligibility already requires a known
-    /// weekly window, so that decision carries `WeeklyUnknown` instead. Recorded rather than
-    /// inferred, because declining to measure and measuring a healthy provider are not the same
-    /// input and must not read the same in the log.
+    /// Retained for compatibility with legacy decision logs.
     ProjectionUnavailable,
-    /// Claude's five hour window is near exhausted and Codex has weekly room, so the task was paced
-    /// away from Claude. Never fires for Codex: only Claude has a five hour window that constrains a
-    /// stream of jobs on this box.
+    /// Retained for compatibility with legacy decision logs.
     FiveHourPacing,
 }
 
@@ -161,21 +150,14 @@ fn implement_exceeds_codex_window(classification: &Classification) -> bool {
 
 /// PURE: the routing decision for a scored task, at the instant `now_epoch_secs`.
 ///
-/// The instant is a parameter rather than a clock read, because the run rate rules below are a
-/// function of how much of each weekly window has elapsed. Passing it in is what makes a decision
-/// replayable: the backtest replays each recorded row at the instant it was actually decided.
+/// The instant is a parameter rather than a clock read because compatible projected-draw log
+/// fields depend on how much of each weekly window has elapsed.
 ///
 /// The rules, in the order they run, and each in the order it must run:
 ///
-/// 1. The capability pin. A task Codex cannot do is not a cheaper job when routed there, it is a
-///    failed one, so a pin bypasses every usage rule below including the ceiling.
-/// 2. Eligibility, before the override: a provider at or over the hard ceiling, or carrying a
-///    weekly number nobody read, is not a destination. Being out of weekly budget is a capacity
-///    fact, and a provider down to its reserve projects to finish INSIDE its allowance (98 percent
-///    used against 99 percent elapsed projects to 99), so an override allowed to run first would
-///    see nothing wrong and route into an exhausted provider.
-/// 3. The projection override. See `projected_draw`.
-/// 4. Claude's five hour pacing, last, on whichever provider the task landed on.
+/// 1. Capability pins select Claude, bypassing automatic capacity routing.
+/// 2. Ordinary work selects between eligible Codex and Grok readings by lowest weekly usage, with
+///    an exact tie staying on Codex. Unknown or exhausted candidates are ineligible.
 pub fn decide(
     classification: Classification,
     usage: UsageSnapshot,
@@ -197,15 +179,13 @@ pub fn decide(
         capability_pin = true;
     }
 
-    let mut provider = match config.policy.default_provider {
-        DefaultProvider::Codex => Provider::Codex,
-        DefaultProvider::Claude => Provider::Claude,
-    };
+    // Ordinary work starts on Codex. Claude is a capability destination only; automatic capacity
+    // routing chooses between Codex and Grok below.
+    let mut provider = Provider::Codex;
     if capability_pin {
         provider = Provider::Claude;
     } else if classification.classifier_failed {
-        // Not a pin: a task nobody could score keeps the configured default and stays eligible for
-        // every usage rule, so it still lands on the provider with room.
+        // Not a pin: a task nobody could score still selects by known workhorse capacity.
         gates.push(Gate::ClassifierFailed);
     }
 
@@ -215,67 +195,45 @@ pub fn decide(
     let claude_projected_draw = projected_draw(&usage.claude, now_epoch_secs);
     let codex_projected_draw = projected_draw(&usage.codex, now_epoch_secs);
 
-    if !capability_pin {
-        if !config.policy.weekly_routing {
-            gates.push(Gate::WeeklyRoutingDisabled);
-        } else {
-            let other = other_provider(provider);
-            // Fail closed on a weekly number nobody read. The percentage of an unread window is 0,
-            // which is the same reading as a genuinely idle provider, so trusting it hands every
-            // job to whichever provider failed to report. An exhausted Codex is exactly that
-            // shape: its rollout carried no weekly window, so it read as 0 percent used, live, and
-            // won every comparison in this block while it was actually hard limited.
-            //
-            // Closing here rather than in the reader keeps the reader's fail open contract intact.
-            // It also cannot block a dispatch: both providers unknown falls through to the
-            // `over_ceiling` arm, which still routes.
-            let eligible = |candidate| {
-                headroom(&usage, candidate).weekly_known()
-                    && weekly_used(&usage, candidate) < config.hard_ceiling_pct
-            };
-            if !headroom(&usage, provider).weekly_known() || !headroom(&usage, other).weekly_known()
-            {
-                gates.push(Gate::WeeklyUnknown);
+    if !capability_pin && !config.policy.weekly_routing {
+        gates.push(Gate::WeeklyRoutingDisabled);
+    } else if !capability_pin {
+        // Fail closed on a weekly number nobody read. The percentage of an unread window is 0,
+        // which is the same reading as a genuinely idle provider, so trusting it hands every job
+        // to whichever provider failed to report.
+        //
+        // Closing here rather than in the reader keeps the reader's fail open contract intact. It
+        // also cannot block a dispatch: both providers unknown fall through to `over_ceiling`.
+        let eligible = |candidate| {
+            headroom(&usage, candidate).weekly_known()
+                && weekly_used(&usage, candidate) < config.hard_ceiling_pct
+        };
+        if !headroom(&usage, Provider::Codex).weekly_known()
+            || !headroom(&usage, Provider::Grok).weekly_known()
+        {
+            gates.push(Gate::WeeklyUnknown);
+        }
+        if !headroom(&usage, Provider::Grok).weekly_known() {
+            gates.push(Gate::GrokUnavailable);
+        }
+        match (eligible(Provider::Codex), eligible(Provider::Grok)) {
+            (false, false) => {
+                // The router routes; refusing work over a ceiling is bonus drain's job. The
+                // fallback stays Codex when neither authoritative weekly reading is usable.
+                gates.push(Gate::OverCeiling);
             }
-            match (eligible(provider), eligible(other)) {
-                (false, false) => {
-                    // The router routes; refusing work over a ceiling is bonus drain's job. The
-                    // override is not consulted, because there is no provider to move to.
-                    gates.push(Gate::OverCeiling);
-                }
-                (false, true) => {
-                    provider = other;
-                    gates.push(Gate::FlippedOnExhaustion);
-                }
-                // Exactly the current provider eligible: the task stays whatever run rate says,
-                // since the only provider it could move to is out of weekly budget.
-                (true, false) => {}
-                (true, true) => {
-                    projection_override(
-                        &mut provider,
-                        &mut gates,
-                        other,
-                        claude_projected_draw,
-                        codex_projected_draw,
-                        config,
-                    );
-                }
+            (false, true) => {
+                provider = Provider::Grok;
+                gates.push(Gate::FlippedOnExhaustion);
             }
-
-            // Pacing runs after the rules above, on the provider they landed on, and reads only
-            // Claude's five hour window: Codex's own is never a routing input. It applies however
-            // the task got to Claude, because an exhausted five hour window is a capacity fact
-            // rather than a preference, and a Claude dispatch into one stalls.
-            //
-            // "Codex has room" is the same `eligible` test the arms above used, rather than a
-            // second inline comparison that could drift away from it. That is what stops a paced
-            // job relocating a Claude stall onto a Codex whose weekly number nobody read.
-            if provider == Provider::Claude
-                && usage.claude.five_hour_pct >= config.claude_five_hour_pacing_pct
-                && eligible(Provider::Codex)
-            {
-                provider = Provider::Codex;
-                gates.push(Gate::FiveHourPacing);
+            // Exactly Codex eligible: the task stays on Codex.
+            (true, false) => {}
+            (true, true) => {
+                // A tie deliberately stays on Codex, so only a strictly lower Grok draw selects
+                // Grok.
+                if weekly_used(&usage, Provider::Grok) < weekly_used(&usage, Provider::Codex) {
+                    provider = Provider::Grok;
+                }
             }
         }
     }
@@ -302,58 +260,6 @@ pub fn decide(
     }
 }
 
-/// PURE: the projection override. Moves the task to `other` when the provider it is on projects to
-/// run out of weekly allowance before its window resets and `other` projects a lighter draw.
-///
-/// Both conditions matter. The first is what makes the rule fire only on a real problem: a provider
-/// projecting under the threshold finishes its week with allowance to spare, and moving work off it
-/// would strand that allowance. The second is what makes the destination an improvement rather than
-/// merely a different provider; without it, two equally doomed providers would trade jobs back and
-/// forth. Comparing the two projections rather than testing `other` against the threshold keeps the
-/// rule useful when BOTH overdraw, which is the week where routing matters most: the task goes to
-/// whichever provider runs out later, and the two drain together instead of one dying first.
-///
-/// This replaced a rule that compared how far ahead of pace each provider was in POINTS, against a
-/// configured gap. Two things were wrong with it. The gap was a tuning constant calibrated against
-/// one particular pair of plan sizes, so it silently went stale when either plan changed: it was
-/// set to 70 points to clear the chronic band that a 5x Codex plan against 20x Claude plans
-/// produced, the Codex plan grew on 2026-08-01, the chronic band collapsed to under 38 points, and
-/// the rule then could not fire at all. It never fired once, across every decision ever logged.
-/// The deeper fault is that a points difference is the wrong shape: `spent - elapsed` under-reacts
-/// early in a window, exactly when there is still time to correct. Twenty percent spent in the
-/// first tenth of a week is 10 points hot and a 200 percent projected draw. A ratio against each
-/// provider's own allowance and its own window needs no plan sizes and no calibration, which is why
-/// the threshold below is 100 rather than a number somebody measured.
-///
-/// Symmetric, because the rule is about the provider the task is on and not about Codex; that it
-/// only ever fires toward Claude on this box is a property of how the box is provisioned today.
-fn projection_override(
-    provider: &mut Provider,
-    gates: &mut Vec<Gate>,
-    other: Provider,
-    claude_projected_draw: Option<f64>,
-    codex_projected_draw: Option<f64>,
-    config: &Config,
-) {
-    let (Some(claude), Some(codex)) = (claude_projected_draw, codex_projected_draw) else {
-        // Routing on a projection nobody could compute is worse than not routing on one. Reaching
-        // here means a window barely started, which projects wildly off a handful of jobs: the
-        // unread-reset half of `projected_draw` cannot reach this point, because eligibility
-        // refused an unknown window before the override was consulted.
-        gates.push(Gate::ProjectionUnavailable);
-        return;
-    };
-    let draw = |candidate| match candidate {
-        Provider::Codex => codex,
-        Provider::Claude | Provider::Grok | Provider::Opencode => claude,
-    };
-    let current = draw(*provider);
-    if current > config.projection_overdraw_pct && draw(other) < current {
-        *provider = other;
-        gates.push(Gate::ProjectedOverdraw);
-    }
-}
-
 /// PURE: what a provider's weekly draw projects to by the time its window resets, as a percent of
 /// that provider's own weekly allowance. Spending 20 percent in the first tenth of the week
 /// projects to 200: at this rate the allowance runs out with most of the week still to go.
@@ -365,13 +271,10 @@ fn projection_override(
 /// None in two cases:
 ///
 /// - The reset epoch is 0, which `usage.rs` documents as "not known" rather than as a window
-///   resetting at the epoch. This one never reaches the override, which runs only once eligibility
-///   has established that both windows are known; it is here so the value RECORDED on such a
-///   decision is an honest absence rather than a number derived from a zero epoch.
+///   resetting at the epoch. The recorded value is therefore an honest absence rather than a
+///   number derived from a zero epoch.
 /// - Less than `MIN_PROJECTION_ELAPSED` of the window has gone. Dividing by a small elapsed
-///   fraction turns one job into a four-figure projection, so early in a window the projection is
-///   not merely noisy, it is confidently wrong in the direction that moves traffic. This is the
-///   case that actually stops the override.
+///   fraction turns one job into a four-figure projection, so the diagnostic is not useful.
 ///
 /// The elapsed fraction is clamped at the top, because a reset outside the window (a stale rollout,
 /// a clock skew) would otherwise read as more than a full window elapsed.
@@ -458,15 +361,6 @@ fn effort_for(provider: Provider, complexity: Complexity) -> Option<String> {
     }
 }
 
-/// PURE: the other member of the Codex/Claude pair. opencode is explicit-only, so it is never
-/// the counterparty of a headroom comparison and maps to Claude's side of the pair.
-fn other_provider(provider: Provider) -> Provider {
-    match provider {
-        Provider::Codex => Provider::Claude,
-        Provider::Claude | Provider::Grok | Provider::Opencode => Provider::Codex,
-    }
-}
-
 /// PURE: the snapshot half a provider is judged on. opencode has no usage source in the MVP, so it
 /// reads as the Claude side it rides on.
 fn headroom(usage: &UsageSnapshot, provider: Provider) -> &Headroom {
@@ -520,6 +414,7 @@ fn rationale(
 mod tests {
     use super::*;
     use crate::classify::TaskContextHorizon;
+    use crate::config::DefaultProvider;
     use crate::usage::{Headroom, parse_codex_rate_limits};
 
     /// The rules the engine routes by live in `tests/pace_routing.rs`, against the public API.
@@ -664,12 +559,19 @@ mod tests {
                     weekly_capacity_known: true,
                     stale: false,
                 },
-                grok: Headroom::closed(),
+                grok: Headroom {
+                    five_hour_pct: 0.0,
+                    five_hour_reset_epoch: 0,
+                    weekly_pct: 10.0,
+                    weekly_reset_epoch: 1_786_004_800,
+                    weekly_capacity_known: true,
+                    stale: false,
+                },
             },
             1_785_400_000,
             &Config::default(),
         );
-        assert_eq!(decision.provider, Provider::Claude);
+        assert_eq!(decision.provider, Provider::Grok);
         assert!(decision.gates.contains(&Gate::FlippedOnExhaustion));
     }
 }

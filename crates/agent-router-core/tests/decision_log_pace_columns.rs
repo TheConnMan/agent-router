@@ -79,7 +79,7 @@ fn a_recorded_decision_writes_the_orchestration_score_and_both_projections() {
     let usage = UsageSnapshot {
         claude: window(5.0, HALF_WEEK),
         codex: window(80.0, HALF_WEEK),
-        grok: Headroom::closed(),
+        grok: window(10.0, HALF_WEEK),
     };
 
     let flipped = decide(
@@ -88,7 +88,7 @@ fn a_recorded_decision_writes_the_orchestration_score_and_both_projections() {
         NOW,
         &Config::default(),
     );
-    assert_eq!(flipped.provider, Provider::Claude);
+    assert_eq!(flipped.provider, Provider::Grok);
     record(&log, &flipped);
 
     let pinned = decide(
