@@ -191,6 +191,25 @@ pub struct ParityConfig {
     pub exceptions: Vec<ParityException>,
 }
 
+/// Capacity preferences for adversarial reviews. These adjust selection only after a candidate
+/// has passed the independent, fresh-capacity, and raw-usage eligibility gates.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct AdversarialReviewConfig {
+    /// Reserve Claude capacity for work that needs its stronger sealed review environment. A
+    /// positive value makes Claude win only when its raw weekly use is this many points lower than
+    /// another eligible reviewer.
+    pub claude_usage_reserve_pct: f64,
+}
+
+impl Default for AdversarialReviewConfig {
+    fn default() -> AdversarialReviewConfig {
+        AdversarialReviewConfig {
+            claude_usage_reserve_pct: 25.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(try_from = "ParityExceptionDocument")]
 pub struct ParityException {
@@ -291,6 +310,7 @@ pub struct Config {
     pub classifier: Classifier,
     /// Which model each provider runs per task complexity.
     pub models: Models,
+    pub adversarial_review: AdversarialReviewConfig,
     pub parity: ParityConfig,
 }
 
@@ -311,6 +331,7 @@ impl Default for Config {
             policy: Policy::default(),
             classifier: Classifier::default(),
             models: Models::default(),
+            adversarial_review: AdversarialReviewConfig::default(),
             parity: ParityConfig::default(),
         }
     }
@@ -734,6 +755,26 @@ mod tests {
             Config::default().projection_overdraw_pct
         );
         assert!(config.policy.weekly_routing);
+    }
+
+    #[test]
+    fn adversarial_review_claude_reserve_defaults_and_is_operator_configurable() {
+        assert_eq!(
+            Config::default()
+                .adversarial_review
+                .claude_usage_reserve_pct,
+            25.0
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let config = load_config(
+            "[adversarial_review]\nclaude_usage_reserve_pct = 12.5\n",
+            &path,
+        )
+        .expect("load the configured reserve");
+
+        assert_eq!(config.adversarial_review.claude_usage_reserve_pct, 12.5);
     }
 
     #[test]

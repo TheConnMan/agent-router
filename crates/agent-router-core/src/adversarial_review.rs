@@ -96,7 +96,21 @@ pub fn review_with_providers(
     request: &ReviewRequest<'_>,
     providers: &[&dyn ReviewProvider],
 ) -> Result<ReviewOutcome> {
-    match select_provider(request.primary_provider, providers) {
+    review_with_claude_usage_reserve(request, providers, 0.0)
+}
+
+/// Run a review with an optional Claude capacity reserve. The reserve is a soft preference: raw
+/// usage still determines eligibility, while the reserve affects only the final choice.
+pub fn review_with_claude_usage_reserve(
+    request: &ReviewRequest<'_>,
+    providers: &[&dyn ReviewProvider],
+    claude_usage_reserve_pct: f64,
+) -> Result<ReviewOutcome> {
+    match select_provider(
+        request.primary_provider,
+        providers,
+        claude_usage_reserve_pct,
+    ) {
         Selection::Selected {
             provider,
             usage,
@@ -137,7 +151,11 @@ pub fn review_registered(request: &ReviewRequest<'_>, config: &Config) -> Review
     let grok = GrokReviewProvider;
     let providers: [&dyn ReviewProvider; 3] = [&claude, &codex, &grok];
 
-    match select_provider(request.primary_provider, &providers) {
+    match select_provider(
+        request.primary_provider,
+        &providers,
+        config.adversarial_review.claude_usage_reserve_pct,
+    ) {
         Selection::Selected {
             provider,
             usage,
@@ -232,6 +250,7 @@ fn skipped_outcome(
 fn select_provider<'a>(
     primary_provider: &str,
     providers: &[&'a dyn ReviewProvider],
+    claude_usage_reserve_pct: f64,
 ) -> Selection<'a> {
     let mut rationale = Vec::with_capacity(providers.len() + 1);
     let mut eligible = Vec::new();
@@ -320,10 +339,6 @@ fn select_provider<'a>(
             continue;
         }
 
-        rationale.push(format!(
-            "{name} eligible at {:.1} percent weekly usage",
-            usage.weekly_pct
-        ));
         usage_provenance.push(CandidateUsage {
             provider: name.to_string(),
             weekly_pct: Some(usage.weekly_pct),
@@ -331,14 +346,24 @@ fn select_provider<'a>(
             eligible: true,
             rejection_reason: None,
         });
-        eligible.push((*provider, usage));
+        let reserve = if name.eq_ignore_ascii_case("claude") {
+            claude_usage_reserve_pct
+        } else {
+            0.0
+        };
+        rationale.push(format!(
+            "{name} eligible at {:.1} percent weekly usage with {:.1} point reserve",
+            usage.weekly_pct, reserve
+        ));
+        eligible.push((*provider, usage, reserve));
     }
 
     eligible.sort_by(
-        |(left_provider, left_usage), (right_provider, right_usage)| {
-            left_usage
-                .weekly_pct
-                .total_cmp(&right_usage.weekly_pct)
+        |(left_provider, left_usage, left_reserve),
+         (right_provider, right_usage, right_reserve)| {
+            (left_usage.weekly_pct + left_reserve)
+                .total_cmp(&(right_usage.weekly_pct + right_reserve))
+                .then_with(|| left_usage.weekly_pct.total_cmp(&right_usage.weekly_pct))
                 .then_with(|| {
                     left_provider
                         .provider_name()
@@ -348,11 +373,11 @@ fn select_provider<'a>(
     );
 
     match eligible.first().copied() {
-        Some((provider, usage)) => {
+        Some((provider, usage, reserve)) => {
             rationale.push(format!(
-                "selected {} at {:.1} percent after excluding primary {}",
+                "selected {} at {:.1} percent weekly usage with {:.1} point reserve after excluding primary {}",
                 provider.provider_name(),
-                usage.weekly_pct,
+                usage.weekly_pct, reserve,
                 primary_provider
             ));
             Selection::Selected {

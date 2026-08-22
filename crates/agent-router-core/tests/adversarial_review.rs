@@ -1,5 +1,6 @@
 use agent_router_core::adversarial_review::{
-    ReviewProvider, ReviewRequest, ReviewStatus, review_with_providers,
+    ReviewProvider, ReviewRequest, ReviewStatus, review_with_claude_usage_reserve,
+    review_with_providers,
 };
 use agent_router_core::{Error, Headroom, Result};
 use std::cell::Cell;
@@ -171,6 +172,28 @@ fn equal_capacity_selection_is_deterministic_across_registration_order() {
     assert_eq!(first.result, second.result);
     assert_eq!(zeta_first.calls.get(), 0);
     assert_eq!(zeta_second.calls.get(), 0);
+}
+
+#[test]
+fn claude_reserve_preserves_premium_capacity_without_changing_eligibility() {
+    let claude = StubReviewer::successful("claude", "claude", Some(fresh(0.0)), "claude review");
+    let grok = StubReviewer::successful("grok", "grok", Some(fresh(20.0)), "grok review");
+
+    let outcome = review_with_claude_usage_reserve(&request("codex"), &[&claude, &grok], 25.0)
+        .expect("Grok wins while Claude's reserve remains larger than the usage gap");
+
+    assert_eq!(outcome.reviewer_provider.as_deref(), Some("grok"));
+    assert_eq!(grok.calls.get(), 1);
+    assert_eq!(claude.calls.get(), 0);
+    assert!(outcome.rationale.contains("25.0 point reserve"));
+
+    // Mutation check: without the reserve, the raw 0 percent Claude reading wins.
+    let raw_claude =
+        StubReviewer::successful("claude", "claude", Some(fresh(0.0)), "claude review");
+    let raw_grok = StubReviewer::successful("grok", "grok", Some(fresh(20.0)), "grok review");
+    let raw = review_with_providers(&request("codex"), &[&raw_claude, &raw_grok])
+        .expect("the raw-usage selection completes");
+    assert_eq!(raw.reviewer_provider.as_deref(), Some("claude"));
 }
 
 #[test]

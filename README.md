@@ -217,6 +217,12 @@ an authoritative leader and capacity is available. It is never an ordinary autom
 The command does not classify the request or start a detached background job. It waits for the
 review to reach a terminal result, then prints the review body.
 
+The eligible provider with the lowest effective weekly usage is selected. By default, Claude has a
+25-point reserve (`[adversarial_review] claude_usage_reserve_pct = 25.0`), protecting its premium
+capacity: Claude is selected only when its raw weekly usage is at least 25 points lower than the
+other eligible reviewer. Set the reserve to `0.0` for raw-usage-only selection. The reserve never
+makes an ineligible provider eligible.
+
 ```bash
 # Have a provider other than Codex review the request and wait for the result.
 agent-router adversarial-review --primary codex "Review the proposed authentication change"
