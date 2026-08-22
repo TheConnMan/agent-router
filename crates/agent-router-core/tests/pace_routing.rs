@@ -56,10 +56,17 @@ fn unknown_window(weekly_pct: f64, five_hour_pct: f64) -> Headroom {
 }
 
 fn usage(claude: Headroom, codex: Headroom) -> UsageSnapshot {
+    usage_with_grok(claude, codex, Headroom::closed())
+}
+
+/// Supply all three provider windows when a rule must distinguish the two workhorse providers.
+/// Most projection regressions intentionally leave Grok unavailable so they retain their
+/// two-provider historical picture.
+fn usage_with_grok(claude: Headroom, codex: Headroom, grok: Headroom) -> UsageSnapshot {
     UsageSnapshot {
         claude,
         codex,
-        grok: Headroom::closed(),
+        grok,
     }
 }
 
@@ -138,14 +145,19 @@ fn the_classifier_answer_carries_the_four_scored_fields_and_nothing_else() {
 // ------------------------------------------------------------------ rule 2: the capability pin
 
 /// Rule 2. Orchestration pins to Claude and bypasses every usage rule: Claude is over the hard
-/// ceiling, its five hour window is exhausted, Codex is empty, and Codex's reset is unknown. Each
-/// of those alone moves a plain task somewhere else, and none of them may move this one.
+/// ceiling, its five hour window is exhausted, Codex is empty, Codex's reset is unknown, and Grok
+/// has the most workhorse headroom. Each of those alone moves a plain task somewhere else, and
+/// none of them may move this one.
 #[test]
 fn an_orchestration_task_pins_to_claude_past_every_usage_rule() {
     let config = Config::default();
     let decision = decide(
         scored(true, false, Complexity::High),
-        usage(window(99.0, HALF_WEEK, 100.0), unknown_window(0.0, 0.0)),
+        usage_with_grok(
+            window(99.0, HALF_WEEK, 100.0),
+            unknown_window(0.0, 0.0),
+            window(1.0, HALF_WEEK, 0.0),
+        ),
         NOW,
         &config,
     );
@@ -165,7 +177,11 @@ fn a_missing_connector_pins_to_claude_past_every_usage_rule() {
     let config = Config::default();
     let decision = decide(
         scored(false, true, Complexity::High),
-        usage(window(99.0, HALF_WEEK, 100.0), unknown_window(0.0, 0.0)),
+        usage_with_grok(
+            window(99.0, HALF_WEEK, 100.0),
+            unknown_window(0.0, 0.0),
+            window(1.0, HALF_WEEK, 0.0),
+        ),
         NOW,
         &config,
     );
@@ -177,9 +193,71 @@ fn a_missing_connector_pins_to_claude_past_every_usage_rule() {
     assert!(!decision.gates.contains(&Gate::FiveHourPacing));
 }
 
-// ------------------------------------------------------------------ rule 3: the hard ceiling
+// ------------------------------------------------- rule 3: the workhorse headroom comparison
 
-/// Rule 3, the case the whole backstop exists for. Claude sits exactly on the configured ceiling
+/// Automatic work stays in the Codex/Grok workhorse pool. Once both report a usable weekly
+/// window, the provider with more weekly headroom wins; equality deliberately preserves Codex as
+/// the deterministic default. Claude is nearly exhausted in every case so these assertions fail
+/// if its premium lane is accidentally reintroduced as a capacity competitor.
+#[test]
+fn workhorse_routing_uses_known_weekly_headroom_and_breaks_ties_to_codex() {
+    let config = Config::default();
+    let scenarios = [
+        (60.0, 10.0, Provider::Grok, "Grok has more weekly headroom"),
+        (10.0, 60.0, Provider::Codex, "Codex has more weekly headroom"),
+        (10.0, 10.0, Provider::Codex, "a tie stays deterministically on Codex"),
+    ];
+
+    for (codex_used, grok_used, expected, reason) in scenarios {
+        let decision = decide(
+            plain(),
+            usage_with_grok(
+                window(99.0, HALF_WEEK, 0.0),
+                window(codex_used, HALF_WEEK, 0.0),
+                window(grok_used, HALF_WEEK, 0.0),
+            ),
+            NOW,
+            &config,
+        );
+
+        assert_eq!(decision.provider, expected, "{reason}");
+    }
+}
+
+/// A zero-looking value without a known weekly window is not free capacity, and the same ceiling
+/// reserve that protects Codex also protects Grok. Either input must leave the healthy workhorse
+/// as the only automatic destination.
+#[test]
+fn unavailable_or_exhausted_grok_cannot_win_the_workhorse_comparison() {
+    let config = Config::default();
+    let scenarios = [
+        (Headroom::closed(), "no Grok telemetry"),
+        (unknown_window(0.0, 0.0), "unknown Grok weekly capacity"),
+        (
+            window(config.hard_ceiling_pct, HALF_WEEK, 0.0),
+            "Grok at the weekly ceiling",
+        ),
+    ];
+
+    for (grok, reason) in scenarios {
+        let decision = decide(
+            plain(),
+            usage_with_grok(
+                window(99.0, HALF_WEEK, 0.0),
+                window(70.0, HALF_WEEK, 0.0),
+                grok,
+            ),
+            NOW,
+            &config,
+        );
+
+        assert_eq!(decision.provider, Provider::Codex, "{reason}");
+    }
+}
+
+// ------------------------------------------------------------------ rule 4: the hard ceiling
+
+/// Rule 4, the case the whole backstop exists for. Claude sits exactly on the configured ceiling
 /// with its window fully elapsed, while Codex projects to a heavier weekly draw. Eligibility is
 /// evaluated before that projection, so the override cannot move the task onto Claude.
 #[test]
@@ -199,7 +277,7 @@ fn the_override_can_never_flip_into_a_provider_at_the_hard_ceiling() {
     assert!(!decision.gates.contains(&Gate::ProjectedOverdraw));
 }
 
-/// Rule 3. Exactly one provider ineligible routes to the other, whatever run rate says. Here run
+/// Rule 4. Exactly one provider ineligible routes to the other, whatever run rate says. Here run
 /// rate argues for staying on Codex (Codex reads 43 points colder), and the ceiling overrides it,
 /// because being out of weekly budget is a capacity fact rather than a preference.
 #[test]
@@ -223,7 +301,7 @@ fn the_one_eligible_provider_takes_the_task_even_when_pace_prefers_the_other() {
     assert_eq!(decision.model.as_deref(), Some("opus[1m]"));
 }
 
-/// Rule 3. Both ineligible keeps the default provider and says so. The router routes; refusing
+/// Rule 4. Both ineligible keeps the default provider and says so. The router routes; refusing
 /// work over a ceiling is bonus drain's job. A 99 point gap would clear the dead zone here, and
 /// must not get the chance.
 #[test]
@@ -866,10 +944,14 @@ fn a_provider_within_two_points_of_its_weekly_limit_takes_no_more_work() {
 fn a_build_tier_implement_run_pins_to_claude_over_every_usage_rule() {
     let config = Config::default();
     for complexity in [Complexity::High, Complexity::Ultra] {
-        // Codex idle, Claude nearly out: usage says Codex, loudly. The pin still wins.
+        // Codex is nearly idle and Grok has more weekly headroom; the capability pin still wins.
         let decision = decide(
             implement(complexity),
-            usage(window(97.0, HALF_WEEK, 0.0), window(1.0, HALF_WEEK, 0.0)),
+            usage_with_grok(
+                window(97.0, HALF_WEEK, 0.0),
+                window(1.0, HALF_WEEK, 0.0),
+                window(0.0, HALF_WEEK, 0.0),
+            ),
             NOW,
             &config,
         );

@@ -166,10 +166,6 @@ fn missing_grok_percentage_keeps_grok_out_of_automatic_candidates() {
         Provider::Codex,
         "Codex is the only eligible provider; unknown Grok must not look empty"
     );
-    assert!(
-        !decision.gates.contains(&Gate::GrokUnavailable),
-        "automatic routing must not record a gate for an explicit only provider"
-    );
 
     let explicit = decide_explicit(
         Provider::Grok,
@@ -189,7 +185,7 @@ fn missing_grok_percentage_keeps_grok_out_of_automatic_candidates() {
 }
 
 #[test]
-fn automatic_routing_never_selects_grok_regardless_of_its_reported_capacity() {
+fn automatic_routing_balances_known_workhorse_weekly_headroom() {
     let unknown_grok = Headroom {
         weekly_pct: 0.0,
         weekly_reset_epoch: RESET,
@@ -198,13 +194,19 @@ fn automatic_routing_never_selects_grok_regardless_of_its_reported_capacity() {
         ..Headroom::full()
     };
     let scenarios = [
-        (known(95.0), known(10.0), known(0.0)),
-        (known(10.0), known(95.0), known(0.0)),
-        (known(95.0), known(10.0), unknown_grok),
-        (known(10.0), known(95.0), unknown_grok),
+        (known(99.0), known(80.0), known(10.0), Provider::Grok),
+        (known(99.0), known(10.0), known(80.0), Provider::Codex),
+        (known(99.0), known(10.0), known(10.0), Provider::Codex),
+        (known(99.0), known(80.0), unknown_grok, Provider::Codex),
+        (
+            known(99.0),
+            known(80.0),
+            known(Config::default().hard_ceiling_pct),
+            Provider::Codex,
+        ),
     ];
 
-    for (claude, codex, grok) in scenarios {
+    for (claude, codex, grok, expected) in scenarios {
         let decision = decide(
             plain_task(),
             UsageSnapshot {
@@ -216,16 +218,12 @@ fn automatic_routing_never_selects_grok_regardless_of_its_reported_capacity() {
             &Config::default(),
         );
 
-        assert!(
-            matches!(decision.provider, Provider::Codex | Provider::Claude),
-            "automatic routing selected {:?} instead of one of its two authorized providers",
-            decision.provider
-        );
+        assert_eq!(decision.provider, expected);
     }
 }
 
 #[test]
-fn grok_can_be_an_eligible_adversarial_reviewer_without_joining_automatic_routing() {
+fn grok_can_be_an_eligible_adversarial_reviewer() {
     let grok = EligibleGrokReviewer;
     let request = ReviewRequest {
         primary_provider: "codex",
