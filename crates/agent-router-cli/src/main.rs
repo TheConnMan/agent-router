@@ -665,7 +665,8 @@ fn outcome_json(outcome: &Outcome) -> serde_json::Value {
         "usage": decision.usage,
         "rationale": decision.rationale,
         "dispatch": outcome.dispatch,
-        "dry_run": outcome.dispatch.is_none(),
+        "dry_run": outcome.dispatch.is_none() && outcome.capability_blocked.is_none(),
+        "capability_blocked": outcome.capability_blocked,
         "log_id": outcome.log_id,
         "log_error": outcome.log_error,
         // Emitted on both paths, as null off the dry run one, so the JSON shape does not depend on
@@ -685,6 +686,12 @@ fn print_outcome(outcome: &Outcome) {
     }
     if let Some(effort) = &decision.effort {
         line.push_str(&format!(" effort {effort}"));
+    }
+    if let Some(reason) = &outcome.capability_blocked {
+        line.push_str(" (capability blocked, nothing dispatched)");
+        println!("{line}");
+        println!("why: {reason}");
+        return;
     }
     match &outcome.dispatch {
         Some(dispatch) => {

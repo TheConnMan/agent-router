@@ -154,7 +154,11 @@ pub fn classify_with_name(task: &str, config: &Config) -> ClassifiedTask {
     let mut scored = match capture(cmd, engine.name(), timeout) {
         Ok(stdout) => match parse_classifier_output_with_name(&stdout, engine) {
             Some((classification, job_name)) => ClassifiedTask {
-                classification,
+                classification: reconcile_configured_local_capabilities(
+                    task,
+                    classification,
+                    &config.connectors,
+                ),
                 job_name: job_name.and_then(|name| validate_job_name(task, &name)),
             },
             None => ClassifiedTask {
@@ -175,6 +179,46 @@ pub fn classify_with_name(task: &str, config: &Config) -> ClassifiedTask {
     // when routing it into the smaller window is most expensive.
     scored.classification.invokes_implement = invokes_implement(task);
     scored
+}
+
+/// PURE: clear a connector miss when the operator's current local-shell inventory proves the
+/// requested capability is already available.
+///
+/// The classifier has no tools, by design, so it can still hallucinate that an endpoint is absent
+/// despite its inventory being in the prompt. This check is deliberately narrower than a fuzzy
+/// connector matcher: it recognizes only the exact capability the configuration records. New
+/// capabilities belong in the operator-maintained inventory and need an explicit matcher here,
+/// rather than treating a word overlap as authority to dispatch.
+pub fn reconcile_configured_local_capabilities(
+    task: &str,
+    mut classification: Classification,
+    connectors: &[String],
+) -> Classification {
+    if !classification.missing_connector || !is_anthropic_usage_analysis(task, connectors) {
+        return classification;
+    }
+
+    classification.missing_connector = false;
+    classification
+        .rationale
+        .push_str("; configured local Anthropic usage endpoint covers this analysis");
+    classification
+}
+
+fn is_anthropic_usage_analysis(task: &str, connectors: &[String]) -> bool {
+    let task = task.to_ascii_lowercase();
+    let asks_for_usage =
+        task.contains("usage") && (task.contains("anthropic") || task.contains("claude"));
+    let has_local_shell = connectors
+        .iter()
+        .any(|connector| connector.eq_ignore_ascii_case("local shell"));
+    let has_usage_endpoint = connectors.iter().any(|connector| {
+        let connector = connector.to_ascii_lowercase();
+        connector.contains("authenticated anthropic usage endpoint")
+            && connector.contains("via local shell")
+    });
+
+    asks_for_usage && has_local_shell && has_usage_endpoint
 }
 
 /// PURE builder: the classifier invocation for the configured engine.
@@ -320,6 +364,14 @@ const JOB_NAME_INSTRUCTION: &str = "create a concise human-readable session titl
 /// an unintelligible fragment gives the model nothing to score, and under the old rubric those
 /// answered claude, because "I cannot tell what this is" reads as "requirements still being
 /// discovered". Unscoreable input has to land on the default provider, not on the pin.
+///
+/// The missing_connector anti-halo is the third. Measured 2026-08-21 over 282 automatic routes,
+/// every likely-incorrect destination was this boolean: false positives treated Claude skills,
+/// local SQLite, local files, gh, and later-named systems as missing connectors, and false
+/// negatives left Granola transcripts and a Slack URL on Codex. The inventory sentence was
+/// already in the prompt and was not enough, including a recorded rationale that Airtable was
+/// "not in inventory" while it was listed. Orchestration already names the things it must not
+/// be inferred from; missing_connector now does the same.
 pub fn classifier_prompt(task: &str, connectors: &[String]) -> String {
     let inventory = connectors.join(", ");
     format!(
@@ -331,7 +383,7 @@ orchestration: several agents must exchange findings with each other partway thr
 
 Degenerate input scores false on both booleans: an empty task, a greeting, a single word, or a fragment nobody could act on gives you nothing to score, and nothing to score is not orchestration. Score such a task complexity "low", task_context_horizon "ordinary", and say in the rationale that there was nothing to score.
 
-The connector inventory is authoritative: Codex on this box can reach {inventory}. Set missing_connector true ONLY when the task must reach a named system absent from that list. Never set it because you cannot see a connector yourself.
+The connector inventory is authoritative: Codex on this box can reach {inventory}. Set missing_connector true ONLY when the task must now reach a named system absent from that list. Never set it because you cannot see a connector yourself. Judge it independently: missing_connector is never inferred from how difficult the task is, from a Claude Code skill name, from a local file, local SQLite database, or local systemd unit, or from GitHub when gh is in the inventory. A Claude Code skill is not a connector. Naming a system a later job would use, mentioning an MCP that does not yet exist, or proposing to add a connector is not enough. Set it true when the task must now read Slack, Granola, Reclaim, or another named system absent from the inventory. When torn on missing_connector, answer false.
 
 Separately, and independently of both booleans, judge how much reasoning the task needs. complexity is "low" when it is conversational, one step, mechanical, or a single file with an obvious answer; "medium" for a normal well scoped implementation or investigation; "high" when it spans several files or is subtle enough to need heavy reasoning or design judgment. Classify work as high when its requested outcome requires substantive judgment: synthesizing evidence, comparing options against criteria, evaluating tradeoffs, prioritizing, making a recommendation, strategically interpreting evidence, or choosing among options. Classify direct definition, location, transcription, or single fact retrieval as low when the answer is direct, even if the request labels the work research or analysis or locating the answer first requires searching a repository or corpus; this low rule applies only when the requested output is the direct location or fact and requires no synthesis or evaluation. Judge the work required by the requested outcome, not labels or isolated terms in the request. complexity is "ultra" only for the rare hardest work, where a wrong call is expensive and hard to reverse: architecture or plan review, a root cause hunt that has already defeated ordinary debugging, or a design decision that sets a direction. Ultra is not "large" or "long running", and it is not "important to the user": when torn between high and ultra, answer high. Complexity is orthogonal to the provider: a low task can run on either provider, and so can an ultra one. Never let complexity change orchestration or missing_connector, and never let either of them change complexity.
 
@@ -723,6 +775,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn configured_local_anthropic_usage_endpoint_overrides_a_false_connector_miss() {
+        let classified = reconcile_configured_local_capabilities(
+            "Analyze Claude weekly usage and recommend how to pace it.",
+            Classification {
+                orchestration: false,
+                missing_connector: true,
+                complexity: Complexity::Medium,
+                task_context_horizon: TaskContextHorizon::Ordinary,
+                rationale: "claimed endpoint unavailable".to_string(),
+                classifier_failed: false,
+                invokes_implement: false,
+            },
+            &[
+                "local shell".to_string(),
+                "authenticated Anthropic usage endpoint (via local shell)".to_string(),
+            ],
+        );
+
+        assert!(
+            !classified.missing_connector,
+            "the configured endpoint is authority over a classifier false positive"
+        );
+        assert!(
+            classified
+                .rationale
+                .contains("configured local Anthropic usage endpoint")
+        );
+    }
+
     /// The prompt is the whole classifier, so the instructions that are there for a measured
     /// reason are pinned rather than left to survive the next edit by luck.
     #[test]
@@ -753,9 +835,28 @@ mod tests {
         // The connector inventory, scored against exactly the configured list.
         assert!(prompt.contains("Codex on this box can reach local shell, airtable"));
         assert!(prompt.contains(
-            "Set missing_connector true ONLY when the task must reach a named system absent from \
-             that list"
+            "Set missing_connector true ONLY when the task must now reach a named system absent \
+             from that list"
         ));
+        // Anti-halo for missing_connector. Measured 2026-08-21: every likely-incorrect auto
+        // route was this boolean, both false positives (skills, local sqlite, gh) and false
+        // negatives (Granola, Slack). The inventory sentence alone did not hold.
+        assert!(prompt.contains("Judge it independently"));
+        assert!(prompt.contains("A Claude Code skill is not a connector"));
+        assert!(prompt.contains(
+            "missing_connector is never inferred from how difficult the task is, from a Claude \
+             Code skill name, from a local file, local SQLite database, or local systemd unit, \
+             or from GitHub when gh is in the inventory"
+        ));
+        assert!(prompt.contains(
+            "Naming a system a later job would use, mentioning an MCP that does not yet exist, \
+             or proposing to add a connector is not enough"
+        ));
+        assert!(prompt.contains(
+            "Set it true when the task must now read Slack, Granola, Reclaim, or another named \
+             system absent from the inventory"
+        ));
+        assert!(prompt.contains("When torn on missing_connector, answer false."));
         assert!(prompt.contains("do a thing"));
         assert!(prompt.contains("GH-123 Sprint 2 Bug Fixes"));
         assert!(prompt.contains("RS-123 Input Box Searching"));

@@ -134,10 +134,10 @@ fn an_orchestration_task_pins_to_claude_past_every_usage_rule() {
     assert!(decision.gates.contains(&Gate::Orchestration));
 }
 
-/// Rule 2, the other half of the pin. A task that cannot reach its connector on Codex is not a
-/// cheaper job when paced there, it is a failed one.
+/// Rule 2. A connector absent from the authoritative inventory is not evidence that Claude has
+/// it, so routing must retain the miss but block dispatch instead of assigning a provider halo.
 #[test]
-fn a_missing_connector_pins_to_claude_past_every_usage_rule() {
+fn a_missing_connector_is_capability_blocked_instead_of_pinning_claude() {
     let config = Config::default();
     let decision = decide(
         scored(false, true, Complexity::High),
@@ -150,8 +150,10 @@ fn a_missing_connector_pins_to_claude_past_every_usage_rule() {
         &config,
     );
 
-    assert_eq!(decision.provider, Provider::Claude);
     assert!(decision.gates.contains(&Gate::MissingConnector));
+    assert!(decision.gates.contains(&Gate::CapabilityBlocked));
+    assert!(decision.capability_blocked);
+    assert_ne!(decision.provider, Provider::Claude);
 }
 
 // ------------------------------------------------- rule 3: the workhorse headroom comparison

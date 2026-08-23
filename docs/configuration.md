@@ -245,11 +245,13 @@ classifier invocation strips both CLI startup cost and the model's thinking toke
 Default `["local shell", "git", "gh (github)", "airtable"]`. The authoritative inventory of what
 Codex can reach on this machine.
 
-This is the one section that genuinely needs human maintenance. Rubric criterion 5 ("Codex has
-every required connector") is scored against exactly this list, and a task needing a system absent
-from it trips the `missing_connector` hard gate, which pins the task to Claude regardless of shape
-or usage. The classifier is explicitly told never to set `missing_connector` because it cannot see
-a connector itself, only because a named system is absent from this list.
+This is the one section that genuinely needs human maintenance. Rubric criterion 5 is scored
+against exactly this local-shell inventory. A configured capability, such as the authenticated
+Anthropic usage endpoint via local shell, prevents a false `missing_connector` result for a
+matching task. A genuinely absent capability returns `capability_blocked` and dispatches no
+provider; absence is not evidence that Claude can reach it. The classifier is explicitly told
+never to set `missing_connector` because it cannot see a connector itself, only because a named
+system is absent from this list.
 
 Keep it accurate in both directions. Listing a connector Codex cannot actually reach sends work to
 a provider that will fail; omitting one it can reach sends work to Claude that did not need to go

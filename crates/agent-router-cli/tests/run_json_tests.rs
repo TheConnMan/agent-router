@@ -404,6 +404,54 @@ fn a_provider_only_dry_run_still_classifies_downstream_values() {
     assert_eq!(dry.classifier_calls(), 1);
 }
 
+/// A classifier-reported connector miss cannot silently become a Claude dispatch: the configured
+/// inventory establishes no provider capability for an absent connector.
+#[cfg(unix)]
+#[test]
+fn an_unavailable_capability_is_reported_without_dispatching_claude() {
+    let fixture = CliFixture::new("capability-blocked");
+    fixture.answers_with(
+        &json!({
+            "orchestration": false,
+            "missing_connector": true,
+            "complexity": "medium",
+            "task_context_horizon": "ordinary",
+            "rationale": "requires unavailable service",
+            "job_name": fixture.classifier_name,
+        })
+        .to_string(),
+    );
+    let output = fixture
+        .run_command()
+        .arg("--json")
+        .output()
+        .expect("run router");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("router json");
+
+    assert_eq!(
+        value["capability_blocked"].as_str(),
+        Some(
+            "required capability is absent from the configured connector inventory; no provider was dispatched"
+        )
+    );
+    assert_eq!(value["dispatch"], Value::Null);
+    assert_eq!(value["dry_run"], false);
+    assert!(
+        value["gates"]
+            .as_array()
+            .is_some_and(|gates| gates.contains(&Value::String("capability_blocked".to_string())))
+    );
+    assert!(
+        !fixture.spawn_log.exists(),
+        "a capability block must never start the Claude job"
+    );
+}
+
 /// Grok and OpenCode have no derived model or effort, so naming either provider must not disclose
 /// the task to a different provider merely to compute values that will be discarded.
 #[cfg(unix)]

@@ -40,10 +40,12 @@ log: row 87 in /home/you/.local/state/agent-router/router.db
    values still come from classification. Grok and OpenCode skip cross-provider classification;
    job naming remains a separate title call when a name was not supplied and dispatch is not a dry
    run.
-2. **Apply the capability pin.** A missing connector, a task needing several agents to exchange
-   findings mid-run, or a build-tier `/implement` run (`implement_context_window`), pins to Claude
-   regardless of usage. These are statements that the task cannot run on Codex at all, so every
-   usage rule below is bypassed. The third one is a context-window fact rather than a feature gap:
+2. **Apply capability gates.** A task needing several agents to exchange findings mid-run or a
+   build-tier `/implement` run (`implement_context_window`) pins to Claude regardless of usage.
+   A missing connector is different: the configured local-shell inventory is checked first; if it
+   does not establish the required capability for any provider, the result is explicit
+   `capability_blocked` and no job is dispatched. The context-window gate is a fact rather than a
+   feature gap:
    Codex's window is 258,400 tokens, and measured 2026-08-11 across 37 Claude and 13 Codex
    `/implement` runs, the median Claude run peaks at 262,017 tokens of resident context with 51
    percent of runs peaking above the whole Codex window. It fires only when the task text actually
@@ -541,8 +543,9 @@ than a silent fallback to defaults, because routing against ceilings and a conne
 operator never wrote is worse than refusing to run.
 
 The one section that genuinely needs human maintenance is `connectors`: it is the authoritative
-inventory of what Codex can reach on this machine, and rubric criterion 5 is scored against exactly
-that list. Anything absent from it is what forces a task to Claude.
+inventory of local-shell capabilities on this machine, and rubric criterion 5 is scored against
+exactly that list. A listed local capability prevents a false `missing_connector` result; an
+absent one returns `capability_blocked` rather than assuming Claude can reach it.
 
 See [docs/configuration.md](docs/configuration.md) for the full reference.
 

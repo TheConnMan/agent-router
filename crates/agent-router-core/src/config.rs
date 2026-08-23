@@ -301,9 +301,9 @@ pub struct Config {
     pub claude_five_hour_pacing_pct: f64,
     /// How long the classifier call may take before it counts as failed.
     pub classifier_timeout_secs: u64,
-    /// What Codex can actually reach on this box. Human-maintained: gate 5 of the rubric
-    /// ("Codex has every required connector") is scored against exactly this list, so anything
-    /// absent here is what forces a task to Claude.
+    /// What the local shell can actually reach on this box. Human-maintained: gate 5 of the
+    /// rubric is scored against exactly this list. An absent capability blocks dispatch unless a
+    /// provider-specific capability is established elsewhere; it must never be assumed for Claude.
     pub connectors: Vec<String>,
     pub policy: Policy,
     /// Which engine and model score a task.

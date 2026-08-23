@@ -54,6 +54,9 @@ pub struct Dispatch {
 pub struct Outcome {
     pub decision: Decision,
     pub dispatch: Option<Dispatch>,
+    /// The router refused to dispatch because the authoritative inventory does not establish the
+    /// required capability for any provider.
+    pub capability_blocked: Option<String>,
     /// None when the row could not be written. A job that is already running must still be
     /// reported to the caller, so a logging failure downgrades to `log_error` rather than
     /// swallowing the job identity behind an Err.
@@ -161,6 +164,29 @@ pub fn run(request: &Request, config: &Config) -> Result<Outcome> {
         .unwrap_or("auto");
     let log = DecisionLog::open()?;
 
+    if decision.capability_blocked {
+        let capability_blocked = "required capability is absent from the configured connector inventory; no provider was dispatched".to_string();
+        let log_id = log.record(&Entry {
+            task: request.task,
+            dir: request.dir,
+            requested,
+            decision: &decision,
+            dry_run: false,
+            job_id: None,
+            job_name: None,
+            outcome: "capability-blocked",
+            effective_effort: None,
+        })?;
+        return Ok(Outcome {
+            decision,
+            dispatch: None,
+            capability_blocked: Some(capability_blocked),
+            log_id: Some(log_id),
+            log_error: None,
+            estimate: None,
+        });
+    }
+
     if request.dry_run {
         // A dry run is how a caller checks an invocation before committing to it, so the claude
         // only scoping flags refuse here too, for the provider the decision landed on: reporting a
@@ -184,6 +210,7 @@ pub fn run(request: &Request, config: &Config) -> Result<Outcome> {
         return Ok(Outcome {
             decision,
             dispatch: None,
+            capability_blocked: None,
             log_id: Some(log_id),
             log_error: None,
             estimate: Some(estimate),
@@ -227,6 +254,7 @@ pub fn run(request: &Request, config: &Config) -> Result<Outcome> {
     Ok(Outcome {
         decision,
         dispatch: Some(dispatch),
+        capability_blocked: None,
         log_id,
         log_error,
         estimate: None,

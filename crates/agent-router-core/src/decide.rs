@@ -24,8 +24,11 @@ pub enum Gate {
     ExplicitProvider,
     /// The classifier could not answer; automatic capacity routing still applies.
     ClassifierFailed,
-    /// A required connector is missing: an automatic Claude decision regardless of shape.
+    /// A required connector is absent from the configured inventory.
     MissingConnector,
+    /// The configured inventory proves no dispatcher has the required capability, so no job was
+    /// started. This follows `MissingConnector` to preserve the classifier observation in logs.
+    CapabilityBlocked,
     /// The task needs several agents exchanging findings mid-run, which Codex cannot do: an
     /// automatic Claude decision regardless of usage.
     Orchestration,
@@ -62,6 +65,7 @@ impl Gate {
             Gate::ExplicitProvider => "explicit_provider",
             Gate::ClassifierFailed => "classifier_failed",
             Gate::MissingConnector => "missing_connector",
+            Gate::CapabilityBlocked => "capability_blocked",
             Gate::Orchestration => "orchestration",
             Gate::ImplementContextWindow => "implement_context_window",
             Gate::FlippedOnExhaustion => "flipped_on_exhaustion",
@@ -99,6 +103,9 @@ pub struct Decision {
     /// None when provider, model, and effort were all pinned.
     pub classification: Option<Classification>,
     pub gates: Vec<Gate>,
+    /// The configured capability inventory could not satisfy the request. `provider` remains the
+    /// ordinary route for log compatibility, but `run` must not dispatch it.
+    pub capability_blocked: bool,
     pub usage: UsageSnapshot,
     /// What each provider's weekly draw projects to at the moment its window resets, as a percent
     /// of that provider's own weekly allowance, at the deciding instant. Over 100 means the
@@ -155,7 +162,9 @@ fn implement_exceeds_codex_window(classification: &Classification) -> bool {
 ///
 /// The rules, in the order they run, and each in the order it must run:
 ///
-/// 1. Capability pins select Claude, bypassing automatic capacity routing.
+/// 1. Capability pins select Claude, bypassing automatic capacity routing. A missing connector is
+///    different: without an inventory-backed provider capability it is blocked, never assumed to
+///    be a Claude capability.
 /// 2. Ordinary work selects between eligible Codex and Grok readings by lowest weekly usage, with
 ///    an exact tie staying on Codex. Unknown or exhausted candidates are ineligible.
 pub fn decide(
@@ -165,10 +174,11 @@ pub fn decide(
     config: &Config,
 ) -> Decision {
     let mut gates = Vec::new();
+    let capability_blocked = classification.missing_connector;
     let mut capability_pin = false;
     if classification.missing_connector {
         gates.push(Gate::MissingConnector);
-        capability_pin = true;
+        gates.push(Gate::CapabilityBlocked);
     }
     if classification.orchestration {
         gates.push(Gate::Orchestration);
@@ -253,6 +263,7 @@ pub fn decide(
         effort: effort_for(provider, complexity),
         classification: Some(classification),
         gates,
+        capability_blocked,
         usage,
         claude_projected_draw,
         codex_projected_draw,
@@ -327,6 +338,7 @@ pub fn decide_explicit(
         effort,
         classification,
         gates,
+        capability_blocked: false,
         usage,
         // No usage rule ran, so no projection was measured. Recording one anyway would put a number
         // in the log that nothing consulted, which the next backtest would read as a rule firing.
@@ -527,11 +539,12 @@ mod tests {
             &config,
         );
         assert!(
-            decision.rationale.starts_with("claude: "),
+            decision.rationale.starts_with("codex: "),
             "{}",
             decision.rationale
         );
         assert!(decision.rationale.contains("missing_connector"));
+        assert!(decision.rationale.contains("capability_blocked"));
         assert!(decision.rationale.contains("codex weekly 71%"));
         assert!(decision.rationale.contains("claude weekly 50%"));
     }
