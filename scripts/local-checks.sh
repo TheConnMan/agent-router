@@ -58,21 +58,25 @@ run_gate() {
     fi
 }
 
-# The tests run against a Claude usage cache that is not there, because a runner does not have one.
-# `usage.rs` otherwise reads a machine-wide `/tmp/claude-usage-cache.json` that no fixture can unset,
-# so a test touching Claude usage sees a live read here and no read at all in CI. That is not a
-# hypothetical: it is what turned main red on 2026-08-06, on a merge every box it was built on
-# called green. Credentials need no equivalent, since `claude_oauth_token` already reads a temp
-# HOME's `.claude/.credentials.json` and finds nothing.
+# The tests run against Claude and Grok usage caches that are not there, because a runner does not
+# have either one. `usage.rs` otherwise reads machine-wide files under `/tmp` that no fixture HOME
+# can unset, so usage tests can see live reads locally and no read at all in CI. Claude's version of
+# that divergence turned main red on 2026-08-06, on a merge every box it was built on called green.
+# Credentials need no equivalent, since both readers already resolve credentials from the fixture
+# HOME or GROK_HOME and find nothing.
 #
-# A path under a directory that does not exist, rather than a temp file that gets deleted: there is
-# no window in which something could create it, and nothing to clean up.
-ABSENT_USAGE_CACHE=/nonexistent/agent-router-local-checks/claude-usage-cache.json
+# Paths under a directory that does not exist, rather than temp files that get deleted: there is no
+# window in which something could create them, and nothing to clean up.
+ABSENT_CLAUDE_USAGE_CACHE=/nonexistent/agent-router-local-checks/claude-usage-cache.json
+ABSENT_GROK_USAGE_CACHE=/nonexistent/agent-router-local-checks/grok-usage-cache.json
 
 run_gate "the router version was bumped" scripts/check-version-bump.sh
 run_gate "formatting" "$CARGO" fmt --all -- --check
 run_gate "clippy" "$CARGO" clippy --workspace --all-targets --all-features --locked -- -D warnings
-run_gate "tests" env "CLAUDE_USAGE_CACHE=$ABSENT_USAGE_CACHE" "$CARGO" test --workspace --locked
+run_gate "tests" env \
+    "CLAUDE_USAGE_CACHE=$ABSENT_CLAUDE_USAGE_CACHE" \
+    "GROK_USAGE_CACHE=$ABSENT_GROK_USAGE_CACHE" \
+    "$CARGO" test --workspace --locked
 
 # The pass stamp, so `pre-push` does not re-run a suite `post-merge` just ran. Keyed on the exact
 # commit, in the common git directory every worktree shares, and written only here on the far side

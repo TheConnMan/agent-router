@@ -1,8 +1,8 @@
-//! Weekly and 5h usage readers for both providers, Rust ports of bonus-drain's `usage.sh`
-//! (Claude) and `codex-usage.sh` (Codex) with the same semantics.
+//! Weekly and 5h usage readers for Claude, Codex, and Grok, following the corresponding
+//! bonus-drain readers' semantics.
 //!
-//! Claude fails open, but Codex fails closed: an unreadable Codex capacity source must not become
-//! a dispatch target.
+//! Claude fails open, but Codex and Grok fail closed: an unreadable capacity source for either
+//! must not become a dispatch target.
 //!
 //! Every unreadable value carries `stale = true`, while a usable parsed payload carries
 //! `stale = false`. `agent-router doctor` reports that provenance and the decision log records it
@@ -17,12 +17,17 @@
 
 use crate::runtime::{default_codex_home, home_dir};
 use std::ffi::OsStr;
-use std::io::{Read as _, Seek as _, SeekFrom};
+use std::fs::{File, OpenOptions};
+use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 /// The Claude usage cache the statusline and bonus-drain already share.
 pub const CLAUDE_USAGE_CACHE_DEFAULT: &str = "/tmp/claude-usage-cache.json";
+/// The Grok usage cache agent-router writes for other local consumers.
+pub const GROK_USAGE_CACHE_DEFAULT: &str = "/tmp/grok-usage-cache.json";
 /// Points the Claude reader at a different cache. Empty or unset means the shared default.
 ///
 /// It exists so a test can decide what Claude's usage read returns. The default is a machine wide
@@ -34,6 +39,11 @@ pub const CLAUDE_USAGE_CACHE_DEFAULT: &str = "/tmp/claude-usage-cache.json";
 /// Pointed at a path that does not exist, this reproduces a runner exactly: no cache to read, and
 /// `claude_oauth_token` already finds nothing under a temp HOME, so the read fails open.
 pub const CLAUDE_USAGE_CACHE_ENV: &str = "CLAUDE_USAGE_CACHE";
+/// Points the Grok reader at a different cache. Empty or unset means the shared default.
+///
+/// Like the Claude override, this keeps tests isolated from a machine-wide cache without mutating
+/// process-global environment variables in parallel tests.
+pub const GROK_USAGE_CACHE_ENV: &str = "GROK_USAGE_CACHE";
 /// How old the shared cache may be before it is refreshed from the API.
 const CACHE_MAX_AGE: Duration = Duration::from_secs(300);
 /// Ceiling on the usage HTTP call, matching `usage.sh`'s `curl --max-time 6`.
@@ -44,7 +54,15 @@ const CODEX_SCAN_N: usize = 20;
 const WINDOW_FIVE_HOUR: i64 = 300;
 /// `window_minutes` of the weekly window.
 const WINDOW_WEEKLY: i64 = 10080;
-const GROK_LOG_TAIL_MAX_BYTES: u64 = 1_048_576;
+/// One fixed-size block used while walking the Grok log backwards. Memory grows only with the
+/// longest individual line, not with the size of the log.
+const GROK_LOG_READ_BYTES: usize = 64 * 1024;
+/// Maximum normalized Grok cache body accepted from the shared `/tmp` path.
+const GROK_USAGE_CACHE_MAX_BYTES: usize = 64 * 1024;
+/// Maximum one-line Grok log event retained while scanning backwards.
+const GROK_LOG_LINE_MAX_BYTES: usize = 1024 * 1024;
+const GROK_BILLING_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
+const GROK_USER_URL: &str = "https://cli-chat-proxy.grok.com/v1/user?include=subscription";
 
 /// One provider's usage snapshot: percent of each window consumed, plus when it resets.
 /// Percentages are 0-100; a reset epoch of 0 means "not known".
@@ -113,13 +131,22 @@ pub struct UsageSnapshot {
 }
 
 impl UsageSnapshot {
-    /// IMPURE: read both providers live.
+    /// IMPURE: read all providers live.
     pub fn read() -> UsageSnapshot {
-        UsageSnapshot {
-            claude: claude_headroom(),
-            codex: codex_headroom(),
-            grok: grok_headroom(),
-        }
+        Self::read_with_grok_source().0
+    }
+
+    /// IMPURE: read all providers once and retain the Grok snapshot's provenance for diagnostics.
+    pub fn read_with_grok_source() -> (UsageSnapshot, GrokUsageSource) {
+        let grok = grok_usage();
+        (
+            UsageSnapshot {
+                claude: claude_headroom(),
+                codex: codex_headroom(),
+                grok: grok.headroom,
+            },
+            grok.source,
+        )
     }
 
     pub const fn full() -> UsageSnapshot {
@@ -133,25 +160,124 @@ impl UsageSnapshot {
 
 // ---------------------------------------------------------------- Grok
 
-/// IMPURE: the Grok snapshot from the official CLI billing log.
-pub fn grok_headroom() -> Headroom {
-    grok_headroom_in(
-        &crate::dispatch::grok::grok_home().join("logs/unified.jsonl"),
+/// Where agent-router obtained a usable Grok capacity reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrokUsageSource {
+    Live,
+    Cache,
+    Log,
+    None,
+}
+
+/// One Grok capacity reading together with the provenance doctor reports.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GrokUsage {
+    pub headroom: Headroom,
+    pub source: GrokUsageSource,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct GrokUsageCache {
+    tier: String,
+    weekly_percent: f64,
+    weekly_reset: i64,
+    source_ts: String,
+}
+
+/// IMPURE: the cache path the Grok reader will use, from `GROK_USAGE_CACHE` or the shared default.
+pub fn grok_usage_cache() -> PathBuf {
+    grok_usage_cache_from(std::env::var_os(GROK_USAGE_CACHE_ENV).as_deref())
+}
+
+/// PURE: the resolution rule behind `grok_usage_cache`, split out so it is testable without
+/// touching the process-global environment.
+pub fn grok_usage_cache_from(var: Option<&OsStr>) -> PathBuf {
+    match var {
+        Some(path) if !path.is_empty() => PathBuf::from(path),
+        _ => PathBuf::from(GROK_USAGE_CACHE_DEFAULT),
+    }
+}
+
+/// IMPURE: one Grok capacity read, retaining whether it came from live billing, cache, log, or no
+/// usable source. A fresh cache avoids the provider calls; a stale cache remains the fallback when
+/// the calls fail.
+pub fn grok_usage() -> GrokUsage {
+    let grok_home = crate::dispatch::grok::grok_home();
+    let cache = grok_usage_cache();
+    grok_usage_in(
+        &cache,
+        &grok_home.join("logs/unified.jsonl"),
         now_epoch(),
+        is_fresh(&cache, CACHE_MAX_AGE),
+        || fetch_grok_usage(&grok_home),
     )
+}
+
+/// IMPURE: the Grok headroom from the read-through cache and provider-owned fallbacks.
+pub fn grok_headroom() -> Headroom {
+    grok_usage().headroom
+}
+
+/// IMPURE only through the supplied paths and fetch function: resolve Grok capacity in the exact
+/// fresh cache, live fetch, stale cache, full log, closed order used by production.
+fn grok_usage_in<F>(
+    cache_path: &Path,
+    log_path: &Path,
+    now: i64,
+    cache_is_fresh: bool,
+    fetch: F,
+) -> GrokUsage
+where
+    F: FnOnce() -> Option<(String, String)>,
+{
+    let cached = read_grok_cache(cache_path).and_then(|body| parse_grok_cache(&body, now));
+    if cache_is_fresh && let Some(headroom) = cached {
+        return GrokUsage {
+            headroom,
+            source: GrokUsageSource::Cache,
+        };
+    }
+
+    if let Some((billing, user)) = fetch()
+        && let Some((headroom, normalized)) = parse_live_grok_usage(&billing, &user, now)
+    {
+        // Only this normalized, non-secret payload is shared. Raw responses and the bearer token
+        // never enter the cache or diagnostics.
+        if let Ok(body) = serde_json::to_string(&normalized) {
+            let _ = write_grok_cache(cache_path, body.as_bytes());
+        }
+        return GrokUsage {
+            headroom,
+            source: GrokUsageSource::Live,
+        };
+    }
+
+    if let Some(headroom) = cached {
+        return GrokUsage {
+            headroom,
+            source: GrokUsageSource::Cache,
+        };
+    }
+    let headroom = grok_headroom_from_log(log_path, now);
+    if headroom != Headroom::closed() {
+        return GrokUsage {
+            headroom,
+            source: GrokUsageSource::Log,
+        };
+    }
+    GrokUsage {
+        headroom: Headroom::closed(),
+        source: GrokUsageSource::None,
+    }
 }
 
 /// PURE except for reading `path`: the newest official weekly SuperGrok Plus billing event.
 pub fn grok_headroom_in(path: &Path, now: i64) -> Headroom {
-    let Some(text) = bounded_log_tail(path) else {
-        return Headroom::closed();
-    };
-    let Some(value) = text.lines().rev().find_map(|line| {
-        let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
-        (value.get("msg").and_then(serde_json::Value::as_str)
-            == Some("billing: fetched credits config"))
-        .then_some(value)
-    }) else {
+    grok_headroom_from_log(path, now)
+}
+
+fn grok_headroom_from_log(path: &Path, now: i64) -> Headroom {
+    let Some(value) = newest_grok_billing_event(path) else {
         return Headroom::closed();
     };
     if value
@@ -187,20 +313,347 @@ pub fn grok_headroom_in(path: &Path, now: i64) -> Headroom {
     }
 }
 
-fn bounded_log_tail(path: &Path) -> Option<String> {
-    let mut file = std::fs::File::open(path).ok()?;
-    let length = file.metadata().ok()?.len();
-    let offset = length.saturating_sub(GROK_LOG_TAIL_MAX_BYTES);
-    file.seek(SeekFrom::Start(offset)).ok()?;
-    let mut bytes = Vec::with_capacity((length - offset) as usize);
-    file.take(GROK_LOG_TAIL_MAX_BYTES)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    if offset > 0 {
-        let first_complete = bytes.iter().position(|byte| *byte == b'\n')? + 1;
-        bytes.drain(..first_complete);
+/// Scan newest-first without loading the whole log. The retained buffer is at most one JSONL line
+/// plus a fixed read block, so a large log with ordinary-sized events stays bounded in memory.
+fn newest_grok_billing_event(path: &Path) -> Option<serde_json::Value> {
+    let mut file = File::open(path).ok()?;
+    let mut remaining = file.metadata().ok()?.len();
+    let mut block = vec![0; GROK_LOG_READ_BYTES];
+    let mut reversed_line = Vec::new();
+    let mut line_over_limit = false;
+
+    while remaining > 0 {
+        let read_len = usize::try_from(remaining.min(GROK_LOG_READ_BYTES as u64)).ok()?;
+        remaining -= read_len as u64;
+        file.seek(SeekFrom::Start(remaining)).ok()?;
+        file.read_exact(&mut block[..read_len]).ok()?;
+        for &byte in block[..read_len].iter().rev() {
+            if byte == b'\n' {
+                if !line_over_limit
+                    && let Some(value) = grok_billing_event_from_reversed_line(&mut reversed_line)
+                {
+                    return Some(value);
+                }
+                reversed_line.clear();
+                line_over_limit = false;
+            } else if line_over_limit {
+                continue;
+            } else if reversed_line.len() < GROK_LOG_LINE_MAX_BYTES {
+                reversed_line.push(byte);
+            } else {
+                reversed_line.clear();
+                line_over_limit = true;
+            }
+        }
     }
-    String::from_utf8(bytes).ok()
+    (!line_over_limit)
+        .then(|| grok_billing_event_from_reversed_line(&mut reversed_line))
+        .flatten()
+}
+
+fn grok_billing_event_from_reversed_line(line: &mut [u8]) -> Option<serde_json::Value> {
+    if line.is_empty() {
+        return None;
+    }
+    line.reverse();
+    let value = serde_json::from_slice::<serde_json::Value>(line).ok()?;
+    (value.get("msg").and_then(serde_json::Value::as_str)
+        == Some("billing: fetched credits config"))
+    .then_some(value)
+}
+
+fn parse_grok_cache(body: &str, now: i64) -> Option<Headroom> {
+    let cache: GrokUsageCache = serde_json::from_str(body).ok()?;
+    if cache.tier != "SuperGrok Plus"
+        || !valid_grok_percentage(cache.weekly_percent)
+        || cache.weekly_reset <= now
+    {
+        return None;
+    }
+    Some(known_grok_headroom(
+        cache.weekly_percent,
+        cache.weekly_reset,
+    ))
+}
+
+/// Read the shared Grok cache without following links or trusting an unbounded `/tmp` file.
+fn read_grok_cache(path: &Path) -> Option<String> {
+    let mut file = open_grok_cache_for_read(path)?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file()
+        || metadata.len() > GROK_USAGE_CACHE_MAX_BYTES as u64
+        || !grok_cache_metadata_is_trusted(&metadata)
+    {
+        return None;
+    }
+
+    let mut body = String::new();
+    std::io::Read::by_ref(&mut file)
+        .take(GROK_USAGE_CACHE_MAX_BYTES as u64 + 1)
+        .read_to_string(&mut body)
+        .ok()?;
+    (body.len() <= GROK_USAGE_CACHE_MAX_BYTES).then_some(body)
+}
+
+#[cfg(unix)]
+fn open_grok_cache_for_read(path: &Path) -> Option<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .ok()
+}
+
+#[cfg(not(unix))]
+fn open_grok_cache_for_read(path: &Path) -> Option<File> {
+    OpenOptions::new().read(true).open(path).ok()
+}
+
+#[cfg(unix)]
+fn grok_cache_metadata_is_trusted(metadata: &std::fs::Metadata) -> bool {
+    metadata.uid() == unsafe { libc::geteuid() }
+        && metadata.mode() & 0o022 == 0
+        && metadata.mode() & 0o400 != 0
+}
+
+#[cfg(not(unix))]
+fn grok_cache_metadata_is_trusted(_metadata: &std::fs::Metadata) -> bool {
+    true
+}
+
+/// Replace the normalized cache body only through a regular file owned by this user.
+fn write_grok_cache(path: &Path, body: &[u8]) -> std::io::Result<()> {
+    if body.len() > GROK_USAGE_CACHE_MAX_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "normalized Grok usage cache is too large",
+        ));
+    }
+
+    let mut file = open_grok_cache_for_write(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || !grok_cache_write_metadata_is_trusted(&metadata) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Grok usage cache must be a securely owned, single-linked regular file",
+        ));
+    }
+    secure_grok_cache_permissions(&file)?;
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(body)
+}
+
+#[cfg(unix)]
+fn open_grok_cache_for_write(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_grok_cache_for_write(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+}
+
+#[cfg(unix)]
+fn grok_cache_write_metadata_is_trusted(metadata: &std::fs::Metadata) -> bool {
+    grok_cache_metadata_is_trusted(metadata) && metadata.nlink() == 1
+}
+
+#[cfg(not(unix))]
+fn grok_cache_write_metadata_is_trusted(_metadata: &std::fs::Metadata) -> bool {
+    true
+}
+
+#[cfg(unix)]
+fn secure_grok_cache_permissions(file: &File) -> std::io::Result<()> {
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn secure_grok_cache_permissions(_file: &File) -> std::io::Result<()> {
+    Ok(())
+}
+
+fn parse_live_grok_usage(
+    billing: &str,
+    user: &str,
+    now: i64,
+) -> Option<(Headroom, GrokUsageCache)> {
+    let billing: serde_json::Value = serde_json::from_str(billing).ok()?;
+    let user: serde_json::Value = serde_json::from_str(user).ok()?;
+    if user
+        .get("subscriptionTier")
+        .and_then(serde_json::Value::as_str)
+        != Some("SuperGrokPlus")
+    {
+        return None;
+    }
+    let config = billing.get("config")?.as_object()?;
+    if config
+        .get("currentPeriod")?
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        != Some("USAGE_PERIOD_TYPE_WEEKLY")
+    {
+        return None;
+    }
+    let reset = config
+        .get("currentPeriod")?
+        .get("end")?
+        .as_str()
+        .and_then(parse_rfc3339_epoch)
+        .filter(|reset| *reset > now)?;
+    let weekly_percent = match config.get("creditUsagePercent") {
+        None => 0.0,
+        Some(value) => value
+            .as_f64()
+            .filter(|value| valid_grok_percentage(*value))?,
+    };
+    let headroom = known_grok_headroom(weekly_percent, reset);
+    Some((
+        headroom,
+        GrokUsageCache {
+            tier: "SuperGrok Plus".to_string(),
+            weekly_percent,
+            weekly_reset: reset,
+            source_ts: format_rfc3339_utc(now),
+        },
+    ))
+}
+
+fn known_grok_headroom(weekly_pct: f64, weekly_reset_epoch: i64) -> Headroom {
+    Headroom {
+        five_hour_pct: 0.0,
+        five_hour_reset_epoch: 0,
+        weekly_pct,
+        weekly_reset_epoch,
+        weekly_capacity_known: true,
+        stale: false,
+    }
+}
+
+fn valid_grok_percentage(value: f64) -> bool {
+    value.is_finite() && (0.0..=100.0).contains(&value)
+}
+
+/// PURE: epoch seconds as the UTC RFC 3339 shape written by the reference shell reader.
+fn format_rfc3339_utc(epoch: i64) -> String {
+    let days = epoch.div_euclid(86_400);
+    let seconds = epoch.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = seconds / 3_600;
+    let minute = seconds % 3_600 / 60;
+    let second = seconds % 60;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+/// PURE: the inverse of `days_from_civil`, returning a Gregorian UTC calendar date.
+fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
+    let shifted = days_since_epoch + 719_468;
+    let era = if shifted >= 0 {
+        shifted
+    } else {
+        shifted - 146_096
+    } / 146_097;
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = shifted_month + if shifted_month < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    (year, month, day)
+}
+
+/// IMPURE: read the first non-empty Grok auth key, call both provider endpoints, and reduce every
+/// file, authentication, transport, status, and body error to None.
+fn fetch_grok_usage(grok_home: &Path) -> Option<(String, String)> {
+    let token = grok_auth_token_from(&std::fs::read_to_string(grok_home.join("auth.json")).ok()?)?;
+    let billing = fetch_grok_body(GROK_BILLING_URL, &token)?;
+    let user = fetch_grok_body(GROK_USER_URL, &token)?;
+    Some((billing, user))
+}
+
+fn fetch_grok_body(url: &str, token: &str) -> Option<String> {
+    ureq::get(url)
+        .config()
+        .https_only(true)
+        .max_redirects(0)
+        .timeout_global(Some(USAGE_HTTP_TIMEOUT))
+        .build()
+        .header("Authorization", &format!("Bearer {token}"))
+        .header("X-XAI-Token-Auth", "xai-grok-cli")
+        .call()
+        .ok()?
+        .body_mut()
+        .read_to_string()
+        .ok()
+}
+
+/// PURE: the first non-empty string key across the Grok CLI auth collection's values. The live
+/// file has appeared as both an array and an object; this preserves JSON input order like jq's
+/// `.[]` rather than inheriting `serde_json::Map`'s configured ordering.
+fn grok_auth_token_from(body: &str) -> Option<String> {
+    let mut deserializer = serde_json::Deserializer::from_str(body);
+    let token = serde::Deserializer::deserialize_any(&mut deserializer, GrokAuthKeyVisitor).ok()?;
+    deserializer.end().ok()?;
+    token
+}
+
+struct GrokAuthKeyVisitor;
+
+impl<'de> serde::de::Visitor<'de> for GrokAuthKeyVisitor {
+    type Value = Option<String>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a Grok auth array or object")
+    }
+
+    fn visit_seq<A>(self, mut entries: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        let mut first = None;
+        while let Some(entry) = entries.next_element::<serde_json::Value>()? {
+            first = first.or_else(|| grok_auth_key(&entry));
+        }
+        Ok(first)
+    }
+
+    fn visit_map<A>(self, mut entries: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut first = None;
+        while let Some((_, entry)) =
+            entries.next_entry::<serde::de::IgnoredAny, serde_json::Value>()?
+        {
+            first = first.or_else(|| grok_auth_key(&entry));
+        }
+        Ok(first)
+    }
+}
+
+fn grok_auth_key(entry: &serde_json::Value) -> Option<String> {
+    entry
+        .get("key")?
+        .as_str()
+        .filter(|key| !key.is_empty())
+        .map(str::to_string)
 }
 
 // ---------------------------------------------------------------- Claude
@@ -580,6 +1033,12 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    #[cfg(unix)]
+    use std::os::unix::{
+        ffi::OsStrExt as _,
+        fs::{FileTypeExt as _, symlink},
+    };
 
     /// The live shape of `/tmp/claude-usage-cache.json` on this box, trimmed to the fields the
     /// reader uses plus enough neighbours to prove the extra keys are ignored.
@@ -973,5 +1432,520 @@ mod tests {
         assert_eq!(codex_headroom_in(dir.path(), now, 20).weekly_pct, 42.0);
         // Only the newest two are scanned, and neither carries capacity: closed.
         assert_eq!(codex_headroom_in(dir.path(), now, 2), Headroom::closed());
+    }
+
+    const GROK_BILLING: &str = r#"{
+      "config": {
+        "currentPeriod": {
+          "type": "USAGE_PERIOD_TYPE_WEEKLY",
+          "end": "2026-08-22T00:00:00+00:00"
+        },
+        "creditUsagePercent": 37.5
+      }
+    }"#;
+    const GROK_USER: &str = r#"{"subscriptionTier":"SuperGrokPlus"}"#;
+
+    fn grok_cache(percent: f64) -> String {
+        format!(
+            r#"{{"tier":"SuperGrok Plus","weekly_percent":{percent},"weekly_reset":1787356800,"source_ts":"2026-08-21T16:35:37Z"}}"#
+        )
+    }
+
+    fn seed_grok_cache(path: &Path, percent: f64) {
+        write_grok_cache(path, grok_cache(percent).as_bytes()).expect("seed secure Grok cache");
+    }
+
+    #[test]
+    fn grok_usage_cache_path_prefers_an_override_and_treats_empty_as_unset() {
+        assert_eq!(
+            grok_usage_cache_from(None),
+            PathBuf::from(GROK_USAGE_CACHE_DEFAULT),
+            "the default stays a shared /tmp path when no override is set"
+        );
+        assert_eq!(
+            grok_usage_cache_from(Some(OsStr::new("/tmp/isolated-grok-cache.json"))),
+            PathBuf::from("/tmp/isolated-grok-cache.json"),
+            "an explicit test or process cache path wins"
+        );
+        assert_eq!(
+            grok_usage_cache_from(Some(OsStr::new(""))),
+            PathBuf::from(GROK_USAGE_CACHE_DEFAULT),
+            "an empty environment variable must not become the working directory"
+        );
+    }
+
+    #[test]
+    fn grok_usage_fresh_cache_short_circuits_both_live_fetch_outcomes() {
+        let directory = tempfile::tempdir().expect("temporary Grok cache");
+        let cache = directory.path().join("grok-usage-cache.json");
+        let log = directory.path().join("no-log.jsonl");
+        seed_grok_cache(&cache, 61.0);
+
+        for live_result in [
+            Some((GROK_BILLING.to_string(), GROK_USER.to_string())),
+            None,
+        ] {
+            let calls = Cell::new(0);
+            let usage = grok_usage_in(&cache, &log, 1_787_313_600, true, || {
+                calls.set(calls.get() + 1);
+                live_result
+            });
+
+            assert_eq!(usage.source, GrokUsageSource::Cache);
+            assert_eq!(usage.headroom.weekly_pct, 61.0);
+            assert_eq!(
+                calls.get(),
+                0,
+                "a fresh cache must avoid every network outcome"
+            );
+        }
+    }
+
+    #[test]
+    fn grok_usage_stale_cache_uses_live_when_available_and_writes_normalized_cache() {
+        let directory = tempfile::tempdir().expect("temporary Grok cache");
+        let cache = directory.path().join("grok-usage-cache.json");
+        let log = directory.path().join("no-log.jsonl");
+        seed_grok_cache(&cache, 61.0);
+
+        let usage = grok_usage_in(&cache, &log, 1_787_313_600, false, || {
+            Some((GROK_BILLING.to_string(), GROK_USER.to_string()))
+        });
+
+        assert_eq!(usage.source, GrokUsageSource::Live);
+        assert_eq!(usage.headroom.weekly_pct, 37.5);
+        assert!(usage.headroom.weekly_capacity_known);
+        assert!(!usage.headroom.stale);
+
+        let written: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&cache).expect("read normalized live cache"),
+        )
+        .expect("cache is normalized JSON rather than a raw provider response");
+        assert_eq!(written["tier"], "SuperGrok Plus");
+        assert_eq!(written["weekly_percent"], 37.5);
+        assert_eq!(written["weekly_reset"], 1_787_356_800);
+        assert!(written["source_ts"].is_string());
+        assert_eq!(written.as_object().map(|fields| fields.len()), Some(4));
+    }
+
+    #[test]
+    fn grok_usage_stale_cache_survives_a_failed_live_fetch() {
+        let directory = tempfile::tempdir().expect("temporary Grok cache");
+        let cache = directory.path().join("grok-usage-cache.json");
+        let log = directory.path().join("no-log.jsonl");
+        seed_grok_cache(&cache, 61.0);
+
+        let usage = grok_usage_in(&cache, &log, 1_787_313_600, false, || None);
+
+        assert_eq!(usage.source, GrokUsageSource::Cache);
+        assert_eq!(usage.headroom.weekly_pct, 61.0);
+        assert!(usage.headroom.weekly_capacity_known);
+    }
+
+    #[test]
+    fn grok_usage_absent_cache_uses_live_and_writes_it() {
+        let directory = tempfile::tempdir().expect("temporary Grok cache");
+        let cache = directory.path().join("new-grok-usage-cache.json");
+        let log = directory.path().join("no-log.jsonl");
+
+        let usage = grok_usage_in(&cache, &log, 1_787_313_600, false, || {
+            Some((GROK_BILLING.to_string(), GROK_USER.to_string()))
+        });
+
+        assert_eq!(usage.source, GrokUsageSource::Live);
+        assert_eq!(usage.headroom.weekly_pct, 37.5);
+        assert!(
+            cache.is_file(),
+            "a successful live read must become the shared cache"
+        );
+    }
+
+    #[test]
+    fn grok_usage_absent_cache_falls_back_to_the_log_then_closed_none() {
+        let directory = tempfile::tempdir().expect("temporary Grok usage paths");
+        let cache = directory.path().join("absent-cache.json");
+        let log = directory.path().join("unified.jsonl");
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/grok-billing-known.jsonl"),
+            &log,
+        )
+        .expect("seed fallback billing log");
+
+        let from_log = grok_usage_in(&cache, &log, 1_787_313_600, false, || None);
+        assert_eq!(from_log.source, GrokUsageSource::Log);
+        assert_eq!(from_log.headroom.weekly_pct, 37.5);
+
+        let none = grok_usage_in(
+            &cache,
+            &directory.path().join("missing-log.jsonl"),
+            1_787_313_600,
+            false,
+            || None,
+        );
+        assert_eq!(none.source, GrokUsageSource::None);
+        assert_eq!(none.headroom, Headroom::closed());
+    }
+
+    #[test]
+    fn grok_usage_rejects_invalid_cache_and_live_capacity_contracts() {
+        let directory = tempfile::tempdir().expect("temporary Grok usage paths");
+        let cache = directory.path().join("grok-usage-cache.json");
+        let log = directory.path().join("no-log.jsonl");
+        let invalid_caches = [
+            r#"{"tier":"Free","weekly_percent":37.5,"weekly_reset":1787356800,"source_ts":"x"}"#,
+            r#"{"tier":"SuperGrok Plus","weekly_percent":101,"weekly_reset":1787356800,"source_ts":"x"}"#,
+            r#"{"tier":"SuperGrok Plus","weekly_percent":37.5,"weekly_reset":1,"source_ts":"x"}"#,
+        ];
+        for body in invalid_caches {
+            std::fs::write(&cache, body).expect("write invalid cache");
+            let usage = grok_usage_in(&cache, &log, 1_787_313_600, true, || None);
+            assert_eq!(usage.source, GrokUsageSource::None, "invalid cache: {body}");
+        }
+
+        let invalid_live = [
+            (GROK_BILLING, r#"{"subscriptionTier":"Free"}"#),
+            (
+                r#"{"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_DAILY","end":"2026-08-22T00:00:00+00:00"},"creditUsagePercent":37.5}}"#,
+                GROK_USER,
+            ),
+            (
+                r#"{"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","end":"2020-08-22T00:00:00+00:00"},"creditUsagePercent":37.5}}"#,
+                GROK_USER,
+            ),
+            (
+                r#"{"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","end":"2026-08-22T00:00:00+00:00"},"creditUsagePercent":-1}}"#,
+                GROK_USER,
+            ),
+            (
+                r#"{"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","end":"2026-08-22T00:00:00+00:00"},"creditUsagePercent":101}}"#,
+                GROK_USER,
+            ),
+        ];
+        let absent_cache = directory.path().join("absent-cache.json");
+        for (billing, user) in invalid_live {
+            let usage = grok_usage_in(&absent_cache, &log, 1_787_313_600, false, || {
+                Some((billing.to_string(), user.to_string()))
+            });
+            assert_eq!(
+                usage.source,
+                GrokUsageSource::None,
+                "invalid live billing: {billing}"
+            );
+        }
+    }
+
+    #[test]
+    fn grok_live_capacity_without_a_percent_is_known_zero() {
+        let directory = tempfile::tempdir().expect("temporary Grok usage paths");
+        let cache = directory.path().join("absent-cache.json");
+        let log = directory.path().join("no-log.jsonl");
+        let billing = r#"{"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","end":"2026-08-22T00:00:00+00:00"}}}"#;
+
+        let usage = grok_usage_in(&cache, &log, 1_787_313_600, false, || {
+            Some((billing.to_string(), GROK_USER.to_string()))
+        });
+
+        assert_eq!(usage.source, GrokUsageSource::Live);
+        assert_eq!(usage.headroom.weekly_pct, 0.0);
+        assert!(
+            usage.headroom.weekly_capacity_known,
+            "the live billing endpoint's absent percent is an authoritative zero"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grok_usage_rejects_a_symlink_cache_without_reading_or_overwriting_its_target() {
+        let directory = tempfile::tempdir().expect("temporary Grok usage paths");
+        let target = directory.path().join("unrelated-target.json");
+        let cache = directory.path().join("grok-usage-cache.json");
+        let log = directory.path().join("no-log.jsonl");
+        let original = grok_cache(61.0);
+        std::fs::write(&target, &original).expect("seed symlink target");
+        symlink(&target, &cache).expect("create cache symlink");
+
+        let usage = grok_usage_in(&cache, &log, 1_787_313_600, true, || {
+            Some((GROK_BILLING.to_string(), GROK_USER.to_string()))
+        });
+
+        assert_eq!(
+            usage.source,
+            GrokUsageSource::Live,
+            "a symlink must not be trusted as a fresh cache read"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read protected symlink target"),
+            original,
+            "a successful live refresh must not write through a cache symlink"
+        );
+        assert!(
+            std::fs::symlink_metadata(&cache)
+                .expect("cache symlink remains present")
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grok_usage_does_not_block_or_write_through_a_fifo_cache() {
+        let directory = tempfile::tempdir().expect("temporary Grok usage paths");
+        let cache = directory.path().join("grok-usage-cache.fifo");
+        let log = directory.path().join("no-log.jsonl");
+        let cache_c_string = std::ffi::CString::new(cache.as_os_str().as_bytes())
+            .expect("temporary cache path contains no NUL");
+        assert_eq!(
+            unsafe { libc::mkfifo(cache_c_string.as_ptr(), 0o600) },
+            0,
+            "create attacker-controlled FIFO cache: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let worker_cache = cache.clone();
+        let worker = std::thread::spawn(move || {
+            let usage = grok_usage_in(&worker_cache, &log, 1_787_313_600, false, || {
+                Some((GROK_BILLING.to_string(), GROK_USER.to_string()))
+            });
+            result_tx.send(usage).expect("return FIFO cache result");
+        });
+
+        let (blocked, usage) = match result_rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(usage) => (false, usage),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // The pre-fix read opens a FIFO as a normal cache file and blocks here. Pair a
+                // writer with it before asserting, so this red test never leaks a worker thread.
+                drop(
+                    OpenOptions::new()
+                        .write(true)
+                        .open(&cache)
+                        .expect("release a blocked FIFO cache reader"),
+                );
+                let usage = result_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("released FIFO cache worker returns promptly");
+                (true, usage)
+            }
+            Err(error) => panic!("FIFO cache worker disconnected: {error}"),
+        };
+        worker.join().expect("FIFO cache worker does not panic");
+
+        assert!(
+            !blocked,
+            "an attacker-created FIFO must be rejected before either cache read or live cache write can block"
+        );
+        assert_eq!(
+            usage.source,
+            GrokUsageSource::Live,
+            "valid live billing remains useful when the cache path is unsafe"
+        );
+        assert!(
+            std::fs::symlink_metadata(&cache)
+                .expect("FIFO cache remains present")
+                .file_type()
+                .is_fifo(),
+            "the live refresh must not replace or write through the FIFO"
+        );
+    }
+
+    #[test]
+    fn oversized_grok_cache_falls_through_to_live_log_and_none() {
+        let directory = tempfile::tempdir().expect("temporary Grok usage paths");
+        let cache = directory.path().join("oversized-cache.json");
+        let log = directory.path().join("unified.jsonl");
+        let oversized = format!("{}{}", " ".repeat(1_048_577), grok_cache(61.0));
+        std::fs::write(&cache, oversized).expect("write oversized but otherwise valid cache");
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/grok-billing-known.jsonl"),
+            &log,
+        )
+        .expect("seed fallback billing log");
+
+        let live = grok_usage_in(&cache, &log, 1_787_313_600, true, || {
+            Some((GROK_BILLING.to_string(), GROK_USER.to_string()))
+        });
+        assert_eq!(live.source, GrokUsageSource::Live);
+
+        std::fs::write(
+            &cache,
+            format!("{}{}", " ".repeat(1_048_577), grok_cache(61.0)),
+        )
+        .expect("restore oversized cache after live refresh");
+        let logged = grok_usage_in(&cache, &log, 1_787_313_600, true, || None);
+        assert_eq!(logged.source, GrokUsageSource::Log);
+        assert_eq!(logged.headroom.weekly_pct, 37.5);
+
+        let none = grok_usage_in(
+            &cache,
+            &directory.path().join("missing-log.jsonl"),
+            1_787_313_600,
+            true,
+            || None,
+        );
+        assert_eq!(none.source, GrokUsageSource::None);
+        assert_eq!(none.headroom, Headroom::closed());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_grok_cache_refresh_sets_owner_only_permissions() {
+        let directory = tempfile::tempdir().expect("temporary Grok usage paths");
+        let cache = directory.path().join("grok-usage-cache.json");
+        let log = directory.path().join("no-log.jsonl");
+
+        let usage = grok_usage_in(&cache, &log, 1_787_313_600, false, || {
+            Some((GROK_BILLING.to_string(), GROK_USER.to_string()))
+        });
+
+        assert_eq!(usage.source, GrokUsageSource::Live);
+        assert_eq!(
+            std::fs::metadata(&cache)
+                .expect("refreshed cache metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "normalized billing data must not remain group/world readable"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grok_usage_does_not_mutate_an_existing_writable_cache_inode() {
+        let directory = tempfile::tempdir().expect("temporary Grok usage paths");
+        let cache = directory.path().join("grok-usage-cache.json");
+        let log = directory.path().join("no-log.jsonl");
+        let original = grok_cache(61.0);
+        std::fs::write(&cache, &original).expect("seed owner-matched writable cache");
+        std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o666))
+            .expect("make the unsafe mode deterministic");
+
+        let usage = grok_usage_in(&cache, &log, 1_787_313_600, true, || {
+            Some((GROK_BILLING.to_string(), GROK_USER.to_string()))
+        });
+
+        assert_eq!(
+            usage.source,
+            GrokUsageSource::Live,
+            "a rejected cache must not prevent a valid live billing reading"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&cache).expect("read protected cache inode"),
+            original,
+            "an unsafe existing inode must not be truncated or overwritten"
+        );
+        assert_eq!(
+            std::fs::metadata(&cache)
+                .expect("protected cache metadata")
+                .mode()
+                & 0o777,
+            0o666,
+            "an unsafe existing inode must not be chmodded during live refresh"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grok_usage_does_not_mutate_a_hard_linked_cache_inode() {
+        let directory = tempfile::tempdir().expect("temporary Grok usage paths");
+        let protected = directory.path().join("unrelated-hard-link.json");
+        let cache = directory.path().join("grok-usage-cache.json");
+        let log = directory.path().join("no-log.jsonl");
+        let original = grok_cache(61.0);
+        std::fs::write(&protected, &original).expect("seed protected cache inode");
+        std::fs::hard_link(&protected, &cache).expect("create cache hard link");
+        let protected_metadata = std::fs::metadata(&protected).expect("protected link metadata");
+        let cache_metadata = std::fs::metadata(&cache).expect("cache link metadata");
+        assert_eq!(protected_metadata.nlink(), 2, "fixture has two hard links");
+        assert_eq!(protected_metadata.ino(), cache_metadata.ino());
+
+        let usage = grok_usage_in(&cache, &log, 1_787_313_600, false, || {
+            Some((GROK_BILLING.to_string(), GROK_USER.to_string()))
+        });
+
+        assert_eq!(
+            usage.source,
+            GrokUsageSource::Live,
+            "a rejected hard link must not prevent a valid live billing reading"
+        );
+        for path in [&protected, &cache] {
+            assert_eq!(
+                std::fs::read_to_string(path).expect("read protected hard link"),
+                original,
+                "live refresh must not overwrite either name for a shared inode"
+            );
+            let metadata = std::fs::metadata(path).expect("protected hard link metadata");
+            assert_eq!(metadata.ino(), protected_metadata.ino());
+            assert_eq!(metadata.nlink(), protected_metadata.nlink());
+            assert_eq!(metadata.mode() & 0o777, protected_metadata.mode() & 0o777);
+        }
+    }
+
+    #[test]
+    fn grok_log_skips_one_oversized_billing_line_and_finds_the_earlier_event() {
+        let directory = tempfile::tempdir().expect("temporary Grok log");
+        let log_path = directory.path().join("unified.jsonl");
+        let mut log = std::fs::File::create(&log_path).expect("create Grok log");
+        let earlier = serde_json::json!({
+            "msg": "billing: fetched credits config",
+            "ctx": {
+                "subscriptionTier": "SuperGrok Plus",
+                "config": {
+                    "currentPeriod": {
+                        "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                        "end": "2026-08-22T00:00:00+00:00",
+                    },
+                    "creditUsagePercent": 37.5,
+                },
+            },
+        });
+        let oversized_newer = serde_json::json!({
+            "msg": "billing: fetched credits config",
+            "padding": "x".repeat(1_048_577),
+            "ctx": {
+                "subscriptionTier": "SuperGrok Plus",
+                "config": {
+                    "currentPeriod": {
+                        "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                        "end": "2026-08-22T00:00:00+00:00",
+                    },
+                    "creditUsagePercent": 88.0,
+                },
+            },
+        });
+        writeln!(log, "{earlier}").expect("write earlier billing event");
+        writeln!(log, "{oversized_newer}").expect("write oversized newer billing event");
+        drop(log);
+
+        let usage = grok_headroom_in(&log_path, 1_787_313_600);
+
+        assert_eq!(
+            usage.weekly_pct, 37.5,
+            "an over-limit line must be discarded without hiding bounded earlier events"
+        );
+        assert!(usage.weekly_capacity_known);
+        assert!(!usage.stale);
+    }
+
+    #[test]
+    fn grok_auth_token_uses_the_first_nonempty_key_without_reporting_it() {
+        let auth = r#"[
+          {"key": ""},
+          {"key": 7},
+          {"key": "first usable test key"},
+          {"key": "later test key"}
+        ]"#;
+
+        assert_eq!(
+            grok_auth_token_from(auth),
+            Some("first usable test key".to_string())
+        );
+        assert_eq!(
+            grok_auth_token_from(r#"{"first":{"key":""},"later":{"key":"object test key"}}"#),
+            Some("object test key".to_string()),
+            "top-level auth objects must be scanned across their child values like jq `.[]`"
+        );
+        assert_eq!(grok_auth_token_from(r#"[{"key":""}]"#), None);
+        assert_eq!(grok_auth_token_from("not json"), None);
     }
 }

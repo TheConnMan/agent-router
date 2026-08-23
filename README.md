@@ -129,7 +129,8 @@ has known capacity, the router still dispatches to the configured default. `agen
 reports the source status and exits nonzero for a stale read, `agent-router usage` names the source
 per provider, and every decision row records `claude_usage_stale` and `codex_usage_stale`.
 Grok capacity participates in ordinary automatic task routing and adversarial review eligibility.
-An unavailable or nonauthoritative weekly reading makes Grok ineligible for both paths.
+No Grok billing data at all is an unknown capacity verdict, not a reading of 100 percent usage;
+it fails closed and makes Grok ineligible for both paths.
 
 Usage comes from:
 
@@ -138,7 +139,12 @@ Usage comes from:
   that shared cache, which the statusline and other tooling also read.
 - **Codex**: the newest rollout under `$CODEX_HOME/sessions` (default `~/.codex/sessions`) that
   carries a `rate_limits` event. Override the scan root with `$CODEX_SESSIONS_DIR`.
-- **Grok**: the official CLI billing log under `~/.grok/logs/unified.jsonl`.
+- **Grok**: a read-through cache at `/tmp/grok-usage-cache.json`, overridden with
+  `$GROK_USAGE_CACHE`. A valid cache under 300 seconds old is used directly. Otherwise Router
+  fetches live Grok billing and writes a normalized, non-secret cache entry on success; if that
+  fails, it uses a valid stale cache, then scans the whole
+  `~/.grok/logs/unified.jsonl` backwards for the newest billing event, and finally reports no
+  capacity. Agent Router is the cache's sole writer; readers must not modify it.
 
 ## Usage
 
@@ -244,7 +250,7 @@ $ agent-router usage
 provider  5h       weekly  source     weekly reset
 claude     12.4%    58.1%  live       in 41h07m
 codex       0.0%  unknown  fail-open  -
-grok        0.0%  unknown  fail-open  -
+grok        0.0%  unknown  none       -
 ```
 
 The weekly column reads `unknown` when `weekly_known` is false, meaning no usable capacity verdict
@@ -252,9 +258,15 @@ was read. An unread window reports 0 percent used, and printing that as `0.0%` s
 nobody took. A live Codex credits verdict can be known without a reset epoch, so it prints its
 weekly percentage with a reset dash. Routing refuses a provider with an unknown weekly verdict.
 
-`source` is where the numbers came from: `live` for a parsed payload and `fail-open` when no usable
-capacity verdict was read. `weekly` prints `unknown` for either unread workhorse window rather than
-claiming a measurement; unknown or ceiling capacity is excluded from auto selection.
+`source` is where the numbers came from. Claude and Codex use `live` for a parsed provider payload
+and `fail-open` when no usable capacity verdict was read. Grok preserves its own provenance:
+`live` is a validated billing fetch, `cache` a validated cache entry, `log` the newest valid billing
+event found by the whole-file reverse scan, and `none` no usable billing data. A `log` event without
+`creditUsagePercent` retains `log` provenance but supplies no weekly capacity: it prints `unknown`
+and is unhealthy in doctor. `none` also fails closed: it prints `unknown`, never claims 100 percent
+usage, and excludes Grok from automatic routing and adversarial review selection. `weekly` prints
+`unknown` for any unread workhorse window rather than claiming a measurement; unknown or ceiling
+capacity is excluded from auto selection.
 
 The weekly window places ordinary work: the lower known percentage wins, with Codex as the tie
 break. If neither workhorse has usable capacity, the default provider is used and the fallback is
@@ -272,8 +284,9 @@ fail claude_usage        fail-open, so the provider reads as completely unused w
 pass codex_on_path       codex at /home/you/.local/bin/codex
 pass codex_app_server    the app-server daemon answers
 pass codex_rate_limits   live, read from the provider's own source
+fail grok_usage          none, no billing data available
 warn opencode_on_path    no executable opencode on PATH, so any dispatch to it will error
-warn grok_binary         no executable grok on PATH, so explicit Grok dispatch will error
+pass grok_binary         grok is available through /home/you/.local/bin/grok
 warn grok_leader_registration  no authoritative persistent Grok leader is registered, so Grok dispatch and review are unavailable
 pass config_parses       absent, defaults apply (/home/you/.config/agent-router/config.toml)
 pass log_writable        /home/you/.local/state/agent-router/router.db takes a write
@@ -287,6 +300,7 @@ pass log_writable        /home/you/.local/state/agent-router/router.db takes a w
 | `codex_on_path` | An executable `codex` on `PATH`. |
 | `codex_app_server` | Whether the app-server daemon answers, which is the transport every Codex dispatch goes through. Observed only: doctor does not start a daemon, so an absent one is reported rather than created. |
 | `codex_rate_limits` | Whether the Codex usage read was live or fell open. |
+| `grok_usage` | Grok billing provenance: `live` and `cache` are usable capacity readings. `log` is healthy only when its event supplies weekly capacity; without `creditUsagePercent`, it remains `log` but is unknown and unhealthy. `none` means no usable billing data and fails closed for routing. |
 | `opencode_on_path` | An executable `opencode` on `PATH`. |
 | `grok_binary` | An executable `grok` on `PATH`. Doctor only observes it and does not create Grok configuration. |
 | `grok_leader_registration` | Whether the public Grok lifecycle reports an authoritative persistent leader. This is separate from the binary check and is required for explicit Grok dispatch and Grok reviewer selection. |
@@ -308,9 +322,13 @@ never a failure: it is a provider the router can route to on request, not one it
 installing it or not never moves the exit code.
 
 A missing Grok binary or authoritative leader is also a warning. These checks describe why Grok is
-unavailable without hiding the automatic capacity decision.
+unavailable without hiding the automatic capacity decision. `grok_usage` is a failure when Grok is
+installed but has no usable weekly capacity, and a warning when Grok is absent. That includes a
+`log` provenance event without `creditUsagePercent`: it is known to be a log read but remains
+unknown capacity. Both it and `none` fail closed instead of masquerading as an exhausted 100 percent
+reading.
 
-Both usage checks come from a single usage read, so doctor asks each provider once and its two
+All three usage checks come from a single usage read, so doctor asks each provider once and its
 lines cannot disagree about the same read.
 
 ### `log`
@@ -533,6 +551,7 @@ See [docs/configuration.md](docs/configuration.md) for the full reference.
 | Path | Contents |
 | --- | --- |
 | `~/.config/agent-router/config.toml` | Routing policy, ceilings, model tiers, connector inventory, parity roots and exceptions. |
+| `/tmp/grok-usage-cache.json` | Normalized, non-secret Grok billing cache. Override with `$GROK_USAGE_CACHE`; Agent Router is its sole writer. |
 | `~/.local/state/agent-router/router.db` | SQLite decision log. Holds full task text, so its directory is created mode `0700`. |
 | `~/.local/state/agent-router/logs/` | Per dispatch stdout and stderr from detached jobs. |
 

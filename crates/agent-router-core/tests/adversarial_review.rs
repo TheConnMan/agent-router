@@ -156,6 +156,48 @@ fn stale_unknown_unavailable_and_ceiling_candidates_are_ineligible() {
 }
 
 #[test]
+fn unknown_grok_capacity_falls_back_to_claude_without_misreporting_it_as_full() {
+    let primary = StubReviewer::successful("codex", "primary", Some(fresh(2.0)), "wrong");
+    let grok = StubReviewer::successful("grok", "grok", Some(Headroom::closed()), "wrong");
+    let claude = StubReviewer::successful("claude", "claude", Some(fresh(12.0)), "claude review");
+
+    let outcome = review_with_providers(&request("codex"), &[&primary, &grok, &claude])
+        .expect("low-usage Claude remains the eligible alternative");
+
+    assert_eq!(outcome.reviewer_provider.as_deref(), Some("claude"));
+    assert_eq!(claude.calls.get(), 1);
+    assert_eq!(
+        grok.calls.get(),
+        0,
+        "unknown Grok capacity must never be invoked"
+    );
+    assert!(
+        outcome.rationale.contains("no billing data available"),
+        "the fail-closed sentinel is no data, not measured utilization: {}",
+        outcome.rationale
+    );
+    assert!(
+        !outcome
+            .rationale
+            .contains("stale at 100.0 percent weekly usage"),
+        "the sentinel must not be rendered as real billing: {}",
+        outcome.rationale
+    );
+    let grok_provenance = outcome
+        .usage_provenance
+        .iter()
+        .find(|candidate| candidate.provider == "grok")
+        .expect("Grok rejection provenance");
+    assert_eq!(grok_provenance.weekly_pct, None);
+    assert!(
+        grok_provenance
+            .rejection_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("no billing data available"))
+    );
+}
+
+#[test]
 fn equal_capacity_selection_is_deterministic_across_registration_order() {
     let alpha_first = StubReviewer::successful("alpha", "a", Some(fresh(20.0)), "alpha review");
     let zeta_first = StubReviewer::successful("zeta", "z", Some(fresh(20.0)), "zeta review");
