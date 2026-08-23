@@ -149,8 +149,8 @@ fn every_classifier_failure_row_replays_as_a_failure_and_still_routes() {
 }
 
 /// Every historical auto row lacks a known Grok weekly window. That must never manufacture a Grok
-/// route: capability pins still take Claude, while every ordinary row deterministically falls back
-/// to Codex until live Grok capacity is available.
+/// route: orchestration still pins Claude, ordinary rows deterministically fall back to Codex, and
+/// a recorded connector miss now preserves its observation while blocking dispatch.
 #[test]
 fn historical_rows_without_known_grok_capacity_never_fabricate_a_grok_auto_route() {
     let config = Config::default();
@@ -162,7 +162,8 @@ fn historical_rows_without_known_grok_capacity_never_fabricate_a_grok_auto_route
 
     for row in auto {
         let classification = row.classification();
-        let capability_pinned = classification.orchestration || classification.missing_connector;
+        let orchestration_pinned = classification.orchestration;
+        let missing_connector = classification.missing_connector;
         assert!(
             !row.usage().grok.weekly_known(),
             "row {} unexpectedly has Grok capacity",
@@ -177,8 +178,13 @@ fn historical_rows_without_known_grok_capacity_never_fabricate_a_grok_auto_route
             row.id
         );
         assert_eq!(
+            decision.capability_blocked, missing_connector,
+            "row {}",
+            row.id
+        );
+        assert_eq!(
             decision.provider,
-            if capability_pinned {
+            if orchestration_pinned {
                 Provider::Claude
             } else {
                 Provider::Codex
