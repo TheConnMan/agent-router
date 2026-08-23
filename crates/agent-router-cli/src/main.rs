@@ -733,22 +733,30 @@ fn db_path() -> String {
 }
 
 fn usage(json: bool) -> agent_router_core::Result<()> {
-    let snapshot = agent_router_core::UsageSnapshot::read();
+    let (snapshot, grok_source) = agent_router_core::UsageSnapshot::read_with_grok_source();
     if json {
         println!("{}", serde_json::to_string_pretty(&snapshot)?);
         return Ok(());
     }
     println!("provider  5h       weekly  source     weekly reset");
-    for (name, headroom) in [
-        ("claude", snapshot.claude),
-        ("codex", snapshot.codex),
-        ("grok", snapshot.grok),
+    for (name, headroom, source) in [
+        (
+            "claude",
+            snapshot.claude,
+            usage_source_label(snapshot.claude.stale),
+        ),
+        (
+            "codex",
+            snapshot.codex,
+            usage_source_label(snapshot.codex.stale),
+        ),
+        ("grok", snapshot.grok, grok_usage_source_label(grok_source)),
     ] {
         println!(
             "{name:<9} {:>5.1}%  {:>7}  {:<9}  {}",
             headroom.five_hour_pct,
             weekly_label(&headroom),
-            usage_source_label(headroom.stale),
+            source,
             reset_label(headroom.weekly_reset_epoch)
         );
     }
@@ -1105,6 +1113,17 @@ fn first_line(task: &str) -> String {
 /// the router knows anything.
 fn usage_source_label(stale: bool) -> &'static str {
     if stale { "fail-open" } else { "live" }
+}
+
+/// Grok keeps its actual capacity provenance: the router either fetched billing, read its cache,
+/// recovered from the CLI log, or had no usable billing record at all.
+fn grok_usage_source_label(source: agent_router_core::usage::GrokUsageSource) -> &'static str {
+    match source {
+        agent_router_core::usage::GrokUsageSource::Live => "live",
+        agent_router_core::usage::GrokUsageSource::Cache => "cache",
+        agent_router_core::usage::GrokUsageSource::Log => "log",
+        agent_router_core::usage::GrokUsageSource::None => "none",
+    }
 }
 
 /// "in 2h13m" for a future reset, "-" when the epoch is unknown, "elapsed" once it has passed.

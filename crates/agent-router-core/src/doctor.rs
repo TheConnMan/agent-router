@@ -45,12 +45,13 @@ impl Report {
 
 /// IMPURE: run every preflight check.
 ///
-/// Both usage checks read one snapshot, so doctor asks each provider once rather than once per
-/// check, and the two lines it prints cannot disagree about the same read.
+/// The usage checks read one snapshot, so doctor asks each provider once rather than once per
+/// check, and the lines it prints cannot disagree about the same read.
 pub fn run() -> Report {
-    let usage = UsageSnapshot::read();
+    let (usage, grok_source) = UsageSnapshot::read_with_grok_source();
     let claude_installed = on_path("claude").is_some();
     let codex_installed = on_path("codex").is_some();
+    let grok_installed = on_path("grok").is_some();
     let mut checks = vec![
         required_binary("claude_on_path", "claude"),
         claude_credentials(),
@@ -58,6 +59,7 @@ pub fn run() -> Report {
         optional_binary("codex_on_path", "codex"),
         codex_app_server(),
         usage_source("codex_rate_limits", usage.codex.stale, codex_installed),
+        grok_usage_source(grok_source, usage.grok, grok_installed),
     ];
     checks.extend(grok_checks());
     checks.extend([
@@ -216,6 +218,40 @@ fn usage_source(name: &'static str, stale: bool, installed: bool) -> Check {
         pass(
             name,
             "live, read from the provider's own source".to_string(),
+        )
+    }
+}
+
+/// Grok capacity has four useful sources rather than the live/fail-open distinction the other
+/// providers use. A missing source fails closed for routing, so doctor must surface it as a
+/// failure when Grok is installed instead of reporting a misleading exhausted percentage.
+fn grok_usage_source(
+    source: crate::usage::GrokUsageSource,
+    headroom: crate::usage::Headroom,
+    installed: bool,
+) -> Check {
+    let name = "grok_usage";
+    let detail = match source {
+        crate::usage::GrokUsageSource::Live => "live, read from Grok billing",
+        crate::usage::GrokUsageSource::Cache => "cache, read from Grok billing cache",
+        crate::usage::GrokUsageSource::Log => "log, read from Grok CLI billing log",
+        crate::usage::GrokUsageSource::None => "none, no billing data available",
+    };
+    if headroom.weekly_known() {
+        return pass(name, detail.to_string());
+    }
+
+    let detail = if source == crate::usage::GrokUsageSource::None {
+        detail.to_string()
+    } else {
+        format!("{detail}, but no usable weekly capacity was present")
+    };
+    if installed {
+        fail(name, detail)
+    } else {
+        warn(
+            name,
+            format!("{detail}, and no binary on PATH to read a real number from"),
         )
     }
 }
@@ -383,5 +419,58 @@ fn fail(name: &'static str, detail: String) -> Check {
         name,
         health: Health::Fail,
         detail,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::usage::{GrokUsageSource, Headroom};
+
+    #[test]
+    fn grok_usage_check_preserves_live_cache_log_and_none_provenance() {
+        let known_capacity = Headroom {
+            weekly_capacity_known: true,
+            ..Headroom::closed()
+        };
+        for (source, expected) in [
+            (GrokUsageSource::Live, "live"),
+            (GrokUsageSource::Cache, "cache"),
+            (GrokUsageSource::Log, "log"),
+        ] {
+            let check = grok_usage_source(source, known_capacity, true);
+            assert_eq!(check.name, "grok_usage");
+            assert_eq!(check.health, Health::Pass, "{expected} is usable capacity");
+            assert!(
+                check.detail.contains(expected),
+                "the check must say {expected}, got: {}",
+                check.detail
+            );
+        }
+
+        let installed_none = grok_usage_source(GrokUsageSource::None, Headroom::closed(), true);
+        assert_eq!(installed_none.name, "grok_usage");
+        assert_eq!(installed_none.health, Health::Fail);
+        assert!(installed_none.detail.contains("none"));
+
+        let absent_none = grok_usage_source(GrokUsageSource::None, Headroom::closed(), false);
+        assert_eq!(absent_none.name, "grok_usage");
+        assert_eq!(absent_none.health, Health::Warn);
+        assert!(absent_none.detail.contains("none"));
+    }
+
+    #[test]
+    fn grok_log_without_weekly_capacity_is_unhealthy_but_keeps_its_provenance() {
+        for (installed, expected_health) in [(true, Health::Fail), (false, Health::Warn)] {
+            let check = grok_usage_source(GrokUsageSource::Log, Headroom::closed(), installed);
+
+            assert_eq!(check.name, "grok_usage");
+            assert_eq!(check.health, expected_health);
+            assert!(
+                check.detail.contains("log"),
+                "the check must retain its provenance, got: {}",
+                check.detail
+            );
+        }
     }
 }

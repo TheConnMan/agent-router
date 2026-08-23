@@ -21,6 +21,7 @@
 
 use serde_json::{Value, json};
 use std::fs;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -134,6 +135,55 @@ impl DoctorFixture {
         self.root.path.join("home")
     }
 
+    fn grok_usage_cache(&self) -> PathBuf {
+        self.root.path.join("grok-usage-cache.json")
+    }
+
+    fn write_grok_usage_cache(&self) {
+        let reset = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs() as i64
+            + 3_600;
+        let cache = self.grok_usage_cache();
+        fs::write(
+            &cache,
+            json!({
+                "tier": "SuperGrok Plus",
+                "weekly_percent": 37.5,
+                "weekly_reset": reset,
+                "source_ts": "2026-08-23T00:00:00Z",
+            })
+            .to_string(),
+        )
+        .expect("write the isolated Grok usage cache");
+        fs::set_permissions(&cache, fs::Permissions::from_mode(0o600))
+            .expect("secure the isolated Grok usage cache");
+    }
+
+    fn write_grok_billing_log(&self) {
+        let logs = self.root.path.join("grok-home/logs");
+        fs::create_dir_all(&logs).expect("create the Grok log directory");
+        fs::write(
+            logs.join("unified.jsonl"),
+            json!({
+                "msg": "billing: fetched credits config",
+                "ctx": {
+                    "subscriptionTier": "SuperGrok Plus",
+                    "config": {
+                        "currentPeriod": {
+                            "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                            "end": "2099-01-01T00:00:00Z",
+                        },
+                        "creditUsagePercent": 37.5,
+                    },
+                },
+            })
+            .to_string(),
+        )
+        .expect("write the isolated Grok billing log");
+    }
+
     /// The credential file the router reads its OAuth token from, in the shape the reader pointers
     /// into. Without this the Claude usage read has nothing to authenticate with.
     fn write_credentials(&self) {
@@ -157,6 +207,7 @@ impl DoctorFixture {
         command
             .env("HOME", self.home())
             .env("GROK_HOME", self.root.path.join("grok-home"))
+            .env(GROK_CACHE_ENV, self.grok_usage_cache())
             .env("CODEX_SESSIONS_DIR", self.root.path.join(sessions))
             .env("PATH", path);
         command
@@ -418,6 +469,44 @@ fn doctor_reports_grok_binary_and_authoritative_leader_registration() {
     );
 }
 
+/// Grok's source label must identify the cache and full-log fallbacks independently of this
+/// machine's `/tmp` cache. `live` is covered by the pure renderer; this binary path proves the
+/// three file-backed/absent states are isolated by `GROK_USAGE_CACHE`.
+#[test]
+fn doctor_reports_isolated_grok_cache_log_and_none_provenance() {
+    let cached_fixture = DoctorFixture::new("grok-cache-provenance");
+    cached_fixture.write_grok_usage_cache();
+    let cached = check_line(
+        &cached_fixture.doctor_stdout(LIVE_SESSIONS, false),
+        "grok_usage",
+    );
+    assert!(
+        cached.contains("cache"),
+        "the fixture's cache must be reported as cache: {cached}"
+    );
+
+    let logged_fixture = DoctorFixture::new("grok-log-provenance");
+    logged_fixture.write_grok_billing_log();
+    let logged = check_line(
+        &logged_fixture.doctor_stdout(LIVE_SESSIONS, false),
+        "grok_usage",
+    );
+    assert!(
+        logged.contains("log"),
+        "with no fixture cache, the full billing log is the source: {logged}"
+    );
+
+    let none_fixture = DoctorFixture::new("grok-none-provenance");
+    let none = check_line(
+        &none_fixture.doctor_stdout(LIVE_SESSIONS, false),
+        "grok_usage",
+    );
+    assert!(
+        none.contains("none"),
+        "a separate fixture must not inherit either earlier cache or log: {none}"
+    );
+}
+
 /// A fail open claude printing `0.0%  0.0%` with nothing else on the line is exactly the
 /// indistinguishable case the marker exists to kill, so the row says where its numbers came from.
 #[test]
@@ -460,6 +549,9 @@ fn the_usage_command_names_its_source_as_live_or_fail_open() {
 /// test harness and `scripts/local-checks.sh` both address the router by, so a rename of the const's
 /// value has to break something, and a test that reads the const with the const would not.
 const CACHE_ENV: &str = "CLAUDE_USAGE_CACHE";
+/// The Grok cache has the same isolation requirement as Claude's: the default is machine-wide,
+/// while this fixture must prove only the cache it created is being reported.
+const GROK_CACHE_ENV: &str = "GROK_USAGE_CACHE";
 
 #[test]
 fn the_usage_cache_override_decides_what_the_claude_read_returns() {

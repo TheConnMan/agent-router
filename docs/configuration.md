@@ -92,6 +92,34 @@ roots = []
 exceptions = []
 ```
 
+## Runtime usage cache
+
+Usage-cache paths are environment variables rather than TOML keys. They are useful for an isolated
+runner or test; an empty value has the same meaning as an unset value.
+
+### `GROK_USAGE_CACHE`
+
+Default `/tmp/grok-usage-cache.json`. This is the Grok billing cache path; set
+`GROK_USAGE_CACHE=/path/to/cache.json` to override it.
+
+The cache is read through in this exact order: a parseable cache younger than 300 seconds; a live
+Grok billing fetch, which writes the cache on success; a parseable stale cache; the newest valid
+billing event found by scanning the entire `~/.grok/logs/unified.jsonl` backwards; then no capacity.
+The reverse log scan is bounded in memory, but not by a byte tail, so an older billing event is not
+lost merely because newer non-billing log output is large.
+
+Agent Router is the cache's sole writer. Successful live reads store only normalized billing fields
+(tier, weekly percent, weekly reset, and source timestamp); raw API responses and bearer credentials
+never enter the cache or diagnostics. Other local consumers may read this file but must not write it.
+
+`agent-router usage` reports Grok provenance as `live`, `cache`, `log`, or `none`, and
+`agent-router doctor` reports the same value through its `grok_usage` check. `live` and `cache`
+carry usable weekly capacity. A `log` event without `creditUsagePercent` retains `log` provenance,
+but has unknown weekly capacity and is reported unhealthy by doctor. `none` means no usable billing
+data at all, not that billing reported 100 percent usage. Unknown `log` capacity and `none`
+deliberately fail closed, so Grok is excluded from automatic routing and adversarial-review
+selection until a usable capacity source is available.
+
 ## Top level keys
 
 ### `hard_ceiling_pct`

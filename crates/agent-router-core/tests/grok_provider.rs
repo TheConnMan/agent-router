@@ -112,7 +112,7 @@ fn official_grok_billing_log_reads_the_newest_plus_weekly_usage() {
 }
 
 #[test]
-fn grok_billing_ignores_events_outside_its_bounded_log_tail() {
+fn grok_billing_finds_event_before_a_suffix_larger_than_one_mib() {
     let directory = tempfile::tempdir().expect("temporary Grok log");
     let path = directory.path().join("unified.jsonl");
     let mut log = fs::File::create(&path).expect("create Grok log");
@@ -131,11 +131,12 @@ fn grok_billing_ignores_events_outside_its_bounded_log_tail() {
     writeln!(log).expect("terminate oversized suffix");
     drop(log);
 
-    assert_eq!(
-        grok_headroom_in(&path, NOW),
-        Headroom::closed(),
-        "an old event outside the bounded tail must not keep Grok eligible"
-    );
+    let headroom = grok_headroom_in(&path, NOW);
+
+    assert_eq!(headroom.weekly_pct, 37.5);
+    assert_eq!(headroom.weekly_reset_epoch, RESET);
+    assert!(headroom.weekly_capacity_known);
+    assert!(!headroom.stale);
 }
 
 #[test]

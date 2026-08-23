@@ -131,6 +131,10 @@ impl EstimateFixture {
         command
             .env("HOME", self.root.path.join("home"))
             .env("GROK_HOME", self.root.path.join("grok-home"))
+            .env(
+                "GROK_USAGE_CACHE",
+                self.root.path.join("grok-usage-cache.json"),
+            )
             .env("CODEX_SESSIONS_DIR", self.sessions(used_percent))
             .env("PATH", path);
         command

@@ -220,6 +220,10 @@ impl ReviewFixture {
             .arg(dir)
             .env("HOME", home)
             .env("GROK_HOME", self.grok_home())
+            .env(
+                "GROK_USAGE_CACHE",
+                self.root.path.join("grok-usage-cache.json"),
+            )
             .env("XDG_CONFIG_HOME", self.root.path.join("home/.config"))
             .env("CODEX_SESSIONS_DIR", &self.sessions)
             .env("CLAUDE_USAGE_CACHE", &self.usage_cache)

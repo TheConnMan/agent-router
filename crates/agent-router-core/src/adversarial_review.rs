@@ -294,10 +294,14 @@ fn select_provider<'a>(
             continue;
         };
         if usage.stale {
-            let reason = format!(
-                "capacity is stale at {:.1} percent weekly usage",
-                usage.weekly_pct
-            );
+            let reason = if name.eq_ignore_ascii_case("grok") && !usage.weekly_capacity_known {
+                "no billing data available".to_string()
+            } else {
+                format!(
+                    "capacity is stale at {:.1} percent weekly usage",
+                    usage.weekly_pct
+                )
+            };
             rationale.push(format!("{name} rejected because {reason}"));
             usage_provenance.push(CandidateUsage {
                 provider: name.to_string(),

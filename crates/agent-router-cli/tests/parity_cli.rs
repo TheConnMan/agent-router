@@ -197,6 +197,7 @@ fn router_command(home: &Path, current_dir: &Path) -> Command {
         .current_dir(current_dir)
         .env("HOME", home)
         .env("GROK_HOME", home.join("grok-home"))
+        .env("GROK_USAGE_CACHE", home.join("grok-usage-cache.json"))
         .env("XDG_CONFIG_HOME", home.join(".config"));
     command
 }
