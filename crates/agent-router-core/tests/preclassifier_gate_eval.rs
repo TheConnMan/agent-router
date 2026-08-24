@@ -123,7 +123,14 @@ fn candidate_preclassifier_gate_measured_against_the_fixture() {
     // an unexplained change in a fired count.
     assert_eq!(
         connectors,
-        vec!["local shell", "git", "gh (github)", "airtable"],
+        vec![
+            "local shell",
+            "local Claude Code session JSONLs (~/.claude/projects)",
+            "authenticated Anthropic usage endpoint (via local shell)",
+            "git",
+            "gh (github)",
+            "airtable",
+        ],
         "the connector inventory in Config::default() changed, so the measured numbers below no \
          longer describe the current configuration and the evaluation must be run again"
     );
