@@ -61,6 +61,8 @@ hard_ceiling_pct = 98.0
 classifier_timeout_secs = 60
 connectors = [
     "local shell",
+    "local Claude Code session JSONLs (~/.claude/projects)",
+    "authenticated Anthropic usage endpoint (via local shell)",
     "git",
     "gh (github)",
     "airtable",

@@ -324,6 +324,8 @@ impl Default for Config {
             classifier_timeout_secs: DEFAULT_CLASSIFIER_TIMEOUT_SECS,
             connectors: vec![
                 "local shell".to_string(),
+                "local Claude Code session JSONLs (~/.claude/projects)".to_string(),
+                "authenticated Anthropic usage endpoint (via local shell)".to_string(),
                 "git".to_string(),
                 "gh (github)".to_string(),
                 "airtable".to_string(),
