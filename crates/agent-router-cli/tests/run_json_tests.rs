@@ -113,6 +113,15 @@ impl CliFixture {
         fs::create_dir_all(&home).expect("create home");
         fs::create_dir_all(&bin).expect("create bin");
         fs::create_dir_all(&cwd).expect("create cwd");
+        // These fixtures emulate Claude's classifier protocol. Pin that test-only dependency so
+        // the production default can move independently to Codex without invoking a real binary.
+        let router_config = home.join(".config/agent-router");
+        fs::create_dir_all(&router_config).expect("create router config directory");
+        fs::write(
+            router_config.join("config.toml"),
+            "[classifier]\nengine = \"claude\"\n",
+        )
+        .expect("write fixture classifier config");
         let task = "/implement RS-123 rename background sessions".to_string();
         let name = short_job_name(&task);
         let classifier_name = "RS-123 Input Box Searching";
