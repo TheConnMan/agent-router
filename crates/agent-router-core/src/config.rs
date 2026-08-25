@@ -94,7 +94,7 @@ pub struct Classifier {
 impl Default for Classifier {
     fn default() -> Classifier {
         Classifier {
-            engine: ClassifierEngine::Claude,
+            engine: ClassifierEngine::Codex,
             claude_model: "haiku".to_string(),
             codex_model: "gpt-5.6-luna".to_string(),
         }
@@ -328,14 +328,9 @@ impl Default for Config {
             projection_overdraw_pct: DEFAULT_PROJECTION_OVERDRAW_PCT,
             claude_five_hour_pacing_pct: DEFAULT_CLAUDE_FIVE_HOUR_PACING_PCT,
             classifier_timeout_secs: DEFAULT_CLASSIFIER_TIMEOUT_SECS,
-            connectors: vec![
-                "local shell".to_string(),
-                "local Claude Code session JSONLs (~/.claude/projects)".to_string(),
-                "authenticated Anthropic usage endpoint (via local shell)".to_string(),
-                "git".to_string(),
-                "gh (github)".to_string(),
-                "airtable".to_string(),
-            ],
+            // Local shell is one capability, not a duplicated inventory of every executable,
+            // file, or authenticated endpoint that the shell can reach.
+            connectors: vec!["local shell".to_string()],
             provider_capabilities: BTreeMap::new(),
             policy: Policy::default(),
             classifier: Classifier::default(),
@@ -751,10 +746,12 @@ mod tests {
         let path = dir.path().join("config.toml");
 
         let defaults = Config::default();
-        assert_eq!(defaults.classifier.engine, ClassifierEngine::Claude);
+        assert_eq!(defaults.classifier.engine, ClassifierEngine::Codex);
         assert_eq!(defaults.classifier.claude_model, "haiku");
         assert_eq!(defaults.classifier.codex_model, "gpt-5.6-luna");
-        assert_eq!(defaults.classifier.model(), "haiku");
+        assert_eq!(defaults.classifier.model(), "gpt-5.6-luna");
+        assert_eq!(defaults.connectors, vec!["local shell"]);
+        assert!(defaults.provider_capabilities.is_empty());
 
         std::fs::write(&path, "hard_ceiling_pct = 90.0\n").expect("write");
         let absent = Config::load_from(&path).expect("loads");
@@ -778,8 +775,9 @@ mod tests {
 
         std::fs::write(&path, "[classifier]\nclaude_model = \"sonnet\"\n").expect("write");
         let claude_only = Config::load_from(&path).expect("loads");
-        assert_eq!(claude_only.classifier.engine, ClassifierEngine::Claude);
-        assert_eq!(claude_only.classifier.model(), "sonnet");
+        assert_eq!(claude_only.classifier.engine, ClassifierEngine::Codex);
+        assert_eq!(claude_only.classifier.model(), "gpt-5.6-luna");
+        assert_eq!(claude_only.classifier.claude_model, "sonnet");
     }
 
     /// An engine name that is not a supported CLI is an error, not a silent fall back to claude:

@@ -59,21 +59,14 @@ A file already stamped `config_version = 4` is not migrated, so its chosen ceili
 config_version = 4
 hard_ceiling_pct = 98.0
 classifier_timeout_secs = 60
-connectors = [
-    "local shell",
-    "local Claude Code session JSONLs (~/.claude/projects)",
-    "authenticated Anthropic usage endpoint (via local shell)",
-    "git",
-    "gh (github)",
-    "airtable",
-]
+connectors = ["local shell"]
 
 [policy]
 default_provider = "codex"
 weekly_routing = true
 
 [classifier]
-engine = "claude"
+engine = "codex"
 claude_model = "haiku"
 codex_model = "gpt-5.6-luna"
 
@@ -245,13 +238,12 @@ classifier invocation strips both CLI startup cost and the model's thinking toke
 
 ### `connectors`
 
-Default `["local shell", "git", "gh (github)", "airtable"]`. The authoritative local-shell
-inventory shown to the classifier.
+Default `["local shell"]`. The authoritative local-shell capability shown to the classifier.
 
 This is the one section that genuinely needs human maintenance. Rubric criterion 5 is scored
-against exactly this local-shell inventory. A configured capability, such as the authenticated
-Anthropic usage endpoint via local shell, prevents a false `missing_connector` result for a
-matching task. A genuinely absent capability returns `capability_blocked` only after provider
+against exactly this local-shell inventory. The shell covers its local executables, files, session
+JSONLs, and authenticated endpoints without advertising each one as a connector. A genuinely absent
+capability returns `capability_blocked` only after provider
 inventories have also been checked; absence is not evidence that Claude can reach it. The classifier is explicitly told
 never to set `missing_connector` because it cannot see a connector itself, only because a named
 system is absent from this list.
@@ -269,7 +261,8 @@ Register a provider manually only when its local inventory cannot be inspected, 
 
 ```toml
 [provider_capabilities]
-claude = ["slack"]
+claude = ["Granola"]
+codex = ["Granola"]
 ```
 
 For an Auto route whose classifier observes a missing connector, providers without a matching
@@ -314,7 +307,7 @@ task.
 
 ### `claude_model` and `codex_model`
 
-Defaults `"haiku"` and `"gpt-5.6-luna"`. The model each engine scores with. Both are kept
+Defaults `"haiku"` and `"gpt-5.6-luna"`; the default engine is Codex. The model each engine scores with. Both are kept
 regardless of which engine is in force, so flipping `engine` is a one word edit rather than a
 re-pick of the model.
 

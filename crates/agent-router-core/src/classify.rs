@@ -201,7 +201,7 @@ pub fn reconcile_configured_local_capabilities(
     classification.missing_connector = false;
     classification
         .rationale
-        .push_str("; configured local Anthropic usage endpoint covers this analysis");
+        .push_str("; local shell covers this analysis");
     classification
 }
 
@@ -212,13 +212,7 @@ fn is_anthropic_usage_analysis(task: &str, connectors: &[String]) -> bool {
     let has_local_shell = connectors
         .iter()
         .any(|connector| connector.eq_ignore_ascii_case("local shell"));
-    let has_usage_endpoint = connectors.iter().any(|connector| {
-        let connector = connector.to_ascii_lowercase();
-        connector.contains("authenticated anthropic usage endpoint")
-            && connector.contains("via local shell")
-    });
-
-    asks_for_usage && has_local_shell && has_usage_endpoint
+    asks_for_usage && has_local_shell
 }
 
 /// PURE builder: the classifier invocation for the configured engine.
@@ -788,20 +782,17 @@ mod tests {
                 classifier_failed: false,
                 invokes_implement: false,
             },
-            &[
-                "local shell".to_string(),
-                "authenticated Anthropic usage endpoint (via local shell)".to_string(),
-            ],
+            &["local shell".to_string()],
         );
 
         assert!(
             !classified.missing_connector,
-            "the configured endpoint is authority over a classifier false positive"
+            "the local shell is authority over a classifier false positive"
         );
         assert!(
             classified
                 .rationale
-                .contains("configured local Anthropic usage endpoint")
+                .contains("local shell covers this analysis")
         );
     }
 
