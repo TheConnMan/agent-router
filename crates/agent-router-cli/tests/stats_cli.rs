@@ -223,6 +223,13 @@ impl StatsFixture {
             fs::create_dir_all(root.path.join(child)).expect("create fixture directory");
         }
         write_fake_claude(&root.path.join("bin"));
+        let router_config = root.path.join("home/.config/agent-router");
+        fs::create_dir_all(&router_config).expect("create router config directory");
+        fs::write(
+            router_config.join("config.toml"),
+            "[classifier]\nengine = \"claude\"\n",
+        )
+        .expect("write fixture classifier config");
         write_exhausted_rollout(&root.path.join(EXHAUSTED));
         write_healthy_grok_rollout(&root.path.join("grok-home"));
         Self { root }
