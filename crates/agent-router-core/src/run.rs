@@ -165,7 +165,7 @@ pub fn run(request: &Request, config: &Config) -> Result<Outcome> {
     let log = DecisionLog::open()?;
 
     if decision.capability_blocked {
-        let capability_blocked = "required capability is absent from the configured connector inventory; no provider was dispatched".to_string();
+        let capability_blocked = "required capability is absent from every configured provider inventory; no provider was dispatched".to_string();
         let log_id = log.record(&Entry {
             task: request.task,
             dir: request.dir,

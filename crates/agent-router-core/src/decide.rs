@@ -174,11 +174,19 @@ pub fn decide(
     config: &Config,
 ) -> Decision {
     let mut gates = Vec::new();
-    let capability_blocked = classification.missing_connector;
+    let capability_providers = if classification.missing_connector {
+        config.capability_providers(&classification.rationale)
+    } else {
+        Vec::new()
+    };
+    let mut capability_blocked =
+        classification.missing_connector && capability_providers.is_empty();
     let mut capability_pin = false;
     if classification.missing_connector {
         gates.push(Gate::MissingConnector);
-        gates.push(Gate::CapabilityBlocked);
+        if capability_blocked {
+            gates.push(Gate::CapabilityBlocked);
+        }
     }
     if classification.orchestration {
         gates.push(Gate::Orchestration);
@@ -192,7 +200,11 @@ pub fn decide(
     // Ordinary work starts on Codex. Claude is a capability destination only; automatic capacity
     // routing chooses between Codex and Grok below.
     let mut provider = Provider::Codex;
-    if capability_pin {
+    if capability_providers == [Provider::Claude] {
+        // Claude remains a capability pin when it is the only established provider.
+        capability_pin = true;
+        provider = Provider::Claude;
+    } else if capability_pin {
         provider = Provider::Claude;
     } else if classification.classifier_failed {
         // Not a pin: a task nobody could score still selects by known workhorse capacity.
@@ -207,6 +219,10 @@ pub fn decide(
 
     if !capability_pin && !config.policy.weekly_routing {
         gates.push(Gate::WeeklyRoutingDisabled);
+        if classification.missing_connector && !capability_providers.contains(&Provider::Codex) {
+            capability_blocked = true;
+            gates.push(Gate::CapabilityBlocked);
+        }
     } else if !capability_pin {
         // Fail closed on a weekly number nobody read. The percentage of an unread window is 0,
         // which is the same reading as a genuinely idle provider, so trusting it hands every job
@@ -215,7 +231,8 @@ pub fn decide(
         // Closing here rather than in the reader keeps the reader's fail open contract intact. It
         // also cannot block a dispatch: both providers unknown fall through to `over_ceiling`.
         let eligible = |candidate| {
-            headroom(&usage, candidate).weekly_known()
+            (!classification.missing_connector || capability_providers.contains(&candidate))
+                && headroom(&usage, candidate).weekly_known()
                 && weekly_used(&usage, candidate) < config.hard_ceiling_pct
         };
         if !headroom(&usage, Provider::Codex).weekly_known()
@@ -230,7 +247,15 @@ pub fn decide(
             (false, false) => {
                 // The router routes; refusing work over a ceiling is bonus drain's job. The
                 // fallback stays Codex when neither authoritative weekly reading is usable.
-                gates.push(Gate::OverCeiling);
+                if classification.missing_connector
+                    && !capability_providers.contains(&Provider::Codex)
+                    && !capability_blocked
+                {
+                    capability_blocked = true;
+                    gates.push(Gate::CapabilityBlocked);
+                } else {
+                    gates.push(Gate::OverCeiling);
+                }
             }
             (false, true) => {
                 provider = Provider::Grok;
