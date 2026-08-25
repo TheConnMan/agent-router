@@ -42,9 +42,12 @@ log: row 87 in /home/you/.local/state/agent-router/router.db
    run.
 2. **Apply capability gates.** A task needing several agents to exchange findings mid-run or a
    build-tier `/implement` run (`implement_context_window`) pins to Claude regardless of usage.
-   A missing connector is different: the configured local-shell inventory is checked first; if it
-   does not establish the required capability for any provider, the result is explicit
-   `capability_blocked` and no job is dispatched. The context-window gate is a fact rather than a
+   A missing connector is different: provider-specific inventories are checked first. Codex MCP
+   server names and enabled plugins are safely discovered from its local config, while Claude.ai
+   connector registrations and other providers can be
+   registered in `provider_capabilities`; unavailable providers are removed before ordinary policy
+   chooses the route. Only a capability absent from every provider inventory is
+   `capability_blocked`. The context-window gate is a fact rather than a
    feature gap:
    Codex's window is 258,400 tokens, and measured 2026-08-11 across 37 Claude and 13 Codex
    `/implement` runs, the median Claude run peaks at 262,017 tokens of resident context with 51
@@ -542,10 +545,11 @@ an omitted key is exactly its default. A file that exists but does not parse is 
 than a silent fallback to defaults, because routing against ceilings and a connector list the
 operator never wrote is worse than refusing to run.
 
-The one section that genuinely needs human maintenance is `connectors`: it is the authoritative
-inventory of local-shell capabilities on this machine, and rubric criterion 5 is scored against
-exactly that list. A listed local capability prevents a false `missing_connector` result; an
-absent one returns `capability_blocked` rather than assuming Claude can reach it.
+`connectors` remains the authoritative local-shell inventory used by the classifier. Provider
+capabilities are separate: Codex MCP server names and enabled plugins are discovered from
+`~/.codex/config.toml`, while Claude.ai registrations are read separately; operators may register
+other provider inventories in `provider_capabilities`. A miss is refused
+only when no provider establishes the named capability.
 
 See [docs/configuration.md](docs/configuration.md) for the full reference.
 

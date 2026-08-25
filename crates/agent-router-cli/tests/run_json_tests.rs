@@ -436,7 +436,7 @@ fn an_unavailable_capability_is_reported_without_dispatching_claude() {
     assert_eq!(
         value["capability_blocked"].as_str(),
         Some(
-            "required capability is absent from the configured connector inventory; no provider was dispatched"
+            "required capability is absent from every configured provider inventory; no provider was dispatched"
         )
     );
     assert_eq!(value["dispatch"], Value::Null);
@@ -449,6 +449,100 @@ fn an_unavailable_capability_is_reported_without_dispatching_claude() {
     assert!(
         !fixture.spawn_log.exists(),
         "a capability block must never start the Claude job"
+    );
+}
+
+/// The real CLI loads Codex's ambient plugin inventory. An enabled Granola plugin establishes a
+/// Codex-only capability and must turn an automatic connector miss into an eligible dry run.
+#[cfg(unix)]
+#[test]
+fn an_enabled_codex_granola_plugin_unblocks_an_auto_route() {
+    let fixture = CliFixture::new("codex-granola-plugin-capability");
+    fixture.answers_with(
+        &json!({
+            "orchestration": false,
+            "missing_connector": true,
+            "complexity": "medium",
+            "task_context_horizon": "ordinary",
+            "rationale": "requires Granola notes",
+            "job_name": fixture.classifier_name,
+        })
+        .to_string(),
+    );
+    let home = fixture.root.path.join("home");
+    let codex_dir = home.join(".codex");
+    fs::create_dir_all(&codex_dir).expect("create Codex config directory");
+    fs::write(
+        codex_dir.join("config.toml"),
+        "[plugins.\"granola@openai-curated\"]\nenabled = true\n",
+    )
+    .expect("write Codex capability inventory");
+
+    let output = fixture
+        .run_command()
+        .arg("--provider")
+        .arg("auto")
+        .arg("--dry-run")
+        .arg("--json")
+        .output()
+        .expect("run router");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("router json");
+    assert_eq!(value["provider"], "codex");
+    assert_eq!(value["capability_blocked"], Value::Null);
+    assert!(value["gates"].as_array().is_some_and(|gates| {
+        gates.contains(&Value::String("missing_connector".to_string()))
+            && !gates.contains(&Value::String("capability_blocked".to_string()))
+    }));
+}
+
+/// Claude account connectors are outside the router's static TOML. Their verified local record
+/// must remain positive capability evidence rather than being treated as unavailable by omission.
+#[cfg(unix)]
+#[test]
+fn a_verified_claude_granola_connector_is_an_auto_capability_destination() {
+    let fixture = CliFixture::new("claude-granola-connector-capability");
+    fixture.answers_with(
+        &json!({
+            "orchestration": false,
+            "missing_connector": true,
+            "complexity": "medium",
+            "task_context_horizon": "ordinary",
+            "rationale": "requires Granola notes",
+            "job_name": fixture.classifier_name,
+        })
+        .to_string(),
+    );
+    fs::write(
+        fixture.root.path.join("home/.claude.json"),
+        r#"{"claudeAiMcpEverConnected":["claude.ai Granola"]}"#,
+    )
+    .expect("write Claude connector inventory");
+
+    let output = fixture
+        .run_command()
+        .arg("--provider")
+        .arg("auto")
+        .arg("--dry-run")
+        .arg("--json")
+        .output()
+        .expect("run router");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("router json");
+    assert_eq!(value["provider"], "claude");
+    assert_eq!(value["capability_blocked"], Value::Null);
+    assert!(
+        value["gates"]
+            .as_array()
+            .is_some_and(|gates| !gates.contains(&Value::String("capability_blocked".to_string())))
     );
 }
 

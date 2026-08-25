@@ -4,6 +4,7 @@
 use crate::classify::Complexity;
 use crate::error::Result;
 use crate::runtime::home_dir;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Weekly percent at which a provider counts as exhausted: within 2 points of the weekly limit is
@@ -305,6 +306,11 @@ pub struct Config {
     /// rubric is scored against exactly this list. An absent capability blocks dispatch unless a
     /// provider-specific capability is established elsewhere; it must never be assumed for Claude.
     pub connectors: Vec<String>,
+    /// Capabilities established for one provider rather than assumed for every provider. The
+    /// Codex entry is augmented at load time from its local MCP inventory; operator entries are
+    /// useful for providers whose inventory cannot be inspected locally.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub provider_capabilities: BTreeMap<String, Vec<String>>,
     pub policy: Policy,
     /// Which engine and model score a task.
     pub classifier: Classifier,
@@ -330,6 +336,7 @@ impl Default for Config {
                 "gh (github)".to_string(),
                 "airtable".to_string(),
             ],
+            provider_capabilities: BTreeMap::new(),
             policy: Policy::default(),
             classifier: Classifier::default(),
             models: Models::default(),
@@ -342,7 +349,67 @@ impl Default for Config {
 impl Config {
     /// IMPURE: the config at the default path, created with defaults when absent.
     pub fn load() -> Result<Config> {
-        Config::load_from(&default_config_path())
+        let mut config = Config::load_from(&default_config_path())?;
+        config.register_discovered_provider_capabilities();
+        Ok(config)
+    }
+
+    /// Return providers whose declared inventory names the capability described by classifier
+    /// rationale. Discovery is deliberately additive and only trusts parsed local config names;
+    /// an unreadable or malformed Codex config establishes nothing.
+    pub fn capability_providers(&self, rationale: &str) -> Vec<crate::provider::Provider> {
+        let rationale = rationale.to_ascii_lowercase();
+        self.provider_capabilities
+            .iter()
+            .filter_map(|(provider, capabilities)| {
+                let supported = capabilities.iter().any(|capability| {
+                    let capability = capability.trim().to_ascii_lowercase();
+                    !capability.is_empty() && rationale.contains(&capability)
+                });
+                supported
+                    .then_some(match provider.as_str() {
+                        "codex" => Some(crate::provider::Provider::Codex),
+                        "claude" => Some(crate::provider::Provider::Claude),
+                        "grok" => Some(crate::provider::Provider::Grok),
+                        "opencode" => Some(crate::provider::Provider::Opencode),
+                        _ => None,
+                    })
+                    .flatten()
+            })
+            .collect()
+    }
+
+    fn register_discovered_provider_capabilities(&mut self) {
+        if let Ok(text) = std::fs::read_to_string(home_dir().join(".codex/config.toml"))
+            && let Ok(document) = toml::from_str::<toml::Value>(&text)
+        {
+            self.register_capabilities("codex", codex_capabilities(&document));
+        }
+        // Account connectors are not project MCP servers. Their absence is unknown, never a
+        // negative capability assertion; a recorded connector is positive availability evidence.
+        if let Ok(text) = std::fs::read_to_string(home_dir().join(".claude.json"))
+            && let Ok(document) = serde_json::from_str::<serde_json::Value>(&text)
+        {
+            self.register_capabilities("claude", claude_capabilities(&document));
+        }
+    }
+
+    fn register_capabilities<I>(&mut self, provider: &str, discovered: I)
+    where
+        I: IntoIterator<Item = String>,
+    {
+        let capabilities = self
+            .provider_capabilities
+            .entry(provider.to_string())
+            .or_default();
+        for name in discovered {
+            if !capabilities
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(&name))
+            {
+                capabilities.push(name);
+            }
+        }
     }
 
     /// IMPURE: the config at `path`, created with defaults when absent, and migrated in place when
@@ -426,6 +493,38 @@ impl Config {
     }
 }
 
+/// Safe, name-only discovery. Both enabled plugins and MCP servers establish Codex capabilities;
+/// their configuration bodies can contain secrets and are deliberately never retained.
+fn codex_capabilities(document: &toml::Value) -> Vec<String> {
+    let mut capabilities = Vec::new();
+    for key in ["mcp_servers", "plugins"] {
+        if let Some(table) = document.get(key).and_then(toml::Value::as_table) {
+            for (name, value) in table {
+                if key != "plugins"
+                    || value.get("enabled").and_then(toml::Value::as_bool) != Some(false)
+                {
+                    capabilities.push(name.split('@').next().unwrap_or(name).to_string());
+                }
+            }
+        }
+    }
+    capabilities
+}
+
+/// Claude records account connectors separately from its MCP configuration. This extracts only a
+/// display-name suffix (for example `Granola`), never connector metadata or credential values.
+fn claude_capabilities(document: &serde_json::Value) -> Vec<String> {
+    document
+        .get("claudeAiMcpEverConnected")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .filter_map(|name| name.strip_prefix("claude.ai "))
+        .map(str::to_string)
+        .collect()
+}
+
 pub fn default_config_path() -> PathBuf {
     home_dir().join(".config/agent-router/config.toml")
 }
@@ -433,6 +532,20 @@ pub fn default_config_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovered_capabilities_are_provider_scoped_and_name_only() {
+        let codex: toml::Value = toml::from_str(
+            "[plugins.\"granola@openai-curated\"]\nenabled = true\n\n[mcp_servers.airtable]\ncommand = 'runner'\n",
+        )
+        .expect("parse Codex config");
+        assert_eq!(codex_capabilities(&codex), vec!["airtable", "granola"]);
+
+        let claude = serde_json::json!({
+            "claudeAiMcpEverConnected": ["claude.ai Granola", "claude.ai Notion"]
+        });
+        assert_eq!(claude_capabilities(&claude), vec!["Granola", "Notion"]);
+    }
 
     #[test]
     fn a_missing_config_is_created_with_defaults_and_reads_back_identically() {

@@ -12,8 +12,9 @@ use agent_router_core::classify::{
     Classification, Complexity, TaskContextHorizon, parse_classification,
 };
 use agent_router_core::config::{Config, DefaultProvider};
-use agent_router_core::decide::{Gate, decide};
+use agent_router_core::decide::{Gate, decide, decide_explicit};
 use agent_router_core::{Headroom, Provider, UsageSnapshot};
+use std::collections::BTreeMap;
 
 /// The instant every case decides at. Any epoch works; this one is in the same range as the
 /// recorded decisions, so a number that looks like a reset in the log reads like one here.
@@ -154,6 +155,67 @@ fn a_missing_connector_is_capability_blocked_instead_of_pinning_claude() {
     assert!(decision.gates.contains(&Gate::CapabilityBlocked));
     assert!(decision.capability_blocked);
     assert_ne!(decision.provider, Provider::Claude);
+}
+
+/// A classifier can correctly recognize a named external system while its old global inventory
+/// cannot. A live provider inventory must narrow the policy pool, not turn that observation into
+/// a global stop: reverting the provider eligibility filter makes this block again.
+#[test]
+fn a_provider_scoped_capability_keeps_auto_routing_inside_the_eligible_pool() {
+    let config = Config {
+        provider_capabilities: BTreeMap::from([
+            ("claude".to_string(), vec!["Granola".to_string()]),
+            ("codex".to_string(), vec!["Granola".to_string()]),
+        ]),
+        ..Config::default()
+    };
+    let decision = decide(
+        Classification {
+            rationale: "requires Granola meeting notes".to_string(),
+            ..scored(false, true, Complexity::Medium)
+        },
+        usage_with_grok(
+            window(99.0, HALF_WEEK, 100.0),
+            window(70.0, HALF_WEEK, 0.0),
+            window(1.0, HALF_WEEK, 0.0),
+        ),
+        NOW,
+        &config,
+    );
+
+    assert_eq!(decision.provider, Provider::Codex);
+    assert!(decision.gates.contains(&Gate::MissingConnector));
+    assert!(!decision.gates.contains(&Gate::CapabilityBlocked));
+    assert!(!decision.capability_blocked);
+}
+
+/// Capability eligibility is an Auto-only preflight. An explicit caller continues to own the
+/// provider choice even when another provider is the only one that advertises the capability.
+#[test]
+fn explicit_provider_bypasses_automatic_capability_eligibility() {
+    let config = Config {
+        provider_capabilities: BTreeMap::from([("codex".to_string(), vec!["Granola".to_string()])]),
+        ..Config::default()
+    };
+    let decision = decide_explicit(
+        Provider::Grok,
+        None,
+        None,
+        Some(Classification {
+            rationale: "requires Granola notes".to_string(),
+            ..scored(false, true, Complexity::Medium)
+        }),
+        usage_with_grok(
+            window(1.0, HALF_WEEK, 0.0),
+            window(1.0, HALF_WEEK, 0.0),
+            window(1.0, HALF_WEEK, 0.0),
+        ),
+        &config,
+    );
+
+    assert_eq!(decision.provider, Provider::Grok);
+    assert_eq!(decision.gates, vec![Gate::ExplicitProvider]);
+    assert!(!decision.capability_blocked);
 }
 
 // ------------------------------------------------- rule 3: the workhorse headroom comparison

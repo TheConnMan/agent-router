@@ -221,9 +221,10 @@ Codex having room is judged by `hard_ceiling_pct`, the same threshold the exhaus
 rather than by a second key that could drift away from it. Codex sitting exactly on that ceiling has
 no room, so no pacing happens: moving the job would relocate the stall rather than avoid it.
 
-A capability pin overrides this entirely. A task that needs a connector Codex cannot reach, or that
-needs several agents exchanging findings mid-run, stays on Claude however exhausted its 5 hour
-window is, because a paced job that cannot do the work is a failed job rather than a cheaper one.
+A capability pin overrides this entirely. A task requiring several agents exchanging findings
+mid-run stays on Claude however exhausted its 5 hour window is. A named connector instead first
+filters providers to inventories that establish it, then applies the ordinary policy within that
+eligible set; it is blocked only if no provider qualifies.
 
 Setting `weekly_routing = false` disables weekly balancing along with every other usage-driven rule.
 
@@ -244,20 +245,36 @@ classifier invocation strips both CLI startup cost and the model's thinking toke
 
 ### `connectors`
 
-Default `["local shell", "git", "gh (github)", "airtable"]`. The authoritative inventory of what
-Codex can reach on this machine.
+Default `["local shell", "git", "gh (github)", "airtable"]`. The authoritative local-shell
+inventory shown to the classifier.
 
 This is the one section that genuinely needs human maintenance. Rubric criterion 5 is scored
 against exactly this local-shell inventory. A configured capability, such as the authenticated
 Anthropic usage endpoint via local shell, prevents a false `missing_connector` result for a
-matching task. A genuinely absent capability returns `capability_blocked` and dispatches no
-provider; absence is not evidence that Claude can reach it. The classifier is explicitly told
+matching task. A genuinely absent capability returns `capability_blocked` only after provider
+inventories have also been checked; absence is not evidence that Claude can reach it. The classifier is explicitly told
 never to set `missing_connector` because it cannot see a connector itself, only because a named
 system is absent from this list.
 
 Keep it accurate in both directions. Listing a connector Codex cannot actually reach sends work to
 a provider that will fail; omitting one it can reach sends work to Claude that did not need to go
 there.
+
+### `provider_capabilities`
+
+Optional provider-scoped capability registration. Codex MCP server names and enabled plugins are
+discovered from `~/.codex/config.toml`; Claude.ai connector registrations are read from
+`~/.claude.json`. A missing source is unknown rather than evidence a provider is unavailable.
+Register a provider manually only when its local inventory cannot be inspected, for example:
+
+```toml
+[provider_capabilities]
+claude = ["slack"]
+```
+
+For an Auto route whose classifier observes a missing connector, providers without a matching
+inventory entry are excluded before the existing capacity policy runs. Explicit `--provider`
+requests remain exact and do not use this automatic eligibility filter.
 
 ## `[policy]`
 
