@@ -1,14 +1,19 @@
-//! Shared fixture helper for writing an executable shell stub.
+//! Shared fixture helpers reused across the resolver / dispatch / classifier test suites.
 //!
 //! Every stub-writing fixture in this workspace used to inline the same three steps: `fs::write`
 //! the script, `set_mode(0o700)`, then exec it. This module is the single place that shape lives,
-//! so the fixture's postcondition can be established once rather than nine times.
+//! so the fixture's postcondition can be established once rather than nine times. The same is
+//! true of the "stripped environment" fixture below: it used to be written out nearly
+//! character-for-character in four separate test files, and had already drifted between them
+//! before it was consolidated here.
 #![cfg(unix)]
 #![allow(dead_code)]
 
+use agent_router_core::binary::Environment;
+use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -133,4 +138,45 @@ pub fn write_stub(path: &Path, body: &str) {
             ),
         }
     }
+}
+
+/// An `Environment` that resolves no provider CLI at all — the fixture behind every "a stripped
+/// environment reports a launch failure" test in this workspace.
+///
+/// `root` selects which of the two variants this fixture needs:
+///
+/// * `Some(root)` builds a temp `HOME` holding nothing and a `PATH` holding one empty directory
+///   under `root`: the service-manager environment (systemd, cron), expressed as data. This is
+///   the shape almost every dispatch and classifier fixture wants, because it exercises "PATH and
+///   HOME exist but resolve nothing" rather than "PATH and HOME are unset".
+/// * `None` builds an `Environment` with no `PATH`, no `HOME`, and no override at all, for a
+///   fixture that specifically targets the HOME-absent / PATH-absent code paths (some systemd
+///   units genuinely run with no `HOME`).
+///
+/// **The explicit empty system fallback list is load-bearing and must not be "simplified" away.**
+/// `Environment::new` already defaults to no system fallbacks, so calling
+/// `.with_system_fallbacks([])` here looks redundant — but stating it explicitly is what keeps
+/// this fixture safe if that default ever changes. Every case built from this helper goes on to
+/// DISPATCH a real provider CLI through `execvp`. If a stripped environment ever regained a system
+/// fallback (accidentally or via a "helpful" default change), it could resolve a real `claude` /
+/// `codex` / `grok` / `opencode` binary actually installed on the host box and start a real,
+/// billable background job from a test run. Do not drop this call, and do not let a future
+/// `Environment::new` default make it look unnecessary.
+pub fn stripped_environment(root: Option<&Path>) -> Environment {
+    let no_system_fallbacks: [PathBuf; 0] = [];
+    match root {
+        Some(root) => {
+            let home = root.join("home");
+            let empty = root.join("empty-path-dir");
+            fs::create_dir_all(&home).expect("create the empty HOME");
+            fs::create_dir_all(&empty).expect("create the empty PATH directory");
+            Environment::new(
+                Some(std::env::join_paths([&empty]).expect("join the fixture PATH")),
+                Some(home),
+                BTreeMap::new(),
+            )
+        }
+        None => Environment::new(None, None, BTreeMap::new()),
+    }
+    .with_system_fallbacks(no_system_fallbacks)
 }

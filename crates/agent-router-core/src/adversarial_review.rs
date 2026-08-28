@@ -1,11 +1,12 @@
+use crate::binary::{self, Environment};
 use crate::classify::Complexity;
 use crate::config::Config;
 use crate::dispatch::grok::{grok_home, spawn_with_lifecycle};
 use crate::error::{Error, Result};
+use crate::provider::Provider;
 use crate::usage::{Headroom, claude_headroom, codex_headroom, grok_headroom};
 use agent_viewer_core::{Backend, GrokBackend, GrokLifecycle, Status as GrokStatus, TailEvent};
-use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
@@ -427,7 +428,8 @@ impl ReviewProvider for ClaudeReviewProvider<'_> {
             )));
         }
 
-        let mut command = Command::new(review_binary(CLAUDE_REVIEW_BIN_ENV, "claude"));
+        let binary = review_binary(CLAUDE_REVIEW_BIN_ENV, Provider::Claude)?;
+        let mut command = Command::new(&binary);
         command
             .current_dir(request.dir)
             .env("CLAUDE_SUBPROCESS", "1")
@@ -445,7 +447,7 @@ impl ReviewProvider for ClaudeReviewProvider<'_> {
             .arg("plan")
             .arg("--strict-mcp-config")
             .arg(request.body);
-        parse_claude_output(run_review(command, "claude")?)
+        parse_claude_output(run_review(command, &binary, Provider::Claude)?)
     }
 }
 
@@ -474,7 +476,8 @@ impl ReviewProvider for CodexReviewProvider<'_> {
             )));
         }
 
-        let mut command = Command::new(review_binary(CODEX_REVIEW_BIN_ENV, "codex"));
+        let binary = review_binary(CODEX_REVIEW_BIN_ENV, Provider::Codex)?;
+        let mut command = Command::new(&binary);
         command
             .current_dir(request.dir)
             .arg("exec")
@@ -486,7 +489,7 @@ impl ReviewProvider for CodexReviewProvider<'_> {
             .arg("--json")
             .arg("--ephemeral")
             .arg(request.body);
-        parse_codex_output(run_review(command, "codex")?)
+        parse_codex_output(run_review(command, &binary, Provider::Codex)?)
     }
 }
 
@@ -506,7 +509,11 @@ impl ReviewProvider for GrokReviewProvider {
     }
 
     fn authoritative_availability(&self) -> std::result::Result<(), String> {
-        let lifecycle = GrokLifecycle::new("grok", grok_home());
+        // This probe's whole contract is a human-readable reason, so a resolution failure becomes
+        // its `Err` string carrying the `Launch` message text rather than a distinct variant.
+        let binary = binary::resolve(Provider::Grok, &Environment::from_process())
+            .map_err(|error| error.to_string())?;
+        let lifecycle = GrokLifecycle::new(binary, grok_home());
         let diagnostics = lifecycle
             .diagnostics()
             .map_err(|error| format!("authoritative Grok leader diagnostics failed: {error}"))?;
@@ -536,7 +543,8 @@ fn run_grok_review(request: &ReviewRequest<'_>) -> Result<(String, String)> {
         )));
     }
 
-    let lifecycle = GrokLifecycle::new("grok", grok_home());
+    let binary = binary::resolve(Provider::Grok, &Environment::from_process())?;
+    let lifecycle = GrokLifecycle::new(binary, grok_home());
     let prompt = format!(
         "{GROK_REVIEW_CONTRACT}\n\nReview request:\n{}",
         request.body
@@ -681,16 +689,33 @@ impl Drop for GrokReviewCleanup<'_> {
     }
 }
 
-fn review_binary(environment: &str, fallback: &str) -> OsString {
-    std::env::var_os(environment).unwrap_or_else(|| OsString::from(fallback))
+/// IMPURE: the reviewer binary for `provider`, through the one resolver.
+///
+/// The review-specific override is passed ahead of the generic per-provider one: an operator who
+/// pins a separate reviewer binary is making a narrower statement than one who pins the dispatch
+/// binary, so it must outrank it. The ordered list is a precedence, not a requirement — with only
+/// the generic override set, the review path still resolves through it.
+fn review_binary(review_env: &'static str, provider: Provider) -> Result<PathBuf> {
+    binary::resolve_named(
+        provider.name(),
+        &[review_env, binary::override_env(provider)],
+        &Environment::from_process(),
+    )
 }
 
-fn run_review(mut command: Command, provider: &str) -> Result<String> {
+fn run_review(mut command: Command, binary: &Path, provider: Provider) -> Result<String> {
+    let override_env = review_override(provider);
+    let provider = provider.name();
     let Output {
         status,
         stdout,
         stderr,
-    } = command.output()?;
+    } = command
+        .output()
+        // The binary resolved, so a NotFound here means it vanished or lost its exec bit in the
+        // window before the exec. `Error::Io`'s Display is the production `os error 2` string, so
+        // it must not reach the log unmapped.
+        .map_err(|error| binary::launch_error(binary, override_env, error))?;
     if !status.success() {
         let detail = String::from_utf8_lossy(&stderr).trim().to_string();
         let suffix = if detail.is_empty() {
@@ -704,6 +729,18 @@ fn run_review(mut command: Command, provider: &str) -> Result<String> {
     }
     String::from_utf8(stdout)
         .map_err(|_| Error::Command(format!("{provider} review printed non UTF-8 output")))
+}
+
+/// PURE: the override a review launch failure should name. The review-specific variable is the
+/// narrower one and is what an operator diagnosing a *review* failure wants pointed at.
+const fn review_override(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Claude => CLAUDE_REVIEW_BIN_ENV,
+        Provider::Codex => CODEX_REVIEW_BIN_ENV,
+        // Grok reviews go through the lifecycle, not `run_review`; the generic override is the
+        // right thing to name if that ever changes.
+        other => binary::override_env(other),
+    }
 }
 
 fn parse_claude_output(stdout: String) -> Result<String> {

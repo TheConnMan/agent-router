@@ -299,18 +299,30 @@ pass log_writable        /home/you/.local/state/agent-router/router.db takes a w
 
 | Check | What it covers |
 | --- | --- |
-| `claude_on_path` | An executable `claude` on `PATH`. The classifier runs on every auto route, so this is exercised even when every task ends up on Codex. |
+| `claude_on_path` | An executable `claude` on `PATH`. The classifier runs on every auto route, so this is exercised even when every task ends up on Codex. Off `PATH` but resolvable is a warning, not a failure — see below. |
 | `claude_credentials` | `~/.claude/.credentials.json` exists, parses, and carries `/claudeAiOauth/accessToken`. Without it the usage reader has nothing to authenticate with. |
 | `claude_usage` | Whether the Claude usage read was live or fell open. |
-| `codex_on_path` | An executable `codex` on `PATH`. |
+| `codex_on_path` | An executable `codex` on `PATH`, or resolvable off it. |
 | `codex_app_server` | Whether the app-server daemon answers, which is the transport every Codex dispatch goes through. Observed only: doctor does not start a daemon, so an absent one is reported rather than created. |
 | `codex_rate_limits` | Whether the Codex usage read was live or fell open. |
 | `grok_usage` | Grok billing provenance: `live` and `cache` are usable capacity readings. `log` is healthy only when its event supplies weekly capacity; without `creditUsagePercent`, it remains `log` but is unknown and unhealthy. `none` means no usable billing data and fails closed for routing. |
-| `opencode_on_path` | An executable `opencode` on `PATH`. |
-| `grok_binary` | An executable `grok` on `PATH`. Doctor only observes it and does not create Grok configuration. |
+| `opencode_on_path` | An executable `opencode` on `PATH`, or resolvable off it. |
+| `grok_binary` | Resolves `grok` through the same override → `PATH` → fallback chain dispatch uses (`AGENT_ROUTER_GROK_BIN`, then `PATH`, then `$HOME/.local/bin` and `/usr/local/bin`) before running lifecycle diagnostics, so a binary absent from `PATH` still passes when an override or a fallback location finds it. Doctor only observes it and does not create Grok configuration. |
 | `grok_leader_registration` | Whether the public Grok lifecycle reports an authoritative persistent leader. This is separate from the binary check and is required for explicit Grok dispatch and Grok reviewer selection. |
 | `config_parses` | The config file parses, read directly so a diagnostic never creates the file it was asked to report on. An absent file is a pass: the router runs on the same defaults. |
 | `log_writable` | The decision log opens and takes an actual write. Opening alone proves nothing, because the schema batch is all `IF NOT EXISTS` and can succeed on a database the next dispatch cannot write to. |
+
+The three `*_on_path` checks ask two questions, and they are not the same question. The first is
+whether the binary is on `PATH`, which is the fact the check is named after and the one its message
+states. The second is whether a dispatch will actually find it: dispatch resolves through the
+per-provider override, then `PATH`, then `$HOME/.local/bin` and `/usr/local/bin`. A binary that is
+off `PATH` but still resolvable is therefore a **warning** naming where dispatch will find it and
+the `AGENT_ROUTER_CLAUDE_BIN` / `AGENT_ROUTER_CODEX_BIN` / `AGENT_ROUTER_OPENCODE_BIN` variable
+that pins it, never a failure — failing there would exit 1 on a box the router handles perfectly
+well. Only a binary that resolves nowhere keeps the old severity and the old `so any dispatch to it
+will error` consequence, which in that case is true.
+`grok_binary` is not one of these: it never asks the `PATH` question at all, resolving straight
+through the dispatch chain, so `AGENT_ROUTER_GROK_BIN` is named by that check's own failure instead.
 
 One rule decides the severity. **Fail** means the router would keep running on inputs it cannot
 trust, or could not run at all: a missing classifier, unreadable credentials, a usage number that is

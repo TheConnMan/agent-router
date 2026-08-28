@@ -51,6 +51,22 @@ pub enum Gate {
     GrokUnavailable,
     /// Weekly usage routing is disabled by policy.
     WeeklyRoutingDisabled,
+    /// The classifier could not LAUNCH a provider's CLI — it resolved nowhere, or the exec failed
+    /// — as distinct from launching it and getting a bad answer back. That provider was therefore
+    /// excluded from the eligibility test, in the same sense as one over its hard ceiling.
+    ///
+    /// This is a DIAGNOSTIC gate, not a provider-moving one. It records only that unlaunchability
+    /// was applied; whether the destination actually changed is recorded separately, by
+    /// `FlippedOnExhaustion` when it moved and by `OverCeiling` when nothing eligible was left.
+    /// It is pushed either way, because the row where an unlaunchable provider kept the work and
+    /// is about to fail loudly is the one an operator most needs to see.
+    ///
+    /// It deliberately does NOT belong in `stats.rs`'s `FLIP_GATES`, whose doc says any new
+    /// provider-moving gate does: on a row that moved, `flipped_on_exhaustion` already counts it
+    /// and `any()` counts a row once, so adding this is a no-op; on a row that did not move — the
+    /// common case, since `GrokUnavailable` makes Grok ineligible whenever its weekly window is
+    /// unread — it would count a flip that never happened.
+    ClassifierUnlaunchable,
     /// Retained for compatibility with legacy decision logs.
     ProjectedOverdraw,
     /// Retained for compatibility with legacy decision logs.
@@ -73,6 +89,7 @@ impl Gate {
             Gate::WeeklyUnknown => "weekly_unknown",
             Gate::GrokUnavailable => "grok_unavailable",
             Gate::WeeklyRoutingDisabled => "weekly_routing_disabled",
+            Gate::ClassifierUnlaunchable => "classifier_unlaunchable",
             Gate::ProjectedOverdraw => "projected_overdraw",
             Gate::ProjectionUnavailable => "projection_unavailable",
             Gate::FiveHourPacing => "five_hour_pacing",
@@ -230,11 +247,29 @@ pub fn decide(
         //
         // Closing here rather than in the reader keeps the reader's fail open contract intact. It
         // also cannot block a dispatch: both providers unknown fall through to `over_ceiling`.
+        //
+        // A provider whose CLI could not be launched is ineligible in exactly the same sense. It
+        // is an eligibility input rather than a re-route instruction, deliberately: Claude is a
+        // capability destination only, and moving work there for a launch failure would invent an
+        // automatic destination this policy does not have. When that leaves nothing eligible the
+        // task stays put and fails loudly at dispatch with a named launch error, which is the
+        // diagnosable outcome the incident lacked.
         let eligible = |candidate| {
             (!classification.missing_connector || capability_providers.contains(&candidate))
                 && headroom(&usage, candidate).weekly_known()
                 && weekly_used(&usage, candidate) < config.hard_ceiling_pct
+                && classification.unlaunchable != Some(candidate)
         };
+        // Only Codex and Grok are ever asked about, so only those two can have been excluded.
+        // Claude is unrepresentable as an exclusion here and Opencode is never a candidate; both
+        // are no-ops rather than an unreachable arm, because the field is deserialized from a log
+        // row and a future engine could widen what it names.
+        if matches!(
+            classification.unlaunchable,
+            Some(Provider::Codex | Provider::Grok)
+        ) {
+            gates.push(Gate::ClassifierUnlaunchable);
+        }
         if !headroom(&usage, Provider::Codex).weekly_known()
             || !headroom(&usage, Provider::Grok).weekly_known()
         {
@@ -451,7 +486,6 @@ fn rationale(
 mod tests {
     use super::*;
     use crate::classify::TaskContextHorizon;
-    use crate::config::DefaultProvider;
     use crate::usage::{Headroom, parse_codex_rate_limits};
 
     /// The rules the engine routes by live in `tests/pace_routing.rs`, against the public API.
@@ -479,6 +513,7 @@ mod tests {
             rationale: "classified for explicit route".to_string(),
             classifier_failed: false,
             invokes_implement: false,
+            unlaunchable: None,
         }
     }
 
@@ -558,6 +593,7 @@ mod tests {
                 rationale: "fixture".to_string(),
                 classifier_failed: false,
                 invokes_implement: false,
+                unlaunchable: None,
             },
             usage(71.0, 50.0),
             1_785_400_000,
@@ -586,7 +622,7 @@ mod tests {
         assert!(!codex.stale);
 
         let decision = decide(
-            Classification::fallback("fixture", DefaultProvider::Codex),
+            Classification::fallback("fixture"),
             UsageSnapshot {
                 codex,
                 claude: Headroom {

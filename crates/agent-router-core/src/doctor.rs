@@ -6,13 +6,15 @@
 //! cannot trust, or could not run at all. `Warn` means a degraded path that fails loudly at the
 //! moment it is used, so nothing silently routes on a wrong number because of it.
 
+use crate::binary::{self, Environment};
 use crate::config::{Config, default_config_path};
 use crate::error::Error;
 use crate::log::DecisionLog;
+use crate::provider::Provider;
 use crate::runtime::home_dir;
 use crate::usage::UsageSnapshot;
 use agent_viewer_core::GrokLifecycle;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// How one check landed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,22 +50,23 @@ impl Report {
 /// The usage checks read one snapshot, so doctor asks each provider once rather than once per
 /// check, and the lines it prints cannot disagree about the same read.
 pub fn run() -> Report {
+    let environment = Environment::from_process();
     let (usage, grok_source) = UsageSnapshot::read_with_grok_source();
-    let claude_installed = on_path("claude").is_some();
-    let codex_installed = on_path("codex").is_some();
-    let grok_installed = on_path("grok").is_some();
+    let claude_installed = on_path("claude", &environment).is_some();
+    let codex_installed = on_path("codex", &environment).is_some();
+    let grok_installed = on_path("grok", &environment).is_some();
     let mut checks = vec![
-        required_binary("claude_on_path", "claude"),
+        required_binary_in(&environment, "claude_on_path", Provider::Claude),
         claude_credentials(),
         usage_source("claude_usage", usage.claude.stale, claude_installed),
-        optional_binary("codex_on_path", "codex"),
+        optional_binary_in(&environment, "codex_on_path", Provider::Codex),
         codex_app_server(),
         usage_source("codex_rate_limits", usage.codex.stale, codex_installed),
         grok_usage_source(grok_source, usage.grok, grok_installed),
     ];
-    checks.extend(grok_checks());
+    checks.extend(grok_checks(&environment));
     checks.extend([
-        optional_binary("opencode_on_path", "opencode"),
+        optional_binary_in(&environment, "opencode_on_path", Provider::Opencode),
         config_parses(),
         log_writable(),
     ]);
@@ -72,8 +75,16 @@ pub fn run() -> Report {
 
 /// Observe both Grok lifecycle prerequisites without starting a leader or creating configuration.
 /// Grok is explicit only, so an unavailable path warns rather than failing the whole router.
-fn grok_checks() -> [Check; 2] {
-    let lifecycle = GrokLifecycle::new("grok", grok_home());
+fn grok_checks(environment: &Environment) -> [Check; 2] {
+    // Resolve before constructing the lifecycle, so this observes the same binary a dispatch would
+    // run rather than whatever `execvp` finds on doctor's own PATH. An unresolvable grok reuses the
+    // diagnostics-unavailable Warn shape below: Grok is explicit-only, so an unavailable path warns
+    // rather than failing the whole router, and `Error::Launch` already names AGENT_ROUTER_GROK_BIN.
+    let binary = match binary::resolve(Provider::Grok, environment) {
+        Ok(binary) => binary,
+        Err(error) => return grok_unavailable(&one_line(&error)),
+    };
+    let lifecycle = GrokLifecycle::new(binary, grok_home());
     match lifecycle.diagnostics() {
         Ok(diagnostics) => {
             let binary = if diagnostics.binary_available {
@@ -109,22 +120,26 @@ fn grok_checks() -> [Check; 2] {
             };
             [binary, leader]
         }
-        Err(error) => {
-            let detail = one_line(&error);
-            [
-                warn(
-                    "grok_binary",
-                    format!("Grok lifecycle diagnostics were unavailable: {detail}"),
-                ),
-                warn(
-                    "grok_leader_registration",
-                    format!(
-                        "Grok lifecycle diagnostics were unavailable and doctor did not start a leader: {detail}"
-                    ),
-                ),
-            ]
-        }
+        Err(error) => grok_unavailable(&one_line(&error)),
     }
+}
+
+/// The two Warn lines a Grok path that could not even be observed produces. Shared so an
+/// unresolvable binary and unavailable diagnostics report identically: in both cases doctor knows
+/// only that the path is unusable and why, and neither is a reason to fail the whole preflight.
+fn grok_unavailable(detail: &str) -> [Check; 2] {
+    [
+        warn(
+            "grok_binary",
+            format!("Grok lifecycle diagnostics were unavailable: {detail}"),
+        ),
+        warn(
+            "grok_leader_registration",
+            format!(
+                "Grok lifecycle diagnostics were unavailable and doctor did not start a leader: {detail}"
+            ),
+        ),
+    ]
 }
 
 fn grok_home() -> PathBuf {
@@ -136,22 +151,65 @@ fn grok_home() -> PathBuf {
 
 /// A binary the router cannot work without. The classifier runs on every auto route, and a
 /// classifier that cannot start falls back to the configured default provider without saying so.
-fn required_binary(name: &'static str, binary: &str) -> Check {
-    match on_path(binary) {
-        Some(path) => pass(name, format!("{binary} at {}", path.display())),
-        None => fail(name, format!("no executable {binary} on PATH")),
-    }
+///
+/// The check reports the PATH *fact* and takes its *consequence* from the resolver. Fail is
+/// doctor's process exit code, so failing on a binary reachable through `$HOME/.local/bin` would
+/// exit 1 on precisely the machines the resolver teaches the router to handle — a preflight raising
+/// a false alarm on the fixed configuration is a worse defect than the one that was fixed.
+pub fn required_binary_in(
+    environment: &Environment,
+    name: &'static str,
+    provider: Provider,
+) -> Check {
+    binary_check(environment, name, provider, Health::Fail)
 }
 
 /// A binary whose absence degrades one dispatch path rather than the router. Every dispatch to
 /// that provider then errors at the moment it is attempted, which is loud enough to be a warning.
-fn optional_binary(name: &'static str, binary: &str) -> Check {
-    match on_path(binary) {
-        Some(path) => pass(name, format!("{binary} at {}", path.display())),
-        None => warn(
+pub fn optional_binary_in(
+    environment: &Environment,
+    name: &'static str,
+    provider: Provider,
+) -> Check {
+    binary_check(environment, name, provider, Health::Warn)
+}
+
+/// The two questions behind every `*_on_path` check, asked in order.
+///
+/// `search_path` answers whether it is on PATH, which is what the check is named after and what its
+/// message asserts. `resolve` answers whether a dispatch will actually find it, which is what
+/// decides the severity. Conflating them either makes the check name lie (if the PATH answer
+/// widened) or makes the consequence lie (if the severity ignored the fallback).
+fn binary_check(
+    environment: &Environment,
+    name: &'static str,
+    provider: Provider,
+    absent: Health,
+) -> Check {
+    let program = provider.name();
+    if let Some(path) = on_path(program, environment) {
+        return pass(name, format!("{program} at {}", path.display()));
+    }
+    match binary::resolve(provider, environment) {
+        Ok(resolved) => warn(
             name,
-            format!("no executable {binary} on PATH, so any dispatch to it will error"),
+            format!(
+                "no executable {program} on PATH, but dispatch will find it at {}; pin it with {}",
+                resolved.display(),
+                binary::override_env(provider)
+            ),
         ),
+        Err(_) => {
+            let detail = match absent {
+                Health::Fail => format!("no executable {program} on PATH"),
+                _ => format!("no executable {program} on PATH, so any dispatch to it will error"),
+            };
+            Check {
+                name,
+                health: absent,
+                detail,
+            }
+        }
     }
 }
 
@@ -357,26 +415,16 @@ pub fn write_probe_health(error: &Error) -> Health {
     }
 }
 
-/// IMPURE: the first executable named `binary` on `$PATH`. Walked here rather than shelled out to
-/// `which`, which would make doctor depend on a binary it does not check for.
-fn on_path(binary: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|directory| directory.join(binary))
-        .find(|candidate| is_executable(candidate))
-}
-
-#[cfg(unix)]
-fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
-
-#[cfg(not(unix))]
-fn is_executable(path: &Path) -> bool {
-    path.is_file()
+/// IMPURE: the first executable named `binary` on `$PATH`. The walk now lives in `binary.rs`, but
+/// it is still hand-rolled rather than shelled out to `which`, which would make doctor depend on a
+/// binary it does not check for.
+///
+/// This stays PATH-only. Doctor's checks are *named* `*_on_path` and its messages say `on PATH`, so
+/// answering the wider resolver question here would report a binary found only in
+/// `$HOME/.local/bin` as being on PATH. The fallback changes the *severity*, in `binary_check`, not
+/// the fact.
+fn on_path(binary: &str, environment: &Environment) -> Option<PathBuf> {
+    binary::search_path(binary, environment)
 }
 
 /// PURE: an error rendered onto one line, because a report is one line per check and a TOML parse

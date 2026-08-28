@@ -11,7 +11,7 @@ use agent_router_core::classify::{Classification, Complexity, TaskContextHorizon
 use agent_router_core::config::Config;
 use agent_router_core::decide::{Decision, decide};
 use agent_router_core::log::{DecisionLog, Entry, Mark};
-use agent_router_core::{DefaultProvider, Headroom, Provider, UsageSnapshot};
+use agent_router_core::{Headroom, Provider, UsageSnapshot};
 use std::path::Path;
 
 const NOW: i64 = 1_785_400_000;
@@ -47,6 +47,7 @@ fn scored(orchestration: bool, task_context_horizon: TaskContextHorizon) -> Clas
         rationale: "fixture".to_string(),
         classifier_failed: false,
         invokes_implement: false,
+        unlaunchable: None,
     }
 }
 
@@ -207,10 +208,7 @@ fn fresh_auto_rows_persist_and_expose_each_context_horizon() {
     for (task, classification) in [
         ("ordinary task", scored(false, TaskContextHorizon::Ordinary)),
         ("extended task", scored(false, TaskContextHorizon::Extended)),
-        (
-            "failed task",
-            Classification::fallback("fixture failure", DefaultProvider::Codex),
-        ),
+        ("failed task", Classification::fallback("fixture failure")),
     ] {
         let decision = decide(classification, usage, NOW, &Config::default());
         log.record(&Entry {

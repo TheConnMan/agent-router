@@ -36,6 +36,30 @@ else
     fi
 fi
 
-~/.cargo/bin/cargo build --release --workspace &&
-    cp target/release/agent-router ~/.cargo/bin/agent-router &&
-    cp target/release/agent-router ~/.local/bin/agent-router
+~/.cargo/bin/cargo build --release --workspace
+
+# `cp` opens the destination and truncates it in place. Background jobs on this box dispatch
+# through ~/.local/bin/agent-router continuously, so a `cp` onto a binary that is currently
+# executing fails ETXTBSY (which set -euo pipefail then turns into a hook failure), and a `cp`
+# interrupted partway (that failure, or anything else) leaves a truncated, unrunnable binary on
+# PATH for the next dispatch to pick up. Writing to a temp file in the destination directory (so
+# it is guaranteed to be on the same filesystem, which is what makes the next step atomic) and
+# `mv -f`-ing it over the real name avoids both: within one filesystem `mv` is a `rename(2)`,
+# which swaps the directory entry atomically, so a concurrent reader/execer sees either the whole
+# old binary or the whole new one, never a partial file, and a process that already has the old
+# binary open keeps running against its own inode.
+install_tmp_files=()
+trap 'rm -f "${install_tmp_files[@]}"' EXIT
+
+install_binary() {
+    local dest_dir="$1"
+    local tmp
+    tmp="$(mktemp "${dest_dir}/.agent-router.new.XXXXXX")"
+    install_tmp_files+=("$tmp")
+    cp target/release/agent-router "$tmp"
+    chmod +x "$tmp"
+    mv -f "$tmp" "${dest_dir}/agent-router"
+}
+
+install_binary ~/.cargo/bin
+install_binary ~/.local/bin

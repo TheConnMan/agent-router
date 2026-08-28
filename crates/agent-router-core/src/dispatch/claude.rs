@@ -1,4 +1,6 @@
+use crate::binary::{CLAUDE_BIN_ENV, Environment};
 use crate::error::{Error, Result};
+use crate::provider::Provider;
 use crate::run::Dispatch;
 use crate::runtime::{canonicalize_dir, now_ms, router_log_path, spawn_detached};
 use serde::Deserialize;
@@ -38,8 +40,38 @@ pub fn dispatch(
     mcp_configs: &[PathBuf],
     strict_mcp_config: bool,
 ) -> Result<Dispatch> {
+    dispatch_in(
+        &Environment::from_process(),
+        cwd,
+        task,
+        name,
+        model,
+        effort,
+        mcp_configs,
+        strict_mcp_config,
+    )
+}
+
+/// IMPURE in `environment` only: the seam the stripped-`PATH` regression tests drive.
+///
+/// The resolution happens here rather than inside `dispatch_with_binary`, so a test that strips
+/// `PATH` exercises the real `resolve` on the real code path. A test that only called
+/// `dispatch_with_binary` would stay green with `Path::new("claude")` still at the top of this
+/// function, which is the whole defect.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_in(
+    environment: &Environment,
+    cwd: &Path,
+    task: &str,
+    name: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+    mcp_configs: &[PathBuf],
+    strict_mcp_config: bool,
+) -> Result<Dispatch> {
+    let binary = crate::binary::resolve(Provider::Claude, environment)?;
     dispatch_with_binary(
-        Path::new("claude"),
+        &binary,
         cwd,
         task,
         name,
@@ -84,7 +116,7 @@ pub fn dispatch_with_binary(
         command.arg("--strict-mcp-config");
     }
     command.arg("--name").arg(name).arg(task);
-    spawn_detached(command, &router_log_path("claude"))?;
+    spawn_detached(command, &router_log_path("claude"), Some(CLAUDE_BIN_ENV))?;
 
     let job_id = resolve_short_id(binary, name, cwd, dispatched_at, timeout);
     Ok(Dispatch {
@@ -171,7 +203,20 @@ fn resolve_short_id(
 /// every finished job would read as absent. The list is still a bounded recent window, so a job
 /// missing from this map is a job the router cannot resolve, never a job that completed.
 pub fn agent_states(timeout: Duration) -> Result<BTreeMap<String, String>> {
-    let rows = list_agents(Path::new("claude"), timeout)?;
+    agent_states_in(&Environment::from_process(), timeout)
+}
+
+/// IMPURE in `environment` only: `agent_states`' resolution seam.
+///
+/// This is a SECOND claude entry point with its own resolution, reached from `status.rs`. Without
+/// it, reconciliation would keep calling `execvp("claude")` while dispatch was fixed, and every job
+/// in the window would read as unresolvable rather than as unread.
+pub fn agent_states_in(
+    environment: &Environment,
+    timeout: Duration,
+) -> Result<BTreeMap<String, String>> {
+    let binary = crate::binary::resolve(Provider::Claude, environment)?;
+    let rows = list_agents(&binary, timeout)?;
     Ok(rows
         .into_iter()
         .filter_map(|row| {
@@ -189,7 +234,11 @@ fn list_agents(binary: &Path, timeout: Duration) -> Result<Vec<AgentRow>> {
         .arg("--all")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command.spawn()?;
+    // Not `?`: that conversion is `Error::Io`, whose `Display` is the production string. A binary
+    // that resolved and then vanished before the exec is still a launch failure.
+    let mut child = command
+        .spawn()
+        .map_err(|error| crate::binary::launch_error(binary, CLAUDE_BIN_ENV, error))?;
     let mut stdout = child
         .stdout
         .take()

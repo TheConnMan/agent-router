@@ -37,6 +37,8 @@ fn pre_versioning() -> u32 {
     0
 }
 
+/// The value `Policy::default_provider` accepts and validates. Still parsed and defaulted, but no
+/// longer consulted by routing; see the field's own doc comment for why.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DefaultProvider {
@@ -47,6 +49,14 @@ pub enum DefaultProvider {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Policy {
+    /// Accepted, defaulted, and validated at load time, but no longer read by routing:
+    /// `Classification::fallback` used to compose "defaulting to {provider}" from this field, and
+    /// no longer takes it at all. Routing now selects between Codex and Grok by capacity, with
+    /// Claude reserved for capability pins, so there is no live "default provider" decision left
+    /// for this field to answer. Kept because it is a documented user-facing config key: removing
+    /// it would either break existing config files or start silently ignoring them, and its
+    /// parse-time validation is still worth keeping. Do not assume the next reader added here
+    /// makes it live again without checking that assumption first.
     pub default_provider: DefaultProvider,
     pub weekly_routing: bool,
 }

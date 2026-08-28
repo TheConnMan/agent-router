@@ -647,6 +647,7 @@ mod tests {
             rationale: "bounded contract".to_string(),
             classifier_failed: false,
             invokes_implement: false,
+            unlaunchable: None,
         };
         let usage = UsageSnapshot {
             claude: Headroom {

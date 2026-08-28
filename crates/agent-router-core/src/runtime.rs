@@ -208,7 +208,17 @@ pub(crate) fn router_log_path(prefix: &str) -> PathBuf {
 }
 
 /// Spawn a process in its own session and append its output to `log_path`.
-pub fn spawn_detached(mut command: Command, log_path: &Path) -> Result<u32> {
+///
+/// `override_env` names the `AGENT_ROUTER_*_BIN` variable that pins the program being spawned, and
+/// is what turns an `ENOENT` here into a named `Error::Launch`. Without it this line converts the
+/// io error straight into `Error::Io`, whose `Display` **is** `No such file or directory (os error
+/// 2)` — the literal string the lost production rows recorded. `None` is for the spawns that are
+/// not provider CLIs: those keep `Error::Io` and nothing about them changes.
+pub fn spawn_detached(
+    mut command: Command,
+    log_path: &Path,
+    override_env: Option<&str>,
+) -> Result<u32> {
     if let Some(parent) = log_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -244,7 +254,16 @@ pub fn spawn_detached(mut command: Command, log_path: &Path) -> Result<u32> {
         command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     }
 
-    Ok(command.spawn()?.id())
+    // The program is read before the spawn so the failure can name it: `Command` is consumed by
+    // the borrow the spawn takes, and the mapper needs the path either way.
+    let program = PathBuf::from(command.get_program());
+    command
+        .spawn()
+        .map(|child| child.id())
+        .map_err(|error| match override_env {
+            Some(override_env) => crate::binary::launch_error(&program, override_env, error),
+            None => crate::Error::Io(error),
+        })
 }
 
 #[cfg(test)]

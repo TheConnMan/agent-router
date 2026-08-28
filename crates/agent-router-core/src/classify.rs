@@ -1,10 +1,17 @@
 //! The classifier: one small-model call that scores a task against the routing rubric and
-//! returns strict JSON. Which engine and model make that call is configured; every failure
-//! retains the configured default and stays eligible for weekly routing.
+//! returns strict JSON. Which engine and model make that call is configured; a failure pins
+//! nothing, so the task stays eligible for ordinary capacity routing.
+//!
+//! One failure is not like the others: a CLI the router could not LAUNCH is a fact about this box,
+//! not about the task, and `Classification::unlaunchable` carries it to `decide` so a provider
+//! that cannot start is not handed more work.
 
-use crate::config::{Classifier, ClassifierEngine, Config, DefaultProvider};
+use crate::binary::Environment;
+use crate::config::{Classifier, ClassifierEngine, Config};
+use crate::provider::Provider;
 use crate::runtime::{home_dir, validate_job_name};
 use std::io::Read;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -90,6 +97,15 @@ pub struct Classification {
     /// substring it can already see would put a capability pin behind a coin flip.
     #[serde(default)]
     pub invokes_implement: bool,
+    /// The provider whose CLI the classifier could not LAUNCH, as opposed to one that ran and
+    /// answered badly. Not part of the model's JSON; evidence from the launch attempt.
+    ///
+    /// Stamped back to `None` at both parse entry points, because a model that echoes the field
+    /// must not get to set it: an answer carrying `"unlaunchable":"codex"` would otherwise make a
+    /// SUCCESSFUL score mark Codex ineligible and push a gate asserting a launch failure that
+    /// never happened.
+    #[serde(default)]
+    pub unlaunchable: Option<Provider>,
 }
 
 /// PURE: does this task dispatch the `/implement` skill?
@@ -112,21 +128,29 @@ pub fn invokes_implement(task: &str) -> bool {
 }
 
 impl Classification {
-    /// The classification used when the classifier could not answer. The configured default
-    /// remains eligible for every usage rule, so failure does not invent a capability pin.
-    pub fn fallback(why: &str, default_provider: DefaultProvider) -> Classification {
-        let provider_name = match default_provider {
-            DefaultProvider::Codex => "codex",
-            DefaultProvider::Claude => "claude",
-        };
+    /// The classification used when the classifier could not answer. It pins nothing, so ordinary
+    /// capacity routing still decides where the task goes.
+    ///
+    /// The rationale names no destination, deliberately. It used to compose
+    /// `classifier failed ({why}), defaulting to {provider}` off `default_provider`, a setting
+    /// routing stopped consulting long ago, and the observed production line was
+    /// `claude requested explicitly: classifier failed (could not run codex: ...), defaulting to
+    /// codex` — a job that ran on Claude, claiming it defaulted to the Codex that had just failed
+    /// to execute. Nothing is lost by dropping the clause: every composed rationale already names
+    /// the provider actually chosen, first.
+    ///
+    /// `unlaunchable` is left `None` here. A bare fallback knows only that no answer arrived; only
+    /// the launch path has the evidence to say a CLI never started.
+    pub fn fallback(why: &str) -> Classification {
         Classification {
             orchestration: false,
             missing_connector: false,
             complexity: Complexity::High,
             task_context_horizon: TaskContextHorizon::Unknown,
-            rationale: format!("classifier failed ({why}), defaulting to {provider_name}"),
+            rationale: format!("classifier failed ({why})"),
             classifier_failed: true,
             invokes_implement: false,
+            unlaunchable: None,
         }
     }
 }
@@ -141,17 +165,36 @@ pub struct ClassifiedTask {
 /// IMPURE: score `task` with the configured classifier engine. Never fails: an unusable answer
 /// becomes the fallback.
 pub fn classify(task: &str, config: &Config) -> Classification {
-    classify_with_name(task, config).classification
+    classify_in(&Environment::from_process(), task, config)
+}
+
+/// IMPURE: score `task` against an explicit environment.
+///
+/// The environment is a parameter rather than a process read so a test can strip `PATH` as data
+/// and still run this exact code path. A test that only injected a binary would prove the argv is
+/// right and prove nothing about whether production resolves at all.
+pub fn classify_in(environment: &Environment, task: &str, config: &Config) -> Classification {
+    classify_with_name_in(environment, task, config).classification
 }
 
 /// IMPURE: score `task` and ask the same small classifier model for a session title. Never fails:
 /// an unusable score becomes the fallback and an unusable title becomes `None`.
 pub fn classify_with_name(task: &str, config: &Config) -> ClassifiedTask {
+    classify_with_name_in(&Environment::from_process(), task, config)
+}
+
+/// IMPURE: the scoring-and-naming call against an explicit environment. See [`classify_in`].
+pub fn classify_with_name_in(
+    environment: &Environment,
+    task: &str,
+    config: &Config,
+) -> ClassifiedTask {
     let prompt = classifier_prompt(task, &config.connectors);
     let timeout = Duration::from_secs(config.classifier_timeout_secs);
     let engine = config.classifier.engine;
-    let cmd = classifier_command(&prompt, &config.classifier);
-    let mut scored = match capture(cmd, engine.name(), timeout) {
+    let answer = classifier_command_in(environment, &prompt, &config.classifier)
+        .and_then(|cmd| capture(cmd, engine, timeout));
+    let mut scored = match answer {
         Ok(stdout) => match parse_classifier_output_with_name(&stdout, engine) {
             Some((classification, job_name)) => ClassifiedTask {
                 classification: reconcile_configured_local_capabilities(
@@ -161,16 +204,17 @@ pub fn classify_with_name(task: &str, config: &Config) -> ClassifiedTask {
                 ),
                 job_name: job_name.and_then(|name| validate_job_name(task, &name)),
             },
+            // A CLI that printed garbage did launch, so this carries no launch evidence.
             None => ClassifiedTask {
-                classification: Classification::fallback(
-                    "unparseable json",
-                    config.policy.default_provider,
-                ),
+                classification: Classification::fallback("unparseable json"),
                 job_name: None,
             },
         },
-        Err(why) => ClassifiedTask {
-            classification: Classification::fallback(&why, config.policy.default_provider),
+        Err(failure) => ClassifiedTask {
+            classification: Classification {
+                unlaunchable: failure.unlaunchable(engine),
+                ..Classification::fallback(failure.why())
+            },
             job_name: None,
         },
     };
@@ -215,11 +259,48 @@ fn is_anthropic_usage_analysis(task: &str, connectors: &[String]) -> bool {
     asks_for_usage && has_local_shell
 }
 
-/// PURE builder: the classifier invocation for the configured engine.
-pub fn classifier_command(prompt: &str, classifier: &Classifier) -> Command {
+/// PURE: the provider whose CLI an engine setting spawns. `ClassifierEngine` has exactly two
+/// variants, so `unlaunchable` can only ever name Codex or Claude.
+const fn engine_provider(engine: ClassifierEngine) -> Provider {
+    match engine {
+        ClassifierEngine::Claude => Provider::Claude,
+        ClassifierEngine::Codex => Provider::Codex,
+    }
+}
+
+/// IMPURE: resolve the configured engine's CLI, then build its invocation.
+///
+/// Resolution lives here rather than inside the builders so the builders stay pure and infallible:
+/// "which claude" and "with what flags" are two questions, and keeping the second answerable
+/// without an installed CLI is what lets the measured argv stay pinned by a unit test on a box
+/// where the first one returns an absolute path.
+///
+/// A failure here is the unlaunchable case, and it must not escape `classify`, which is documented
+/// as never failing and whose callers rely on that.
+fn classifier_command_in(
+    environment: &Environment,
+    prompt: &str,
+    classifier: &Classifier,
+) -> std::result::Result<Command, ClassifierFailure> {
+    let provider = engine_provider(classifier.engine);
+    let binary = crate::binary::resolve(provider, environment)
+        .map_err(|error| ClassifierFailure::Launch(error.to_string()))?;
+    Ok(classifier_command_with_binary(&binary, prompt, classifier))
+}
+
+/// PURE builder: the classifier invocation for the configured engine, against a known binary.
+pub fn classifier_command_with_binary(
+    binary: &std::path::Path,
+    prompt: &str,
+    classifier: &Classifier,
+) -> Command {
     match classifier.engine {
-        ClassifierEngine::Claude => claude_classifier_command(prompt, &classifier.claude_model),
-        ClassifierEngine::Codex => codex_classifier_command(prompt, &classifier.codex_model),
+        ClassifierEngine::Claude => {
+            claude_classifier_command_with_binary(binary, prompt, &classifier.claude_model)
+        }
+        ClassifierEngine::Codex => {
+            codex_classifier_command_with_binary(binary, prompt, &classifier.codex_model)
+        }
     }
 }
 
@@ -248,8 +329,12 @@ pub fn classifier_command(prompt: &str, classifier: &Classifier) -> Command {
 ///
 /// `--safe-mode` also makes the scoring hermetic, which matters independently of speed: the
 /// verdict must not shift because a project's CLAUDE.md or a skill happened to load.
-pub fn claude_classifier_command(prompt: &str, model: &str) -> Command {
-    let mut cmd = Command::new("claude");
+pub fn claude_classifier_command_with_binary(
+    binary: &std::path::Path,
+    prompt: &str,
+    model: &str,
+) -> Command {
+    let mut cmd = Command::new(binary);
     cmd.env("CLAUDE_SUBPROCESS", "1")
         .env("MAX_THINKING_TOKENS", "0")
         .arg("-p")
@@ -300,8 +385,12 @@ const DISABLED_FEATURES: [&str; 6] = [
 /// let scoring burn codex quota while the router kept deciding against the last dispatched job's
 /// percentage, and a codex at its ceiling would keep reading as having headroom. Persisting the
 /// rollout costs a session file per task and keeps the routing input honest.
-pub fn codex_classifier_command(prompt: &str, model: &str) -> Command {
-    let mut cmd = Command::new("codex");
+pub fn codex_classifier_command_with_binary(
+    binary: &std::path::Path,
+    prompt: &str,
+    model: &str,
+) -> Command {
+    let mut cmd = Command::new(binary);
     cmd.arg("exec")
         .arg("--model")
         .arg(model)
@@ -426,10 +515,19 @@ Reply with exactly this JSON object, filled in:
 /// scoring path does not use this: it already has an answer carrying a title, and asking twice
 /// would pay for the title twice.
 pub fn job_name(task: &str, config: &Config) -> Option<String> {
+    job_name_in(&Environment::from_process(), task, config)
+}
+
+/// IMPURE: the naming call against an explicit environment. See [`classify_in`].
+///
+/// A CLI that resolves nowhere returns `None` here rather than propagating: naming is optional by
+/// design, and the job still dispatches under the name the caller derived from the task.
+pub fn job_name_in(environment: &Environment, task: &str, config: &Config) -> Option<String> {
     let engine = config.classifier.engine;
-    let cmd = classifier_command(&job_name_prompt(task), &config.classifier);
+    let cmd =
+        classifier_command_in(environment, &job_name_prompt(task), &config.classifier).ok()?;
     let timeout = Duration::from_secs(config.classifier_timeout_secs);
-    let stdout = capture(cmd, engine.name(), timeout).ok()?;
+    let stdout = capture(cmd, engine, timeout).ok()?;
     validate_job_name(task, &parse_job_name(&stdout, engine)?)
 }
 
@@ -467,7 +565,11 @@ pub fn parse_classifier_output_with_name(
     if classification.task_context_horizon == TaskContextHorizon::Unknown {
         return None;
     }
+    // Only the launch path may set these; a model that echoes either field must not claim a
+    // failure the router did not observe. `unlaunchable` is the sharper of the two: an answer
+    // carrying it would mark a working provider ineligible on a SUCCESSFUL score.
     classification.classifier_failed = false;
+    classification.unlaunchable = None;
     let job_name = value
         .get("job_name")
         .and_then(serde_json::Value::as_str)
@@ -509,8 +611,10 @@ pub fn parse_classification(text: &str) -> Option<Classification> {
     if classification.task_context_horizon == TaskContextHorizon::Unknown {
         return None;
     }
-    // Only `fallback` may set this; a model that echoes the field must not claim it failed.
+    // Only `fallback` may set `classifier_failed`, and only the launch path may set
+    // `unlaunchable`; a model that echoes either must not claim a failure that never happened.
     classification.classifier_failed = false;
+    classification.unlaunchable = None;
     Some(classification)
 }
 
@@ -523,25 +627,114 @@ fn parse_classifier_value(text: &str) -> Option<serde_json::Value> {
     serde_json::from_str(text.get(start..=end)?).ok()
 }
 
+/// Why the classifier produced no answer, split by whether its CLI ever started.
+///
+/// The split is the whole routing signal. A CLI that ran and timed out says nothing about the
+/// provider's health; a CLI that never started says the provider cannot take work on this box at
+/// all. Flattening both to one string is what left `decide` with nothing to act on while 13
+/// dispatches were lost to a `PATH` that did not carry the binary.
+///
+/// It is a sentence first and a kind second — the sentence is what reaches the fallback's
+/// rationale and the decision log — so it derefs to that sentence and every caller reads it as the
+/// `String` this used to be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ClassifierFailure {
+    /// The CLI was never launched: it resolved nowhere, or the exec itself failed.
+    Launch(String),
+    /// The CLI ran and then failed — a timeout, a nonzero exit, an unreadable answer.
+    Ran(String),
+}
+
+impl ClassifierFailure {
+    /// PURE: the sentence that lands in the fallback's rationale and in the decision log.
+    fn why(&self) -> &str {
+        match self {
+            ClassifierFailure::Launch(why) | ClassifierFailure::Ran(why) => why,
+        }
+    }
+
+    /// PURE: the provider this failure proves could not be launched, if any.
+    fn unlaunchable(&self, engine: ClassifierEngine) -> Option<Provider> {
+        match self {
+            ClassifierFailure::Launch(_) => Some(engine_provider(engine)),
+            ClassifierFailure::Ran(_) => None,
+        }
+    }
+}
+
 /// IMPURE: run `cmd` to completion within `timeout`, returning stdout. The failure is a
 /// sentence naming what went wrong, since it lands in the fallback's rationale and in the
 /// decision log. `engine` names the CLI in those messages, so a fallback says which classifier
 /// failed rather than always blaming claude.
+///
+/// Every `Ran` message below is byte-identical to the one it carried before the failure kind was
+/// split out: the rationales are recorded, and the tests that pin them are pinning production
+/// strings.
+///
+/// The spawn failure is the exception, and deliberately. Its `{e}` rendered as `No such file or
+/// directory (os error 2)` — the production string from the incident, stored verbatim into the
+/// classification rationale after a *correct* resolution. It goes through
+/// [`crate::binary::launch_error`] instead, which names the resolved binary and the override that
+/// would pin a working one; an io kind that mapper declines still renders its own text, because
+/// a full disk during a fork is not a missing CLI.
+/// PURE: the classifier respawn's io error, classified.
+///
+/// The spawn is a second chance to lose the diagnosis: resolution already produced an absolute
+/// path, and if the binary is unlinked or loses its exec bit before the fork, this is where the
+/// bare `No such file or directory (os error 2)` used to enter the classification rationale and
+/// the decision log. `binary::launch_error` owns which io kinds are launch faults, so the two
+/// spawn sites cannot drift.
+///
+/// The returned VARIANT is the load-bearing half, not just its text. `Error::Launch` means the
+/// binary is missing or unusable; every other kind is an unrelated spawn fault after a correct
+/// resolution — `EMFILE`, a fork that lost to memory pressure, a broken pipe — and those are
+/// transient. Reporting one as `Launch` would set `Classification::unlaunchable`, which `decide`
+/// reads as a conjunct of eligibility, so a healthy provider would be excluded from automatic
+/// routing by a fault that says nothing about its CLI. `Ran` still marks the classifier failed and
+/// still falls back; it just leaves routing eligibility alone. This mirrors the variant match
+/// every other post-resolution spawn site already does (`dispatch/grok.rs`, `dispatch/codex.rs`,
+/// `dispatch/opencode.rs`).
+fn spawn_failure(
+    program: &std::path::Path,
+    engine: ClassifierEngine,
+    error: std::io::Error,
+) -> ClassifierFailure {
+    let diagnosis = crate::binary::launch_error(
+        program,
+        crate::binary::override_env(engine_provider(engine)),
+        error,
+    );
+    // Composed once: the sentence is byte-identical in both arms, because it is a recorded
+    // production string and the tests that pin it are pinning that string.
+    let why = format!("could not run {}: {diagnosis}", engine.name());
+    match diagnosis {
+        crate::error::Error::Launch(_) => ClassifierFailure::Launch(why),
+        // `Error::Io`'s `Display` is the io error's own, so the declined kinds still carry their
+        // own text — they just stop claiming the provider is unlaunchable.
+        _ => ClassifierFailure::Ran(why),
+    }
+}
+
 fn capture(
     mut cmd: Command,
-    engine: &str,
+    engine: ClassifierEngine,
     timeout: Duration,
-) -> std::result::Result<String, String> {
+) -> std::result::Result<String, ClassifierFailure> {
+    // The CLI's name is what every message below says; the engine itself is carried only so a
+    // launch failure can name the override variable that would pin a working binary.
+    let cli = engine.name();
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    // Read before the spawn borrows the command: the mapper needs the resolved program either way.
+    let program = PathBuf::from(cmd.get_program());
     let mut child = cmd
         .spawn()
-        .map_err(|e| format!("could not run {engine}: {e}"))?;
+        .map_err(|e| spawn_failure(&program, engine, e))?;
     let mut stdout = child
         .stdout
         .take()
-        .ok_or_else(|| format!("{engine} gave no stdout pipe"))?;
+        .ok_or_else(|| ClassifierFailure::Ran(format!("{cli} gave no stdout pipe")))?;
     // A reader thread, not a read after wait: a classifier answer larger than the pipe buffer
     // would otherwise block the child forever and read as a timeout.
     let (tx, rx) = std::sync::mpsc::channel();
@@ -558,18 +751,27 @@ fn capture(
                     .recv_timeout(Duration::from_secs(2))
                     .ok()
                     .flatten()
-                    .ok_or_else(|| format!("{engine} stdout was unreadable"));
+                    .ok_or_else(|| ClassifierFailure::Ran(format!("{cli} stdout was unreadable")));
             }
-            Ok(Some(status)) => return Err(format!("{engine} exited {status}")),
+            Ok(Some(status)) => {
+                return Err(ClassifierFailure::Ran(format!("{cli} exited {status}")));
+            }
             Ok(None) => {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(format!("timed out after {}s", timeout.as_secs()));
+                    return Err(ClassifierFailure::Ran(format!(
+                        "timed out after {}s",
+                        timeout.as_secs()
+                    )));
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Err(e) => return Err(format!("could not wait for {engine}: {e}")),
+            Err(e) => {
+                return Err(ClassifierFailure::Ran(format!(
+                    "could not wait for {cli}: {e}"
+                )));
+            }
         }
     }
 }
@@ -577,6 +779,7 @@ fn capture(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     /// The live envelope shape of `claude -p --output-format json`, trimmed to the keys that
     /// matter plus a couple of neighbours.
@@ -753,16 +956,31 @@ mod tests {
     }
 
     /// A failure is not a capability pin: it scores no orchestration and no missing connector, so
-    /// the configured default stands and every usage rule still applies to it.
+    /// ordinary capacity routing still applies to it.
+    ///
+    /// The destination assertion here is INVERTED rather than deleted, and it is the guard against
+    /// the reported defect re-landing. The rationale used to compose
+    /// `classifier failed ({why}), defaulting to {provider}`, and the observed production line was
+    /// `claude requested explicitly: classifier failed (could not run codex: ...), defaulting to
+    /// codex` — a job that ran on Claude, claiming it defaulted to the Codex that had just failed
+    /// to execute. A fallback picks no provider, so it must name none.
     #[test]
-    fn the_fallback_pins_nothing_and_says_why() {
-        let got = Classification::fallback("timed out after 30s", DefaultProvider::Claude);
+    fn the_fallback_pins_nothing_claims_no_destination_and_says_why() {
+        let got = Classification::fallback("timed out after 30s");
         assert!(!got.orchestration);
         assert!(!got.missing_connector);
         assert_eq!(got.complexity, Complexity::High);
         assert!(got.classifier_failed);
+        assert_eq!(
+            got.unlaunchable, None,
+            "the bare fallback records no launch evidence; only the launch path sets it"
+        );
         assert!(got.rationale.contains("timed out after 30s"));
-        assert!(got.rationale.contains("defaulting to claude"));
+        assert!(
+            !got.rationale.contains("defaulting to"),
+            "a fallback must not claim a destination it does not choose: {}",
+            got.rationale
+        );
         assert_eq!(
             serde_json::to_value(got).expect("serializes")["task_context_horizon"],
             "unknown"
@@ -781,6 +999,7 @@ mod tests {
                 rationale: "claimed endpoint unavailable".to_string(),
                 classifier_failed: false,
                 invokes_implement: false,
+                unlaunchable: None,
             },
             &["local shell".to_string()],
         );
@@ -1002,9 +1221,14 @@ mod tests {
     /// The startup-stripping flags are the reason the classifier fits its timeout at all, so they
     /// are pinned: losing one silently doubles the call and every task starts falling back to
     /// claude with `classifier_failed`.
+    ///
+    /// Pointed at the PURE argv builder rather than at the resolving wrapper. Resolution and argv
+    /// are two jobs: the wrapper answers "which claude", this builder answers "with what flags",
+    /// and asserting the program name here is what keeps the second question answerable on a box
+    /// where the first one resolves to an absolute path.
     #[test]
     fn the_claude_invocation_pins_the_startup_stripping_flags() {
-        let cmd = claude_classifier_command("score this", "haiku");
+        let cmd = claude_classifier_command_with_binary(Path::new("claude"), "score this", "haiku");
         assert_eq!(cmd.get_program(), std::ffi::OsStr::new("claude"));
         let args = args_of(&cmd);
         for flag in [
@@ -1035,7 +1259,8 @@ mod tests {
     /// the read-only sandbox is what keeps a scoring call from touching the box.
     #[test]
     fn the_codex_invocation_pins_its_hermetic_flags_and_a_read_only_sandbox() {
-        let cmd = codex_classifier_command("score this", "gpt-5.6-luna");
+        let cmd =
+            codex_classifier_command_with_binary(Path::new("codex"), "score this", "gpt-5.6-luna");
         assert_eq!(cmd.get_program(), std::ffi::OsStr::new("codex"));
         let args = args_of(&cmd);
         assert_eq!(args.first().map(String::as_str), Some("exec"));
@@ -1078,7 +1303,12 @@ mod tests {
     /// every task. This is the loud version of that failure, run against the installed codex.
     #[test]
     fn every_disabled_feature_is_a_name_the_installed_codex_still_knows() {
-        let Ok(listed) = Command::new("codex").arg("features").arg("list").output() else {
+        let environment = crate::binary::Environment::from_process();
+        let Ok(binary) = crate::binary::resolve(Provider::Codex, &environment) else {
+            // No codex on this box: it cannot be the classifier engine here either.
+            return;
+        };
+        let Ok(listed) = Command::new(binary).arg("features").arg("list").output() else {
             // No codex on this box: it cannot be the classifier engine here either.
             return;
         };
@@ -1110,20 +1340,22 @@ mod tests {
             codex_model: "gpt-5.6-luna".to_string(),
         };
 
-        let on_claude = classifier_command("score this", &classifier);
+        let on_claude =
+            classifier_command_with_binary(Path::new("claude"), "score this", &classifier);
         assert_eq!(on_claude.get_program(), std::ffi::OsStr::new("claude"));
         assert!(args_of(&on_claude).contains(&"haiku".to_string()));
         assert!(!args_of(&on_claude).contains(&"gpt-5.6-luna".to_string()));
 
         classifier.engine = ClassifierEngine::Codex;
-        let on_codex = classifier_command("score this", &classifier);
+        let on_codex =
+            classifier_command_with_binary(Path::new("codex"), "score this", &classifier);
         assert_eq!(on_codex.get_program(), std::ffi::OsStr::new("codex"));
         assert!(args_of(&on_codex).contains(&"gpt-5.6-luna".to_string()));
         assert!(!args_of(&on_codex).contains(&"haiku".to_string()));
 
         // A retuned model reaches the invocation; nothing pins the catalogue names in code.
         classifier.codex_model = "gpt-5.6-terra".to_string();
-        let retuned = classifier_command("score this", &classifier);
+        let retuned = classifier_command_with_binary(Path::new("codex"), "score this", &classifier);
         assert!(args_of(&retuned).contains(&"gpt-5.6-terra".to_string()));
     }
 
@@ -1193,8 +1425,13 @@ mod tests {
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg("sleep 5");
         let start = Instant::now();
-        let err = capture(cmd, "codex", Duration::from_millis(300)).expect_err("must time out");
-        assert!(err.contains("timed out"), "got {err:?}");
+        let err = capture(cmd, ClassifierEngine::Codex, Duration::from_millis(300))
+            .expect_err("must time out");
+        assert!(
+            matches!(err, ClassifierFailure::Ran(_)),
+            "a CLI that ran and overran its deadline carries no launch evidence: {err:?}"
+        );
+        assert!(err.why().contains("timed out"), "got {err:?}");
         assert!(start.elapsed() < Duration::from_secs(2));
     }
 
@@ -1203,17 +1440,139 @@ mod tests {
         let mut ok = Command::new("sh");
         ok.arg("-c").arg("printf hi");
         assert_eq!(
-            capture(ok, "claude", Duration::from_secs(5)),
+            capture(ok, ClassifierEngine::Claude, Duration::from_secs(5)),
             Ok("hi".to_string())
         );
 
         let mut bad = Command::new("sh");
         bad.arg("-c").arg("exit 7");
-        let err = capture(bad, "codex", Duration::from_secs(5)).expect_err("must fail");
-        assert!(err.contains("exited"), "got {err:?}");
+        let err =
+            capture(bad, ClassifierEngine::Codex, Duration::from_secs(5)).expect_err("must fail");
+        assert!(err.why().contains("exited"), "got {err:?}");
         // The failure sentence lands in the decision log, so it must name the engine that
         // actually ran rather than always blaming claude.
-        assert!(err.contains("codex"), "got {err:?}");
+        assert!(err.why().contains("codex"), "got {err:?}");
+    }
+
+    /// The classifier's own residue after a correct resolution: the binary is unlinked between
+    /// `binary::resolve` and the fork. This used to store `No such file or directory (os error 2)`
+    /// — the incident string, verbatim — into the classification rationale and from there into the
+    /// decision row. The variant assertions are the guard: `Launch` plus an `unlaunchable`
+    /// provider is what the row's `error: launch failed:` prefix and the headroom accounting read.
+    #[test]
+    fn a_classifier_that_vanishes_between_resolution_and_spawn_is_a_named_launch_failure() {
+        let missing = Path::new("/nonexistent/agent-router-classifier");
+        let err = capture(
+            Command::new(missing),
+            ClassifierEngine::Claude,
+            Duration::from_secs(5),
+        )
+        .expect_err("a missing binary cannot spawn");
+
+        assert!(
+            matches!(err, ClassifierFailure::Launch(_)),
+            "a spawn that never ran is a launch failure: {err:?}"
+        );
+        assert_eq!(
+            err.unlaunchable(ClassifierEngine::Claude),
+            Some(Provider::Claude)
+        );
+        // Equality against the canonical producer, not a substring: a revert to `{e}` still reads
+        // plausibly, and only pinning `binary::launch_error`'s own sentence catches it.
+        assert_eq!(
+            err.why(),
+            format!(
+                "could not run claude: {}",
+                crate::binary::launch_error(
+                    missing,
+                    crate::binary::CLAUDE_BIN_ENV,
+                    std::io::Error::from(std::io::ErrorKind::NotFound),
+                )
+            )
+        );
+    }
+
+    /// The other permanent case, and the one the split missed. A resolved classifier binary that
+    /// carries an execute bit but is not a runnable image — wrong architecture, or a script with
+    /// no valid shebang — fails the exec `ENOEXEC`, which Rust leaves in the unstable
+    /// `Uncategorized` kind. Read as transient, the persisted row omits `classifier_unlaunchable`
+    /// and `decide` stays free to route to a codex whose CLI cannot execute at all.
+    ///
+    /// As with the transient case below, the `Classification` assertion is the load-bearing half:
+    /// the rationale sentence is byte-identical under both variants, so only `unlaunchable`
+    /// catches a regression here.
+    #[test]
+    fn a_classifier_that_is_not_a_runnable_image_is_a_launch_failure() {
+        const ENOEXEC: i32 = 8;
+
+        let failure = spawn_failure(
+            Path::new("/home/operator/.local/bin/codex"),
+            ClassifierEngine::Codex,
+            std::io::Error::from_raw_os_error(ENOEXEC),
+        );
+
+        assert!(
+            matches!(failure, ClassifierFailure::Launch(_)),
+            "a binary that cannot be exec'd never ran, and retrying will not change that: \
+             {failure:?}"
+        );
+        assert_eq!(
+            failure.unlaunchable(ClassifierEngine::Codex),
+            Some(Provider::Codex)
+        );
+
+        // Composed exactly as `classify` composes it, so the assertion is on what `decide` reads.
+        let classification = Classification {
+            unlaunchable: failure.unlaunchable(ClassifierEngine::Codex),
+            ..Classification::fallback(failure.why())
+        };
+        assert_eq!(
+            classification.unlaunchable,
+            Some(Provider::Codex),
+            "routing must not stay free to select a provider whose CLI cannot execute"
+        );
+    }
+
+    /// The bound on that routing: an io kind `binary::launch_error` declines is not a missing CLI,
+    /// and its own text must survive rather than be rewritten as a launch diagnosis.
+    ///
+    /// The variant is the half that actually matters, and asserting only the text is the trap this
+    /// test fell into once: the sentence is byte-identical under `Launch` and `Ran`, so a text-only
+    /// assertion passes against code that promotes a transient fork failure into a sticky,
+    /// self-excluding `unlaunchable` and drops a healthy provider out of automatic routing. The
+    /// `Classification` assertion is the end of that chain, since `decide` reads `unlaunchable`,
+    /// not the rationale.
+    #[test]
+    fn a_spawn_fault_that_is_not_about_the_binary_keeps_its_own_text() {
+        let failure = spawn_failure(
+            Path::new("/usr/bin/claude"),
+            ClassifierEngine::Claude,
+            std::io::Error::from(std::io::ErrorKind::OutOfMemory),
+        );
+
+        assert!(
+            matches!(failure, ClassifierFailure::Ran(_)),
+            "a spawn fault that is not about the binary is a run failure, not a launch one: \
+             {failure:?}"
+        );
+        assert_eq!(failure.unlaunchable(ClassifierEngine::Claude), None);
+        assert_eq!(
+            failure.why(),
+            format!(
+                "could not run claude: {}",
+                crate::error::Error::Io(std::io::Error::from(std::io::ErrorKind::OutOfMemory))
+            )
+        );
+
+        // Composed exactly as `classify` composes it, so the assertion is on what `decide` reads.
+        let classification = Classification {
+            unlaunchable: failure.unlaunchable(ClassifierEngine::Claude),
+            ..Classification::fallback(failure.why())
+        };
+        assert_eq!(
+            classification.unlaunchable, None,
+            "a transient spawn fault must not exclude the provider from routing"
+        );
     }
 }
 
