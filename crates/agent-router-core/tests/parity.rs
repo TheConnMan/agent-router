@@ -58,7 +58,7 @@ fn git_directory_and_worktree_file_markers_define_the_project_root() {
         if worktree_marker {
             write(&repository.join(".git"), "gitdir: ../metadata");
         } else {
-            std::fs::create_dir_all(repository.join(".git")).expect("create git marker");
+            write(&repository.join(".git/HEAD"), "ref: refs/heads/main\n");
         }
         write(
             &repository.join(".codex/config.toml"),
@@ -95,6 +95,9 @@ fn a_candidate_without_git_does_not_inherit_a_parent_codex_layer() {
     let fixture = tempfile::tempdir().expect("tempdir");
     let parent = fixture.path().join("parent");
     let project = parent.join("project");
+    // An empty `.git` directory is not a repository. Machines that have one at `/tmp/.git`
+    // used to make every tempfile inherit Codex layers all the way up to `/tmp`.
+    std::fs::create_dir_all(fixture.path().join(".git")).expect("empty git dir");
     write(
         &parent.join(".codex/config.toml"),
         r#"
@@ -125,7 +128,7 @@ fn codex_layers_merge_in_root_to_leaf_order_with_field_precedence() {
     let repository = fixture.path().join("repository");
     let middle = repository.join("middle");
     let leaf = middle.join("leaf");
-    std::fs::create_dir_all(repository.join(".git")).expect("create git marker");
+    write(&repository.join(".git/HEAD"), "ref: refs/heads/main\n");
     write(
         &repository.join(".codex/config.toml"),
         r#"

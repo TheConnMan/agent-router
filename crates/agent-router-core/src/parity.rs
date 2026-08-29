@@ -739,13 +739,26 @@ fn line_and_column(source: &str, offset: usize) -> (usize, usize) {
 fn project_root(candidate: &Path) -> PathBuf {
     let mut current = candidate;
     loop {
-        if current.join(".git").exists() {
+        if is_git_root(current) {
             return current.to_path_buf();
         }
         let Some(parent) = current.parent() else {
             return candidate.to_path_buf();
         };
         current = parent;
+    }
+}
+
+/// A git root the way git itself decides one: a `.git` *file* (worktree `gitdir:` pointer) or a
+/// `.git` directory that contains `HEAD`. An empty `.git` directory is not a repository — git
+/// reports "not a git repository" for one — so treating `exists()` as sufficient would let a stray
+/// `/tmp/.git` make every tempfile look like it lives inside a git checkout.
+fn is_git_root(directory: &Path) -> bool {
+    let marker = directory.join(".git");
+    match std::fs::metadata(&marker) {
+        Ok(metadata) if metadata.is_file() => true,
+        Ok(metadata) if metadata.is_dir() => marker.join("HEAD").is_file(),
+        _ => false,
     }
 }
 
