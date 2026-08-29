@@ -1,6 +1,6 @@
 # agent-router
 
-Route ordinary work automatically between Codex and Grok using authoritative weekly usage, pin
+Route ordinary work automatically between Codex and Grok using projected weekly pace, pin
 capability-heavy work to premium Claude, or dispatch explicitly to any provider, then record why.
 
 The problem it solves: workhorse providers with separate weekly quotas, and a running judgement call
@@ -56,13 +56,18 @@ log: row 87 in /home/you/.local/state/agent-router/router.db
    which is the build tier; `low` and `medium` implement runs are the direct and quick tiers, they
    fit comfortably, and they stay on ordinary routing. An unscored task reads as `high`, so a
    classifier failure on an implement run pins rather than gambles.
-3. **Balance the workhorses by weekly usage.** Auto normal work considers Codex and Grok only. A
+3. **Balance the workhorses by weekly pace.** Auto normal work considers Codex and Grok only. A
    provider at or above `hard_ceiling_pct`, or whose weekly usage is unknown or non-authoritative,
-   is excluded. When both are available, the lower weekly percentage wins; ties go to Codex.
-   If neither has usable capacity, the configured default (Codex by default) is used and the
-   decision visibly records the all-unavailable fallback. Claude's 5-hour window does not pace
-   automatic routing; Claude is reserved for the capability pins above. Grok remains available for
-   explicit dispatch with `--provider grok`.
+   is excluded. When both are available, each provider's current weekly percent is divided by the
+   fraction of its own window that has elapsed: that projected draw is what the week finishes at
+   if spending continues at this rate. The lower projected draw wins, so a provider further into
+   its week at a higher current percent can still take work when it is under-pacing the other.
+   Ties go to Codex. When either projection cannot be computed (typically a window with less than
+   a twentieth elapsed), the comparison falls back to lower current weekly percent and records
+   `projection_unavailable`. If neither has usable capacity, the configured default (Codex by
+   default) is used and the decision visibly records the all-unavailable fallback. Claude's
+   5-hour window does not pace automatic routing; Claude is reserved for the capability pins
+   above. Grok remains available for explicit dispatch with `--provider grok`.
 4. **Complete the provider, model, and effort pins.** With no pins, classification chooses the
    provider through usage routing, then complexity chooses the Codex model from its tier table and
    maps low to low, medium to medium, and high or ultra to high effort. Grok uses its lifecycle
@@ -273,9 +278,11 @@ usage, and excludes Grok from automatic routing and adversarial review selection
 `unknown` for any unread workhorse window rather than claiming a measurement; unknown or ceiling
 capacity is excluded from auto selection.
 
-The weekly window places ordinary work: the lower known percentage wins, with Codex as the tie
-break. If neither workhorse has usable capacity, the default provider is used and the fallback is
-recorded. Claude's 5-hour window is informational and does not pace auto routing.
+The weekly window places ordinary work: when both workhorses have a projected draw, the lower
+projection wins, with Codex as the tie break. Current weekly percent is the fallback when a
+projection cannot be computed. If neither workhorse has usable capacity, the default provider is
+used and the fallback is recorded. Claude's 5-hour window is informational and does not pace auto
+routing.
 
 ### `doctor`
 
@@ -354,9 +361,9 @@ Recent routing decisions, newest first.
 
 ```bash
 $ agent-router log --limit 3
-#87 codex orchestration no medium proj claude 88% codex 61% gates[] codex 23% claude 58% 019c3f2a dispatched
+#87 codex orchestration no medium proj claude 88% codex 61% grok 40% gates[] claude 58% codex 23% grok 8% 019c3f2a dispatched
      Port usage.sh to Rust with the same fail-open semantics
-#86 claude orchestration yes high proj claude 88% codex 61% gates[orchestration] codex 23% claude 58% 019c3f19 dispatched mark bad note routed to codex, needed connectors
+#86 claude orchestration yes high proj claude 88% codex 61% grok 40% gates[orchestration] claude 58% codex 23% grok 8% 019c3f19 dispatched mark bad note routed to codex, needed connectors
      Fix the flaky parity test and work out why it only fails in CI
 
 # Judge a decision: was routing it there the right call.

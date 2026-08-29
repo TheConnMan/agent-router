@@ -816,8 +816,8 @@ fn log(
     for row in &rows {
         println!(
             "#{id} {provider}{dry} orchestration {orchestration} {complexity} \
-             proj claude {claude_pace} codex {codex_pace} \
-             gates[{gates}] codex {codex:.0}% claude {claude:.0}% {job} \
+             proj claude {claude_pace} codex {codex_pace} grok {grok_pace} \
+             gates[{gates}] claude {claude:.0}% codex {codex:.0}% grok {grok} {job} \
              {outcome}{judgement}",
             id = row.id,
             provider = row.provider,
@@ -826,9 +826,11 @@ fn log(
             orchestration = flag(row.orchestration),
             claude_pace = pace(row.claude_projected_draw),
             codex_pace = pace(row.codex_projected_draw),
+            grok_pace = pace(row.grok_projected_draw),
             gates = row.gates,
-            codex = row.codex_weekly_pct,
             claude = row.claude_weekly_pct,
+            codex = row.codex_weekly_pct,
+            grok = weekly(row.grok_weekly_pct),
             // The job handle and what became of it are both printed, because a reconciled row
             // carries a job id, so a state only reachable through --json would be a column written
             // and never read back.
@@ -1062,9 +1064,11 @@ fn row_json(row: &Row) -> serde_json::Value {
         "missing_connector": row.missing_connector,
         "claude_projected_draw": row.claude_projected_draw,
         "codex_projected_draw": row.codex_projected_draw,
+        "grok_projected_draw": row.grok_projected_draw,
         "gates": row.gates,
         "claude_weekly_pct": row.claude_weekly_pct,
         "codex_weekly_pct": row.codex_weekly_pct,
+        "grok_weekly_pct": row.grok_weekly_pct,
         "dry_run": row.dry_run,
         "job_id": row.job_id,
         "job_name": row.job_name,
@@ -1102,6 +1106,15 @@ fn flag(value: Option<bool>) -> &'static str {
 fn pace(projected_draw: Option<f64>) -> String {
     match projected_draw {
         Some(projected_draw) => format!("{projected_draw:.0}%"),
+        None => "-".to_string(),
+    }
+}
+
+/// A recorded weekly percent, or "-" when the row does not know. Older rows predate the Grok
+/// columns, and a row whose Grok weekly window was unread stores null rather than a sentinel.
+fn weekly(value: Option<f64>) -> String {
+    match value {
+        Some(value) => format!("{value:.0}%"),
         None => "-".to_string(),
     }
 }

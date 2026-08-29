@@ -122,8 +122,9 @@ selection until a usable capacity source is available.
 Default `98.0`. Weekly percent used at or above which a provider counts as exhausted.
 
 A provider at or over this ceiling is ineligible, and so is a provider whose weekly window nobody
-read. The lower weekly percentage wins when both workhorse providers are eligible; ties go to Codex.
-Exactly one ineligible sends the task to the other. Both ineligible keeps the default provider and
+read. When both workhorse providers are eligible, the lower projected weekly draw wins; ties go to
+Codex. Current weekly percent is the fallback only when a projection cannot be computed. Exactly
+one ineligible sends the task to the other. Both ineligible keeps the default provider and
 records the all-unavailable fallback visibly.
 
 An unread weekly window is ineligible because it reports no capacity verdict, so trusting it would
@@ -151,15 +152,14 @@ the better of two providers and there is no third one; declining work outright b
 queued it. So the reserve buys headroom while both providers are not yet in it, and the last thing
 it protects against is routing a job into an exhausted provider while the other one still has room.
 
-Eligibility is judged before the projection override, not after, and that order is load bearing. A
+Eligibility is judged before the pace comparison, not after, and that order is load bearing. A
 provider down to its reserve projects to finish INSIDE its allowance whenever its window is nearly
-elapsed (98 percent used against 99 percent elapsed projects to 99), so an override allowed to run
-first would see nothing wrong and route into a provider that is out of budget.
+elapsed (98 percent used against 99 percent elapsed projects to 99), so a pace comparison allowed
+to run first would see nothing wrong and route into a provider that is out of budget.
 
 ### `projection_overdraw_pct`
 
-Default `100.0`. The projected weekly draw, as a percent of a provider's own allowance, above which
-a task moves off that provider.
+Default `100.0`. Retained for compatibility; automatic workhorse selection does not consult it.
 
 A provider's projected draw is `weekly_pct` divided by the fraction of its own weekly window that
 has elapsed: what its spending so far extrapolates to by the time its window resets. 80 percent
@@ -167,31 +167,23 @@ spent with half the window gone projects to 160, meaning it runs out with days t
 providers reset at different instants, so each is measured against its own reset and its own
 allowance, which is what makes two providers on different sized plans comparable at all.
 
-The override moves a task when the provider it is on projects above this threshold AND the other
-provider projects lower. Both halves matter. The first keeps it quiet: a provider finishing its week
-inside its allowance is not a problem to route around, and moving work off it would strand budget
-that was going to be spent. The second makes the destination an improvement rather than merely
-different, and it deliberately compares the two projections rather than testing the other against
-the threshold, so that when BOTH providers are overdrawing the task still goes to whichever runs out
-later and the two drain together.
-
-When either projection cannot be computed the override is skipped entirely and the decision is
-tagged `projection_unavailable`; when it fires, the decision is tagged `projected_overdraw`. The
-comparison is strictly greater, so a projection exactly on the threshold holds.
+When both workhorses are eligible and both projections exist, the lower projected draw wins, with
+an exact tie staying on Codex. That is the whole selector: a provider finishing its week inside
+its allowance still yields to one that is further under-pacing, because the goal is to equalize
+end-of-week utilization rather than to wait until someone overdraws. Current weekly percent is
+the fallback when either projection cannot be computed, and that fallback is tagged
+`projection_unavailable`.
 
 In practice `projection_unavailable` means one thing only: less than a twentieth of a provider's
 window has elapsed, so dividing by that elapsed fraction would turn a couple of jobs into a four
-figure projection. A projection is also uncomputable when a reset was never read, but the override
-runs only with both providers eligible and eligibility already requires a known weekly window, so
-that decision carries `weekly_unknown` instead, which names the reason rather than the consequence.
+figure projection. A projection is also uncomputable when a reset was never read, but the
+comparison runs only with both providers eligible and eligibility already requires a known weekly
+window, so that decision carries `weekly_unknown` instead, which names the reason rather than the
+consequence.
 
-The retired `pace_unavailable` recorded the same idea under the run rate rule. Rows already in the
-log carry it, which is why it stays documented.
-
-The default is not a tuned number. A projection of 100 is precisely "finishes the week having spent
-exactly its plan", so above it is the definition of running out early, which is the whole question
-the rule asks. Raise it to let a provider run further past its pace before work moves; there is no
-reason to lower it.
+The retired `projected_overdraw` gate and this threshold named a later override that only moved
+work once a provider projected past 100. Rows already in the log carry that tag, which is why it
+stays documented. The key is not read as an alias for a gap and is not a second ceiling.
 
 Neither `pace_flip_gap` nor `headroom_flip_gap` is read as an alias. Both named rules that
 thresholded a difference between two providers' numbers, and `pace_flip_gap` in particular had to be
@@ -200,15 +192,15 @@ constant wearing the clothes of a policy: it was set to 70 points to clear the b
 against 20x Claude plans produced, the Codex plan grew on 2026-08-01, the band collapsed to under 38
 points, and the configured value then sat above every reading the box could produce. The override
 stopped firing entirely and nothing reported that it had. A ratio against each provider's own
-allowance has no such dependency, which is why this key has no measured default to go stale.
+allowance has no such dependency, which is why the selector compares those ratios directly.
 
 ### `claude_five_hour_pacing_pct` (observational)
 
 Default `90.0`. Retained for compatibility and reporting; Claude's 5-hour usage does not pace
 automatic routing.
 
-No automatic decision uses this threshold. Normal work balances Codex and Grok by authoritative
-weekly usage; Claude is selected only by capability/context pins.
+No automatic decision uses this threshold. Normal work balances Codex and Grok by projected
+weekly draw; Claude is selected only by capability/context pins.
 
 Codex having room is judged by `hard_ceiling_pct`, the same threshold the exhaustion flip uses,
 rather than by a second key that could drift away from it. Codex sitting exactly on that ceiling has

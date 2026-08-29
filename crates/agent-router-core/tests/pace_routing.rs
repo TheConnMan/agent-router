@@ -1,12 +1,15 @@
-//! Workhorse routing: automatic tasks balance between Codex and Grok from measured weekly
-//! headroom, while Claude remains reserved for capability and context pins.
+//! Workhorse routing: automatic tasks balance between Codex and Grok from projected weekly
+//! draw (pace), while Claude remains reserved for capability and context pins.
 //!
 //! The engine under test is pure, so `decide` takes the instant it is deciding at rather than
 //! reading the clock: every case below fixes `NOW` and states each provider's reset as a distance
 //! from it, which is what makes the arithmetic assertable at all.
 //!
-//! A smaller weekly percentage means more remaining weekly headroom. Unknown readings and the
-//! final reserve below the hard ceiling are not eligible capacity, so neither can win a balance.
+//! A smaller projected draw means the provider is further below its own week's pace. When both
+//! windows are equally elapsed that is the same as a smaller weekly percentage; when they are
+//! not, the under-pacing provider wins even at a higher current percent. Unknown readings and
+//! the final reserve below the hard ceiling are not eligible capacity, so neither can win a
+//! balance.
 
 use agent_router_core::classify::{
     Classification, Complexity, TaskContextHorizon, parse_classification,
@@ -222,9 +225,10 @@ fn explicit_provider_bypasses_automatic_capability_eligibility() {
 // ------------------------------------------------- rule 3: the workhorse headroom comparison
 
 /// Automatic work stays in the Codex/Grok workhorse pool. Once both report a usable weekly
-/// window, the provider with more weekly headroom wins; equality deliberately preserves Codex as
-/// the deterministic default. Claude is nearly exhausted in every case so these assertions fail
-/// if its premium lane is accidentally reintroduced as a capacity competitor.
+/// window, and both windows are equally elapsed, the provider with more weekly headroom wins;
+/// equality deliberately preserves Codex as the deterministic default. Claude is nearly exhausted
+/// in every case so these assertions fail if its premium lane is accidentally reintroduced as a
+/// capacity competitor.
 #[test]
 fn workhorse_routing_uses_known_weekly_headroom_and_breaks_ties_to_codex() {
     let config = Config::default();
@@ -258,6 +262,78 @@ fn workhorse_routing_uses_known_weekly_headroom_and_breaks_ties_to_codex() {
 
         assert_eq!(decision.provider, expected, "{reason}");
     }
+}
+
+/// Pace, not current percent. Codex is further into its week at 11 percent used (projects to 82);
+/// Grok is earlier in its week at 9 percent used (projects to 86). Current percent would pick
+/// Grok; projected draw picks the under-pacing Codex.
+#[test]
+fn a_higher_current_percent_still_wins_when_it_is_further_below_pace() {
+    let config = Config::default();
+    let decision = decide(
+        plain(),
+        usage_with_grok(
+            window(99.0, HALF_WEEK, 0.0),
+            // 145.5h remaining of 168h: 13.4 percent elapsed, 11 / 0.134 = 82 projected.
+            window(11.0, 523_800, 0.0),
+            // 150.5h remaining of 168h: 10.4 percent elapsed, 9 / 0.104 = 86 projected.
+            window(9.0, 541_800, 0.0),
+        ),
+        NOW,
+        &config,
+    );
+
+    assert_eq!(decision.provider, Provider::Codex);
+    assert!(!decision.gates.contains(&Gate::ProjectionUnavailable));
+    let grok_draw = decision.grok_projected_draw.expect("grok projects");
+    let codex_draw = decision.codex_projected_draw.expect("codex projects");
+    assert!(
+        codex_draw < grok_draw,
+        "codex {codex_draw} should be further below pace than grok {grok_draw}"
+    );
+}
+
+/// The inverse: Grok is further into its week at a higher current percent, but still under-pacing
+/// Codex, so Grok takes the work.
+#[test]
+fn grok_wins_on_pace_even_with_a_higher_current_percent() {
+    let config = Config::default();
+    let decision = decide(
+        plain(),
+        usage_with_grok(
+            window(99.0, HALF_WEEK, 0.0),
+            window(9.0, 541_800, 0.0),
+            window(11.0, 523_800, 0.0),
+        ),
+        NOW,
+        &config,
+    );
+
+    assert_eq!(decision.provider, Provider::Grok);
+}
+
+/// Early in both windows a projection is noise, so the comparison falls back to current weekly
+/// percent and says so. Four percent elapsed is under the twentieth-of-a-week floor.
+#[test]
+fn an_uncomputable_projection_falls_back_to_weekly_percent() {
+    let config = Config::default();
+    // 96 percent of the window still remaining: 4 percent elapsed.
+    let early = 580_608;
+    let decision = decide(
+        plain(),
+        usage_with_grok(
+            window(99.0, HALF_WEEK, 0.0),
+            window(20.0, early, 0.0),
+            window(10.0, early, 0.0),
+        ),
+        NOW,
+        &config,
+    );
+
+    assert_eq!(decision.provider, Provider::Grok);
+    assert!(decision.gates.contains(&Gate::ProjectionUnavailable));
+    assert_eq!(decision.codex_projected_draw, None);
+    assert_eq!(decision.grok_projected_draw, None);
 }
 
 /// A zero-looking value without a known weekly window is not free capacity, and the same ceiling

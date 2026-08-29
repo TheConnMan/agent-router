@@ -1,5 +1,5 @@
 //! The decision engine: capability pins select Claude; ordinary work selects the eligible Codex or
-//! Grok provider with the lower authoritative weekly usage. Pure given its inputs.
+//! Grok provider with the lower projected weekly draw. Pure given its inputs.
 
 use crate::classify::{Classification, Complexity};
 use crate::config::Config;
@@ -69,7 +69,10 @@ pub enum Gate {
     ClassifierUnlaunchable,
     /// Retained for compatibility with legacy decision logs.
     ProjectedOverdraw,
-    /// Retained for compatibility with legacy decision logs.
+    /// Both workhorses are eligible but at least one projected weekly draw could not be computed,
+    /// so the comparison fell back to raw weekly percent used. Typically this is a window with
+    /// less than a twentieth elapsed, where dividing by that fraction would turn a couple of jobs
+    /// into a four-figure projection.
     ProjectionUnavailable,
     /// Retained for compatibility with legacy decision logs.
     FiveHourPacing,
@@ -127,11 +130,12 @@ pub struct Decision {
     /// What each provider's weekly draw projects to at the moment its window resets, as a percent
     /// of that provider's own weekly allowance, at the deciding instant. Over 100 means the
     /// provider runs out before the window does. None when the projection could not be computed,
-    /// and therefore when the override could not run: the log records the number the rule saw, so
-    /// the next tuning pass reads why a task moved rather than only that it did. Always None on
-    /// the explicit path, which ran no usage rule to measure.
+    /// and therefore when the pace comparison could not use that provider's number: the log
+    /// records the reading the rule saw, so the next tuning pass reads why a task moved rather
+    /// than only that it did. Always None on the explicit path, which ran no usage rule to measure.
     pub claude_projected_draw: Option<f64>,
     pub codex_projected_draw: Option<f64>,
+    pub grok_projected_draw: Option<f64>,
     pub rationale: String,
 }
 
@@ -182,8 +186,13 @@ fn implement_exceeds_codex_window(classification: &Classification) -> bool {
 /// 1. Capability pins select Claude, bypassing automatic capacity routing. A missing connector is
 ///    different: without an inventory-backed provider capability it is blocked, never assumed to
 ///    be a Claude capability.
-/// 2. Ordinary work selects between eligible Codex and Grok readings by lowest weekly usage, with
-///    an exact tie staying on Codex. Unknown or exhausted candidates are ineligible.
+/// 2. Ordinary work selects between eligible Codex and Grok. Eligibility is still current weekly
+///    percent: unknown or at/over the hard ceiling is out. When both are eligible and both
+///    projected draws exist, the lower projected draw wins — that is the provider further below
+///    its own week's pace, which is not the same as the lower current percent when the windows
+///    started at different times. An exact projected-draw tie stays on Codex. When either
+///    projection is missing, the comparison falls back to lower current weekly percent and
+///    records `projection_unavailable`.
 pub fn decide(
     classification: Classification,
     usage: UsageSnapshot,
@@ -233,6 +242,7 @@ pub fn decide(
     let mut model = model_for(pre_usage_provider, complexity, config);
     let claude_projected_draw = projected_draw(&usage.claude, now_epoch_secs);
     let codex_projected_draw = projected_draw(&usage.codex, now_epoch_secs);
+    let grok_projected_draw = projected_draw(&usage.grok, now_epoch_secs);
 
     if !capability_pin && !config.policy.weekly_routing {
         gates.push(Gate::WeeklyRoutingDisabled);
@@ -299,11 +309,28 @@ pub fn decide(
             // Exactly Codex eligible: the task stays on Codex.
             (true, false) => {}
             (true, true) => {
-                // A tie deliberately stays on Codex, so only a strictly lower Grok draw selects
-                // Grok.
-                if weekly_used(&usage, Provider::Grok) < weekly_used(&usage, Provider::Codex) {
-                    provider = Provider::Grok;
-                }
+                // Pace, not current percent: a provider further into its week can sit at a higher
+                // used percentage and still be the one under-burning. A tie, and a missing
+                // projection, stay on the weekly-percent comparison, which itself ties to Codex.
+                provider = match (codex_projected_draw, grok_projected_draw) {
+                    (Some(codex_draw), Some(grok_draw)) => {
+                        if grok_draw < codex_draw {
+                            Provider::Grok
+                        } else {
+                            Provider::Codex
+                        }
+                    }
+                    _ => {
+                        gates.push(Gate::ProjectionUnavailable);
+                        if weekly_used(&usage, Provider::Grok)
+                            < weekly_used(&usage, Provider::Codex)
+                        {
+                            Provider::Grok
+                        } else {
+                            Provider::Codex
+                        }
+                    }
+                };
             }
         }
     }
@@ -327,6 +354,7 @@ pub fn decide(
         usage,
         claude_projected_draw,
         codex_projected_draw,
+        grok_projected_draw,
         rationale,
     }
 }
@@ -404,6 +432,7 @@ pub fn decide_explicit(
         // in the log that nothing consulted, which the next backtest would read as a rule firing.
         claude_projected_draw: None,
         codex_projected_draw: None,
+        grok_projected_draw: None,
         rationale,
     }
 }
@@ -468,7 +497,7 @@ fn rationale(
         )
     };
     format!(
-        "{}: {}{tags} (orchestration {}; codex weekly {:.0}%, claude weekly {:.0}%, claude 5h {:.0}%)",
+        "{}: {}{tags} (orchestration {}; {}, {}, {}, claude 5h {:.0}%)",
         provider.name(),
         classification.rationale,
         if classification.orchestration {
@@ -476,10 +505,19 @@ fn rationale(
         } else {
             "no"
         },
-        usage.codex.weekly_pct,
-        usage.claude.weekly_pct,
+        weekly_label("claude", &usage.claude),
+        weekly_label("codex", &usage.codex),
+        weekly_label("grok", &usage.grok),
         usage.claude.five_hour_pct,
     )
+}
+
+fn weekly_label(name: &str, headroom: &Headroom) -> String {
+    if headroom.weekly_known() {
+        format!("{name} weekly {:.0}%", headroom.weekly_pct)
+    } else {
+        format!("{name} weekly unknown")
+    }
 }
 
 #[cfg(test)]
@@ -494,10 +532,12 @@ mod tests {
         UsageSnapshot {
             codex: Headroom {
                 weekly_pct: codex_weekly,
+                weekly_capacity_known: true,
                 ..Headroom::full()
             },
             claude: Headroom {
                 weekly_pct: claude_weekly,
+                weekly_capacity_known: true,
                 ..Headroom::full()
             },
             grok: Headroom::closed(),
@@ -565,6 +605,7 @@ mod tests {
         // No usage rule ran on this path, so there is no run rate to record.
         assert_eq!(decision.claude_projected_draw, None);
         assert_eq!(decision.codex_projected_draw, None);
+        assert_eq!(decision.grok_projected_draw, None);
 
         // Fully pinned inputs stay exact when classification is absent.
         let pinned = decide_explicit(
@@ -580,9 +621,9 @@ mod tests {
     }
 
     /// The rationale is the one line the CLI prints and the viewer shows, so it names the provider,
-    /// every gate that fired, and the numbers those gates were decided on.
+    /// every gate that fired, and the weekly numbers every available provider was decided on.
     #[test]
-    fn the_rationale_names_the_provider_the_gates_and_both_weekly_numbers() {
+    fn the_rationale_names_the_provider_the_gates_and_every_weekly_number() {
         let config = Config::default();
         let decision = decide(
             Classification {
@@ -608,6 +649,7 @@ mod tests {
         assert!(decision.rationale.contains("capability_blocked"));
         assert!(decision.rationale.contains("codex weekly 71%"));
         assert!(decision.rationale.contains("claude weekly 50%"));
+        assert!(decision.rationale.contains("grok weekly unknown"));
     }
 
     #[test]

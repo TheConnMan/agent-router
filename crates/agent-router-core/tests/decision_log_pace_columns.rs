@@ -118,6 +118,17 @@ fn a_recorded_decision_writes_the_orchestration_score_and_both_projections() {
     assert_eq!(rows[0].1, Some(10.0));
     assert_eq!(rows[0].2, Some(160.0));
     assert!(rows[1].0, "the pinned row scored orchestration");
+    drop(statement);
+
+    let (grok_draw, grok_weekly): (Option<f64>, Option<f64>) = conn
+        .query_row(
+            "SELECT grok_projected_draw, grok_weekly_pct FROM decisions ORDER BY id LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("grok columns exist");
+    assert_eq!(grok_draw, Some(20.0));
+    assert_eq!(grok_weekly, Some(10.0));
 }
 
 /// A reset that was never read has no projection, and the column says so rather than carrying a
@@ -366,6 +377,8 @@ fn a_database_written_before_pace_gains_the_columns_and_keeps_its_rows() {
     assert_eq!(rows[0].task, "a recorded task");
     assert_eq!(rows[0].provider, "claude");
     assert_eq!(rows[0].gates, "claude_signals");
+    assert_eq!(rows[0].grok_weekly_pct, None);
+    assert_eq!(rows[0].grok_projected_draw, None);
 
     let conn = rusqlite::Connection::open(&path).expect("reopen");
     let (signals, weekly, orchestration, claude_pace, codex_pace): (

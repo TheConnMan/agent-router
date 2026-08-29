@@ -67,9 +67,13 @@ pub struct Row {
     /// a different scale; the two series must not be read as one.
     pub claude_projected_draw: Option<f64>,
     pub codex_projected_draw: Option<f64>,
+    pub grok_projected_draw: Option<f64>,
     pub gates: String,
     pub claude_weekly_pct: f64,
     pub codex_weekly_pct: f64,
+    /// None on a row written before Grok weekly capacity was logged, and on a row whose Grok
+    /// weekly window was unknown at record time.
+    pub grok_weekly_pct: Option<f64>,
     pub dry_run: bool,
     pub job_id: Option<String>,
     pub job_name: Option<String>,
@@ -206,6 +210,7 @@ CREATE TABLE IF NOT EXISTS decisions (
     missing_connector   INTEGER,
     claude_projected_draw REAL,
     codex_projected_draw  REAL,
+    grok_projected_draw   REAL,
     gates               TEXT    NOT NULL,
     rationale           TEXT    NOT NULL,
     claude_five_hour_pct   REAL NOT NULL,
@@ -216,6 +221,8 @@ CREATE TABLE IF NOT EXISTS decisions (
     codex_five_hour_reset  INTEGER NOT NULL,
     codex_weekly_pct       REAL NOT NULL,
     codex_weekly_reset     INTEGER NOT NULL,
+    grok_weekly_pct        REAL,
+    grok_weekly_reset      INTEGER,
     claude_usage_stale     INTEGER,
     codex_usage_stale      INTEGER,
     dry_run             INTEGER NOT NULL,
@@ -239,7 +246,8 @@ codex_ready_count, claude_signal_count, missing_connector, gates, claude_weekly_
 codex_weekly_pct, dry_run, job_id, job_name, outcome, rationale, complexity, \
 task_context_horizon, claude_usage_stale, codex_usage_stale, orchestration, \
 claude_projected_draw, codex_projected_draw, \
-reconciled_at_ms, mark, note, effective_effort, router_version";
+reconciled_at_ms, mark, note, effective_effort, router_version, grok_weekly_pct, \
+grok_projected_draw";
 
 /// The narrower list the stats reader needs, so a report never pays for columns it drops.
 const STATS_COLUMNS: &str = "created_at_ms, requested, provider, complexity, gates, dry_run, \
@@ -324,11 +332,12 @@ impl DecisionLog {
                 claude_weekly_reset, codex_five_hour_pct, codex_five_hour_reset,
                 codex_weekly_pct, codex_weekly_reset, dry_run, job_id, job_name, outcome,
                 complexity, task_context_horizon, claude_usage_stale, codex_usage_stale,
-                claude_projected_draw, codex_projected_draw, effective_effort, router_version
+                claude_projected_draw, codex_projected_draw, grok_projected_draw,
+                effective_effort, router_version, grok_weekly_pct, grok_weekly_reset
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
                 ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30,
-                ?31
+                ?31, ?32, ?33, ?34
             )",
             rusqlite::params![
                 now_ms(),
@@ -360,8 +369,11 @@ impl DecisionLog {
                 usage.codex.stale,
                 decision.claude_projected_draw,
                 decision.codex_projected_draw,
+                decision.grok_projected_draw,
                 entry.effective_effort,
                 ROUTER_VERSION,
+                usage.grok.weekly_known().then_some(usage.grok.weekly_pct),
+                usage.grok.weekly_reset_epoch,
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -504,8 +516,9 @@ impl DecisionLog {
         let series = statement
             .query_map(
                 rusqlite::params![provider, model, i64::try_from(limit).unwrap_or(i64::MAX)],
-                |row: &rusqlite::Row| row.get(0),
+                |row: &rusqlite::Row| row.get::<_, Option<f64>>(0),
             )?
+            .filter_map(|value| value.transpose())
             .collect::<rusqlite::Result<Vec<f64>>>()?;
         Ok(series)
     }
@@ -550,6 +563,8 @@ impl DecisionLog {
                     note: row.get(30)?,
                     effective_effort: row.get(31)?,
                     router_version: row.get(32)?,
+                    grok_weekly_pct: row.get(33)?,
+                    grok_projected_draw: row.get(34)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<Row>>>()?;
@@ -564,7 +579,7 @@ impl DecisionLog {
 /// Same columns, different physical order: `SCHEMA` places these mid table while `ALTER TABLE ADD
 /// COLUMN` can only append them, so a fresh and a migrated database disagree on every ordinal and
 /// every read must name the columns it wants rather than `SELECT *` or a `pragma_table_info` index.
-const MISSING_COLUMNS: [(&str, &str); 12] = [
+const MISSING_COLUMNS: [(&str, &str); 15] = [
     ("complexity", "TEXT"),
     ("task_context_horizon", "TEXT"),
     ("claude_usage_stale", "INTEGER"),
@@ -577,6 +592,9 @@ const MISSING_COLUMNS: [(&str, &str); 12] = [
     ("note", "TEXT"),
     ("effective_effort", "TEXT"),
     ("router_version", "TEXT"),
+    ("grok_weekly_pct", "REAL"),
+    ("grok_weekly_reset", "INTEGER"),
+    ("grok_projected_draw", "REAL"),
 ];
 
 /// IMPURE: bring a database written before any of those columns up to the current schema. Guarded
@@ -604,6 +622,7 @@ fn weekly_column(provider: &str) -> Option<&'static str> {
     match provider {
         "claude" => Some("claude_weekly_pct"),
         "codex" => Some("codex_weekly_pct"),
+        "grok" => Some("grok_weekly_pct"),
         _ => None,
     }
 }
@@ -702,9 +721,12 @@ mod tests {
         assert_eq!(row.missing_connector, Some(false));
         assert_eq!(row.claude_weekly_pct, 60.0);
         assert_eq!(row.codex_weekly_pct, 10.0);
-        // Both resets were read, so both projections travel with the row.
+        assert_eq!(row.grok_weekly_pct, None);
+        // Both resets were read, so both projections travel with the row. Grok was closed, so
+        // it has no weekly reading and no projection.
         assert!(row.claude_projected_draw.is_some());
         assert!(row.codex_projected_draw.is_some());
+        assert_eq!(row.grok_projected_draw, None);
         assert_eq!(row.job_id.as_deref(), Some("thread-abc"));
         assert_eq!(row.outcome, "dispatched");
         assert!(!row.dry_run);
@@ -782,6 +804,7 @@ mod tests {
         assert_eq!(row.complexity, None);
         assert_eq!(row.claude_projected_draw, None);
         assert_eq!(row.codex_projected_draw, None);
+        assert_eq!(row.grok_projected_draw, None);
         assert_eq!(row.gates, "explicit_provider");
     }
 

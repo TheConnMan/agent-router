@@ -287,23 +287,15 @@ pub struct Config {
     /// consulting this ceiling, so a router that spends down to the limit leaves nothing for the
     /// work a person is doing by hand.
     pub hard_ceiling_pct: f64,
-    /// Projected weekly draw, as a percent of a provider's own allowance, above which a task moves
-    /// off that provider (provided the other projects lower). Strictly greater: a projection
-    /// exactly here holds.
+    /// Retained for compatibility with generated config files. Automatic workhorse selection
+    /// compares projected weekly draws directly and does not consult this threshold.
     ///
-    /// The default of 100 is not a tuned number. A projection of 100 says the provider finishes its
-    /// weekly window at exactly its allowance, so above 100 is the definition of running out early,
-    /// and that is the whole condition the rule is asking about. Raise it to let a provider run
-    /// further past its pace before work moves; there is no reason to lower it.
-    ///
-    /// This is deliberately NOT a points-based gap. The previous key, `pace_flip_gap`, compared how
-    /// far ahead of pace each provider was in points, and its value had to clear whatever chronic
-    /// band the two plan sizes happened to produce. That made it a plan-sized constant wearing the
-    /// clothes of a policy: when the Codex plan grew on 2026-08-01 the band collapsed and the
-    /// configured 70 became unreachable, so the override silently stopped existing. A ratio against
-    /// each provider's own allowance has no such dependency. Neither `pace_flip_gap` nor
-    /// `headroom_flip_gap` is read as an alias: a number tuned for either older comparison means
-    /// nothing under this one, and honouring it would restore the exact failure.
+    /// The previous key, `pace_flip_gap`, compared how far ahead of pace each provider was in
+    /// points, and its value had to clear whatever chronic band the two plan sizes happened to
+    /// produce. That made it a plan-sized constant wearing the clothes of a policy: when the Codex
+    /// plan grew on 2026-08-01 the band collapsed and the configured 70 became unreachable, so
+    /// the override silently stopped existing. Neither `pace_flip_gap` nor `headroom_flip_gap` is
+    /// read as an alias.
     pub projection_overdraw_pct: f64,
     /// Claude five hour percent used at or above which a task is paced away from Claude, provided
     /// Codex has weekly room. Codex's own five hour number never influences routing. Declared here
