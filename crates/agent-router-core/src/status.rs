@@ -7,8 +7,10 @@
 //! a process, a socket, or a disk sits inside either pure function, so the mapping table and the
 //! monotonicity rule are both testable with no backend at all.
 
+use crate::binary::Environment;
 use crate::error::Result;
 use crate::log::{DecisionLog, StatusRow};
+use crate::provider::Provider;
 use crate::runtime::home_dir;
 use crate::stats::Window;
 use agent_viewer_core::{GrokLifecycle, Status as GrokStatus};
@@ -313,7 +315,12 @@ fn grok_states(rows: &[StatusRow]) -> Option<BTreeMap<String, Observation>> {
     if !rows.iter().any(|row| row.provider == "grok") {
         return None;
     }
-    let sessions = GrokLifecycle::new("grok", grok_home()).list().ok()?;
+    // Resolved rather than named: a bare "grok" here would keep reaching `execvp` with whatever
+    // `PATH` the caller inherited, so every Grok row in the window would read as unresolvable on
+    // exactly the boxes dispatch was just taught to handle. Reconciliation only observes, so an
+    // unresolvable grok is `None` — the honest partial report — not a hard failure.
+    let binary = crate::binary::resolve(Provider::Grok, &Environment::from_process()).ok()?;
+    let sessions = GrokLifecycle::new(binary, grok_home()).list().ok()?;
     let mut states = BTreeMap::new();
     for session in sessions {
         use std::collections::btree_map::Entry;

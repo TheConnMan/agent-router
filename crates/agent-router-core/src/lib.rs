@@ -2,6 +2,7 @@
 //! and provider dispatch.
 
 pub mod adversarial_review;
+pub mod binary;
 pub mod classify;
 pub mod config;
 pub mod decide;

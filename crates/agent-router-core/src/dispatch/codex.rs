@@ -1,4 +1,6 @@
+use crate::binary::{CODEX_BIN_ENV, Environment};
 use crate::error::{Error, Result};
+use crate::provider::Provider;
 use crate::run::Dispatch;
 use crate::runtime::home_dir;
 use crate::status::Observation;
@@ -253,9 +255,26 @@ pub fn dispatch(
     model: Option<&str>,
     effort: Option<&str>,
 ) -> Result<Dispatch> {
+    dispatch_in(&Environment::from_process(), cwd, task, name, model, effort)
+}
+
+/// IMPURE in `environment` only: the resolution seam.
+///
+/// Codex resolves at the top, unlike opencode: `probe_daemon` always execs `codex app-server daemon
+/// version`, so a daemon that is already running does not spare this path the binary. Resolving
+/// once here also keeps `daemon_command`'s poll loop from re-resolving on every iteration.
+pub fn dispatch_in(
+    environment: &Environment,
+    cwd: &Path,
+    task: &str,
+    name: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> Result<Dispatch> {
+    let binary = crate::binary::resolve(Provider::Codex, environment)?;
     #[cfg(target_os = "linux")]
     {
-        let daemon = ensure_daemon().map_err(Error::Command)?;
+        let daemon = ensure_daemon(&binary)?;
         let mut client = Client::connect(&daemon)?;
         match spawn_on_initialized_rpc(&mut client, cwd, task, name, model, effort) {
             SpawnAttempt::Started {
@@ -276,7 +295,7 @@ pub fn dispatch(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (cwd, task, name, model, effort);
+        let _ = (binary, cwd, task, name, model, effort);
         Err(Error::Command(
             "codex app-server daemon transport is unavailable on this platform".to_string(),
         ))
@@ -306,8 +325,8 @@ fn stable_daemon_cwd() -> PathBuf {
     }
 }
 
-fn daemon_command(action: &str) -> Command {
-    let mut command = Command::new("codex");
+fn daemon_command(binary: &Path, action: &str) -> Command {
+    let mut command = Command::new(binary);
     command
         .arg("app-server")
         .arg("daemon")
@@ -320,27 +339,62 @@ fn daemon_command(action: &str) -> Command {
 /// that must not create the state it is reporting on (doctor, status) uses it rather than
 /// `ensure_daemon`.
 pub(crate) fn probe_daemon() -> Option<Daemon> {
-    let stdout = run_reporting_failure(daemon_command("version"), PROBE_TIMEOUT).ok()?;
-    parse_daemon_version(&stdout)
+    // The signature stays argument-free on purpose. `probe_daemon` has three callers — the two in
+    // this file and `doctor.rs`, which is another stream's file — so resolving INSIDE it is what
+    // keeps this change off doctor's ledger. A resolution failure here is `None`, which is exactly
+    // right: to something that is only asking, an unlaunchable codex means no daemon answers. The
+    // loud, named failure belongs to `ensure_daemon`, which is trying to start one.
+    let binary = crate::binary::resolve(Provider::Codex, &Environment::from_process()).ok()?;
+    // The one place a probe's launch failure is discarded, and the only one that may be: this
+    // wrapper is the observation-only entry point, and to something that is merely asking, an
+    // unlaunchable codex means no daemon answers.
+    probe_daemon_with_binary(&binary).ok().flatten()
 }
 
-fn ensure_daemon() -> std::result::Result<Daemon, String> {
-    if let Some(daemon) = probe_daemon() {
+/// IMPURE: the same probe against an already-resolved binary, so a caller inside a poll loop
+/// resolves once rather than once per iteration.
+///
+/// `Ok(None)` is the probe's own answer — "no daemon is up" — and it covers every way the version
+/// command can run and decline to name one, including a nonzero exit and the probe deadline.
+/// `Err` is reserved for a launch failure, because that is not an answer about the daemon at all:
+/// it says the CLI could not be executed. Swallowing it here made `ensure_daemon` poll a binary
+/// that could never answer and then persist an `Error::Command` timeout, which is precisely the
+/// laundering the decision log's `error: launch failed:` prefix exists to catch.
+fn probe_daemon_with_binary(binary: &Path) -> Result<Option<Daemon>> {
+    match run_reporting_failure(daemon_command(binary, "version"), PROBE_TIMEOUT) {
+        Ok(stdout) => Ok(parse_daemon_version(&stdout)),
+        Err(launch @ Error::Launch(_)) => Err(launch),
+        Err(_) => Ok(None),
+    }
+}
+
+/// IMPURE: the running daemon, started if one is not up.
+///
+/// Carries the crate `Error` rather than a `String`: `dispatch` used to consume this with
+/// `.map_err(Error::Command)`, which flattened a launch failure into an undifferentiated
+/// `Error::Command` even when its message read correctly — invisible to any substring test, and
+/// the exact laundering the decision log's `error: launch failed:` prefix exists to catch.
+fn ensure_daemon(binary: &Path) -> Result<Daemon> {
+    if let Some(daemon) = probe_daemon_with_binary(binary)? {
         return Ok(daemon);
     }
     let deadline = Instant::now() + START_TIMEOUT;
-    if let Err(error) = run_reporting_failure(daemon_command("start"), START_TIMEOUT) {
-        return probe_daemon().ok_or(error);
+    if let Err(error) = run_reporting_failure(daemon_command(binary, "start"), START_TIMEOUT) {
+        // A daemon another process already started answers regardless of why this start failed.
+        return match probe_daemon_with_binary(binary)? {
+            Some(daemon) => Ok(daemon),
+            None => Err(error),
+        };
     }
     loop {
-        if let Some(daemon) = probe_daemon() {
+        if let Some(daemon) = probe_daemon_with_binary(binary)? {
             return Ok(daemon);
         }
         if Instant::now() >= deadline {
-            return Err(
+            return Err(Error::Command(
                 "`codex app-server daemon start` reported success but no daemon answered"
                     .to_string(),
-            );
+            ));
         }
         std::thread::sleep(
             Duration::from_millis(200).min(deadline.saturating_duration_since(Instant::now())),
@@ -348,23 +402,27 @@ fn ensure_daemon() -> std::result::Result<Daemon, String> {
     }
 }
 
-fn run_reporting_failure(
-    mut command: Command,
-    timeout: Duration,
-) -> std::result::Result<String, String> {
+/// IMPURE: run one codex command to completion under a deadline.
+///
+/// Carries the crate `Error` so a launch failure survives the trip to `ensure_daemon` and on to the
+/// decision row. Every other failure keeps its message byte-identically inside `Error::Command`,
+/// whose `Display` is `{0}`, so nothing an operator reads changes.
+fn run_reporting_failure(mut command: Command, timeout: Duration) -> Result<String> {
     let description = describe(&command);
+    // Read before the spawn borrows the command: the mapper needs the program either way.
+    let program = PathBuf::from(command.get_program());
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command
         .spawn()
-        .map_err(|error| format!("could not run `{description}`: {error}"))?;
+        .map_err(|error| crate::binary::launch_error(&program, CODEX_BIN_ENV, error))?;
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| format!("`{description}` gave no stdout pipe"))?;
+        .ok_or_else(|| Error::Command(format!("`{description}` gave no stdout pipe")))?;
     let stderr = child
         .stderr
         .take()
-        .ok_or_else(|| format!("`{description}` gave no stderr pipe"))?;
+        .ok_or_else(|| Error::Command(format!("`{description}` gave no stderr pipe")))?;
     let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
     let (stderr_tx, stderr_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -386,17 +444,23 @@ fn run_reporting_failure(
             Ok(None) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!("`{description}` timed out after {timeout:?}"));
+                return Err(Error::Command(format!(
+                    "`{description}` timed out after {timeout:?}"
+                )));
             }
             Err(error) => {
-                return Err(format!("could not wait for `{description}`: {error}"));
+                return Err(Error::Command(format!(
+                    "could not wait for `{description}`: {error}"
+                )));
             }
         }
     };
     let stdout = stdout_rx
         .recv_timeout(OUTPUT_GRACE)
-        .map_err(|_| format!("`{description}` stdout was unreadable"))?
-        .map_err(|error| format!("`{description}` stdout was unreadable: {error}"))?;
+        .map_err(|_| Error::Command(format!("`{description}` stdout was unreadable")))?
+        .map_err(|error| {
+            Error::Command(format!("`{description}` stdout was unreadable: {error}"))
+        })?;
     let stderr = stderr_rx
         .recv_timeout(OUTPUT_GRACE)
         .unwrap_or_else(|_| Ok(Vec::new()))
@@ -408,9 +472,12 @@ fn run_reporting_failure(
         } else {
             format!(": {why}")
         };
-        return Err(format!("`{description}` exited {status}{suffix}"));
+        return Err(Error::Command(format!(
+            "`{description}` exited {status}{suffix}"
+        )));
     }
-    String::from_utf8(stdout).map_err(|_| format!("`{description}` printed non utf8 stdout"))
+    String::from_utf8(stdout)
+        .map_err(|_| Error::Command(format!("`{description}` printed non utf8 stdout")))
 }
 
 fn read_limited(mut reader: impl Read) -> std::io::Result<Vec<u8>> {
@@ -520,5 +587,54 @@ fn remaining(deadline: Instant) -> Result<Duration> {
         Err(Error::Command("app-server request timed out".to_string()))
     } else {
         Ok(remaining)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// PURE-ish: the first of these that exists, so the fixture does not pin one distro's layout.
+    fn first_existing(candidates: &[&str]) -> PathBuf {
+        candidates
+            .iter()
+            .map(PathBuf::from)
+            .find(|candidate| candidate.is_file())
+            .expect("a test fixture binary must exist")
+    }
+
+    /// The probe used to answer `Option`, which made an unlaunchable codex indistinguishable from
+    /// a codex that answered "no daemon". `ensure_daemon` then polled to its deadline and
+    /// persisted `Error::Command`, hiding the launch failure the decision row exists to show.
+    /// The variant is the whole assertion: both spellings produce a readable message.
+    #[test]
+    fn a_probe_of_a_missing_binary_is_a_launch_failure_not_an_absent_daemon() {
+        let error = probe_daemon_with_binary(Path::new("/nonexistent/agent-router-codex"))
+            .expect_err("a missing binary cannot be probed");
+
+        assert!(
+            matches!(error, Error::Launch(_)),
+            "an unlaunchable codex is a launch failure, not a silent absence: {error:?}"
+        );
+    }
+
+    /// The bound: a probe that RAN and did not name a daemon is an answer, not a failure, so
+    /// `ensure_daemon` still goes on to start one rather than aborting the dispatch.
+    #[test]
+    fn a_probe_that_runs_and_names_no_daemon_is_an_absent_daemon() {
+        let ran = first_existing(&["/bin/echo", "/usr/bin/echo"]);
+
+        assert_eq!(
+            probe_daemon_with_binary(&ran).expect("a probe that ran is not a failure"),
+            None
+        );
+    }
+
+    /// The observation-only wrapper is the one place that discard is correct, and its
+    /// zero-argument signature is what keeps `doctor` and `thread_states` off this change.
+    #[test]
+    fn the_public_probe_stays_argument_free_and_swallows_its_failures() {
+        let probe: fn() -> Option<Daemon> = probe_daemon;
+        let _ = probe;
     }
 }

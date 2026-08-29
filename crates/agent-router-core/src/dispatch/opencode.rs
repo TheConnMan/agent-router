@@ -1,4 +1,6 @@
+use crate::binary::{Environment, OPENCODE_BIN_ENV};
 use crate::error::{Error, Result};
+use crate::provider::Provider;
 use crate::run::Dispatch;
 use crate::runtime::{home_dir, router_log_path, spawn_detached};
 use base64::Engine as _;
@@ -117,13 +119,13 @@ impl ManagedClient {
     }
 
     #[cfg(target_os = "linux")]
-    fn for_router() -> Result<Self> {
+    fn for_router_in(environment: &Environment) -> Result<Self> {
         let state_dir = home_dir().join(".local/state/agent-router");
         ensure_owner_only_directory(&state_dir).map_err(Error::Command)?;
         let _lock =
             acquire_launch_lock(&state_dir, SERVER_STARTUP_TIMEOUT).map_err(Error::Command)?;
         let credentials = load_credentials(&state_dir.join("router.db")).map_err(Error::Command)?;
-        let pin = ensure_server(&state_dir, &credentials).map_err(Error::Command)?;
+        let pin = ensure_server(environment, &state_dir, &credentials)?;
         Ok(Self {
             endpoint: pin.endpoint,
             credentials,
@@ -302,21 +304,59 @@ pub fn dispatch(
     task: &str,
     name: &str,
     model: Option<&str>,
+    effort: Option<&str>,
+) -> Result<Dispatch> {
+    dispatch_in(&Environment::from_process(), cwd, task, name, model, effort)
+}
+
+/// IMPURE in `environment` only: the resolution seam.
+///
+/// Nothing is resolved HERE, and that is the point. `ensure_server` returns an already-running
+/// server before it spawns anything, so a box with a live server on 4097/4098 and no `opencode`
+/// reachable works today; resolving at the top of this function would fail it with a launch error
+/// that the fix itself introduced. Resolution therefore sits immediately before the spawn, after
+/// the probe.
+pub fn dispatch_in(
+    environment: &Environment,
+    cwd: &Path,
+    task: &str,
+    name: &str,
+    model: Option<&str>,
     _effort: Option<&str>,
 ) -> Result<Dispatch> {
     #[cfg(target_os = "linux")]
     {
-        ManagedClient::for_router()?.dispatch(cwd, task, name, model)
+        ManagedClient::for_router_in(environment)?.dispatch(cwd, task, name, model)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        dispatch_cli(cwd, task, name, model)
+        dispatch_cli_in(environment, cwd, task, name, model)
     }
 }
 
+/// This arm spawns unconditionally — there is no probe to come after — so resolving up front is
+/// safe here in a way it is not on the managed-server path.
 #[cfg(not(target_os = "linux"))]
-fn dispatch_cli(cwd: &Path, task: &str, name: &str, model: Option<&str>) -> Result<Dispatch> {
-    let mut command = std::process::Command::new("opencode");
+fn dispatch_cli_in(
+    environment: &Environment,
+    cwd: &Path,
+    task: &str,
+    name: &str,
+    model: Option<&str>,
+) -> Result<Dispatch> {
+    let binary = crate::binary::resolve(Provider::Opencode, environment)?;
+    dispatch_cli_with_binary(&binary, cwd, task, name, model)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn dispatch_cli_with_binary(
+    binary: &Path,
+    cwd: &Path,
+    task: &str,
+    name: &str,
+    model: Option<&str>,
+) -> Result<Dispatch> {
+    let mut command = std::process::Command::new(binary);
     command
         .arg("run")
         .arg("--dir")
@@ -329,7 +369,11 @@ fn dispatch_cli(cwd: &Path, task: &str, name: &str, model: Option<&str>) -> Resu
         command.arg("-m").arg(model);
     }
     command.arg(task);
-    spawn_detached(command, &router_log_path("opencode"))?;
+    spawn_detached(
+        command,
+        &router_log_path("opencode"),
+        Some(OPENCODE_BIN_ENV),
+    )?;
     Ok(Dispatch {
         job_id: None,
         job_name: name.to_string(),
@@ -707,11 +751,17 @@ fn private_plugin_url(path: &Path) -> String {
     url
 }
 
+/// IMPURE: the managed server this router owns, started only if none is already answering.
+///
+/// Carries the crate `Error` rather than a `String` so a launch failure survives to the decision
+/// row instead of being folded into the per-port `failures` join, where it would read as a port
+/// problem and persist as an undifferentiated `Error::Command`.
 #[cfg(target_os = "linux")]
 fn ensure_server(
+    environment: &Environment,
     state_dir: &Path,
     credentials: &Credentials,
-) -> std::result::Result<ProcessIdentity, String> {
+) -> Result<ProcessIdentity> {
     let candidates = [
         SocketAddr::from(([127, 0, 0, 1], 4097)),
         SocketAddr::from(([127, 0, 0, 1], 4098)),
@@ -722,7 +772,7 @@ fn ensure_server(
         }
     }
 
-    let config = private_server_config(state_dir)?;
+    let config = private_server_config(state_dir).map_err(Error::Command)?;
     let durable_cwd = {
         let home = home_dir();
         if home.is_dir() {
@@ -733,6 +783,7 @@ fn ensure_server(
     };
     let deadline = Instant::now() + SERVER_STARTUP_TIMEOUT;
     let mut failures = Vec::new();
+    let mut resolved: Option<PathBuf> = None;
     for endpoint in candidates {
         if Instant::now() >= deadline {
             failures.push(format!(
@@ -745,7 +796,21 @@ fn ensure_server(
             failures.push(format!("port {}: occupied ({error})", endpoint.port()));
             continue;
         }
-        let mut command = Command::new("opencode");
+        // THE ordering constraint. Everything above this line can return without ever needing the
+        // binary — the probe loop hands back a server that is already running, and an occupied port
+        // is diagnosed as an occupied port. Resolving any earlier turns a box that works today,
+        // with a live server and no reachable `opencode`, into a launch failure shipped by the fix.
+        //
+        // Resolved once and reused across the candidate ports rather than per iteration.
+        let binary = match resolved {
+            Some(ref binary) => binary.clone(),
+            None => {
+                let binary = crate::binary::resolve(Provider::Opencode, environment)?;
+                resolved = Some(binary.clone());
+                binary
+            }
+        };
+        let mut command = Command::new(&binary);
         command
             .arg("serve")
             .arg("--hostname")
@@ -757,8 +822,16 @@ fn ensure_server(
             .env("OPENCODE_SERVER_PASSWORD", &credentials.password)
             .env("AGENT_ROUTER_OPENCODE_SERVER", "1")
             .env("OPENCODE_CONFIG_CONTENT", &config);
-        let pid = match spawn_detached(command, &router_log_path("opencode-server")) {
+        let pid = match spawn_detached(
+            command,
+            &router_log_path("opencode-server"),
+            Some(OPENCODE_BIN_ENV),
+        ) {
             Ok(pid) => pid,
+            // A binary that resolved and then failed to exec is about the binary, not the ports, so
+            // it returns rather than joining the per-port failure list. Trying the next port would
+            // fail identically, and the joined string would flatten the variant.
+            Err(error @ Error::Launch(_)) => return Err(error),
             Err(error) => {
                 failures.push(format!(
                     "port {}: {}",
@@ -768,7 +841,7 @@ fn ensure_server(
                 continue;
             }
         };
-        let start_time = process_start_time(pid)?;
+        let start_time = process_start_time(pid).map_err(Error::Command)?;
         let mut last_error = "server did not become ready".to_string();
         while Instant::now() < deadline {
             match probe_owned_server(endpoint, credentials, Some(pid)) {
@@ -791,9 +864,11 @@ fn ensure_server(
         ));
     }
     if failures.is_empty() {
-        Err("no managed OpenCode server candidate was available".to_string())
+        Err(Error::Command(
+            "no managed OpenCode server candidate was available".to_string(),
+        ))
     } else {
-        Err(failures.join("; "))
+        Err(Error::Command(failures.join("; ")))
     }
 }
 

@@ -5,7 +5,7 @@
 //! capacity from an absent reading.
 
 use agent_router_core::classify::{Classification, Complexity, TaskContextHorizon};
-use agent_router_core::config::{Config, DefaultProvider};
+use agent_router_core::config::Config;
 use agent_router_core::decide::{Decision, Gate, decide};
 use agent_router_core::{Headroom, Provider, UsageSnapshot};
 use serde::Deserialize;
@@ -67,7 +67,7 @@ impl HistoricalRow {
 
     fn classification(&self) -> Classification {
         if self.classifier_failed() {
-            return Classification::fallback("replayed classifier failure", DefaultProvider::Codex);
+            return Classification::fallback("replayed classifier failure");
         }
         let signals = self
             .claude_signals
@@ -81,6 +81,7 @@ impl HistoricalRow {
             rationale: "replayed".to_string(),
             classifier_failed: false,
             invokes_implement: false,
+            unlaunchable: None,
         }
     }
 

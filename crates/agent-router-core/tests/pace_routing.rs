@@ -11,7 +11,7 @@
 use agent_router_core::classify::{
     Classification, Complexity, TaskContextHorizon, parse_classification,
 };
-use agent_router_core::config::{Config, DefaultProvider};
+use agent_router_core::config::Config;
 use agent_router_core::decide::{Gate, decide, decide_explicit};
 use agent_router_core::{Headroom, Provider, UsageSnapshot};
 use std::collections::BTreeMap;
@@ -65,6 +65,7 @@ fn scored(orchestration: bool, missing_connector: bool, complexity: Complexity) 
         rationale: "fixture".to_string(),
         classifier_failed: false,
         invokes_implement: false,
+        unlaunchable: None,
     }
 }
 
@@ -452,7 +453,7 @@ fn disabled_weekly_routing_switches_workhorse_balancing_off() {
 fn a_failed_classifier_stays_eligible_for_workhorse_balancing() {
     let config = Config::default();
     let decision = decide(
-        Classification::fallback("timed out after 60s", DefaultProvider::Codex),
+        Classification::fallback("timed out after 60s"),
         usage_with_grok(
             window(99.0, HALF_WEEK, 0.0),
             window(80.0, HALF_WEEK, 0.0),
@@ -554,7 +555,7 @@ fn the_implement_pin_needs_both_the_invocation_and_the_build_tier() {
 #[test]
 fn an_unscored_implement_run_pins_to_claude() {
     let config = Config::default();
-    let mut unscored = Classification::fallback("timeout", DefaultProvider::Codex);
+    let mut unscored = Classification::fallback("timeout");
     unscored.invokes_implement = true;
     let decision = decide(
         unscored,

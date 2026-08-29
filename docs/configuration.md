@@ -229,12 +229,23 @@ stream of jobs on this box.
 
 Default `60`. How long the classifier call may take before it counts as failed.
 
-A failed classifier is not fatal, but it is not cheap either: the configured `default_provider`
-stays in force, complexity reads as `high`, and the decision is tagged `classifier_failed`, so a
-timeout can pick both the wrong provider and the top model tier. The measured call is 3.4-7.0s, so
-this default is headroom for a slow tail rather than a target. It is viable only because the
-classifier invocation strips both CLI startup cost and the model's thinking tokens; see the note in
-`classify.rs` for the measured numbers behind that.
+A failed classifier is not fatal, but it is not cheap either: the fallback pins nothing, so
+ordinary capacity routing picks the provider, complexity reads as `high`, and the decision is
+tagged `classifier_failed`, so a timeout can pick both the wrong provider and the top model tier.
+A classifier the router could not *launch* is tagged `classifier_unlaunchable` as well, and that
+provider is excluded as one conjunct of the automatic capacity eligibility test — the same test
+that already excludes a provider over the hard ceiling or carrying an unread weekly number. That
+test only runs for ordinary auto-routed work; a capability pin or an explicit `--provider` skips it
+entirely, so unlaunchability never touches either of those paths. Within the test, an unlaunchable
+Codex commonly leaves nothing eligible, because Grok is ineligible whenever its own weekly reading
+is unavailable, which is Grok's normal state. `decide` does not invent a fallback for that case: it
+deliberately keeps the work on Codex, adds the `over_ceiling` gate, and lets the dispatch fail loudly
+with a named `launch failed:` error — the router routes, and rerouting an unlaunchable classifier's
+task to Claude would make Claude an automatic destination, contradicting the rule that Claude is a
+capability destination only. The measured call is 3.4-7.0s, so this default is headroom for a slow
+tail rather than a target. It is viable only because the classifier invocation strips both CLI
+startup cost and the model's thinking tokens; see the note in `classify.rs` for the measured numbers
+behind that.
 
 ### `connectors`
 
@@ -277,6 +288,9 @@ Default `"codex"`. Either `"codex"` or `"grok"` for the workhorse fallback. The 
 both workhorses are unavailable (Codex by default).
 
 Claude is selected by capability/context pins and is not a workhorse usage-routing destination.
+
+Still parsed, defaulted, and validated on load, but no longer consulted by routing, which selects
+between Codex and Grok by capacity instead.
 
 ### `weekly_routing`
 

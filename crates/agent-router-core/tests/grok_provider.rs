@@ -40,6 +40,7 @@ fn plain_task() -> Classification {
         rationale: "portable fixture".to_string(),
         classifier_failed: false,
         invokes_implement: false,
+        unlaunchable: None,
     }
 }
 
