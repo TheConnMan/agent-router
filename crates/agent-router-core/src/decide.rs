@@ -39,7 +39,11 @@ pub enum Gate {
     /// either at or over the hard ceiling, or carrying a weekly number nobody read: see
     /// `WeeklyUnknown`, which is recorded alongside this one to tell the two apart.
     FlippedOnExhaustion,
-    /// Both workhorse providers are ineligible, so Codex was used anyway.
+    /// Both workhorse providers are ineligible on CAPACITY, so Codex was used anyway. Recorded
+    /// only when at least one candidate cleared the capability filter: a field emptied purely by
+    /// a missing connector is `CapabilityBlocked` and nothing else, because naming it
+    /// `over_ceiling` alongside a weekly reading of 14 percent tells a reviewer the opposite of
+    /// what happened.
     OverCeiling,
     /// At least one provider's weekly window was never read, so its percentage is a default rather
     /// than a reading. Such a provider is ineligible: an unread window reports 0 percent used, and
@@ -264,12 +268,18 @@ pub fn decide(
         // automatic destination this policy does not have. When that leaves nothing eligible the
         // task stays put and fails loudly at dispatch with a named launch error, which is the
         // diagnosable outcome the incident lacked.
-        let eligible = |candidate| {
-            (!classification.missing_connector || capability_providers.contains(&candidate))
-                && headroom(&usage, candidate).weekly_known()
+        //
+        // Capability and capacity are split so the gates can name which one emptied the field.
+        // They are one predicate for routing and two for the log.
+        let capability_eligible = |candidate| {
+            !classification.missing_connector || capability_providers.contains(&candidate)
+        };
+        let usage_eligible = |candidate| {
+            headroom(&usage, candidate).weekly_known()
                 && weekly_used(&usage, candidate) < config.hard_ceiling_pct
                 && classification.unlaunchable != Some(candidate)
         };
+        let eligible = |candidate| capability_eligible(candidate) && usage_eligible(candidate);
         // Only Codex and Grok are ever asked about, so only those two can have been excluded.
         // Claude is unrepresentable as an exclusion here and Opencode is never a candidate; both
         // are no-ops rather than an unreachable arm, because the field is deserialized from a log
@@ -298,7 +308,12 @@ pub fn decide(
                 {
                     capability_blocked = true;
                     gates.push(Gate::CapabilityBlocked);
-                } else {
+                } else if capability_eligible(Provider::Codex)
+                    || capability_eligible(Provider::Grok)
+                {
+                    // Some candidate had the capability and still had nowhere to go, so this
+                    // really is a capacity verdict. When neither did, `CapabilityBlocked` is
+                    // already recorded and adding `over_ceiling` would misattribute the block.
                     gates.push(Gate::OverCeiling);
                 }
             }
@@ -650,6 +665,44 @@ mod tests {
         assert!(decision.rationale.contains("codex weekly 71%"));
         assert!(decision.rationale.contains("claude weekly 50%"));
         assert!(decision.rationale.contains("grok weekly unknown"));
+    }
+
+    /// Regression, decision log 2026-08-24 to 2026-08-29: six rows recorded
+    /// `missing_connector,capability_blocked,over_ceiling` while their own usage columns read
+    /// claude 14% / codex 1% against a 98% ceiling. `over_ceiling` is a capacity verdict, and a
+    /// field emptied by the capability filter alone must not borrow it.
+    #[test]
+    fn a_capability_emptied_field_is_not_labelled_over_ceiling() {
+        let config = Config::default();
+        let blocked = Classification {
+            orchestration: false,
+            missing_connector: true,
+            complexity: Complexity::Medium,
+            task_context_horizon: TaskContextHorizon::Ordinary,
+            // Names no capability in the default inventory, so no provider is credited.
+            rationale: "requires a Slack thread nobody has an inventory for".to_string(),
+            classifier_failed: false,
+            invokes_implement: false,
+            unlaunchable: None,
+        };
+        let decision = decide(blocked, usage(1.0, 14.0), 1_785_400_000, &config);
+        assert!(decision.capability_blocked);
+        assert!(decision.gates.contains(&Gate::CapabilityBlocked));
+        assert!(
+            !decision.gates.contains(&Gate::OverCeiling),
+            "capacity was 1% and 14%, nowhere near the ceiling: {}",
+            decision.rationale
+        );
+
+        // A genuine capacity exhaustion with no connector question still records the gate.
+        let exhausted = decide(
+            Classification::fallback("ordinary work, no connector named"),
+            usage(99.0, 99.0),
+            1_785_400_000,
+            &config,
+        );
+        assert!(!exhausted.capability_blocked);
+        assert!(exhausted.gates.contains(&Gate::OverCeiling));
     }
 
     #[test]
