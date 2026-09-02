@@ -535,6 +535,24 @@ impl ReviewProvider for GrokReviewProvider {
     }
 }
 
+/// PURE: classify a poll-loop status after spawn has already confirmed working.
+/// Grok's leader reports a finished review as Idle; Done is inferred later from durable
+/// `turn_completed`. After spawn waited for working, Idle on that session is the finished turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GrokReviewPoll {
+    Complete,
+    Continue,
+    Fail,
+}
+
+fn grok_review_poll(status: &GrokStatus) -> GrokReviewPoll {
+    match status {
+        GrokStatus::Done | GrokStatus::Idle => GrokReviewPoll::Complete,
+        GrokStatus::Working | GrokStatus::Unknown => GrokReviewPoll::Continue,
+        GrokStatus::Error | GrokStatus::NeedsInput { .. } => GrokReviewPoll::Fail,
+    }
+}
+
 fn run_grok_review(request: &ReviewRequest<'_>) -> Result<(String, String)> {
     if !request.dir.is_dir() {
         return Err(Error::Command(format!(
@@ -581,8 +599,8 @@ fn run_grok_review(request: &ReviewRequest<'_>) -> Result<(String, String)> {
             }
         };
 
-        match &session.status {
-            GrokStatus::Done => {
+        match grok_review_poll(&session.status) {
+            GrokReviewPoll::Complete => {
                 let backend = GrokBackend::new();
                 let result = match backend.tail(&session, 256) {
                     Ok(events) => events.into_iter().rev().find_map(|event| match event {
@@ -602,22 +620,24 @@ fn run_grok_review(request: &ReviewRequest<'_>) -> Result<(String, String)> {
                 cleanup.complete()?;
                 return Ok((result, session_id));
             }
-            GrokStatus::Error => {
-                return Err(
-                    cleanup.failure(format!("Grok review {session_id} ended with an error"))
-                );
+            GrokReviewPoll::Fail => {
+                match &session.status {
+                    GrokStatus::NeedsInput { reason } => {
+                        let detail = reason
+                            .as_deref()
+                            .filter(|reason| !reason.trim().is_empty())
+                            .map(|reason| format!(": {reason}"))
+                            .unwrap_or_default();
+                        return Err(cleanup
+                            .failure(format!("Grok review {session_id} needs input{detail}")));
+                    }
+                    _ => {
+                        return Err(cleanup
+                            .failure(format!("Grok review {session_id} ended with an error")));
+                    }
+                }
             }
-            GrokStatus::NeedsInput { reason } => {
-                let detail = reason
-                    .as_deref()
-                    .filter(|reason| !reason.trim().is_empty())
-                    .map(|reason| format!(": {reason}"))
-                    .unwrap_or_default();
-                return Err(
-                    cleanup.failure(format!("Grok review {session_id} needs input{detail}"))
-                );
-            }
-            GrokStatus::Working | GrokStatus::Idle | GrokStatus::Unknown => {}
+            GrokReviewPoll::Continue => {}
         }
 
         if started.elapsed() >= GROK_REVIEW_TIMEOUT {
@@ -786,4 +806,58 @@ fn parse_codex_output(stdout: String) -> Result<String> {
                 .map(str::to_string)
         })
         .ok_or_else(|| Error::Command("codex review returned no review body".to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idle_after_working_is_the_completed_path() {
+        let sequence = [GrokStatus::Working, GrokStatus::Idle];
+        let classified: Vec<_> = sequence.iter().map(grok_review_poll).collect();
+        assert_eq!(
+            classified,
+            [GrokReviewPoll::Continue, GrokReviewPoll::Complete]
+        );
+        assert_eq!(
+            grok_review_poll(&GrokStatus::Done),
+            GrokReviewPoll::Complete
+        );
+    }
+
+    #[test]
+    fn idle_is_not_still_running() {
+        assert_eq!(
+            grok_review_poll(&GrokStatus::Idle),
+            GrokReviewPoll::Complete
+        );
+        assert_ne!(
+            grok_review_poll(&GrokStatus::Idle),
+            GrokReviewPoll::Continue
+        );
+        assert_eq!(
+            grok_review_poll(&GrokStatus::Working),
+            GrokReviewPoll::Continue
+        );
+        assert_eq!(
+            grok_review_poll(&GrokStatus::Unknown),
+            GrokReviewPoll::Continue
+        );
+    }
+
+    #[test]
+    fn error_and_needs_input_remain_fail() {
+        assert_eq!(grok_review_poll(&GrokStatus::Error), GrokReviewPoll::Fail);
+        assert_eq!(
+            grok_review_poll(&GrokStatus::NeedsInput { reason: None }),
+            GrokReviewPoll::Fail
+        );
+        assert_eq!(
+            grok_review_poll(&GrokStatus::NeedsInput {
+                reason: Some("approval required".to_string())
+            }),
+            GrokReviewPoll::Fail
+        );
+    }
 }
