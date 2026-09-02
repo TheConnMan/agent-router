@@ -113,6 +113,16 @@ fn official_grok_billing_log_reads_the_newest_plus_weekly_usage() {
 }
 
 #[test]
+fn official_grok_billing_log_reads_the_newest_heavy_weekly_usage() {
+    let headroom = grok_headroom_in(&fixture("grok-billing-heavy.jsonl"), NOW);
+
+    assert_eq!(headroom.weekly_pct, 1.0);
+    assert_eq!(headroom.weekly_reset_epoch, RESET);
+    assert!(headroom.weekly_capacity_known);
+    assert!(!headroom.stale);
+}
+
+#[test]
 fn grok_billing_finds_event_before_a_suffix_larger_than_one_mib() {
     let directory = tempfile::tempdir().expect("temporary Grok log");
     let path = directory.path().join("unified.jsonl");

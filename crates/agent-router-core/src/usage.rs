@@ -271,19 +271,31 @@ where
     }
 }
 
-/// PURE except for reading `path`: the newest official weekly SuperGrok Plus billing event.
+/// PURE except for reading `path`: the newest official weekly paid SuperGrok billing event.
 pub fn grok_headroom_in(path: &Path, now: i64) -> Headroom {
     grok_headroom_from_log(path, now)
+}
+
+fn grok_paid_weekly_display_tier(tier: &str) -> bool {
+    matches!(tier, "SuperGrok Plus" | "SuperGrok Heavy")
+}
+
+fn grok_display_tier_from_api(tier: &str) -> Option<&'static str> {
+    match tier {
+        "SuperGrokPlus" => Some("SuperGrok Plus"),
+        "SuperGrokPro" => Some("SuperGrok Heavy"),
+        _ => None,
+    }
 }
 
 fn grok_headroom_from_log(path: &Path, now: i64) -> Headroom {
     let Some(value) = newest_grok_billing_event(path) else {
         return Headroom::closed();
     };
-    if value
+    if !value
         .pointer("/ctx/subscriptionTier")
         .and_then(serde_json::Value::as_str)
-        != Some("SuperGrok Plus")
+        .is_some_and(grok_paid_weekly_display_tier)
         || value
             .pointer("/ctx/config/currentPeriod/type")
             .and_then(serde_json::Value::as_str)
@@ -364,7 +376,7 @@ fn grok_billing_event_from_reversed_line(line: &mut [u8]) -> Option<serde_json::
 
 fn parse_grok_cache(body: &str, now: i64) -> Option<Headroom> {
     let cache: GrokUsageCache = serde_json::from_str(body).ok()?;
-    if cache.tier != "SuperGrok Plus"
+    if !grok_paid_weekly_display_tier(&cache.tier)
         || !valid_grok_percentage(cache.weekly_percent)
         || cache.weekly_reset <= now
     {
@@ -493,13 +505,10 @@ fn parse_live_grok_usage(
 ) -> Option<(Headroom, GrokUsageCache)> {
     let billing: serde_json::Value = serde_json::from_str(billing).ok()?;
     let user: serde_json::Value = serde_json::from_str(user).ok()?;
-    if user
+    let display_tier = user
         .get("subscriptionTier")
         .and_then(serde_json::Value::as_str)
-        != Some("SuperGrokPlus")
-    {
-        return None;
-    }
+        .and_then(grok_display_tier_from_api)?;
     let config = billing.get("config")?.as_object()?;
     if config
         .get("currentPeriod")?
@@ -525,7 +534,7 @@ fn parse_live_grok_usage(
     Some((
         headroom,
         GrokUsageCache {
-            tier: "SuperGrok Plus".to_string(),
+            tier: display_tier.to_string(),
             weekly_percent,
             weekly_reset: reset,
             source_ts: format_rfc3339_utc(now),
@@ -1651,6 +1660,74 @@ mod tests {
             usage.headroom.weekly_capacity_known,
             "the live billing endpoint's absent percent is an authoritative zero"
         );
+    }
+
+    const GROK_USER_HEAVY: &str = r#"{"subscriptionTier":"SuperGrokPro"}"#;
+
+    #[test]
+    fn grok_live_supergrok_pro_normalizes_to_heavy_display_tier() {
+        let directory = tempfile::tempdir().expect("temporary Grok usage paths");
+        let cache = directory.path().join("new-grok-usage-cache.json");
+        let log = directory.path().join("no-log.jsonl");
+
+        let usage = grok_usage_in(&cache, &log, 1_787_313_600, false, || {
+            Some((GROK_BILLING.to_string(), GROK_USER_HEAVY.to_string()))
+        });
+
+        assert_eq!(usage.source, GrokUsageSource::Live);
+        assert_eq!(usage.headroom.weekly_pct, 37.5);
+        assert!(usage.headroom.weekly_capacity_known);
+        let written: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&cache).expect("read normalized Heavy cache"),
+        )
+        .expect("cache is normalized JSON");
+        assert_eq!(written["tier"], "SuperGrok Heavy");
+        assert_eq!(written["weekly_percent"], 37.5);
+    }
+
+    #[test]
+    fn grok_cache_accepts_heavy_display_tier() {
+        let directory = tempfile::tempdir().expect("temporary Grok cache");
+        let cache = directory.path().join("grok-usage-cache.json");
+        let log = directory.path().join("no-log.jsonl");
+        write_grok_cache(
+            &cache,
+            br#"{"tier":"SuperGrok Heavy","weekly_percent":1.0,"weekly_reset":1787356800,"source_ts":"2026-08-21T16:35:37Z"}"#,
+        )
+        .expect("seed Heavy cache");
+
+        let usage = grok_usage_in(&cache, &log, 1_787_313_600, true, || None);
+
+        assert_eq!(usage.source, GrokUsageSource::Cache);
+        assert_eq!(usage.headroom.weekly_pct, 1.0);
+        assert!(usage.headroom.weekly_capacity_known);
+    }
+
+    #[test]
+    fn grok_log_accepts_heavy_display_tier() {
+        let directory = tempfile::tempdir().expect("temporary Grok log");
+        let log_path = directory.path().join("unified.jsonl");
+        let event = serde_json::json!({
+            "msg": "billing: fetched credits config",
+            "ctx": {
+                "subscriptionTier": "SuperGrok Heavy",
+                "config": {
+                    "currentPeriod": {
+                        "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                        "end": "2026-08-22T00:00:00+00:00",
+                    },
+                    "creditUsagePercent": 1.0,
+                },
+            },
+        });
+        std::fs::write(&log_path, format!("{event}\n")).expect("write Heavy billing event");
+
+        let usage = grok_headroom_in(&log_path, 1_787_313_600);
+
+        assert_eq!(usage.weekly_pct, 1.0);
+        assert_eq!(usage.weekly_reset_epoch, 1_787_356_800);
+        assert!(usage.weekly_capacity_known);
+        assert!(!usage.stale);
     }
 
     #[cfg(unix)]
