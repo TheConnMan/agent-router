@@ -1,5 +1,5 @@
 use agent_router_core::doctor::Health;
-use agent_router_core::log::{DecisionLog, Row};
+use agent_router_core::log::{DecisionLog, ReviewEntry, Row};
 use agent_router_core::parity::{Difference, GlobalReport, ParityReport, ServerProjection, Status};
 use agent_router_core::run::{Outcome, Request};
 use agent_router_core::stats::{Rate, Stats, Window};
@@ -153,17 +153,19 @@ fn adversarial_review_exit(
     let primary_provider = match agent_router_core::run::parse_provider(&primary) {
         Ok(Some(provider)) => provider.name(),
         Ok(None) => {
-            return print_adversarial_review(
+            return finish_adversarial_review(
                 &agent_router_core::adversarial_review::failed_outcome(
                     &primary,
                     "primary provider must be codex, claude, or grok",
                 ),
+                None,
                 json,
             );
         }
         Err(error) => {
-            return print_adversarial_review(
+            return finish_adversarial_review(
                 &agent_router_core::adversarial_review::failed_outcome(&primary, error.to_string()),
+                None,
                 json,
             );
         }
@@ -173,11 +175,12 @@ fn adversarial_review_exit(
         None => match std::env::current_dir() {
             Ok(dir) => dir,
             Err(error) => {
-                return print_adversarial_review(
+                return finish_adversarial_review(
                     &agent_router_core::adversarial_review::failed_outcome(
                         primary_provider,
                         error.to_string(),
                     ),
+                    None,
                     json,
                 );
             }
@@ -186,11 +189,12 @@ fn adversarial_review_exit(
     let config = match agent_router_core::Config::load() {
         Ok(config) => config,
         Err(error) => {
-            return print_adversarial_review(
+            return finish_adversarial_review(
                 &agent_router_core::adversarial_review::failed_outcome(
                     primary_provider,
                     error.to_string(),
                 ),
+                Some(&dir),
                 json,
             );
         }
@@ -201,7 +205,46 @@ fn adversarial_review_exit(
         dir: &dir,
     };
     let outcome = agent_router_core::adversarial_review::review_registered(&request, &config);
-    print_adversarial_review(&outcome, json)
+    finish_adversarial_review(&outcome, Some(&dir), json)
+}
+
+/// Persist one reviews row, then print. A write failure is swallowed so it cannot change the
+/// review's exit code or output.
+fn finish_adversarial_review(
+    outcome: &agent_router_core::adversarial_review::ReviewOutcome,
+    dir: Option<&Path>,
+    json: bool,
+) -> std::process::ExitCode {
+    persist_adversarial_review(outcome, dir);
+    print_adversarial_review(outcome, json)
+}
+
+fn persist_adversarial_review(
+    outcome: &agent_router_core::adversarial_review::ReviewOutcome,
+    dir: Option<&Path>,
+) {
+    let exit_status = match outcome.status {
+        agent_router_core::adversarial_review::ReviewStatus::Completed => 0,
+        agent_router_core::adversarial_review::ReviewStatus::Skipped => 3,
+        agent_router_core::adversarial_review::ReviewStatus::Failed => 1,
+    };
+    let usage_provenance =
+        serde_json::to_string(&outcome.usage_provenance).unwrap_or_else(|_| "[]".to_string());
+    let body_bytes =
+        i64::try_from(outcome.result.as_deref().map_or(0, str::len)).unwrap_or(i64::MAX);
+    let dir = dir.unwrap_or(Path::new(""));
+    let _ = DecisionLog::open().and_then(|log| {
+        log.record_review(&ReviewEntry {
+            exit_status,
+            primary: &outcome.primary_provider,
+            reviewer_provider: outcome.reviewer_provider.as_deref(),
+            reviewer_model: outcome.reviewer_model.as_deref(),
+            usage_provenance: &usage_provenance,
+            rationale: &outcome.rationale,
+            body_bytes,
+            dir,
+        })
+    });
 }
 
 fn print_adversarial_review(

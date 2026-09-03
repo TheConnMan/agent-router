@@ -1,6 +1,6 @@
-//! The decision log: one SQLite row per routing decision at
-//! `~/.local/state/agent-router/router.db`. This is the tuning data for the heuristic and the
-//! answer to "why did this route here".
+//! The SQLite log at `~/.local/state/agent-router/router.db`: one `decisions` row per routing
+//! decision, and one `reviews` row per adversarial review. `decisions` is the tuning data for the
+//! heuristic and the answer to "why did this route here".
 
 use crate::decide::Decision;
 use crate::error::{Error, Result};
@@ -28,6 +28,34 @@ pub struct Entry<'a> {
     /// fact from the effort the router decided. None where the backend says nothing, which is every
     /// claude and grok dispatch and every dry run.
     pub effective_effort: Option<&'a str>,
+}
+
+/// One adversarial-review row to write: the outcome fields the CLI exit site can produce.
+#[derive(Debug, Clone)]
+pub struct ReviewEntry<'a> {
+    pub exit_status: i64,
+    pub primary: &'a str,
+    pub reviewer_provider: Option<&'a str>,
+    pub reviewer_model: Option<&'a str>,
+    pub usage_provenance: &'a str,
+    pub rationale: &'a str,
+    pub body_bytes: i64,
+    pub dir: &'a Path,
+}
+
+/// One reviews row read back.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReviewRow {
+    pub id: i64,
+    pub ts: i64,
+    pub exit_status: i64,
+    pub primary: String,
+    pub reviewer_provider: Option<String>,
+    pub reviewer_model: Option<String>,
+    pub usage_provenance: String,
+    pub rationale: String,
+    pub body_bytes: i64,
+    pub dir: String,
 }
 
 /// One row read back, flattened for display.
@@ -238,6 +266,23 @@ CREATE TABLE IF NOT EXISTS decisions (
 CREATE INDEX IF NOT EXISTS decisions_created_at ON decisions(created_at_ms);
 ";
 
+/// A new table, so an existing database picks it up the same way `decisions` did: `CREATE TABLE IF
+/// NOT EXISTS` on open. `"primary"` is quoted because it is a SQLite keyword.
+const REVIEWS_SCHEMA: &str = "\
+CREATE TABLE IF NOT EXISTS reviews (
+    id                  INTEGER PRIMARY KEY,
+    ts                  INTEGER NOT NULL,
+    exit_status         INTEGER NOT NULL,
+    \"primary\"         TEXT    NOT NULL,
+    reviewer_provider   TEXT,
+    reviewer_model      TEXT,
+    usage_provenance    TEXT    NOT NULL,
+    rationale           TEXT    NOT NULL,
+    body_bytes          INTEGER NOT NULL,
+    dir                 TEXT    NOT NULL
+);
+";
+
 /// The retired score columns are still selected, because the rows written under them are the
 /// corpus and reading them back through the tool is the only way to see one.
 const SELECT_COLUMNS: &str = "\
@@ -288,6 +333,7 @@ impl DecisionLog {
         let conn = Connection::open(path)?;
         conn.busy_timeout(std::time::Duration::from_millis(500))?;
         conn.execute_batch(SCHEMA)?;
+        conn.execute_batch(REVIEWS_SCHEMA)?;
         add_missing_columns(&conn)?;
         Ok(DecisionLog { conn })
     }
@@ -374,6 +420,28 @@ impl DecisionLog {
                 ROUTER_VERSION,
                 usage.grok.weekly_known().then_some(usage.grok.weekly_pct),
                 usage.grok.weekly_reset_epoch,
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// IMPURE: append one adversarial-review outcome. Returns its row id.
+    pub fn record_review(&self, entry: &ReviewEntry) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO reviews (
+                ts, exit_status, \"primary\", reviewer_provider, reviewer_model,
+                usage_provenance, rationale, body_bytes, dir
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                now_ms(),
+                entry.exit_status,
+                entry.primary,
+                entry.reviewer_provider,
+                entry.reviewer_model,
+                entry.usage_provenance,
+                entry.rationale,
+                entry.body_bytes,
+                entry.dir.to_string_lossy(),
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -568,6 +636,32 @@ impl DecisionLog {
                 })
             })?
             .collect::<rusqlite::Result<Vec<Row>>>()?;
+        Ok(rows)
+    }
+
+    /// The `limit` newest adversarial reviews, newest first.
+    pub fn recent_reviews(&self, limit: usize) -> Result<Vec<ReviewRow>> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, ts, exit_status, \"primary\", reviewer_provider, reviewer_model, \
+             usage_provenance, rationale, body_bytes, dir \
+             FROM reviews ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = statement
+            .query_map([i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
+                Ok(ReviewRow {
+                    id: row.get(0)?,
+                    ts: row.get(1)?,
+                    exit_status: row.get(2)?,
+                    primary: row.get(3)?,
+                    reviewer_provider: row.get(4)?,
+                    reviewer_model: row.get(5)?,
+                    usage_provenance: row.get(6)?,
+                    rationale: row.get(7)?,
+                    body_bytes: row.get(8)?,
+                    dir: row.get(9)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<ReviewRow>>>()?;
         Ok(rows)
     }
 }
@@ -1204,5 +1298,67 @@ mod tests {
         }
         let reopened = DecisionLog::open_at(&path).expect("reopens");
         assert_eq!(reopened.recent(10).expect("reads").len(), 1);
+    }
+
+    /// A database that only has `decisions` gains `reviews` on open, keeps its decision rows, and
+    /// can record a review afterwards. This is the migration an existing router.db takes.
+    #[test]
+    fn an_existing_database_gains_the_reviews_table_and_keeps_its_decision_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("router.db");
+        {
+            let conn = rusqlite::Connection::open(&path).expect("create older database");
+            conn.execute_batch(SCHEMA).expect("decisions schema only");
+            conn.execute(
+                "INSERT INTO decisions (
+                    created_at_ms, task, dir, requested, provider, gates, rationale,
+                    claude_five_hour_pct, claude_five_hour_reset, claude_weekly_pct,
+                    claude_weekly_reset, codex_five_hour_pct, codex_five_hour_reset,
+                    codex_weekly_pct, codex_weekly_reset, dry_run, outcome
+                ) VALUES (1, 'older row', '/tmp', 'auto', 'codex', '', 'why', 0, 0, 0, 0, 0, 0, \
+                 0, 0, 1, 'dry-run')",
+                [],
+            )
+            .expect("older row");
+            let names: Vec<String> = conn
+                .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+                .expect("list tables")
+                .query_map([], |row| row.get(0))
+                .expect("query")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("names");
+            assert_eq!(names, vec!["decisions"]);
+        }
+
+        let log = DecisionLog::open_at(&path).expect("migrates on open");
+        let rows = log.recent(10).expect("reads the older row back");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].task, "older row");
+
+        log.record_review(&ReviewEntry {
+            exit_status: 0,
+            primary: "codex",
+            reviewer_provider: Some("claude"),
+            reviewer_model: Some("opus"),
+            usage_provenance: "[]",
+            rationale: "picked claude",
+            body_bytes: 4,
+            dir: Path::new("/tmp"),
+        })
+        .expect("records a review");
+
+        let reviews = log.recent_reviews(10).expect("reads reviews");
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0].exit_status, 0);
+        assert_eq!(reviews[0].primary, "codex");
+        assert_eq!(reviews[0].reviewer_provider.as_deref(), Some("claude"));
+        assert_eq!(reviews[0].reviewer_model.as_deref(), Some("opus"));
+        assert_eq!(reviews[0].usage_provenance, "[]");
+        assert_eq!(reviews[0].rationale, "picked claude");
+        assert_eq!(reviews[0].body_bytes, 4);
+        assert_eq!(reviews[0].dir, "/tmp");
+        assert!(reviews[0].ts > 0);
+
+        DecisionLog::open_at(&path).expect("reopens");
     }
 }

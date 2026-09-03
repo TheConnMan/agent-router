@@ -572,7 +572,7 @@ See [docs/configuration.md](docs/configuration.md) for the full reference.
 | --- | --- |
 | `~/.config/agent-router/config.toml` | Routing policy, ceilings, model tiers, connector inventory, parity roots and exceptions. |
 | `/tmp/grok-usage-cache.json` | Normalized, non-secret Grok billing cache. Override with `$GROK_USAGE_CACHE`; Agent Router is its sole writer. |
-| `~/.local/state/agent-router/router.db` | SQLite decision log. Holds full task text, so its directory is created mode `0700`. |
+| `~/.local/state/agent-router/router.db` | SQLite log. `decisions` holds routing decisions including full task text; `reviews` holds one row per adversarial review. The directory is created mode `0700`. |
 | `~/.local/state/agent-router/logs/` | Per dispatch stdout and stderr from detached jobs. |
 
 ## Development

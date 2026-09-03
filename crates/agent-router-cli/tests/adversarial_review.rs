@@ -3,8 +3,10 @@
 #[path = "../../agent-router-core/tests/common/mod.rs"]
 mod common;
 
+use agent_router_core::log::{DecisionLog, ReviewRow};
 use serde_json::{Value, json};
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -196,6 +198,19 @@ impl ReviewFixture {
 
     fn grok_home(&self) -> PathBuf {
         self.root.path.join("grok-home")
+    }
+
+    fn db_path(&self) -> PathBuf {
+        self.root
+            .path
+            .join("home/.local/state/agent-router/router.db")
+    }
+
+    fn reviews(&self) -> Vec<ReviewRow> {
+        DecisionLog::open_at(&self.db_path())
+            .expect("open the fixture log")
+            .recent_reviews(10)
+            .expect("read reviews")
     }
 
     fn command(&self) -> Command {
@@ -553,4 +568,52 @@ fn invocation_failure_returns_json_failure_and_exit_one() {
     assert_eq!(value["result"], Value::Null);
     assert!(!fixture.codex_log.exists());
     assert!(!argv(&fixture.claude_log).is_empty());
+}
+
+#[test]
+fn a_review_exit_writes_one_reviews_row() {
+    let fixture = ReviewFixture::new("persist review", Some(23.0));
+    let output = fixture.run_json();
+    assert_exit(&output, 0);
+    let value = parse_json(&output);
+
+    let rows = fixture.reviews();
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(row.exit_status, 0);
+    assert_eq!(row.primary, "codex");
+    assert_eq!(row.reviewer_provider.as_deref(), Some("claude"));
+    assert_eq!(
+        row.reviewer_model.as_deref(),
+        value["reviewer_model"].as_str()
+    );
+    assert_eq!(row.rationale, value["rationale"].as_str().unwrap());
+    assert_eq!(
+        row.body_bytes,
+        i64::try_from(value["result"].as_str().unwrap().len()).unwrap()
+    );
+    assert_eq!(row.dir, fixture.cwd.to_string_lossy());
+    assert!(row.ts > 0);
+    let provenance: Value = serde_json::from_str(&row.usage_provenance).expect("provenance json");
+    assert_eq!(provenance, value["usage_provenance"]);
+}
+
+#[test]
+fn a_read_only_reviews_db_does_not_change_the_review_exit_status() {
+    let fixture = ReviewFixture::new("readonly reviews db", Some(23.0));
+    DecisionLog::open_at(&fixture.db_path()).expect("create the fixture log");
+    fs::set_permissions(fixture.db_path(), fs::Permissions::from_mode(0o444))
+        .expect("make the log read only");
+
+    let output = fixture.run_json();
+    assert_exit(&output, 0);
+    let value = parse_json(&output);
+    assert_eq!(value["status"], "completed");
+    assert_eq!(value["result"], "completed review body");
+
+    let reviews = DecisionLog::open_at(&fixture.db_path())
+        .expect("reopen the read only log")
+        .recent_reviews(10)
+        .expect("read reviews");
+    assert!(reviews.is_empty());
 }
