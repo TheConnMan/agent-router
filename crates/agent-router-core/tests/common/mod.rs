@@ -9,7 +9,9 @@
 #![cfg(unix)]
 #![allow(dead_code)]
 
+use agent_router_core::Context;
 use agent_router_core::binary::Environment;
+use agent_router_core::config::Config;
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -178,4 +180,18 @@ pub fn stripped_environment(root: Option<&Path>) -> Environment {
         None => Environment::new(None, None, BTreeMap::new()),
     }
     .with_system_fallbacks(no_system_fallbacks)
+}
+
+/// A Context over a stripped environment, with HOME under `root/home` and default config.
+pub fn stripped_context(root: &Path) -> Context {
+    Context::new(
+        stripped_environment(Some(root)),
+        root.join("home"),
+        Config::default(),
+    )
+}
+
+/// A Context from an explicit environment, home, and config.
+pub fn context(environment: Environment, home: PathBuf, config: Config) -> Context {
+    Context::new(environment, home, config)
 }

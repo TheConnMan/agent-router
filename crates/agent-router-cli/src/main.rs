@@ -122,34 +122,53 @@ enum Command {
     },
 }
 
+enum CliStatus {
+    Success,
+    Failure,
+    Unrunnable,
+    ReviewSkipped,
+}
+
+fn exit_code(status: CliStatus) -> std::process::ExitCode {
+    match status {
+        CliStatus::Success => std::process::ExitCode::SUCCESS,
+        CliStatus::Failure => std::process::ExitCode::FAILURE,
+        CliStatus::Unrunnable => std::process::ExitCode::from(2),
+        CliStatus::ReviewSkipped => std::process::ExitCode::from(3),
+    }
+}
+
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
-    match cli.command {
-        Command::Doctor => doctor_exit(),
-        Command::Parity { roots, json } => parity_exit(roots, json),
-        Command::Status { limit, since, json } => status_exit(limit, since, json),
+    let mut ctx = agent_router_core::Context::from_process();
+    let status = match cli.command {
+        Command::Doctor => doctor_status(&ctx),
+        Command::Parity { roots, json } => parity_status(&mut ctx, roots, json),
+        Command::Status { limit, since, json } => status_status(&ctx, limit, since, json),
         Command::AdversarialReview {
             request,
             primary,
             dir,
             json,
-        } => adversarial_review_exit(request, primary, dir, json),
-        command => match run(Cli { command }) {
-            Ok(()) => std::process::ExitCode::SUCCESS,
+        } => adversarial_review_status(&mut ctx, request, primary, dir, json),
+        command => match run(Cli { command }, &mut ctx) {
+            Ok(()) => CliStatus::Success,
             Err(e) => {
                 eprintln!("agent-router: {e}");
-                std::process::ExitCode::FAILURE
+                CliStatus::Failure
             }
         },
-    }
+    };
+    exit_code(status)
 }
 
-fn adversarial_review_exit(
+fn adversarial_review_status(
+    ctx: &mut agent_router_core::Context,
     body: String,
     primary: String,
     dir: Option<PathBuf>,
     json: bool,
-) -> std::process::ExitCode {
+) -> CliStatus {
     let primary_provider = match agent_router_core::run::parse_provider(&primary) {
         Ok(Some(provider)) => provider.name(),
         Ok(None) => {
@@ -160,6 +179,7 @@ fn adversarial_review_exit(
                 ),
                 None,
                 json,
+                ctx,
             );
         }
         Err(error) => {
@@ -167,6 +187,7 @@ fn adversarial_review_exit(
                 &agent_router_core::adversarial_review::failed_outcome(&primary, error.to_string()),
                 None,
                 json,
+                ctx,
             );
         }
     };
@@ -182,30 +203,29 @@ fn adversarial_review_exit(
                     ),
                     None,
                     json,
+                    ctx,
                 );
             }
         },
     };
-    let config = match agent_router_core::Config::load() {
-        Ok(config) => config,
-        Err(error) => {
-            return finish_adversarial_review(
-                &agent_router_core::adversarial_review::failed_outcome(
-                    primary_provider,
-                    error.to_string(),
-                ),
-                Some(&dir),
-                json,
-            );
-        }
-    };
+    if let Err(error) = ctx.load_config() {
+        return finish_adversarial_review(
+            &agent_router_core::adversarial_review::failed_outcome(
+                primary_provider,
+                error.to_string(),
+            ),
+            Some(&dir),
+            json,
+            ctx,
+        );
+    }
     let request = agent_router_core::adversarial_review::ReviewRequest {
         primary_provider,
         body: &body,
         dir: &dir,
     };
-    let outcome = agent_router_core::adversarial_review::review_registered(&request, &config);
-    finish_adversarial_review(&outcome, Some(&dir), json)
+    let outcome = agent_router_core::adversarial_review::review_registered(&request, ctx);
+    finish_adversarial_review(&outcome, Some(&dir), json, ctx)
 }
 
 /// Persist one reviews row, then print. A write failure is swallowed so it cannot change the
@@ -214,14 +234,16 @@ fn finish_adversarial_review(
     outcome: &agent_router_core::adversarial_review::ReviewOutcome,
     dir: Option<&Path>,
     json: bool,
-) -> std::process::ExitCode {
-    persist_adversarial_review(outcome, dir);
+    ctx: &agent_router_core::Context,
+) -> CliStatus {
+    persist_adversarial_review(outcome, dir, ctx);
     print_adversarial_review(outcome, json)
 }
 
 fn persist_adversarial_review(
     outcome: &agent_router_core::adversarial_review::ReviewOutcome,
     dir: Option<&Path>,
+    ctx: &agent_router_core::Context,
 ) {
     let exit_status = match outcome.status {
         agent_router_core::adversarial_review::ReviewStatus::Completed => 0,
@@ -233,7 +255,7 @@ fn persist_adversarial_review(
     let body_bytes =
         i64::try_from(outcome.result.as_deref().map_or(0, str::len)).unwrap_or(i64::MAX);
     let dir = dir.unwrap_or(Path::new(""));
-    let _ = DecisionLog::open().and_then(|log| {
+    let _ = DecisionLog::open_in(&ctx.home).and_then(|log| {
         log.record_review(&ReviewEntry {
             exit_status,
             primary: &outcome.primary_provider,
@@ -250,7 +272,7 @@ fn persist_adversarial_review(
 fn print_adversarial_review(
     outcome: &agent_router_core::adversarial_review::ReviewOutcome,
     json: bool,
-) -> std::process::ExitCode {
+) -> CliStatus {
     if json {
         println!(
             "{}",
@@ -277,22 +299,16 @@ fn print_adversarial_review(
     }
 
     match outcome.status {
-        agent_router_core::adversarial_review::ReviewStatus::Completed => {
-            std::process::ExitCode::SUCCESS
-        }
-        agent_router_core::adversarial_review::ReviewStatus::Skipped => {
-            std::process::ExitCode::from(3)
-        }
-        agent_router_core::adversarial_review::ReviewStatus::Failed => {
-            std::process::ExitCode::FAILURE
-        }
+        agent_router_core::adversarial_review::ReviewStatus::Completed => CliStatus::Success,
+        agent_router_core::adversarial_review::ReviewStatus::Skipped => CliStatus::ReviewSkipped,
+        agent_router_core::adversarial_review::ReviewStatus::Failed => CliStatus::Failure,
     }
 }
 
 /// Doctor owns its exit code the same way parity does: a failing check is reported by exiting
 /// nonzero, not by an error, since the report itself is the output.
-fn doctor_exit() -> std::process::ExitCode {
-    let report = agent_router_core::doctor::run();
+fn doctor_status(ctx: &agent_router_core::Context) -> CliStatus {
+    let report = agent_router_core::doctor::run(ctx);
     for check in &report.checks {
         println!(
             "{:<4} {:<19} {}",
@@ -302,9 +318,9 @@ fn doctor_exit() -> std::process::ExitCode {
         );
     }
     if report.failed() {
-        std::process::ExitCode::FAILURE
+        CliStatus::Failure
     } else {
-        std::process::ExitCode::SUCCESS
+        CliStatus::Success
     }
 }
 
@@ -316,19 +332,19 @@ fn health_label(health: Health) -> &'static str {
     }
 }
 
-fn parity_exit(roots: Vec<PathBuf>, json: bool) -> std::process::ExitCode {
-    let config = match agent_router_core::Config::load() {
-        Ok(config) => config,
-        Err(error) => {
-            eprintln!(
-                "agent-router: parity configuration error: {}",
-                escape_terminal_controls(&error.to_string())
-            );
-            return std::process::ExitCode::from(2);
-        }
-    };
-    let home = agent_router_core::runtime::home_dir();
-    let report = match agent_router_core::parity::check(&roots, &config, &home) {
+fn parity_status(
+    ctx: &mut agent_router_core::Context,
+    roots: Vec<PathBuf>,
+    json: bool,
+) -> CliStatus {
+    if let Err(error) = ctx.load_config() {
+        eprintln!(
+            "agent-router: parity configuration error: {}",
+            escape_terminal_controls(&error.to_string())
+        );
+        return CliStatus::Unrunnable;
+    }
+    let report = match agent_router_core::parity::check(&roots, &ctx.config, &ctx.home) {
         Ok(report) => report,
         Err(error) => {
             eprintln!(
@@ -336,7 +352,7 @@ fn parity_exit(roots: Vec<PathBuf>, json: bool) -> std::process::ExitCode {
                  .codex/config.toml: {}",
                 escape_terminal_controls(&error.to_string())
             );
-            return std::process::ExitCode::from(2);
+            return CliStatus::Unrunnable;
         }
     };
 
@@ -351,25 +367,30 @@ fn parity_exit(roots: Vec<PathBuf>, json: bool) -> std::process::ExitCode {
     }
 
     match report.status() {
-        Status::Aligned | Status::Intentional => std::process::ExitCode::SUCCESS,
-        Status::Drift => std::process::ExitCode::FAILURE,
+        Status::Aligned | Status::Intentional => CliStatus::Success,
+        Status::Drift => CliStatus::Failure,
     }
 }
 
 /// Status owns its exit code the way doctor and parity do, because the report is the output: 0 when
 /// nothing in the window is known to have failed, 1 when something is, and 2 when the command could
 /// not run at all. An `unknown` never moves it, since an absence of information is not a finding.
-fn status_exit(limit: usize, since: Option<String>, json: bool) -> std::process::ExitCode {
+fn status_status(
+    ctx: &agent_router_core::Context,
+    limit: usize,
+    since: Option<String>,
+    json: bool,
+) -> CliStatus {
     let since_ms = match since.as_deref().map(agent_router_core::stats::parse_since) {
         Some(Ok(lookback)) => Some(agent_router_core::runtime::now_ms() - lookback),
         Some(Err(error)) => return status_unrunnable(&error),
         None => None,
     };
-    let log = match DecisionLog::open() {
+    let log = match DecisionLog::open_in(&ctx.home) {
         Ok(log) => log,
         Err(error) => return status_unrunnable(&error),
     };
-    let report = match agent_router_core::status::reconcile(&log, Window { limit, since_ms }) {
+    let report = match agent_router_core::status::reconcile(ctx, &log, Window { limit, since_ms }) {
         Ok(report) => report,
         Err(error) => return status_unrunnable(&error),
     };
@@ -385,19 +406,19 @@ fn status_exit(limit: usize, since: Option<String>, json: bool) -> std::process:
     }
 
     if report.failed() {
-        std::process::ExitCode::FAILURE
+        CliStatus::Failure
     } else {
-        std::process::ExitCode::SUCCESS
+        CliStatus::Success
     }
 }
 
 /// A command that never ran exits 2, which is a different fact from a window carrying a failure.
-fn status_unrunnable(error: &agent_router_core::Error) -> std::process::ExitCode {
+fn status_unrunnable(error: &agent_router_core::Error) -> CliStatus {
     eprintln!(
         "agent-router: status could not run: {}",
         escape_terminal_controls(&error.to_string())
     );
-    std::process::ExitCode::from(2)
+    CliStatus::Unrunnable
 }
 
 fn status_json(report: &Report) -> serde_json::Value {
@@ -454,7 +475,7 @@ fn trace_label(traced: Option<bool>) -> &'static str {
     }
 }
 
-fn run(cli: Cli) -> agent_router_core::Result<()> {
+fn run(cli: Cli, ctx: &mut agent_router_core::Context) -> agent_router_core::Result<()> {
     match cli.command {
         Command::Run {
             task,
@@ -468,6 +489,7 @@ fn run(cli: Cli) -> agent_router_core::Result<()> {
             strict_mcp_config,
             json,
         } => route(
+            ctx,
             task,
             dir,
             provider,
@@ -479,14 +501,14 @@ fn run(cli: Cli) -> agent_router_core::Result<()> {
             strict_mcp_config,
             json,
         ),
-        Command::Usage { json } => usage(json),
+        Command::Usage { json } => usage(ctx, json),
         Command::Log {
             limit,
             mark,
             note,
             json,
-        } => log(limit, &mark, note.as_deref(), json),
-        Command::Stats { limit, since, json } => stats(limit, since, json),
+        } => log(ctx, limit, &mark, note.as_deref(), json),
+        Command::Stats { limit, since, json } => stats(ctx, limit, since, json),
         Command::AdversarialReview { .. } => {
             unreachable!("adversarial review has a command specific exit path")
         }
@@ -661,6 +683,7 @@ fn kind_label(difference: &Difference) -> &'static str {
 // Parameters are the run subcommand's clap flags passed straight through, so the count tracks the CLI surface.
 #[allow(clippy::too_many_arguments)]
 fn route(
+    ctx: &mut agent_router_core::Context,
     task: String,
     dir: Option<PathBuf>,
     provider: String,
@@ -676,7 +699,7 @@ fn route(
         Some(dir) => dir,
         None => std::env::current_dir()?,
     };
-    let config = agent_router_core::Config::load()?;
+    ctx.load_config()?;
     let request = Request {
         task: &task,
         dir: &dir,
@@ -688,11 +711,11 @@ fn route(
         mcp_configs,
         strict_mcp_config,
     };
-    let outcome = agent_router_core::run::run(&request, &config)?;
+    let outcome = agent_router_core::run::run(&request, ctx)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&outcome_json(&outcome))?);
     } else {
-        print_outcome(&outcome);
+        print_outcome(&outcome, ctx);
     }
     Ok(())
 }
@@ -718,7 +741,7 @@ fn outcome_json(outcome: &Outcome) -> serde_json::Value {
     })
 }
 
-fn print_outcome(outcome: &Outcome) {
+fn print_outcome(outcome: &Outcome, ctx: &agent_router_core::Context) {
     let decision = &outcome.decision;
     let mut line = decision.provider.name().to_string();
     if let Some(classification) = &decision.classification {
@@ -749,11 +772,11 @@ fn print_outcome(outcome: &Outcome) {
         print_estimate(estimate);
     }
     match (outcome.log_id, &outcome.log_error) {
-        (Some(id), _) => println!("log: row {id} in {}", db_path()),
+        (Some(id), _) => println!("log: row {id} in {}", db_path(ctx)),
         // The job is running regardless, so this is a warning on stderr, not a failure.
         (None, error) => eprintln!(
             "log: NOT RECORDED in {}: {}",
-            db_path(),
+            db_path(ctx),
             error.as_deref().unwrap_or("unknown error")
         ),
     }
@@ -776,14 +799,12 @@ fn print_estimate(estimate: &agent_router_core::estimate::Estimate) {
     }
 }
 
-fn db_path() -> String {
-    agent_router_core::log::default_db_path()
-        .display()
-        .to_string()
+fn db_path(ctx: &agent_router_core::Context) -> String {
+    ctx.db_path().display().to_string()
 }
 
-fn usage(json: bool) -> agent_router_core::Result<()> {
-    let (snapshot, grok_source) = agent_router_core::UsageSnapshot::read_with_grok_source();
+fn usage(ctx: &agent_router_core::Context, json: bool) -> agent_router_core::Result<()> {
+    let (snapshot, grok_source) = agent_router_core::UsageSnapshot::read_with_grok_source(ctx);
     if json {
         println!("{}", serde_json::to_string_pretty(&snapshot)?);
         return Ok(());
@@ -825,6 +846,7 @@ fn weekly_label(headroom: &agent_router_core::Headroom) -> String {
 }
 
 fn log(
+    ctx: &agent_router_core::Context,
     limit: usize,
     mark: &[String],
     note: Option<&str>,
@@ -841,7 +863,7 @@ fn log(
                     .to_string(),
             ));
         }
-        return mark_row(mark, note);
+        return mark_row(ctx, mark, note);
     }
     // A note with nothing to attach it to is refused rather than dropped, mirroring the rule that
     // --model requires an explicit --provider: a caller passing a note believes it recorded one.
@@ -850,7 +872,7 @@ fn log(
             "--note requires --mark: a note is the reason for one row's judgement".to_string(),
         ));
     }
-    let rows = DecisionLog::open()?.recent(limit)?;
+    let rows = DecisionLog::open_in(&ctx.home)?.recent(limit)?;
     if json {
         let rows: Vec<serde_json::Value> = rows.iter().map(row_json).collect();
         println!("{}", serde_json::to_string_pretty(&rows)?);
@@ -893,7 +915,11 @@ fn log(
 /// `--mark` short circuits: it records one judgement and prints one confirmation line, rather than
 /// following it with a listing the caller did not ask for. Every value is validated in core, which
 /// owns the accepted vocabulary and is the only thing that writes the columns.
-fn mark_row(mark: &[String], note: Option<&str>) -> agent_router_core::Result<()> {
+fn mark_row(
+    ctx: &agent_router_core::Context,
+    mark: &[String],
+    note: Option<&str>,
+) -> agent_router_core::Result<()> {
     // clap appends on a repeated option, so a second --mark arrives here as four values rather
     // than as a parse failure. A repeat is a command error like any other, never a panic.
     let [row_id, value] = mark else {
@@ -905,7 +931,7 @@ fn mark_row(mark: &[String], note: Option<&str>) -> agent_router_core::Result<()
     };
     let id = agent_router_core::log::parse_row_id(row_id)?;
     let mark = agent_router_core::log::parse_mark(value)?;
-    DecisionLog::open()?.mark(id, mark, note)?;
+    DecisionLog::open_in(&ctx.home)?.mark(id, mark, note)?;
     println!(
         "#{id} marked {}{}",
         mark.tag(),
@@ -935,7 +961,12 @@ fn judgement_note(note: Option<&str>) -> String {
     }
 }
 
-fn stats(limit: usize, since: Option<String>, json: bool) -> agent_router_core::Result<()> {
+fn stats(
+    ctx: &agent_router_core::Context,
+    limit: usize,
+    since: Option<String>,
+    json: bool,
+) -> agent_router_core::Result<()> {
     let since_ms = match &since {
         Some(window) => {
             let lookback = agent_router_core::stats::parse_since(window)?;
@@ -943,7 +974,7 @@ fn stats(limit: usize, since: Option<String>, json: bool) -> agent_router_core::
         }
         None => None,
     };
-    let log = DecisionLog::open()?;
+    let log = DecisionLog::open_in(&ctx.home)?;
     let stats = agent_router_core::stats::collect(&log, Window { limit, since_ms })?;
     if json {
         println!("{}", serde_json::to_string_pretty(&stats_json(&stats))?);

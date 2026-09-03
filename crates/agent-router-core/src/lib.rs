@@ -5,6 +5,7 @@ pub mod adversarial_review;
 pub mod binary;
 pub mod classify;
 pub mod config;
+pub mod context;
 pub mod decide;
 pub mod dispatch;
 pub mod doctor;
@@ -23,6 +24,7 @@ pub use classify::Classification;
 pub use config::{
     Classifier, ClassifierEngine, Config, ParityConfig, ParityException, ParityKind, Policy,
 };
+pub use context::Context;
 pub use decide::{Decision, Gate};
 pub use error::{Error, Result};
 pub use parity::{Difference, GlobalReport, ParityReport, ServerProjection, Status};

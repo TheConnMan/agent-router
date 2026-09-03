@@ -1,4 +1,5 @@
-use crate::binary::{CLAUDE_BIN_ENV, Environment};
+use crate::binary::CLAUDE_BIN_ENV;
+use crate::context::Context;
 use crate::error::{Error, Result};
 use crate::provider::Provider;
 use crate::run::Dispatch;
@@ -31,36 +32,9 @@ struct AgentRow {
     state: Option<String>,
 }
 
-pub fn dispatch(
-    cwd: &Path,
-    task: &str,
-    name: &str,
-    model: Option<&str>,
-    effort: Option<&str>,
-    mcp_configs: &[PathBuf],
-    strict_mcp_config: bool,
-) -> Result<Dispatch> {
-    dispatch_in(
-        &Environment::from_process(),
-        cwd,
-        task,
-        name,
-        model,
-        effort,
-        mcp_configs,
-        strict_mcp_config,
-    )
-}
-
-/// IMPURE in `environment` only: the seam the stripped-`PATH` regression tests drive.
-///
-/// The resolution happens here rather than inside `dispatch_with_binary`, so a test that strips
-/// `PATH` exercises the real `resolve` on the real code path. A test that only called
-/// `dispatch_with_binary` would stay green with `Path::new("claude")` still at the top of this
-/// function, which is the whole defect.
 #[allow(clippy::too_many_arguments)]
-pub fn dispatch_in(
-    environment: &Environment,
+pub fn dispatch(
+    ctx: &Context,
     cwd: &Path,
     task: &str,
     name: &str,
@@ -69,7 +43,7 @@ pub fn dispatch_in(
     mcp_configs: &[PathBuf],
     strict_mcp_config: bool,
 ) -> Result<Dispatch> {
-    let binary = crate::binary::resolve(Provider::Claude, environment)?;
+    let binary = crate::binary::resolve(Provider::Claude, &ctx.environment)?;
     dispatch_with_binary(
         &binary,
         cwd,
@@ -80,6 +54,7 @@ pub fn dispatch_in(
         mcp_configs,
         strict_mcp_config,
         ID_TIMEOUT,
+        &ctx.home,
     )
 }
 
@@ -94,6 +69,7 @@ pub fn dispatch_with_binary(
     mcp_configs: &[PathBuf],
     strict_mcp_config: bool,
     timeout: Duration,
+    home: &Path,
 ) -> Result<Dispatch> {
     let resolved_configs = resolve_mcp_configs(mcp_configs)?;
 
@@ -116,7 +92,11 @@ pub fn dispatch_with_binary(
         command.arg("--strict-mcp-config");
     }
     command.arg("--name").arg(name).arg(task);
-    spawn_detached(command, &router_log_path("claude"), Some(CLAUDE_BIN_ENV))?;
+    spawn_detached(
+        command,
+        &router_log_path(home, "claude"),
+        Some(CLAUDE_BIN_ENV),
+    )?;
 
     let job_id = resolve_short_id(binary, name, cwd, dispatched_at, timeout);
     Ok(Dispatch {
@@ -202,20 +182,8 @@ fn resolve_short_id(
 /// The `--all` flag on the list below is load bearing: without it the list is running jobs only, so
 /// every finished job would read as absent. The list is still a bounded recent window, so a job
 /// missing from this map is a job the router cannot resolve, never a job that completed.
-pub fn agent_states(timeout: Duration) -> Result<BTreeMap<String, String>> {
-    agent_states_in(&Environment::from_process(), timeout)
-}
-
-/// IMPURE in `environment` only: `agent_states`' resolution seam.
-///
-/// This is a SECOND claude entry point with its own resolution, reached from `status.rs`. Without
-/// it, reconciliation would keep calling `execvp("claude")` while dispatch was fixed, and every job
-/// in the window would read as unresolvable rather than as unread.
-pub fn agent_states_in(
-    environment: &Environment,
-    timeout: Duration,
-) -> Result<BTreeMap<String, String>> {
-    let binary = crate::binary::resolve(Provider::Claude, environment)?;
+pub fn agent_states(ctx: &Context, timeout: Duration) -> Result<BTreeMap<String, String>> {
+    let binary = crate::binary::resolve(Provider::Claude, &ctx.environment)?;
     let rows = list_agents(&binary, timeout)?;
     Ok(rows
         .into_iter()

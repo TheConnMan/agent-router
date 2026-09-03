@@ -4,7 +4,7 @@
 
 use crate::decide::Decision;
 use crate::error::{Error, Result};
-use crate::runtime::{home_dir, now_ms};
+use crate::runtime::now_ms;
 use rusqlite::Connection;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -303,10 +303,10 @@ pub struct DecisionLog {
 }
 
 impl DecisionLog {
-    /// IMPURE: the log at the default path, creating the state directory (0700, it records task
-    /// text) and the schema when absent.
-    pub fn open() -> Result<DecisionLog> {
-        DecisionLog::open_at(&default_db_path())
+    /// IMPURE: the log at the default path under `home`, creating the state directory (0700, it
+    /// records task text) and the schema when absent.
+    pub fn open_in(home: &Path) -> Result<DecisionLog> {
+        DecisionLog::open_at(&default_db_path(home))
     }
 
     pub fn open_at(path: &Path) -> Result<DecisionLog> {
@@ -837,8 +837,8 @@ fn weekly_column(provider: &str) -> Option<&'static str> {
     }
 }
 
-pub fn default_db_path() -> PathBuf {
-    home_dir().join(".local/state/agent-router/router.db")
+pub fn default_db_path(home: &Path) -> PathBuf {
+    home.join(".local/state/agent-router/router.db")
 }
 
 /// The log holds full task text, so its directory is the owner's alone.

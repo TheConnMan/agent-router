@@ -6,10 +6,10 @@
 //! not about the task, and `Classification::unlaunchable` carries it to `decide` so a provider
 //! that cannot start is not handed more work.
 
-use crate::binary::Environment;
-use crate::config::{Classifier, ClassifierEngine, Config};
+use crate::config::{Classifier, ClassifierEngine};
+use crate::context::Context;
 use crate::provider::Provider;
-use crate::runtime::{home_dir, validate_job_name};
+use crate::runtime::validate_job_name;
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -164,35 +164,17 @@ pub struct ClassifiedTask {
 
 /// IMPURE: score `task` with the configured classifier engine. Never fails: an unusable answer
 /// becomes the fallback.
-pub fn classify(task: &str, config: &Config) -> Classification {
-    classify_in(&Environment::from_process(), task, config)
-}
-
-/// IMPURE: score `task` against an explicit environment.
-///
-/// The environment is a parameter rather than a process read so a test can strip `PATH` as data
-/// and still run this exact code path. A test that only injected a binary would prove the argv is
-/// right and prove nothing about whether production resolves at all.
-pub fn classify_in(environment: &Environment, task: &str, config: &Config) -> Classification {
-    classify_with_name_in(environment, task, config).classification
+pub fn classify(ctx: &Context, task: &str) -> Classification {
+    classify_with_name(ctx, task).classification
 }
 
 /// IMPURE: score `task` and ask the same small classifier model for a session title. Never fails:
 /// an unusable score becomes the fallback and an unusable title becomes `None`.
-pub fn classify_with_name(task: &str, config: &Config) -> ClassifiedTask {
-    classify_with_name_in(&Environment::from_process(), task, config)
-}
-
-/// IMPURE: the scoring-and-naming call against an explicit environment. See [`classify_in`].
-pub fn classify_with_name_in(
-    environment: &Environment,
-    task: &str,
-    config: &Config,
-) -> ClassifiedTask {
-    let prompt = classifier_prompt(task, &config.connectors);
-    let timeout = Duration::from_secs(config.classifier_timeout_secs);
-    let engine = config.classifier.engine;
-    let answer = classifier_command_in(environment, &prompt, &config.classifier)
+pub fn classify_with_name(ctx: &Context, task: &str) -> ClassifiedTask {
+    let prompt = classifier_prompt(task, &ctx.config.connectors);
+    let timeout = Duration::from_secs(ctx.config.classifier_timeout_secs);
+    let engine = ctx.config.classifier.engine;
+    let answer = classifier_command_in(ctx, &prompt, &ctx.config.classifier)
         .and_then(|cmd| capture(cmd, engine, timeout));
     let mut scored = match answer {
         Ok(stdout) => match parse_classifier_output_with_name(&stdout, engine) {
@@ -200,7 +182,7 @@ pub fn classify_with_name_in(
                 classification: reconcile_configured_local_capabilities(
                     task,
                     classification,
-                    &config.connectors,
+                    &ctx.config.connectors,
                 ),
                 job_name: job_name.and_then(|name| validate_job_name(task, &name)),
             },
@@ -278,14 +260,18 @@ const fn engine_provider(engine: ClassifierEngine) -> Provider {
 /// A failure here is the unlaunchable case, and it must not escape `classify`, which is documented
 /// as never failing and whose callers rely on that.
 fn classifier_command_in(
-    environment: &Environment,
+    ctx: &Context,
     prompt: &str,
     classifier: &Classifier,
 ) -> std::result::Result<Command, ClassifierFailure> {
     let provider = engine_provider(classifier.engine);
-    let binary = crate::binary::resolve(provider, environment)
+    let binary = crate::binary::resolve(provider, &ctx.environment)
         .map_err(|error| ClassifierFailure::Launch(error.to_string()))?;
-    Ok(classifier_command_with_binary(&binary, prompt, classifier))
+    let mut cmd = classifier_command_with_binary(&binary, prompt, classifier);
+    if ctx.home.is_dir() {
+        cmd.current_dir(&ctx.home);
+    }
+    Ok(cmd)
 }
 
 /// PURE builder: the classifier invocation for the configured engine, against a known binary.
@@ -346,7 +332,6 @@ pub fn claude_classifier_command_with_binary(
         .arg("--safe-mode")
         .arg("--strict-mcp-config")
         .arg(prompt);
-    run_from_home(&mut cmd);
     cmd
 }
 
@@ -406,16 +391,7 @@ pub fn codex_classifier_command_with_binary(
         cmd.arg("--disable").arg(feature);
     }
     cmd.arg(prompt);
-    run_from_home(&mut cmd);
     cmd
-}
-
-/// Run from home, never the task dir: nothing about the task's own project should be loaded.
-fn run_from_home(cmd: &mut Command) {
-    let home = home_dir();
-    if home.is_dir() {
-        cmd.current_dir(&home);
-    }
 }
 
 /// What a session title has to look like, asked for in exactly these words by both prompts below.
@@ -514,19 +490,10 @@ Reply with exactly this JSON object, filled in:
 /// It costs one small-model call, so the caller decides whether the job is worth naming. The
 /// scoring path does not use this: it already has an answer carrying a title, and asking twice
 /// would pay for the title twice.
-pub fn job_name(task: &str, config: &Config) -> Option<String> {
-    job_name_in(&Environment::from_process(), task, config)
-}
-
-/// IMPURE: the naming call against an explicit environment. See [`classify_in`].
-///
-/// A CLI that resolves nowhere returns `None` here rather than propagating: naming is optional by
-/// design, and the job still dispatches under the name the caller derived from the task.
-pub fn job_name_in(environment: &Environment, task: &str, config: &Config) -> Option<String> {
-    let engine = config.classifier.engine;
-    let cmd =
-        classifier_command_in(environment, &job_name_prompt(task), &config.classifier).ok()?;
-    let timeout = Duration::from_secs(config.classifier_timeout_secs);
+pub fn job_name(ctx: &Context, task: &str) -> Option<String> {
+    let engine = ctx.config.classifier.engine;
+    let cmd = classifier_command_in(ctx, &job_name_prompt(task), &ctx.config.classifier).ok()?;
+    let timeout = Duration::from_secs(ctx.config.classifier_timeout_secs);
     let stdout = capture(cmd, engine, timeout).ok()?;
     validate_job_name(task, &parse_job_name(&stdout, engine)?)
 }
@@ -1302,7 +1269,12 @@ mod tests {
     /// every task. This is the loud version of that failure, run against the installed codex.
     #[test]
     fn every_disabled_feature_is_a_name_the_installed_codex_still_knows() {
-        let environment = crate::binary::Environment::from_process();
+        let environment = crate::binary::Environment::new(
+            std::env::var_os("PATH"),
+            std::env::var_os("HOME").map(std::path::PathBuf::from),
+            Default::default(),
+        )
+        .with_system_fallbacks([crate::binary::SYSTEM_FALLBACK_DIR]);
         let Ok(binary) = crate::binary::resolve(Provider::Codex, &environment) else {
             // No codex on this box: it cannot be the classifier engine here either.
             return;

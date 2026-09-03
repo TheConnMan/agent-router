@@ -8,10 +8,10 @@
 
 use crate::binary::{self, Environment};
 use crate::config::{Config, default_config_path};
+use crate::context::Context;
 use crate::error::Error;
 use crate::log::DecisionLog;
 use crate::provider::Provider;
-use crate::runtime::home_dir;
 use crate::usage::UsageSnapshot;
 use agent_viewer_core::GrokLifecycle;
 use std::path::PathBuf;
@@ -49,38 +49,38 @@ impl Report {
 ///
 /// The usage checks read one snapshot, so doctor asks each provider once rather than once per
 /// check, and the lines it prints cannot disagree about the same read.
-pub fn run() -> Report {
-    let environment = Environment::from_process();
-    let (usage, grok_source) = UsageSnapshot::read_with_grok_source();
-    let claude_installed = on_path("claude", &environment).is_some();
-    let codex_installed = on_path("codex", &environment).is_some();
-    let grok_installed = on_path("grok", &environment).is_some();
+pub fn run(ctx: &Context) -> Report {
+    let environment = &ctx.environment;
+    let (usage, grok_source) = UsageSnapshot::read_with_grok_source(ctx);
+    let claude_installed = on_path("claude", environment).is_some();
+    let codex_installed = on_path("codex", environment).is_some();
+    let grok_installed = on_path("grok", environment).is_some();
     let mut checks = vec![
-        required_binary_in(&environment, "claude_on_path", Provider::Claude),
-        claude_credentials(),
+        required_binary_in(environment, "claude_on_path", Provider::Claude),
+        claude_credentials(ctx),
         usage_source("claude_usage", usage.claude.stale, claude_installed),
-        optional_binary_in(&environment, "codex_on_path", Provider::Codex),
-        codex_app_server(),
+        optional_binary_in(environment, "codex_on_path", Provider::Codex),
+        codex_app_server(ctx),
         usage_source("codex_rate_limits", usage.codex.stale, codex_installed),
         grok_usage_source(grok_source, usage.grok, grok_installed),
     ];
-    checks.extend(grok_checks(&environment));
-    checks.extend([config_parses(), log_writable()]);
+    checks.extend(grok_checks(ctx));
+    checks.extend([config_parses(ctx), log_writable(ctx)]);
     Report { checks }
 }
 
 /// Observe both Grok lifecycle prerequisites without starting a leader or creating configuration.
 /// Grok is explicit only, so an unavailable path warns rather than failing the whole router.
-fn grok_checks(environment: &Environment) -> [Check; 2] {
+fn grok_checks(ctx: &Context) -> [Check; 2] {
     // Resolve before constructing the lifecycle, so this observes the same binary a dispatch would
     // run rather than whatever `execvp` finds on doctor's own PATH. An unresolvable grok reuses the
     // diagnostics-unavailable Warn shape below: Grok is explicit-only, so an unavailable path warns
     // rather than failing the whole router, and `Error::Launch` already names AGENT_ROUTER_GROK_BIN.
-    let binary = match binary::resolve(Provider::Grok, environment) {
+    let binary = match binary::resolve(Provider::Grok, &ctx.environment) {
         Ok(binary) => binary,
         Err(error) => return grok_unavailable(&one_line(&error)),
     };
-    let lifecycle = GrokLifecycle::new(binary, grok_home());
+    let lifecycle = GrokLifecycle::new(binary, ctx.grok_home());
     match lifecycle.diagnostics() {
         Ok(diagnostics) => {
             let binary = if diagnostics.binary_available {
@@ -136,13 +136,6 @@ fn grok_unavailable(detail: &str) -> [Check; 2] {
             ),
         ),
     ]
-}
-
-fn grok_home() -> PathBuf {
-    std::env::var_os("GROK_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home_dir().join(".grok"))
 }
 
 /// A binary the router cannot work without. The classifier runs on every auto route, and a
@@ -211,8 +204,8 @@ fn binary_check(
 
 /// The token the Claude usage reader authenticates with. Without it the reader has nothing to
 /// call the usage endpoint with, so it fails open and Claude reads as completely unused.
-fn claude_credentials() -> Check {
-    let path = home_dir().join(".claude/.credentials.json");
+fn claude_credentials(ctx: &Context) -> Check {
+    let path = ctx.claude_credentials();
     let name = "claude_credentials";
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
@@ -314,9 +307,9 @@ fn grok_usage_source(
 /// It only observes: dispatch starts a daemon when none is running, and a diagnostic command must
 /// not create the state it is diagnosing, so this asks and reports the answer. A daemon that does
 /// not answer errors at dispatch time, which is why an absent one is a warning.
-fn codex_app_server() -> Check {
+fn codex_app_server(ctx: &Context) -> Check {
     let name = "codex_app_server";
-    match crate::dispatch::codex::probe_daemon() {
+    match crate::dispatch::codex::probe_daemon(ctx) {
         Some(_) => pass(name, "the app-server daemon answers".to_string()),
         None => warn(
             name,
@@ -327,12 +320,12 @@ fn codex_app_server() -> Check {
     }
 }
 
-/// Read and parse the file directly rather than through `Config::load()`, which writes a default
+/// Read and parse the file directly rather than through `Config::load_in()`, which writes a default
 /// file when one is absent: a diagnostic command must not create the state it is diagnosing. An
-/// absent file is a pass, because the router runs on the same defaults `load()` would have written.
-fn config_parses() -> Check {
+/// absent file is a pass, because the router runs on the same defaults `load_in()` would have written.
+fn config_parses(ctx: &Context) -> Check {
     let name = "config_parses";
-    let path = default_config_path();
+    let path = default_config_path(&ctx.home);
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -356,10 +349,10 @@ fn config_parses() -> Check {
 
 /// Opening the log is not evidence it can be written, so this probes an actual write. A log that
 /// cannot take a row loses the record of every decision made while it stays that way.
-fn log_writable() -> Check {
+fn log_writable(ctx: &Context) -> Check {
     let name = "log_writable";
-    let path = crate::log::default_db_path();
-    let log = match DecisionLog::open() {
+    let path = crate::log::default_db_path(&ctx.home);
+    let log = match DecisionLog::open_in(&ctx.home) {
         Ok(log) => log,
         Err(error) => {
             return fail(

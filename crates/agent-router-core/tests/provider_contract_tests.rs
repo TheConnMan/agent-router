@@ -1,4 +1,8 @@
 #[cfg(target_os = "linux")]
+use agent_router_core::binary::{CODEX_BIN_ENV, Environment};
+#[cfg(target_os = "linux")]
+use agent_router_core::config::Config;
+#[cfg(target_os = "linux")]
 use agent_router_core::decide::decide_explicit;
 use agent_router_core::dispatch::claude::dispatch_with_binary;
 #[cfg(target_os = "linux")]
@@ -15,10 +19,12 @@ use agent_router_core::run::Request;
 use agent_router_core::runtime::truncated_title;
 #[cfg(target_os = "linux")]
 use agent_router_core::status::Observation;
-use agent_router_core::{Error, Result};
+use agent_router_core::{Context, Error, Result};
 #[cfg(target_os = "linux")]
 use agent_router_core::{Provider, UsageSnapshot};
 use serde_json::{Value, json};
+#[cfg(target_os = "linux")]
+use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::fs;
 #[cfg(unix)]
@@ -635,6 +641,7 @@ fn claude_uses_background_argv_and_excludes_a_prior_same_name_and_cwd() {
         &[],
         false,
         Duration::from_millis(250),
+        &root.path,
     )
     .expect("claude dispatch");
 
@@ -669,6 +676,7 @@ fn claude_argv_carries_the_decided_effort_and_omits_the_flag_without_one() {
             &[],
             false,
             Duration::from_millis(25),
+            &root.path,
         )
         .expect("claude dispatch");
 
@@ -779,6 +787,7 @@ fn claude_argv_places_mcp_scoping_between_the_model_flags_and_the_name() {
             &case.configs,
             case.strict,
             Duration::from_millis(25),
+            &root.path,
         )
         .expect("claude dispatch");
 
@@ -820,6 +829,7 @@ fn unreadable_mcp_config_names_the_path_without_its_body_and_spawns_nothing() {
         std::slice::from_ref(&config),
         false,
         Duration::from_millis(25),
+        &root.path,
     )
     .expect_err("an unreadable MCP config must fail");
 
@@ -870,6 +880,7 @@ fn readable_mcp_config_reaches_claude_by_path_and_never_by_its_contents() {
         std::slice::from_ref(&config),
         true,
         Duration::from_millis(25),
+        &root.path,
     )
     .expect("a readable MCP config must dispatch");
 
@@ -906,6 +917,7 @@ fn relative_mcp_config_resolves_against_the_router_cwd_not_the_job_cwd() {
         std::slice::from_ref(&relative),
         false,
         Duration::from_millis(25),
+        &root.path,
     )
     .expect_err("an absent MCP config must fail");
 
@@ -947,6 +959,7 @@ fn directory_mcp_config_is_refused_as_not_a_regular_file_and_spawns_nothing() {
         std::slice::from_ref(&config),
         false,
         Duration::from_millis(25),
+        &root.path,
     )
     .expect_err("a directory MCP config must fail");
 
@@ -994,6 +1007,7 @@ fn claude_running_job_keeps_its_name_when_the_id_is_not_yet_published() {
         &[],
         false,
         Duration::from_millis(25),
+        &root.path,
     )
     .expect("the background job is running even before its id is listed");
 
@@ -1038,6 +1052,7 @@ fn claude_spawns_and_finds_the_job_under_the_caller_supplied_name_verbatim() {
         &[],
         false,
         Duration::from_millis(250),
+        &root.path,
     )
     .expect("claude dispatch");
 
@@ -1153,7 +1168,16 @@ fn codex_decision_effort_reaches_turn_start_at_the_dispatch_boundary() {
         strict_mcp_config: false,
     };
 
-    let dispatched = dispatch_decision(&decision, &request).expect("codex dispatch");
+    let ctx = Context::new(
+        Environment::new(
+            None,
+            Some(root.path.clone()),
+            BTreeMap::from([(CODEX_BIN_ENV.to_string(), OsString::from(&binary))]),
+        ),
+        root.path.clone(),
+        Config::default(),
+    );
+    let dispatched = dispatch_decision(&ctx, &decision, &request).expect("codex dispatch");
     assert_eq!(
         dispatched.job_id.as_deref(),
         Some("thread through dispatch")
@@ -1245,7 +1269,19 @@ fn a_thread_read_that_spends_its_budget_does_not_starve_the_reads_after_it() {
     );
     let _path = PathGuard::prepend(&root.path);
 
-    let states = thread_states(&["slow thread".to_string(), "later thread".to_string()]);
+    let ctx = Context::new(
+        Environment::new(
+            None,
+            Some(root.path.clone()),
+            BTreeMap::from([(CODEX_BIN_ENV.to_string(), OsString::from(&binary))]),
+        ),
+        root.path.clone(),
+        Config::default(),
+    );
+    let states = thread_states(
+        &ctx,
+        &["slow thread".to_string(), "later thread".to_string()],
+    );
 
     assert!(
         contacted.load(Ordering::SeqCst),
@@ -1327,7 +1363,12 @@ fn mcp_scoping_on_a_non_claude_decision_fails_before_any_provider_work() {
             strict_mcp_config,
         };
 
-        let error = dispatch_decision(&decision, &request)
+        let ctx = Context::new(
+            Environment::new(None, Some(root.path.clone()), BTreeMap::new()),
+            root.path.clone(),
+            Config::default(),
+        );
+        let error = dispatch_decision(&ctx, &decision, &request)
             .expect_err("scoping must be rejected for a non-claude provider");
 
         let rendered = error.to_string();

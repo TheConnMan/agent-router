@@ -108,8 +108,8 @@ fn real_launch_failure(root: &Path) -> Result<Dispatch> {
     let environment = common::stripped_environment(Some(root));
     // Claude rather than codex: the claude dispatch path is not OS-gated, so the persisted string
     // under test is a real production one on every target this crate builds for.
-    agent_router_core::dispatch::claude::dispatch_in(
-        &environment,
+    agent_router_core::dispatch::claude::dispatch(
+        &common::context(environment, root.join("home"), Default::default()),
         &cwd,
         "audit the airtable records",
         "Fixture Job",

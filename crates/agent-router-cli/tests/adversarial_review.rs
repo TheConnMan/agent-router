@@ -196,7 +196,7 @@ impl ReviewFixture {
         }
     }
 
-    fn grok_home(&self) -> PathBuf {
+    fn grok_state_dir(&self) -> PathBuf {
         self.root.path.join("grok-home")
     }
 
@@ -234,7 +234,7 @@ impl ReviewFixture {
             .arg("--dir")
             .arg(dir)
             .env("HOME", home)
-            .env("GROK_HOME", self.grok_home())
+            .env("GROK_HOME", self.grok_state_dir())
             .env(
                 "GROK_USAGE_CACHE",
                 self.root.path.join("grok-usage-cache.json"),
@@ -400,7 +400,7 @@ fn registered_reviewer_provenance_includes_grok_and_excludes_grok_primary() {
 #[test]
 fn registered_grok_reviewer_requires_an_authoritative_live_leader() {
     let fixture = ReviewFixture::new("grok leader unavailable", Some(23.0));
-    write_grok_usage(&fixture.grok_home(), 1.0);
+    write_grok_usage(&fixture.grok_state_dir(), 1.0);
 
     let output = fixture.run_json();
     assert_exit(&output, 0);

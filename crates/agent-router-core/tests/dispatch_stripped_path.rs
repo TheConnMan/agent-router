@@ -127,8 +127,8 @@ fn a_claude_dispatch_off_a_stripped_path_reports_a_launch_failure() {
     let cwd = root.path().join("work");
     std::fs::create_dir_all(&cwd).expect("create the working directory");
 
-    let error = agent_router_core::dispatch::claude::dispatch_in(
-        &stripped(root.path()),
+    let error = agent_router_core::dispatch::claude::dispatch(
+        &common::stripped_context(root.path()),
         &cwd,
         "score this",
         "Fixture Job",
@@ -149,9 +149,11 @@ fn a_claude_dispatch_off_a_stripped_path_reports_a_launch_failure() {
 fn a_claude_agent_states_read_off_a_stripped_path_reports_a_launch_failure() {
     let root = tempfile::tempdir().expect("tempdir");
 
-    let error: Error =
-        agent_router_core::dispatch::claude::agent_states_in(&stripped(root.path()), TIMEOUT)
-            .expect_err("no claude resolves off a stripped environment");
+    let error: Error = agent_router_core::dispatch::claude::agent_states(
+        &common::stripped_context(root.path()),
+        TIMEOUT,
+    )
+    .expect_err("no claude resolves off a stripped environment");
 
     assert_named_launch_failure("claude agent_states", error, "claude", CLAUDE_BIN_ENV);
 }
@@ -172,8 +174,8 @@ fn a_codex_dispatch_off_a_stripped_path_reports_a_launch_failure() {
     let cwd = root.path().join("work");
     std::fs::create_dir_all(&cwd).expect("create the working directory");
 
-    let error = agent_router_core::dispatch::codex::dispatch_in(
-        &stripped(root.path()),
+    let error = agent_router_core::dispatch::codex::dispatch(
+        &common::stripped_context(root.path()),
         &cwd,
         "score this",
         "Fixture Job",
@@ -195,8 +197,8 @@ fn a_grok_dispatch_off_a_stripped_path_reports_a_launch_failure() {
     let cwd = root.path().join("work");
     std::fs::create_dir_all(&cwd).expect("create the working directory");
 
-    let error = agent_router_core::dispatch::grok::dispatch_in(
-        &stripped(root.path()),
+    let error = agent_router_core::dispatch::grok::dispatch(
+        &common::stripped_context(root.path()),
         &cwd,
         "score this",
         "Fixture Job",
@@ -277,7 +279,7 @@ fn every_dispatch_path_reports_a_launch_failure_rather_than_a_bare_io_error() {
     let root = tempfile::tempdir().expect("tempdir");
     let cwd = root.path().join("work");
     std::fs::create_dir_all(&cwd).expect("create the working directory");
-    let environment = stripped(root.path());
+    let ctx = common::stripped_context(root.path());
 
     // Every `Provider` variant appears, so a variant added later must be added here too.
     let cases: [DispatchCase<'_>; 3] = [
@@ -285,46 +287,58 @@ fn every_dispatch_path_reports_a_launch_failure_rather_than_a_bare_io_error() {
             Provider::Claude,
             "claude",
             CLAUDE_BIN_ENV,
-            Box::new(|| {
-                agent_router_core::dispatch::claude::dispatch_in(
-                    &environment,
-                    &cwd,
-                    "score this",
-                    "Fixture Job",
-                    None,
-                    None,
-                    &[] as &[PathBuf],
-                    false,
-                )
+            Box::new({
+                let ctx = ctx.clone();
+                let cwd = cwd.clone();
+                move || {
+                    agent_router_core::dispatch::claude::dispatch(
+                        &ctx,
+                        &cwd,
+                        "score this",
+                        "Fixture Job",
+                        None,
+                        None,
+                        &[] as &[PathBuf],
+                        false,
+                    )
+                }
             }),
         ),
         (
             Provider::Codex,
             "codex",
             CODEX_BIN_ENV,
-            Box::new(|| {
-                agent_router_core::dispatch::codex::dispatch_in(
-                    &environment,
-                    &cwd,
-                    "score this",
-                    "Fixture Job",
-                    None,
-                    None,
-                )
+            Box::new({
+                let ctx = ctx.clone();
+                let cwd = cwd.clone();
+                move || {
+                    agent_router_core::dispatch::codex::dispatch(
+                        &ctx,
+                        &cwd,
+                        "score this",
+                        "Fixture Job",
+                        None,
+                        None,
+                    )
+                }
             }),
         ),
         (
             Provider::Grok,
             "grok",
             GROK_BIN_ENV,
-            Box::new(|| {
-                agent_router_core::dispatch::grok::dispatch_in(
-                    &environment,
-                    &cwd,
-                    "score this",
-                    "Fixture Job",
-                    None,
-                )
+            Box::new({
+                let ctx = ctx.clone();
+                let cwd = cwd.clone();
+                move || {
+                    agent_router_core::dispatch::grok::dispatch(
+                        &ctx,
+                        &cwd,
+                        "score this",
+                        "Fixture Job",
+                        None,
+                    )
+                }
             }),
         ),
     ];

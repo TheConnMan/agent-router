@@ -45,7 +45,7 @@ const OVERRIDE_SUFFIX: &str = "_BIN";
 /// It is not consulted unconditionally. [`Environment::from_process`] puts it into the environment
 /// as data, so it is searched exactly when the environment under test is the real one — see
 /// [`Environment::system_fallbacks`] for why that distinction is load-bearing.
-const SYSTEM_FALLBACK_DIR: &str = "/usr/local/bin";
+pub const SYSTEM_FALLBACK_DIR: &str = "/usr/local/bin";
 
 /// The user half of the fallback list, relative to `$HOME`. This single directory is what closes
 /// the reported defect: it is the directory a login shell adds and a service manager does not.

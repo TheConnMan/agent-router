@@ -1,8 +1,8 @@
-use crate::binary::{CODEX_BIN_ENV, Environment};
+use crate::binary::CODEX_BIN_ENV;
+use crate::context::Context;
 use crate::error::{Error, Result};
 use crate::provider::Provider;
 use crate::run::Dispatch;
-use crate::runtime::home_dir;
 use crate::status::Observation;
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -169,10 +169,10 @@ fn read_field(line: &str, expected_id: i64, pointer: &str) -> Option<String> {
 /// This probes for a daemon and never starts one: a command reporting on jobs that already exist
 /// must not create the state it is reporting on. No daemon means every thread reports unavailable,
 /// which is the honest partial report rather than a command failure.
-pub fn thread_states(thread_ids: &[String]) -> BTreeMap<String, Observation> {
+pub fn thread_states(ctx: &Context, thread_ids: &[String]) -> BTreeMap<String, Observation> {
     #[cfg(target_os = "linux")]
     {
-        if let Some(daemon) = probe_daemon()
+        if let Some(daemon) = probe_daemon(ctx)
             && let Ok(mut client) = Client::connect(&daemon)
         {
             return thread_states_on_rpc(&mut client, thread_ids);
@@ -249,32 +249,17 @@ pub fn spawn_on_initialized_rpc(
 }
 
 pub fn dispatch(
+    ctx: &Context,
     cwd: &Path,
     task: &str,
     name: &str,
     model: Option<&str>,
     effort: Option<&str>,
 ) -> Result<Dispatch> {
-    dispatch_in(&Environment::from_process(), cwd, task, name, model, effort)
-}
-
-/// IMPURE in `environment` only: the resolution seam.
-///
-/// Codex resolves at the top: `probe_daemon` always execs `codex app-server daemon
-/// version`, so a daemon that is already running does not spare this path the binary. Resolving
-/// once here also keeps `daemon_command`'s poll loop from re-resolving on every iteration.
-pub fn dispatch_in(
-    environment: &Environment,
-    cwd: &Path,
-    task: &str,
-    name: &str,
-    model: Option<&str>,
-    effort: Option<&str>,
-) -> Result<Dispatch> {
-    let binary = crate::binary::resolve(Provider::Codex, environment)?;
+    let binary = crate::binary::resolve(Provider::Codex, &ctx.environment)?;
     #[cfg(target_os = "linux")]
     {
-        let daemon = ensure_daemon(&binary)?;
+        let daemon = ensure_daemon(&binary, &ctx.home)?;
         let mut client = Client::connect(&daemon)?;
         match spawn_on_initialized_rpc(&mut client, cwd, task, name, model, effort) {
             SpawnAttempt::Started {
@@ -295,7 +280,7 @@ pub fn dispatch_in(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (binary, cwd, task, name, model, effort);
+        let _ = (binary, cwd, task, name, model, effort, ctx);
         Err(Error::Command(
             "codex app-server daemon transport is unavailable on this platform".to_string(),
         ))
@@ -316,39 +301,33 @@ fn parse_daemon_version(stdout: &str) -> Option<Daemon> {
     })
 }
 
-fn stable_daemon_cwd() -> PathBuf {
-    let home = home_dir();
+fn stable_daemon_cwd(home: &Path) -> PathBuf {
     if home.is_dir() {
-        home
+        home.to_path_buf()
     } else {
         PathBuf::from("/")
     }
 }
 
-fn daemon_command(binary: &Path, action: &str) -> Command {
+fn daemon_command(binary: &Path, action: &str, home: &Path) -> Command {
     let mut command = Command::new(binary);
     command
         .arg("app-server")
         .arg("daemon")
         .arg(action)
-        .current_dir(stable_daemon_cwd());
+        .current_dir(stable_daemon_cwd(home));
     command
 }
 
 /// IMPURE: the running app-server daemon, or None when none answers. This only asks, so a caller
 /// that must not create the state it is reporting on (doctor, status) uses it rather than
 /// `ensure_daemon`.
-pub(crate) fn probe_daemon() -> Option<Daemon> {
-    // The signature stays argument-free on purpose. `probe_daemon` has three callers — the two in
-    // this file and `doctor.rs`, which is another stream's file — so resolving INSIDE it is what
-    // keeps this change off doctor's ledger. A resolution failure here is `None`, which is exactly
-    // right: to something that is only asking, an unlaunchable codex means no daemon answers. The
-    // loud, named failure belongs to `ensure_daemon`, which is trying to start one.
-    let binary = crate::binary::resolve(Provider::Codex, &Environment::from_process()).ok()?;
+pub(crate) fn probe_daemon(ctx: &Context) -> Option<Daemon> {
+    let binary = crate::binary::resolve(Provider::Codex, &ctx.environment).ok()?;
     // The one place a probe's launch failure is discarded, and the only one that may be: this
     // wrapper is the observation-only entry point, and to something that is merely asking, an
     // unlaunchable codex means no daemon answers.
-    probe_daemon_with_binary(&binary).ok().flatten()
+    probe_daemon_with_binary(&binary, &ctx.home).ok().flatten()
 }
 
 /// IMPURE: the same probe against an already-resolved binary, so a caller inside a poll loop
@@ -360,8 +339,8 @@ pub(crate) fn probe_daemon() -> Option<Daemon> {
 /// it says the CLI could not be executed. Swallowing it here made `ensure_daemon` poll a binary
 /// that could never answer and then persist an `Error::Command` timeout, which is precisely the
 /// laundering the decision log's `error: launch failed:` prefix exists to catch.
-fn probe_daemon_with_binary(binary: &Path) -> Result<Option<Daemon>> {
-    match run_reporting_failure(daemon_command(binary, "version"), PROBE_TIMEOUT) {
+fn probe_daemon_with_binary(binary: &Path, home: &Path) -> Result<Option<Daemon>> {
+    match run_reporting_failure(daemon_command(binary, "version", home), PROBE_TIMEOUT) {
         Ok(stdout) => Ok(parse_daemon_version(&stdout)),
         Err(launch @ Error::Launch(_)) => Err(launch),
         Err(_) => Ok(None),
@@ -374,20 +353,21 @@ fn probe_daemon_with_binary(binary: &Path) -> Result<Option<Daemon>> {
 /// `.map_err(Error::Command)`, which flattened a launch failure into an undifferentiated
 /// `Error::Command` even when its message read correctly — invisible to any substring test, and
 /// the exact laundering the decision log's `error: launch failed:` prefix exists to catch.
-fn ensure_daemon(binary: &Path) -> Result<Daemon> {
-    if let Some(daemon) = probe_daemon_with_binary(binary)? {
+fn ensure_daemon(binary: &Path, home: &Path) -> Result<Daemon> {
+    if let Some(daemon) = probe_daemon_with_binary(binary, home)? {
         return Ok(daemon);
     }
     let deadline = Instant::now() + START_TIMEOUT;
-    if let Err(error) = run_reporting_failure(daemon_command(binary, "start"), START_TIMEOUT) {
+    if let Err(error) = run_reporting_failure(daemon_command(binary, "start", home), START_TIMEOUT)
+    {
         // A daemon another process already started answers regardless of why this start failed.
-        return match probe_daemon_with_binary(binary)? {
+        return match probe_daemon_with_binary(binary, home)? {
             Some(daemon) => Ok(daemon),
             None => Err(error),
         };
     }
     loop {
-        if let Some(daemon) = probe_daemon_with_binary(binary)? {
+        if let Some(daemon) = probe_daemon_with_binary(binary, home)? {
             return Ok(daemon);
         }
         if Instant::now() >= deadline {
@@ -609,8 +589,9 @@ mod tests {
     /// The variant is the whole assertion: both spellings produce a readable message.
     #[test]
     fn a_probe_of_a_missing_binary_is_a_launch_failure_not_an_absent_daemon() {
-        let error = probe_daemon_with_binary(Path::new("/nonexistent/agent-router-codex"))
-            .expect_err("a missing binary cannot be probed");
+        let error =
+            probe_daemon_with_binary(Path::new("/nonexistent/agent-router-codex"), Path::new("/"))
+                .expect_err("a missing binary cannot be probed");
 
         assert!(
             matches!(error, Error::Launch(_)),
@@ -625,16 +606,17 @@ mod tests {
         let ran = first_existing(&["/bin/echo", "/usr/bin/echo"]);
 
         assert_eq!(
-            probe_daemon_with_binary(&ran).expect("a probe that ran is not a failure"),
+            probe_daemon_with_binary(&ran, Path::new("/"))
+                .expect("a probe that ran is not a failure"),
             None
         );
     }
 
-    /// The observation-only wrapper is the one place that discard is correct, and its
-    /// zero-argument signature is what keeps `doctor` and `thread_states` off this change.
+    /// The observation-only wrapper is the one place that discard is correct: a launch failure
+    /// is `None`, which is an honest "no daemon answers" to doctor and status.
     #[test]
-    fn the_public_probe_stays_argument_free_and_swallows_its_failures() {
-        let probe: fn() -> Option<Daemon> = probe_daemon;
+    fn the_public_probe_swallows_its_failures() {
+        let probe: fn(&Context) -> Option<Daemon> = probe_daemon;
         let _ = probe;
     }
 }

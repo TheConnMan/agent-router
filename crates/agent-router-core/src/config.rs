@@ -3,7 +3,6 @@
 
 use crate::classify::Complexity;
 use crate::error::Result;
-use crate::runtime::home_dir;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -300,10 +299,10 @@ impl Default for Config {
 }
 
 impl Config {
-    /// IMPURE: the config at the default path, created with defaults when absent.
-    pub fn load() -> Result<Config> {
-        let mut config = Config::load_from(&default_config_path())?;
-        config.register_discovered_provider_capabilities();
+    /// IMPURE: the config at the default path under `home`, created with defaults when absent.
+    pub fn load_in(home: &Path) -> Result<Config> {
+        let mut config = Config::load_from(&default_config_path(home))?;
+        config.register_discovered_provider_capabilities(home);
         Ok(config)
     }
 
@@ -331,15 +330,15 @@ impl Config {
             .collect()
     }
 
-    fn register_discovered_provider_capabilities(&mut self) {
-        if let Ok(text) = std::fs::read_to_string(home_dir().join(".codex/config.toml"))
+    fn register_discovered_provider_capabilities(&mut self, home: &Path) {
+        if let Ok(text) = std::fs::read_to_string(home.join(".codex/config.toml"))
             && let Ok(document) = toml::from_str::<toml::Value>(&text)
         {
             self.register_capabilities("codex", codex_capabilities(&document));
         }
         // Account connectors are not project MCP servers. Their absence is unknown, never a
         // negative capability assertion; a recorded connector is positive availability evidence.
-        if let Ok(text) = std::fs::read_to_string(home_dir().join(".claude.json"))
+        if let Ok(text) = std::fs::read_to_string(home.join(".claude.json"))
             && let Ok(document) = serde_json::from_str::<serde_json::Value>(&text)
         {
             self.register_capabilities("claude", claude_capabilities(&document));
@@ -446,8 +445,8 @@ fn claude_capabilities(document: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
-pub fn default_config_path() -> PathBuf {
-    home_dir().join(".config/agent-router/config.toml")
+pub fn default_config_path(home: &Path) -> PathBuf {
+    home.join(".config/agent-router/config.toml")
 }
 
 #[cfg(test)]

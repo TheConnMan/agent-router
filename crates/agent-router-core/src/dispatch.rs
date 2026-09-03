@@ -1,3 +1,4 @@
+use crate::context::Context;
 use crate::error::{Error, Result};
 use crate::provider::Provider;
 use crate::run::{Dispatch, Request};
@@ -6,7 +7,11 @@ pub mod claude;
 pub mod codex;
 pub mod grok;
 
-pub fn dispatch(decision: &crate::decide::Decision, request: &Request) -> Result<Dispatch> {
+pub fn dispatch(
+    ctx: &Context,
+    decision: &crate::decide::Decision,
+    request: &Request,
+) -> Result<Dispatch> {
     if !request.dir.is_dir() {
         return Err(Error::Command(format!(
             "{} is not a directory",
@@ -20,6 +25,7 @@ pub fn dispatch(decision: &crate::decide::Decision, request: &Request) -> Result
         .unwrap_or_else(|| crate::runtime::short_job_name(request.task));
     match decision.provider {
         Provider::Codex => codex::dispatch(
+            ctx,
             request.dir,
             request.task,
             &name,
@@ -27,6 +33,7 @@ pub fn dispatch(decision: &crate::decide::Decision, request: &Request) -> Result
             decision.effort.as_deref(),
         ),
         Provider::Claude => claude::dispatch(
+            ctx,
             request.dir,
             request.task,
             &name,
@@ -35,9 +42,13 @@ pub fn dispatch(decision: &crate::decide::Decision, request: &Request) -> Result
             request.mcp_configs,
             request.strict_mcp_config,
         ),
-        Provider::Grok => {
-            grok::dispatch(request.dir, request.task, &name, decision.model.as_deref())
-        }
+        Provider::Grok => grok::dispatch(
+            ctx,
+            request.dir,
+            request.task,
+            &name,
+            decision.model.as_deref(),
+        ),
     }
 }
 

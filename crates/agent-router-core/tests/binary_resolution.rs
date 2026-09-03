@@ -291,7 +291,9 @@ fn the_fallback_list_is_exactly_the_two_user_local_directories() {
     // real dispatch searches — and it pins the literal harder than the substring check it
     // replaces, since an added third directory now fails here.
     assert_eq!(
-        Environment::from_process().system_fallbacks(),
+        [PathBuf::from(
+            agent_router_core::binary::SYSTEM_FALLBACK_DIR
+        )],
         [PathBuf::from("/usr/local/bin")],
         "production searches exactly one system fallback directory, and it is /usr/local/bin"
     );

@@ -15,7 +15,7 @@
 //! the numbers came from a real reading of the provider rather than from a default, which is the
 //! distinction routing acts on, and `usage.sh` reports the same cache the same way.
 
-use crate::runtime::{default_codex_home, home_dir};
+use crate::context::Context;
 use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write as _};
@@ -135,8 +135,8 @@ pub struct UsageSnapshot {
 
 impl UsageSnapshot {
     /// IMPURE: read all providers live.
-    pub fn read() -> UsageSnapshot {
-        Self::read_with_grok_source().0
+    pub fn read(ctx: &Context) -> UsageSnapshot {
+        Self::read_with_grok_source(ctx).0
     }
 
     /// IMPURE: read all providers once and retain the Grok snapshot's provenance for diagnostics.
@@ -146,12 +146,12 @@ impl UsageSnapshot {
     /// Codex before the Grok/Claude HTTP work (the slow part) keeps that rollout out of the
     /// snapshot even when those fetches outlast the classifier. Reordering the two HTTP reads is
     /// a separate change and is not done here.
-    pub fn read_with_grok_source() -> (UsageSnapshot, GrokUsageSource) {
-        let codex = codex_headroom();
-        let grok = grok_usage();
+    pub fn read_with_grok_source(ctx: &Context) -> (UsageSnapshot, GrokUsageSource) {
+        let codex = codex_headroom(ctx);
+        let grok = grok_usage(ctx);
         (
             UsageSnapshot {
-                claude: claude_headroom(),
+                claude: claude_headroom(ctx),
                 codex,
                 grok: grok.headroom,
             },
@@ -194,13 +194,8 @@ struct GrokUsageCache {
     source_ts: String,
 }
 
-/// IMPURE: the cache path the Grok reader will use, from `GROK_USAGE_CACHE` or the shared default.
-pub fn grok_usage_cache() -> PathBuf {
-    grok_usage_cache_from(std::env::var_os(GROK_USAGE_CACHE_ENV).as_deref())
-}
-
-/// PURE: the resolution rule behind `grok_usage_cache`, split out so it is testable without
-/// touching the process-global environment.
+/// PURE: the resolution rule behind the Grok usage cache path, split out so it is testable
+/// without touching the process-global environment.
 pub fn grok_usage_cache_from(var: Option<&OsStr>) -> PathBuf {
     match var {
         Some(path) if !path.is_empty() => PathBuf::from(path),
@@ -211,21 +206,21 @@ pub fn grok_usage_cache_from(var: Option<&OsStr>) -> PathBuf {
 /// IMPURE: one Grok capacity read, retaining whether it came from live billing, cache, log, or no
 /// usable source. A fresh cache avoids the provider calls; a stale cache remains the fallback when
 /// the calls fail.
-pub fn grok_usage() -> GrokUsage {
-    let grok_home = crate::dispatch::grok::grok_home();
-    let cache = grok_usage_cache();
+pub fn grok_usage(ctx: &Context) -> GrokUsage {
+    let grok_home = ctx.grok_home().to_path_buf();
+    let cache = ctx.grok_usage_cache.clone();
     grok_usage_in(
         &cache,
         &grok_home.join("logs/unified.jsonl"),
-        now_epoch(),
+        (ctx.now_epoch)(),
         is_fresh(&cache, CACHE_MAX_AGE),
         || fetch_grok_usage(&grok_home),
     )
 }
 
 /// IMPURE: the Grok headroom from the read-through cache and provider-owned fallbacks.
-pub fn grok_headroom() -> Headroom {
-    grok_usage().headroom
+pub fn grok_headroom(ctx: &Context) -> Headroom {
+    grok_usage(ctx).headroom
 }
 
 /// IMPURE only through the supplied paths and fetch function: resolve Grok capacity in the exact
@@ -677,15 +672,9 @@ fn grok_auth_key(entry: &serde_json::Value) -> Option<String> {
 
 // ---------------------------------------------------------------- Claude
 
-/// IMPURE: the cache path the Claude reader will use, from `CLAUDE_USAGE_CACHE` or the shared
-/// default.
-pub fn claude_usage_cache() -> PathBuf {
-    claude_usage_cache_from(std::env::var_os(CLAUDE_USAGE_CACHE_ENV).as_deref())
-}
-
-/// PURE: the resolution rule behind `claude_usage_cache`, split out so it is testable without
-/// touching the environment. Env vars are process global and Rust runs tests in threads, so a test
-/// that set one would decide what a sibling test read.
+/// PURE: the resolution rule behind the Claude usage cache path, split out so it is testable
+/// without touching the environment. Env vars are process global and Rust runs tests in threads,
+/// so a test that set one would decide what a sibling test read.
 pub fn claude_usage_cache_from(var: Option<&OsStr>) -> PathBuf {
     match var {
         Some(path) if !path.is_empty() => PathBuf::from(path),
@@ -696,9 +685,8 @@ pub fn claude_usage_cache_from(var: Option<&OsStr>) -> PathBuf {
 /// IMPURE: the Claude snapshot, from the shared cache when it is under 5 minutes old and from
 /// the OAuth usage endpoint otherwise. A stale cache is preferred over nothing; nothing at all
 /// reads as full headroom.
-pub fn claude_headroom() -> Headroom {
-    let cache = claude_usage_cache();
-    let cache = cache.as_path();
+pub fn claude_headroom(ctx: &Context) -> Headroom {
+    let cache = ctx.claude_usage_cache.as_path();
     if is_fresh(cache, CACHE_MAX_AGE)
         && let Some(headroom) = std::fs::read_to_string(cache)
             .ok()
@@ -707,7 +695,7 @@ pub fn claude_headroom() -> Headroom {
     {
         return headroom;
     }
-    if let Some(body) = fetch_claude_usage()
+    if let Some(body) = fetch_claude_usage(ctx)
         && let Some(headroom) = parse_claude_usage(&body)
     {
         // Refresh the cache the statusline and bonus-drain share, exactly as `usage.sh` does.
@@ -753,8 +741,8 @@ fn resets_at_epoch(window: &serde_json::Value) -> Option<i64> {
 }
 
 /// IMPURE: GET the OAuth usage endpoint with the CLI's own credentials. Any failure is None.
-fn fetch_claude_usage() -> Option<String> {
-    let token = claude_oauth_token()?;
+fn fetch_claude_usage(ctx: &Context) -> Option<String> {
+    let token = claude_oauth_token(ctx)?;
     ureq::get("https://api.anthropic.com/api/oauth/usage")
         .config()
         .timeout_global(Some(USAGE_HTTP_TIMEOUT))
@@ -769,8 +757,8 @@ fn fetch_claude_usage() -> Option<String> {
         .ok()
 }
 
-fn claude_oauth_token() -> Option<String> {
-    let path = home_dir().join(".claude/.credentials.json");
+fn claude_oauth_token(ctx: &Context) -> Option<String> {
+    let path = ctx.claude_credentials();
     let value: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
     value
@@ -782,16 +770,8 @@ fn claude_oauth_token() -> Option<String> {
 // ---------------------------------------------------------------- Codex
 
 /// IMPURE: the Codex snapshot from the newest rollout carrying a `rate_limits` event.
-pub fn codex_headroom() -> Headroom {
-    codex_headroom_in(&codex_sessions_dir(), now_epoch(), CODEX_SCAN_N)
-}
-
-/// `$CODEX_SESSIONS_DIR` if set (the reference script's test hook), else `<codex home>/sessions`.
-pub fn codex_sessions_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("CODEX_SESSIONS_DIR") {
-        return PathBuf::from(dir);
-    }
-    default_codex_home().join("sessions")
+pub fn codex_headroom(ctx: &Context) -> Headroom {
+    codex_headroom_in(&ctx.codex_sessions_dir, (ctx.now_epoch)(), CODEX_SCAN_N)
 }
 
 /// The Codex snapshot from `sessions_dir`, scanning the `scan_n` newest rollouts newest-first.

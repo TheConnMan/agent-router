@@ -43,13 +43,6 @@ fn nonempty_var(name: &str) -> Option<OsString> {
     Some(value)
 }
 
-/// `$CODEX_HOME` when set, otherwise `$HOME/.codex`.
-pub fn default_codex_home() -> PathBuf {
-    std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home_dir().join(".codex"))
-}
-
 /// Current time as epoch milliseconds.
 pub fn now_ms() -> i64 {
     SystemTime::now()
@@ -201,9 +194,8 @@ pub fn canonicalize_dir(path: &Path) -> PathBuf {
     })
 }
 
-pub(crate) fn router_log_path(prefix: &str) -> PathBuf {
-    home_dir()
-        .join(".local/state/agent-router/logs")
+pub(crate) fn router_log_path(home: &Path, prefix: &str) -> PathBuf {
+    home.join(".local/state/agent-router/logs")
         .join(format!("{prefix}-{}.log", now_ms()))
 }
 

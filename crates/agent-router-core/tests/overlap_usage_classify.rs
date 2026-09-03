@@ -7,6 +7,7 @@
 
 mod common;
 
+use agent_router_core::Context;
 use agent_router_core::binary::{CLAUDE_BIN_ENV, Environment};
 use agent_router_core::config::{ClassifierEngine, Config};
 use agent_router_core::log::DecisionLog;
@@ -105,6 +106,7 @@ fn usage_read_overlaps_classification_on_the_auto_route() {
     let environment = slow_classifier_environment(root.path());
     let mut config = Config::default();
     config.classifier.engine = ClassifierEngine::Claude;
+    let ctx = Context::new(environment, root.path().join("home"), config);
     let injected = distinctive_usage();
     let request = Request {
         task: "summarize the weekly usage report",
@@ -121,8 +123,7 @@ fn usage_read_overlaps_classification_on_the_auto_route() {
     let started = Instant::now();
     let outcome = run_with(
         &request,
-        &config,
-        &environment,
+        &ctx,
         || {
             std::thread::sleep(USAGE_DELAY);
             injected

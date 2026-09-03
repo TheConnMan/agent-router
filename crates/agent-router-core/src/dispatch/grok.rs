@@ -1,38 +1,32 @@
-use crate::binary::{Environment, GROK_BIN_ENV};
+use crate::binary::GROK_BIN_ENV;
+use crate::context::Context;
 use crate::error::{Error, Result};
 use crate::provider::Provider;
 use crate::run::Dispatch;
 use agent_viewer_core::{GrokLifecycle, SpawnResult};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// IMPURE: start one headless Grok task through Agent Viewer's official lifecycle.
-pub fn dispatch(cwd: &Path, task: &str, name: &str, model: Option<&str>) -> Result<Dispatch> {
-    dispatch_in(&Environment::from_process(), cwd, task, name, model)
-}
-
-/// IMPURE in `environment` only: the resolution seam.
-///
-/// Resolution happens before `GrokLifecycle` is constructed, so a missing grok is the router's own
-/// named failure rather than something an external crate reports in its own words.
-pub fn dispatch_in(
-    environment: &Environment,
+pub fn dispatch(
+    ctx: &Context,
     cwd: &Path,
     task: &str,
     name: &str,
     model: Option<&str>,
 ) -> Result<Dispatch> {
-    let binary = crate::binary::resolve(Provider::Grok, environment)?;
-    dispatch_with_binary(&binary, cwd, task, name, model)
+    let binary = crate::binary::resolve(Provider::Grok, &ctx.environment)?;
+    dispatch_with_binary(&binary, ctx.grok_home(), cwd, task, name, model)
 }
 
 pub fn dispatch_with_binary(
     binary: &Path,
+    grok_home: &Path,
     cwd: &Path,
     task: &str,
     name: &str,
     model: Option<&str>,
 ) -> Result<Dispatch> {
-    let lifecycle = GrokLifecycle::new(binary, grok_home());
+    let lifecycle = GrokLifecycle::new(binary, grok_home);
     dispatch_from(binary, cwd, task, name, model, |cwd, task, model| {
         lifecycle.spawn(cwd, task, model)
     })
@@ -131,13 +125,6 @@ fn exact_session_id(
 /// PURE: a Grok lifecycle failure that is not a launch failure, in the words it has always used.
 fn lifecycle_failure(error: &dyn std::fmt::Display) -> Error {
     Error::Command(format!("Grok lifecycle spawn failed: {error}"))
-}
-
-pub(crate) fn grok_home() -> PathBuf {
-    std::env::var_os("GROK_HOME")
-        .filter(|home| !home.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| agent_viewer_core::home_dir().join(".grok"))
 }
 
 #[cfg(test)]

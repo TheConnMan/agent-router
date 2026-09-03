@@ -7,15 +7,13 @@
 //! a process, a socket, or a disk sits inside either pure function, so the mapping table and the
 //! monotonicity rule are both testable with no backend at all.
 
-use crate::binary::Environment;
+use crate::context::Context;
 use crate::error::Result;
 use crate::log::{DecisionLog, StatusRow};
 use crate::provider::Provider;
-use crate::runtime::home_dir;
 use crate::stats::Window;
 use agent_viewer_core::{GrokLifecycle, Status as GrokStatus};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::time::Duration;
 
 /// The claude job list is one process, and the reconciler has no reason to wait longer for it than
@@ -230,11 +228,15 @@ fn report_row(
 ///
 /// A backend that does not answer costs its own rows their reconciliation and nothing else: the
 /// report is partial rather than absent, which is the useful output when one provider is down.
-pub fn reconcile(log: &DecisionLog, window: Window) -> Result<Report> {
+pub fn reconcile(ctx: &Context, log: &DecisionLog, window: Window) -> Result<Report> {
     let rows = log.status_rows(window.limit, window.since_ms)?;
-    let claude = claude_states(&rows);
-    let codex = codex_states(&rows);
-    let grok = grok_states(&rows);
+    let claude = claude_states(ctx, &rows);
+    let codex = codex_states(ctx, &rows);
+    let grok = grok_states(ctx, &rows);
+    let transcripts = rows
+        .iter()
+        .any(|row| row.provider == "claude")
+        .then(|| list_claude_transcripts(&ctx.claude_projects()));
 
     let mut reported = Vec::with_capacity(rows.len());
     for row in &rows {
@@ -262,7 +264,11 @@ pub fn reconcile(log: &DecisionLog, window: Window) -> Result<Report> {
         // Selected by the row's own provider column, never by the shape of the id string, so a
         // codex thread id that happens to look like a short id is never swept for.
         let traced = match row.provider.as_str() {
-            "claude" => transcript_exists(&row.job_id),
+            "claude" => transcripts.as_ref().and_then(|names| {
+                names
+                    .as_ref()
+                    .map(|names| transcript_exists(names, &row.job_id))
+            }),
             _ => None,
         };
         // A provider the reconciler cannot ask about is never offered to `settle`, so its row is
@@ -288,16 +294,16 @@ pub fn reconcile(log: &DecisionLog, window: Window) -> Result<Report> {
 
 /// IMPURE: the claude job list, or None when the router could not read it. One call serves the
 /// whole window, and a window holding no claude row never runs `claude` at all.
-fn claude_states(rows: &[StatusRow]) -> Option<BTreeMap<String, String>> {
+fn claude_states(ctx: &Context, rows: &[StatusRow]) -> Option<BTreeMap<String, String>> {
     if !rows.iter().any(|row| row.provider == "claude") {
         return None;
     }
-    crate::dispatch::claude::agent_states(AGENTS_TIMEOUT).ok()
+    crate::dispatch::claude::agent_states(ctx, AGENTS_TIMEOUT).ok()
 }
 
 /// IMPURE: what the app-server knows about the codex threads in the window. Empty when there are
 /// none, so a window with no codex row never even probes for a daemon.
-fn codex_states(rows: &[StatusRow]) -> BTreeMap<String, Observation> {
+fn codex_states(ctx: &Context, rows: &[StatusRow]) -> BTreeMap<String, Observation> {
     let thread_ids: Vec<String> = rows
         .iter()
         .filter(|row| row.provider == "codex")
@@ -306,12 +312,12 @@ fn codex_states(rows: &[StatusRow]) -> BTreeMap<String, Observation> {
     if thread_ids.is_empty() {
         return BTreeMap::new();
     }
-    crate::dispatch::codex::thread_states(&thread_ids)
+    crate::dispatch::codex::thread_states(ctx, &thread_ids)
 }
 
 /// IMPURE: one public lifecycle listing serves every Grok row in the window. Exact duplicate
 /// identities are ambiguous rather than whichever row happened to be listed last.
-fn grok_states(rows: &[StatusRow]) -> Option<BTreeMap<String, Observation>> {
+fn grok_states(ctx: &Context, rows: &[StatusRow]) -> Option<BTreeMap<String, Observation>> {
     if !rows.iter().any(|row| row.provider == "grok") {
         return None;
     }
@@ -319,8 +325,8 @@ fn grok_states(rows: &[StatusRow]) -> Option<BTreeMap<String, Observation>> {
     // `PATH` the caller inherited, so every Grok row in the window would read as unresolvable on
     // exactly the boxes dispatch was just taught to handle. Reconciliation only observes, so an
     // unresolvable grok is `None` — the honest partial report — not a hard failure.
-    let binary = crate::binary::resolve(Provider::Grok, &Environment::from_process()).ok()?;
-    let sessions = GrokLifecycle::new(binary, grok_home()).list().ok()?;
+    let binary = crate::binary::resolve(Provider::Grok, &ctx.environment).ok()?;
+    let sessions = GrokLifecycle::new(binary, ctx.grok_home()).list().ok()?;
     let mut states = BTreeMap::new();
     for session in sessions {
         use std::collections::btree_map::Entry;
@@ -336,37 +342,32 @@ fn grok_states(rows: &[StatusRow]) -> Option<BTreeMap<String, Observation>> {
     Some(states)
 }
 
-fn grok_home() -> PathBuf {
-    std::env::var_os("GROK_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home_dir().join(".grok"))
-}
-
-/// IMPURE: whether a claude session left a transcript on disk, which answers whether there is
-/// anything to go read about a job the router cannot otherwise resolve.
+/// IMPURE: list session transcript file names under `~/.claude/projects` once per report.
 ///
-/// The project directory is wildcarded rather than derived from the row's `dir`: no session on this
-/// box has a cwd containing `.` or `_`, so that encoding cannot be confirmed and must not be relied
-/// on. The transcript is never opened, because a finished job and a running one end their files the
-/// same way, so existence is the entire signal. None when the sweep could not run at all, which is
-/// a different fact from finding nothing.
-fn transcript_exists(short_id: &str) -> Option<bool> {
-    let projects = std::fs::read_dir(home_dir().join(".claude/projects")).ok()?;
-    // The hyphen anchors the match to the end of a session UUID's first segment, so a short id that
-    // is a prefix of another cannot match it.
-    let prefix = format!("{short_id}-");
+/// None when the sweep could not run at all, which is a different fact from finding nothing.
+fn list_claude_transcripts(projects_dir: &std::path::Path) -> Option<Vec<String>> {
+    let projects = std::fs::read_dir(projects_dir).ok()?;
+    let mut names = Vec::new();
     for project in projects.flatten() {
         let Ok(transcripts) = std::fs::read_dir(project.path()) else {
             continue;
         };
         for transcript in transcripts.flatten() {
-            let name = transcript.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with(&prefix) && name.ends_with(".jsonl") {
-                return Some(true);
-            }
+            names.push(transcript.file_name().to_string_lossy().into_owned());
         }
     }
-    Some(false)
+    Some(names)
+}
+
+/// PURE: whether a claude session left a transcript on disk, which answers whether there is
+/// anything to go read about a job the router cannot otherwise resolve.
+///
+/// The hyphen anchors the match to the end of a session UUID's first segment, so a short id that
+/// is a prefix of another cannot match it. The transcript is never opened, because a finished job
+/// and a running one end their files the same way, so existence is the entire signal.
+fn transcript_exists(names: &[String], short_id: &str) -> bool {
+    let prefix = format!("{short_id}-");
+    names
+        .iter()
+        .any(|name| name.starts_with(&prefix) && name.ends_with(".jsonl"))
 }

@@ -7,16 +7,17 @@
 //! not choose, and nothing recorded WHICH provider could not be launched, so routing had no signal
 //! to act on.
 //!
-//! Every case drives `classify_in` / `job_name_in` with an explicit `Environment`. No
+//! Every case drives `classify` / `job_name` with an explicit `Context`. No
 //! process-environment mutation and no user-namespace isolation: see `binary_resolution.rs`.
 
 #![cfg(unix)]
 
+use agent_router_core::Context;
 use agent_router_core::Provider;
 use agent_router_core::binary::{CLAUDE_BIN_ENV, CODEX_BIN_ENV, Environment};
 use agent_router_core::classify::{
-    Classification, Complexity, TaskContextHorizon, classify_in, classify_with_name_in,
-    job_name_in, parse_classification, parse_classifier_output_with_name,
+    Classification, Complexity, TaskContextHorizon, classify, classify_with_name, job_name,
+    parse_classification, parse_classifier_output_with_name,
 };
 use agent_router_core::config::{ClassifierEngine, Config};
 use std::collections::BTreeMap;
@@ -70,6 +71,10 @@ fn config_on(engine: ClassifierEngine) -> Config {
     config
 }
 
+fn ctx(root: &Path, environment: Environment, config: Config) -> Context {
+    Context::new(environment, root.join("home"), config)
+}
+
 // ------------------------------------------------------------------ #10: could not launch
 
 /// Plan test #10. When the classifier's own CLI cannot be launched, the fallback must record WHICH
@@ -102,10 +107,9 @@ fn a_classifier_whose_cli_cannot_be_launched_falls_back_with_the_named_message()
             CLAUDE_BIN_ENV,
         ),
     ] {
-        let classification = classify_in(
-            &environment,
+        let classification = classify(
+            &ctx(root.path(), environment.clone(), config_on(engine)),
             "audit the airtable records",
-            &config_on(engine),
         );
 
         assert!(
@@ -157,7 +161,10 @@ fn a_classifier_that_ran_and_failed_is_not_marked_unlaunchable() {
         // Keep the timeout case bounded: the deadline is the behaviour under test, not the wait.
         config.classifier_timeout_secs = 1;
 
-        let classification = classify_in(&environment, "audit the airtable records", &config);
+        let classification = classify(
+            &ctx(root.path(), environment, config),
+            "audit the airtable records",
+        );
 
         assert!(
             classification.classifier_failed,
@@ -213,10 +220,13 @@ fn job_name_returns_none_when_the_classifier_cannot_be_launched() {
     let root = tempfile::tempdir().expect("tempdir");
 
     assert_eq!(
-        job_name_in(
-            &stripped(root.path()),
+        job_name(
+            &ctx(
+                root.path(),
+                stripped(root.path()),
+                config_on(ClassifierEngine::Codex),
+            ),
             "GH-123 audit the airtable records",
-            &config_on(ClassifierEngine::Codex),
         ),
         None,
         "a job that cannot be named still dispatches"
@@ -294,10 +304,13 @@ fn the_fallback_claims_no_destination_and_still_says_why() {
 fn the_named_classify_path_reports_the_same_unlaunchable_evidence() {
     let root = tempfile::tempdir().expect("tempdir");
 
-    let scored = classify_with_name_in(
-        &stripped(root.path()),
+    let scored = classify_with_name(
+        &ctx(
+            root.path(),
+            stripped(root.path()),
+            config_on(ClassifierEngine::Codex),
+        ),
         "audit the airtable records",
-        &config_on(ClassifierEngine::Codex),
     );
 
     assert_eq!(scored.classification.unlaunchable, Some(Provider::Codex));

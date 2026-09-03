@@ -1,7 +1,7 @@
-use crate::binary::{self, Environment};
+use crate::binary::{self};
 use crate::classify::Complexity;
-use crate::config::Config;
-use crate::dispatch::grok::{grok_home, spawn_with_lifecycle};
+use crate::context::Context;
+use crate::dispatch::grok::spawn_with_lifecycle;
 use crate::error::{Error, Result};
 use crate::provider::Provider;
 use crate::usage::{Headroom, claude_headroom, codex_headroom, grok_headroom};
@@ -135,7 +135,7 @@ pub fn review_with_claude_usage_reserve(
     }
 }
 
-pub fn review_registered(request: &ReviewRequest<'_>, config: &Config) -> ReviewOutcome {
+pub fn review_registered(request: &ReviewRequest<'_>, ctx: &Context) -> ReviewOutcome {
     if !request.dir.is_dir() {
         return failed_outcome(
             request.primary_provider,
@@ -144,18 +144,20 @@ pub fn review_registered(request: &ReviewRequest<'_>, config: &Config) -> Review
     }
 
     let claude = ClaudeReviewProvider {
-        model: config.models.claude.pick(Complexity::High),
+        model: ctx.config.models.claude.pick(Complexity::High),
+        ctx,
     };
     let codex = CodexReviewProvider {
-        model: config.models.codex.pick(Complexity::High),
+        model: ctx.config.models.codex.pick(Complexity::High),
+        ctx,
     };
-    let grok = GrokReviewProvider;
+    let grok = GrokReviewProvider { ctx };
     let providers: [&dyn ReviewProvider; 3] = [&claude, &codex, &grok];
 
     match select_provider(
         request.primary_provider,
         &providers,
-        config.adversarial_review.claude_usage_reserve_pct,
+        ctx.config.adversarial_review.claude_usage_reserve_pct,
     ) {
         Selection::Selected {
             provider,
@@ -405,6 +407,7 @@ fn select_provider<'a>(
 
 struct ClaudeReviewProvider<'a> {
     model: &'a str,
+    ctx: &'a Context,
 }
 
 impl ReviewProvider for ClaudeReviewProvider<'_> {
@@ -417,7 +420,7 @@ impl ReviewProvider for ClaudeReviewProvider<'_> {
     }
 
     fn usage(&self) -> Option<Headroom> {
-        Some(claude_headroom())
+        Some(claude_headroom(self.ctx))
     }
 
     fn review(&self, request: &ReviewRequest<'_>) -> Result<String> {
@@ -428,7 +431,7 @@ impl ReviewProvider for ClaudeReviewProvider<'_> {
             )));
         }
 
-        let binary = review_binary(CLAUDE_REVIEW_BIN_ENV, Provider::Claude)?;
+        let binary = review_binary(self.ctx, CLAUDE_REVIEW_BIN_ENV, Provider::Claude)?;
         let mut command = Command::new(&binary);
         command
             .current_dir(request.dir)
@@ -453,6 +456,7 @@ impl ReviewProvider for ClaudeReviewProvider<'_> {
 
 struct CodexReviewProvider<'a> {
     model: &'a str,
+    ctx: &'a Context,
 }
 
 impl ReviewProvider for CodexReviewProvider<'_> {
@@ -465,7 +469,7 @@ impl ReviewProvider for CodexReviewProvider<'_> {
     }
 
     fn usage(&self) -> Option<Headroom> {
-        Some(codex_headroom())
+        Some(codex_headroom(self.ctx))
     }
 
     fn review(&self, request: &ReviewRequest<'_>) -> Result<String> {
@@ -476,7 +480,7 @@ impl ReviewProvider for CodexReviewProvider<'_> {
             )));
         }
 
-        let binary = review_binary(CODEX_REVIEW_BIN_ENV, Provider::Codex)?;
+        let binary = review_binary(self.ctx, CODEX_REVIEW_BIN_ENV, Provider::Codex)?;
         let mut command = Command::new(&binary);
         command
             .current_dir(request.dir)
@@ -493,9 +497,11 @@ impl ReviewProvider for CodexReviewProvider<'_> {
     }
 }
 
-struct GrokReviewProvider;
+struct GrokReviewProvider<'a> {
+    ctx: &'a Context,
+}
 
-impl ReviewProvider for GrokReviewProvider {
+impl ReviewProvider for GrokReviewProvider<'_> {
     fn provider_name(&self) -> &str {
         "grok"
     }
@@ -505,15 +511,15 @@ impl ReviewProvider for GrokReviewProvider {
     }
 
     fn usage(&self) -> Option<Headroom> {
-        Some(grok_headroom())
+        Some(grok_headroom(self.ctx))
     }
 
     fn authoritative_availability(&self) -> std::result::Result<(), String> {
         // This probe's whole contract is a human-readable reason, so a resolution failure becomes
         // its `Err` string carrying the `Launch` message text rather than a distinct variant.
-        let binary = binary::resolve(Provider::Grok, &Environment::from_process())
+        let binary = binary::resolve(Provider::Grok, &self.ctx.environment)
             .map_err(|error| error.to_string())?;
-        let lifecycle = GrokLifecycle::new(binary, grok_home());
+        let lifecycle = GrokLifecycle::new(binary, self.ctx.grok_home());
         let diagnostics = lifecycle
             .diagnostics()
             .map_err(|error| format!("authoritative Grok leader diagnostics failed: {error}"))?;
@@ -524,14 +530,14 @@ impl ReviewProvider for GrokReviewProvider {
     }
 
     fn review(&self, request: &ReviewRequest<'_>) -> Result<String> {
-        run_grok_review(request).map(|(result, _)| result)
+        run_grok_review(self.ctx, request).map(|(result, _)| result)
     }
 
     fn review_with_identity(
         &self,
         request: &ReviewRequest<'_>,
     ) -> Result<(String, Option<String>)> {
-        run_grok_review(request).map(|(result, session_id)| (result, Some(session_id)))
+        run_grok_review(self.ctx, request).map(|(result, session_id)| (result, Some(session_id)))
     }
 }
 
@@ -553,7 +559,7 @@ fn grok_review_poll(status: &GrokStatus) -> GrokReviewPoll {
     }
 }
 
-fn run_grok_review(request: &ReviewRequest<'_>) -> Result<(String, String)> {
+fn run_grok_review(ctx: &Context, request: &ReviewRequest<'_>) -> Result<(String, String)> {
     if !request.dir.is_dir() {
         return Err(Error::Command(format!(
             "target directory does not exist: {}",
@@ -561,8 +567,8 @@ fn run_grok_review(request: &ReviewRequest<'_>) -> Result<(String, String)> {
         )));
     }
 
-    let binary = binary::resolve(Provider::Grok, &Environment::from_process())?;
-    let lifecycle = GrokLifecycle::new(binary, grok_home());
+    let binary = binary::resolve(Provider::Grok, &ctx.environment)?;
+    let lifecycle = GrokLifecycle::new(binary, ctx.grok_home());
     let prompt = format!(
         "{GROK_REVIEW_CONTRACT}\n\nReview request:\n{}",
         request.body
@@ -715,11 +721,11 @@ impl Drop for GrokReviewCleanup<'_> {
 /// pins a separate reviewer binary is making a narrower statement than one who pins the dispatch
 /// binary, so it must outrank it. The ordered list is a precedence, not a requirement — with only
 /// the generic override set, the review path still resolves through it.
-fn review_binary(review_env: &'static str, provider: Provider) -> Result<PathBuf> {
+fn review_binary(ctx: &Context, review_env: &'static str, provider: Provider) -> Result<PathBuf> {
     binary::resolve_named(
         provider.name(),
         &[review_env, binary::override_env(provider)],
-        &Environment::from_process(),
+        &ctx.environment,
     )
 }
 
