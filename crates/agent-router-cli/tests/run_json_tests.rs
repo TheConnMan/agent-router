@@ -65,6 +65,9 @@ struct CliFixture {
     classifier_log: PathBuf,
     /// What the fake `claude -p` answers, replaceable per test.
     classifier_answer_file: PathBuf,
+    /// Optional one-JSON-object-per-line queue consumed before `classifier_answer_file`. Empty
+    /// means every call reads the answer file, which is the default.
+    classifier_queue: PathBuf,
 }
 
 /// The envelope `claude -p --output-format json` wraps the model's text in.
@@ -127,6 +130,7 @@ impl CliFixture {
         let classifier_name = "RS-123 Input Box Searching";
         let spawn_log = root.path.join("claude.argv");
         let classifier_log = root.path.join("claude.-p.calls");
+        let classifier_queue = root.path.join("classifier.queue");
         // The model titles a job on both routes now, so that is the name the listing advertises
         // and the name the router matches its own spawn against to resolve a short id.
         let listed = listed.unwrap_or(classifier_name);
@@ -163,12 +167,21 @@ impl CliFixture {
              fi\n\
              if [ \"$1\" = \"-p\" ]; then\n\
                printf 'called\\n' >> {}\n\
+               queue={}\n\
+               if [ -s \"$queue\" ]; then\n\
+                 IFS= read -r line < \"$queue\" || true\n\
+                 tail -n +2 \"$queue\" > \"$queue.tmp\"\n\
+                 mv \"$queue.tmp\" \"$queue\"\n\
+                 printf '%s\\n' \"$line\"\n\
+                 exit 0\n\
+               fi\n\
                cat {}\n\
                exit 0\n\
              fi\n\
              printf '%s\\n' \"$@\" > {}\n",
             shell_quote(&agents),
             shell_quote(&classifier_log.to_string_lossy()),
+            shell_quote(&classifier_queue.to_string_lossy()),
             shell_quote(&classifier_answer_file.to_string_lossy()),
             shell_quote(&spawn_log.to_string_lossy())
         );
@@ -183,6 +196,7 @@ impl CliFixture {
             spawn_log,
             classifier_log,
             classifier_answer_file,
+            classifier_queue,
         }
     }
 
@@ -191,6 +205,16 @@ impl CliFixture {
     fn answers_with(&self, text: &str) {
         fs::write(&self.classifier_answer_file, claude_result(text))
             .expect("rewrite the classifier answer");
+    }
+
+    /// One compact JSON envelope per `claude -p` call, consumed in order, then the answer file.
+    fn answers_sequence(&self, answers: &[&str]) {
+        let mut body = String::new();
+        for answer in answers {
+            body.push_str(&claude_result(answer));
+            body.push('\n');
+        }
+        fs::write(&self.classifier_queue, body).expect("write the classifier answer queue");
     }
 
     fn answers_with_complexity(&self, complexity: &str) {
@@ -360,15 +384,90 @@ fn an_explicit_provider_still_names_its_job_with_the_model() {
     assert_eq!(value["gates"], json!(["explicit_provider"]));
 }
 
-/// The title is cosmetic, so a naming call that answers nothing usable must cost the job nothing:
-/// it dispatches under the derived name instead of failing or going unnamed.
+/// A scored title that forgot the ticket is still a title: prepend the ticket rather than
+/// throwing the model's words away and falling back to the first few words of the prompt.
+#[cfg(unix)]
+#[test]
+fn a_scored_title_that_omits_the_ticket_is_recovered_without_a_second_call() {
+    let recovered = "RS-123 Rename Background Sessions";
+    let fixture = CliFixture::listing_agent_named("recovered-ticket-title", Some(recovered));
+    fixture.answers_with(
+        &json!({
+            "orchestration": false,
+            "missing_connector": false,
+            "complexity": "medium",
+            "task_context_horizon": "ordinary",
+            "rationale": "fixture recovery",
+            "job_name": "Rename Background Sessions",
+        })
+        .to_string(),
+    );
+    let output = fixture
+        .run_command()
+        .arg("--provider")
+        .arg("claude")
+        .arg("--json")
+        .output()
+        .expect("run router");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("router json");
+    assert_eq!(value["dispatch"]["job_name"], recovered);
+    assert_eq!(
+        fixture.classifier_calls(),
+        1,
+        "recovering the ticket must not pay for a second naming call"
+    );
+}
+
+/// A punctuated or unparseable scored title is not the last word: one title-only call still
+/// names the job when that call answers in contract.
+#[cfg(unix)]
+#[test]
+fn an_unusable_scored_title_retries_the_title_only_call() {
+    let recovered = "RS-123 Input Box Searching";
+    let fixture = CliFixture::listing_agent_named("retry-title", Some(recovered));
+    fixture.answers_sequence(&[
+        &json!({
+            "orchestration": false,
+            "missing_connector": false,
+            "complexity": "medium",
+            "task_context_horizon": "ordinary",
+            "rationale": "fixture scored",
+            "job_name": "Renaming: background, sessions!",
+        })
+        .to_string(),
+        &json!({ "job_name": recovered }).to_string(),
+    ]);
+    let output = fixture
+        .run_command()
+        .arg("--provider")
+        .arg("claude")
+        .arg("--json")
+        .output()
+        .expect("run router");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("router json");
+    assert_eq!(value["dispatch"]["job_name"], recovered);
+    assert_eq!(fixture.classifier_calls(), 2);
+}
+
+/// The title is cosmetic, so a naming call that answers nothing usable even after the title-only
+/// retry must cost the job nothing: it dispatches under the derived name instead of failing or
+/// going unnamed.
 #[cfg(unix)]
 #[test]
 fn an_unusable_title_leaves_an_explicit_job_on_its_derived_name() {
     for answer in [
         "I cannot name this task.",
         r#"{"job_name":"Renaming: background, sessions!"}"#,
-        r#"{"job_name":"Rename Background Sessions"}"#,
     ] {
         let fixture = CliFixture::listing_agent_named("unusable-title", None);
         fixture.answers_with(answer);
@@ -388,6 +487,11 @@ fn an_unusable_title_leaves_an_explicit_job_on_its_derived_name() {
         assert_eq!(
             value["dispatch"]["job_name"], fixture.name,
             "answer {answer:?} must leave the derived name in place"
+        );
+        assert_eq!(
+            fixture.classifier_calls(),
+            2,
+            "answer {answer:?} must retry the title-only call before the derived name"
         );
     }
 }

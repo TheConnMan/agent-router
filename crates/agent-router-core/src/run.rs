@@ -189,12 +189,15 @@ where
     } else {
         (read_usage(), None)
     };
+    // A scored title is used when it is usable. Otherwise one title-only call runs: the scoring
+    // model often spends the call on the rubric and drops a punctuated or ticket-less title, and
+    // Grok never scores at all. short_job_name remains only if that dedicated call is also
+    // unusable, so a job still dispatches.
     let generated_name = if request.name.is_none() && !request.dry_run {
-        match &classified {
-            Some(classified) => classified.job_name.clone(),
-            None if !derives_routing_values => None,
-            None => crate::classify::job_name(ctx, request.task),
-        }
+        classified
+            .as_ref()
+            .and_then(|classified| classified.job_name.clone())
+            .or_else(|| crate::classify::job_name(ctx, request.task))
     } else {
         None
     };

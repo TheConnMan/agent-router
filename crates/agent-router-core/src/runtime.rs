@@ -125,8 +125,9 @@ pub fn short_job_name(task: &str) -> String {
 
 /// Validate and normalize a title returned by the classifier model.
 ///
-/// A ticket in the task must lead the title. The remaining title must contain two to six words,
-/// and punctuation is rejected so a model explanation cannot become a session name.
+/// A ticket in the task leads the title, even when the model forgot to include it: the remaining
+/// words are the description. The description must contain two to six words, and punctuation is
+/// rejected so a model explanation cannot become a session name.
 pub fn validate_job_name(task: &str, candidate: &str) -> Option<String> {
     let words: Vec<&str> = candidate.split_whitespace().collect();
     if words.is_empty() || words.iter().any(|word| !valid_title_word(word)) {
@@ -136,25 +137,23 @@ pub fn validate_job_name(task: &str, candidate: &str) -> Option<String> {
     let ticket = task
         .split(|character: char| !(character.is_alphanumeric() || character == '-'))
         .find(|word| is_ticket(word));
-    let description = if let Some(ticket) = ticket {
-        if words.first().copied() != Some(ticket) {
-            return None;
-        }
-        &words[1..]
-    } else {
-        words.as_slice()
+    let description: Vec<&str> = match ticket {
+        Some(ticket) => words
+            .iter()
+            .copied()
+            .filter(|word| !word.eq_ignore_ascii_case(ticket))
+            .collect(),
+        None => words,
     };
     if !(2..=6).contains(&description.len()) {
         return None;
     }
 
-    let mut normalized = Vec::with_capacity(words.len());
+    let mut normalized = Vec::with_capacity(description.len() + usize::from(ticket.is_some()));
     if let Some(ticket) = ticket {
         normalized.push(ticket.to_string());
-        normalized.extend(description.iter().map(|word| title_case(word)));
-    } else {
-        normalized.extend(words.iter().map(|word| title_case(word)));
     }
+    normalized.extend(description.iter().map(|word| title_case(word)));
     Some(normalized.join(" "))
 }
 
@@ -294,10 +293,17 @@ mod tests {
     }
 
     #[test]
-    fn a_model_title_must_start_with_the_task_ticket_and_have_two_to_six_description_words() {
+    fn a_model_title_that_omits_the_task_ticket_still_gets_the_ticket_prepended() {
         assert_eq!(
             validate_job_name("/implement GH-123 fix bugs", "Fix Bugs GH-123"),
-            None
+            Some("GH-123 Fix Bugs".to_string())
+        );
+        assert_eq!(
+            validate_job_name(
+                "/implement RS-123 rename background sessions",
+                "Rename Background Sessions"
+            ),
+            Some("RS-123 Rename Background Sessions".to_string())
         );
         assert_eq!(
             validate_job_name("/implement GH-123 fix bugs", "GH-123 Fix"),

@@ -345,9 +345,10 @@ pub fn codex_classifier_command_with_binary(
 /// What a session title has to look like, asked for in exactly these words by both prompts below.
 ///
 /// Shared rather than written twice because `validate_job_name` is the other half of the contract:
-/// it rejects a title outside this shape, and a rejected title is invisible, since the caller
-/// silently keeps the derived name. Two copies of this paragraph would drift, and the drift would
-/// show up as one of the two prompts quietly never producing a usable title again.
+/// it rejects a title outside this shape, and a rejected title is invisible. The caller then
+/// retries with the title-only prompt before the derived name. Two copies of this paragraph would
+/// drift, and the drift would show up as one of the two prompts quietly never producing a usable
+/// title again.
 const JOB_NAME_INSTRUCTION: &str = "create a concise human-readable session title for this task. \
      If the task contains a ticket ID such as GH-123 or RS-123, start with that exact ticket ID. \
      Then add two to six Title Case words describing the feature or thread. If there is no ticket \
@@ -417,8 +418,8 @@ Reply with exactly this JSON object, filled in:
 /// the naming call did.
 ///
 /// It costs one small-model call, so the caller decides whether the job is worth naming. The
-/// scoring path does not use this: it already has an answer carrying a title, and asking twice
-/// would pay for the title twice.
+/// scoring path uses this only when its own title was unusable: asking twice for a title that
+/// already passed would pay for the same name twice.
 pub fn job_name(ctx: &Context, task: &str) -> Option<String> {
     let engine = ctx.config.classifier.engine;
     let cmd = classifier_command_in(ctx, &job_name_prompt(task), &ctx.config.classifier).ok()?;

@@ -34,10 +34,12 @@ log: row 87 in /home/you/.local/state/agent-router/router.db
    nothing to reach for. If the call fails or times out, automatic capacity routing still selects
    between Codex and Grok and the decision is tagged `classifier_failed`. The same classifier model also generates
    the job title. A ticket ID leads the title, followed by two to six concise Title Case words, such
-   as `GH-123 Sprint 2 Bug Fixes` or `RS-123 Input Box Searching`. A run that names its provider is
-   The routing classifier runs whenever provider, model, or effort is omitted for Claude or Codex.
-   An explicit Claude or Codex provider therefore pins only the provider: omitted model and effort
-   values still come from classification. Grok skips cross-provider classification;
+   as `GH-123 Sprint 2 Bug Fixes` or `RS-123 Input Box Searching`. A title that forgot the ticket
+   still keeps the model's words, with the ticket prepended. An unusable scored title (punctuation,
+   wrong length, unparseable) gets one dedicated title-only call before the last-ditch prompt
+   prefix. The routing classifier runs whenever provider, model, or effort is omitted for Claude or
+   Codex. An explicit Claude or Codex provider therefore pins only the provider: omitted model and
+   effort values still come from classification. Grok skips cross-provider classification;
    job naming remains a separate title call when a name was not supplied and dispatch is not a dry
    run.
 2. **Apply capability gates.** A task needing several agents to exchange findings mid-run or a
@@ -181,7 +183,7 @@ agent-router run "Fix the failing test" --dir ~/git/other-project
 | `--provider <NAME>` | `auto` | `auto` classifies the task, balances ordinary work between Codex and Grok, and pins Claude for capability needs. An explicit provider pins it. |
 | `--model <NAME>` | tier table | Model pin. Requires an explicit `--provider`. With explicit Claude or Codex and no effort, classification fills effort. Pairing it with `--provider auto` is rejected. An explicit Grok model reaches the public lifecycle unchanged. |
 | `--effort <NAME>` | complexity mapping | Effort pin. Requires an explicit provider and model. Low maps to low, medium to medium, and high or ultra maps to high for Codex and Claude. Grok rejects this flag. |
-| `--name <NAME>` | the model's title, or three to five words derived from the task | Name for the dispatched job. Supplying it skips the naming call. It reaches the `claude --bg --name` argv verbatim, names the Codex thread, and is recorded as `job_name` in the decision log for every provider, so callers that reconcile inflight jobs by exact name depend on it. An empty or whitespace only name is rejected. |
+| `--name <NAME>` | the model's title, recovered if it omitted a ticket, or one title-only retry; three to five words derived from the task only if both fail | Name for the dispatched job. Supplying it skips the naming call. It reaches the `claude --bg --name` argv verbatim, names the Codex thread, and is recorded as `job_name` in the decision log for every provider, so callers that reconcile inflight jobs by exact name depend on it. An empty or whitespace only name is rejected. |
 | `--dry-run` | off | Decide and log, dispatch nothing, and project the weekly draw the job is likely to cost on the provider it landed on. |
 | `--mcp-config <PATH>` | none | MCP config file for the dispatched Claude job. Repeatable. Rejected for every other provider, including Grok, and the check runs after routing, so pairing it with `--provider auto` fails whenever classification lands on a provider other than Claude. |
 | `--strict-mcp-config` | off | Use only the `--mcp-config` files and drop every inherited MCP server. See the warning below before using it. |
