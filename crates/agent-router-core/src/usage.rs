@@ -18,7 +18,7 @@
 use crate::runtime::{default_codex_home, home_dir};
 use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
-use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+use std::io::{Read, Seek, SeekFrom, Write as _};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
@@ -50,6 +50,9 @@ const CACHE_MAX_AGE: Duration = Duration::from_secs(300);
 const USAGE_HTTP_TIMEOUT: Duration = Duration::from_secs(6);
 /// How many newest rollouts are scanned for a `rate_limits` event.
 const CODEX_SCAN_N: usize = 20;
+/// One fixed-size block used while walking a Codex rollout backwards. Memory grows only with the
+/// longest individual line, not with the size of the rollout.
+const CODEX_ROLLOUT_READ_BYTES: usize = 64 * 1024;
 /// `window_minutes` of the 5h window.
 const WINDOW_FIVE_HOUR: i64 = 300;
 /// `window_minutes` of the weekly window.
@@ -796,22 +799,95 @@ pub fn codex_headroom_in(sessions_dir: &Path, now: i64, scan_n: usize) -> Headro
 }
 
 /// IMPURE: the newest `rate_limits` line with a credits object or weekly window, scanning rollouts
-/// newest-first and each rollout's own lines last-first.
+/// newest-first and each rollout's own lines last-first. Each readable file is walked backwards in
+/// fixed-size blocks so a large active session does not have to be loaded whole. An unreadable
+/// file is skipped, matching the previous `read_to_string` error path.
 fn newest_capacity_rate_limits_line(sessions_dir: &Path, scan_n: usize) -> Option<String> {
     for path in newest_rollouts(sessions_dir, scan_n) {
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
+        let mut file = match File::open(&path) {
+            Ok(file) => file,
             Err(_) => continue,
         };
-        let found = text
-            .lines()
-            .rev()
-            .find(|line| line.contains("\"rate_limits\"") && carries_capacity_verdict(line));
-        if let Some(line) = found {
-            return Some(line.to_string());
+        if let Some(line) = last_capacity_rate_limits_line(&mut file) {
+            return Some(line);
         }
     }
     None
+}
+
+/// Last line in `reader` that contains `"rate_limits"` and passes `carries_capacity_verdict`.
+/// Generic over `Read + Seek` so a test can inject a byte-counting reader.
+fn last_capacity_rate_limits_line<R: Read + Seek>(reader: &mut R) -> Option<String> {
+    last_matching_line_from_end(reader, CODEX_ROLLOUT_READ_BYTES, |line| {
+        line.contains("\"rate_limits\"") && carries_capacity_verdict(line)
+    })
+}
+
+/// Walk `reader` backwards in `block_size` chunks, returning the last (nearest-to-EOF) line for
+/// which `matches` is true. Line breaks match `str::lines()`: `\n` or `\r\n`, with no trailing
+/// empty line. Memory is one reconstructed line plus one block. Invalid UTF-8 aborts the file,
+/// matching `read_to_string` skipping an unreadable candidate.
+fn last_matching_line_from_end<R, F>(
+    reader: &mut R,
+    block_size: usize,
+    mut matches: F,
+) -> Option<String>
+where
+    R: Read + Seek,
+    F: FnMut(&str) -> bool,
+{
+    let mut remaining = reader.seek(SeekFrom::End(0)).ok()?;
+    if remaining == 0 {
+        return None;
+    }
+    let mut block = vec![0; block_size];
+    let mut reversed_line = Vec::new();
+    let mut skip_cr = false;
+
+    while remaining > 0 {
+        let read_len = usize::try_from(remaining.min(block_size as u64)).ok()?;
+        remaining -= read_len as u64;
+        reader.seek(SeekFrom::Start(remaining)).ok()?;
+        reader.read_exact(&mut block[..read_len]).ok()?;
+        for &byte in block[..read_len].iter().rev() {
+            if skip_cr {
+                skip_cr = false;
+                if byte == b'\r' {
+                    continue;
+                }
+            }
+            if byte == b'\n' {
+                match completed_line(&mut reversed_line, &mut matches) {
+                    Ok(Some(line)) => return Some(line),
+                    Ok(None) => {}
+                    Err(_) => return None,
+                }
+                reversed_line.clear();
+                skip_cr = true;
+            } else {
+                reversed_line.push(byte);
+            }
+        }
+    }
+    completed_line(&mut reversed_line, &mut matches)
+        .ok()
+        .flatten()
+}
+
+/// `Ok(Some)` is a match, `Ok(None)` is an empty or non-matching line, `Err` is invalid UTF-8.
+fn completed_line<F>(
+    reversed: &mut [u8],
+    matches: &mut F,
+) -> Result<Option<String>, std::str::Utf8Error>
+where
+    F: FnMut(&str) -> bool,
+{
+    if reversed.is_empty() {
+        return Ok(None);
+    }
+    reversed.reverse();
+    let line = std::str::from_utf8(reversed)?;
+    Ok(matches(line).then(|| line.to_string()))
 }
 
 /// PURE: whether a rollout line's `rate_limits` payload can supply a capacity verdict. Parsing
@@ -1043,6 +1119,7 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 mod tests {
     use super::*;
     use std::cell::Cell;
+    use std::io::{Cursor, Read, Seek, SeekFrom};
     #[cfg(unix)]
     use std::os::unix::{
         ffi::OsStrExt as _,
@@ -1441,6 +1518,208 @@ mod tests {
         assert_eq!(codex_headroom_in(dir.path(), now, 20).weekly_pct, 42.0);
         // Only the newest two are scanned, and neither carries capacity: closed.
         assert_eq!(codex_headroom_in(dir.path(), now, 2), Headroom::closed());
+    }
+
+    struct CountingReader<R> {
+        inner: R,
+        bytes_read: usize,
+    }
+
+    impl<R: Read> Read for CountingReader<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.bytes_read += n;
+            Ok(n)
+        }
+    }
+
+    impl<R: Seek> Seek for CountingReader<R> {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    fn capacity_line(pct: i64, reset: i64) -> String {
+        format!(
+            r#"{{"payload":{{"rate_limits":{{"primary":{{"window_minutes":10080,"used_percent":{pct},"resets_at":{reset}}},"secondary":null}}}}}}"#
+        )
+    }
+
+    fn filler_line() -> &'static str {
+        r#"{"payload":{"type":"item"}}"#
+    }
+
+    fn scan_capacity_line(bytes: &[u8]) -> (Option<String>, usize) {
+        let mut reader = CountingReader {
+            inner: Cursor::new(bytes),
+            bytes_read: 0,
+        };
+        let found = last_capacity_rate_limits_line(&mut reader);
+        (found, reader.bytes_read)
+    }
+
+    #[test]
+    fn codex_tail_scan_reads_only_the_final_blocks_of_a_large_rollout() {
+        let reset = 1_000_000 + 3600;
+        let verdict = capacity_line(41, reset);
+        let filler = format!("{}\n", filler_line());
+        let mut body = String::new();
+        while body.len() < CODEX_ROLLOUT_READ_BYTES * 3 {
+            body.push_str(&filler);
+        }
+        body.push_str(&verdict);
+        body.push('\n');
+
+        let (found, bytes_read) = scan_capacity_line(body.as_bytes());
+        assert_eq!(found.as_deref(), Some(verdict.as_str()));
+        assert!(
+            bytes_read <= CODEX_ROLLOUT_READ_BYTES * 2,
+            "tail scan must stop after a small constant number of blocks; read {bytes_read} of {}",
+            body.len()
+        );
+        assert!(
+            bytes_read < body.len() / 2,
+            "must not read the whole rollout: read {bytes_read} of {}",
+            body.len()
+        );
+    }
+
+    #[test]
+    fn codex_tail_scan_matches_a_verdict_line_that_spans_a_block_boundary() {
+        let reset = 1_000_000 + 3600;
+        let verdict = capacity_line(41, reset);
+        let mut verdict_nl = verdict.clone();
+        verdict_nl.push('\n');
+        assert!(
+            verdict_nl.len() > 20,
+            "the split keeps 20 trailing bytes of the verdict in the last block"
+        );
+
+        let mut trailing = Vec::new();
+        let filler = format!("{}\n", filler_line());
+        while trailing.len() < CODEX_ROLLOUT_READ_BYTES - 20 {
+            trailing.extend_from_slice(filler.as_bytes());
+        }
+        trailing.truncate(CODEX_ROLLOUT_READ_BYTES - 20);
+
+        let mut body = format!("{}\n", filler_line()).into_bytes();
+        body.extend_from_slice(verdict_nl.as_bytes());
+        body.extend_from_slice(&trailing);
+
+        let (found, bytes_read) = scan_capacity_line(&body);
+        assert_eq!(found.as_deref(), Some(verdict.as_str()));
+        assert!(
+            bytes_read > CODEX_ROLLOUT_READ_BYTES,
+            "a split line must pull the previous block; read {bytes_read}"
+        );
+        assert!(
+            bytes_read <= CODEX_ROLLOUT_READ_BYTES * 2,
+            "a split line still stays within two blocks; read {bytes_read}"
+        );
+    }
+
+    #[test]
+    fn codex_tail_scan_uses_the_last_verdict_even_when_later_lines_follow() {
+        let reset = 1_000_000 + 3600;
+        let older = capacity_line(11, reset);
+        let newer = capacity_line(41, reset);
+        let body = format!("{older}\n{newer}\n{}\n{}\n", filler_line(), filler_line());
+        let (found, _) = scan_capacity_line(body.as_bytes());
+        assert_eq!(found.as_deref(), Some(newer.as_str()));
+    }
+
+    #[test]
+    fn codex_tail_scan_returns_none_for_an_empty_rollout() {
+        let (found, bytes_read) = scan_capacity_line(b"");
+        assert_eq!(found, None);
+        assert_eq!(bytes_read, 0);
+    }
+
+    #[test]
+    fn codex_tail_scan_aborts_a_file_when_a_later_line_is_invalid_utf8() {
+        let reset = 1_000_000 + 3600;
+        let mut body = capacity_line(11, reset).into_bytes();
+        body.push(b'\n');
+        body.extend_from_slice(&[0xff, 0xfe, 0xfd, b'\n']);
+        let (found, _) = scan_capacity_line(&body);
+        assert_eq!(
+            found, None,
+            "invalid UTF-8 must skip the candidate, not an older verdict in the same file"
+        );
+    }
+
+    #[test]
+    fn codex_headroom_falls_through_a_newer_rollout_with_no_verdict() {
+        let now = 1_000_000;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let weekly = format!(
+            r#"{{"payload":{{"rate_limits":{{"primary":{{"window_minutes":10080,"used_percent":42,"resets_at":{}}},"secondary":null}}}}}}"#,
+            now + 3600
+        );
+        rollout(dir.path(), "older-with-verdict.jsonl", &weekly, 100);
+        rollout(
+            dir.path(),
+            "newer-without-verdict.jsonl",
+            &format!("{}\n{}\n", filler_line(), filler_line()),
+            200,
+        );
+        let got = codex_headroom_in(dir.path(), now, 20);
+        assert_eq!(
+            got.weekly_pct, 42.0,
+            "a newer rollout with no capacity verdict must not hide the next-newest"
+        );
+    }
+
+    #[test]
+    fn codex_headroom_skips_an_empty_newer_rollout_and_reads_the_next() {
+        let now = 1_000_000;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let weekly = format!(
+            r#"{{"payload":{{"rate_limits":{{"primary":{{"window_minutes":10080,"used_percent":42,"resets_at":{}}},"secondary":null}}}}}}"#,
+            now + 3600
+        );
+        rollout(dir.path(), "older-with-verdict.jsonl", &weekly, 100);
+        rollout(dir.path(), "empty.jsonl", "", 200);
+        let got = codex_headroom_in(dir.path(), now, 20);
+        assert_eq!(got.weekly_pct, 42.0);
+
+        let only_empty = tempfile::tempdir().expect("tempdir");
+        rollout(only_empty.path(), "empty.jsonl", "", 100);
+        assert_eq!(
+            codex_headroom_in(only_empty.path(), now, 20),
+            Headroom::closed()
+        );
+    }
+
+    #[test]
+    fn codex_headroom_skips_a_newer_rollout_with_invalid_utf8() {
+        let now = 1_000_000;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let weekly = |pct: i64| {
+            format!(
+                r#"{{"payload":{{"rate_limits":{{"primary":{{"window_minutes":10080,"used_percent":{pct},"resets_at":{}}},"secondary":null}}}}}}"#,
+                now + 3600
+            )
+        };
+        rollout(dir.path(), "older-with-verdict.jsonl", &weekly(42), 100);
+        let mut newer = weekly(11).into_bytes();
+        newer.push(b'\n');
+        newer.extend_from_slice(&[0xff, 0xfe, 0xfd, b'\n']);
+        let newer_path = dir.path().join("newer-invalid.jsonl");
+        std::fs::write(&newer_path, newer).expect("write invalid utf8 rollout");
+        let mtime = std::fs::FileTimes::new()
+            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(200));
+        std::fs::File::options()
+            .write(true)
+            .open(&newer_path)
+            .expect("open invalid utf8 rollout")
+            .set_times(mtime)
+            .expect("set mtime");
+        let got = codex_headroom_in(dir.path(), now, 20);
+        assert_eq!(
+            got.weekly_pct, 42.0,
+            "a newer unreadable rollout must fall through like read_to_string failure"
+        );
     }
 
     const GROK_BILLING: &str = r#"{
