@@ -32,7 +32,6 @@ use std::path::{Path, PathBuf};
 pub const CLAUDE_BIN_ENV: &str = "AGENT_ROUTER_CLAUDE_BIN";
 pub const CODEX_BIN_ENV: &str = "AGENT_ROUTER_CODEX_BIN";
 pub const GROK_BIN_ENV: &str = "AGENT_ROUTER_GROK_BIN";
-pub const OPENCODE_BIN_ENV: &str = "AGENT_ROUTER_OPENCODE_BIN";
 
 /// The prefix and suffix that mark an environment variable as a binary override, including the
 /// review-specific ones `adversarial_review` owns. `Environment::from_process` captures exactly
@@ -58,7 +57,6 @@ pub const fn override_env(provider: Provider) -> &'static str {
         Provider::Claude => CLAUDE_BIN_ENV,
         Provider::Codex => CODEX_BIN_ENV,
         Provider::Grok => GROK_BIN_ENV,
-        Provider::Opencode => OPENCODE_BIN_ENV,
     }
 }
 
@@ -184,8 +182,8 @@ pub fn search_path(binary: &str, environment: &Environment) -> Option<PathBuf> {
 /// IMPURE: where `provider`'s CLI actually lives — override, then `$PATH`, then the fallback list.
 ///
 /// Returns an absolute path, because a relative one would spawn correctly from the resolving
-/// process and fail from a child with a different cwd, and both the classifier and the opencode
-/// server change directory before spawning.
+/// process and fail from a child with a different cwd, and the classifier changes directory
+/// before spawning.
 pub fn resolve(provider: Provider, environment: &Environment) -> Result<PathBuf> {
     resolve_named(provider.name(), &[override_env(provider)], environment)
 }

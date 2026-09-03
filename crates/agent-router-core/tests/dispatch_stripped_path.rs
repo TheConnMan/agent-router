@@ -30,9 +30,7 @@
 
 #![cfg(unix)]
 
-use agent_router_core::binary::{
-    CLAUDE_BIN_ENV, CODEX_BIN_ENV, Environment, GROK_BIN_ENV, OPENCODE_BIN_ENV,
-};
+use agent_router_core::binary::{CLAUDE_BIN_ENV, CODEX_BIN_ENV, Environment, GROK_BIN_ENV};
 use agent_router_core::dispatch::grok::dispatch_with_lifecycle;
 use agent_router_core::doctor::{Health, Report, optional_binary_in, required_binary_in};
 use agent_router_core::run::Dispatch;
@@ -44,15 +42,6 @@ use std::time::Duration;
 mod common;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
-
-/// The two ports `ensure_server` probes and then binds. Named here because the opencode ordering
-/// guard has to make both of them unavailable, and a third candidate added upstream would make
-/// that guard silently vacuous.
-const OPENCODE_PORTS: [u16; 2] = [4097, 4098];
-
-/// Serializes the two opencode cases against each other. They state opposite preconditions about
-/// the same two fixed ports, and libtest runs a file's tests as concurrent threads.
-static OPENCODE_PORT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// The empty system fallback list, named so every fixture below states the guarantee out loud
 /// rather than inheriting it: no host directory is searched, so no host binary can be spawned.
@@ -175,7 +164,7 @@ fn a_claude_agent_states_read_off_a_stripped_path_reports_a_launch_failure() {
 /// `.map_err(Error::Command)`, so a launch failure with a perfectly correct message would still
 /// persist as an undifferentiated `Error::Command`. Only the variant assertion catches that, which
 /// is why `assert_named_launch_failure` matches the variant first and reads the message second.
-// The codex daemon transport and the opencode managed server are Linux-only paths.
+// The codex daemon transport is a Linux-only path.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_codex_dispatch_off_a_stripped_path_reports_a_launch_failure() {
@@ -268,95 +257,7 @@ fn a_grok_lifecycle_failure_that_is_not_a_missing_binary_keeps_its_existing_mess
     );
 }
 
-// ------------------------------------------------------------------ opencode: both directions
-
-/// The opencode spawn arm. Reached only after the probe loop finds no live server and a candidate
-/// port binds, which is exactly where D3(a) says resolution belongs.
-///
-/// Precondition: neither candidate port answers. A live managed OpenCode server on 4097 or 4098
-/// would take the probe's early return and this case would have nothing to assert, so the
-/// precondition is checked rather than assumed.
-// The codex daemon transport and the opencode managed server are Linux-only paths.
-#[cfg(target_os = "linux")]
-#[test]
-fn an_opencode_dispatch_with_no_resolvable_binary_reports_launch() {
-    let _guard = OPENCODE_PORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    for port in OPENCODE_PORTS {
-        let probe = std::net::TcpListener::bind(("127.0.0.1", port));
-        assert!(
-            probe.is_ok(),
-            "port {port} is occupied, so the spawn arm is unreachable; stop the OpenCode server \
-             listening there and re-run"
-        );
-    }
-
-    let root = tempfile::tempdir().expect("tempdir");
-    let cwd = root.path().join("work");
-    std::fs::create_dir_all(&cwd).expect("create the working directory");
-
-    let error = agent_router_core::dispatch::opencode::dispatch_in(
-        &stripped(root.path()),
-        &cwd,
-        "score this",
-        "Fixture Job",
-        None,
-        None,
-    )
-    .expect_err("no opencode resolves off a stripped environment");
-
-    assert_named_launch_failure("opencode dispatch", error, "opencode", OPENCODE_BIN_ENV);
-}
-
-/// The D3(a) regression guard, and the one place in this diff where the correct behaviour is "do
-/// not resolve".
-///
-/// `ensure_server` returns an already-running server before it spawns anything, so a box with a
-/// live server on 4097/4098 and no `opencode` on PATH WORKS TODAY. Resolving at the top of
-/// `dispatch` — which the first draft of the plan prescribed — would fail that box with
-/// `Error::Launch`: a brand-new failure on a working path, shipped by the fix.
-///
-/// Both candidate ports are held here, so the run cannot reach the spawn. The failure that comes
-/// back must therefore be about the ports, never about the binary: a `Launch` here proves
-/// resolution was hoisted above the probe.
-// The codex daemon transport and the opencode managed server are Linux-only paths.
-#[cfg(target_os = "linux")]
-#[test]
-fn an_already_running_opencode_server_does_not_require_the_binary() {
-    let _guard = OPENCODE_PORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let held: Vec<_> = OPENCODE_PORTS
-        .iter()
-        .filter_map(|port| std::net::TcpListener::bind(("127.0.0.1", *port)).ok())
-        .collect();
-
-    let root = tempfile::tempdir().expect("tempdir");
-    let cwd = root.path().join("work");
-    std::fs::create_dir_all(&cwd).expect("create the working directory");
-
-    let outcome = agent_router_core::dispatch::opencode::dispatch_in(
-        &stripped(root.path()),
-        &cwd,
-        "score this",
-        "Fixture Job",
-        None,
-        None,
-    );
-    drop(held);
-
-    if let Err(error) = outcome {
-        assert!(
-            !matches!(error, Error::Launch(_)),
-            "no candidate port could be spawned on, so the binary was never needed; a Launch here \
-             means resolution was hoisted above the probe and a working path just regressed: \
-             {error:?}"
-        );
-        assert!(
-            !error.to_string().contains(OPENCODE_BIN_ENV),
-            "the diagnosis must be the ports, not the binary: {error}"
-        );
-    }
-}
-
-// ------------------------------------------------------------------ the four-provider table
+// ------------------------------------------------------------------ the three-provider table
 
 /// One row of the parity table below: the provider, its display name, the override env var that
 /// pins its binary, and a thunk that drives its `_in(&Environment, …)` dispatch seam.
@@ -367,20 +268,19 @@ type DispatchCase<'a> = (
     Box<dyn Fn() -> Result<Dispatch> + 'a>,
 );
 
-/// The parity gate, stated as a test. A fifth provider added without resolver wiring fails here
+/// The parity gate, stated as a test. A fourth provider added without resolver wiring fails here
 /// rather than shipping, which is what the AC1 grep cannot do on its own.
-// The codex daemon transport and the opencode managed server are Linux-only paths.
+// The codex daemon transport is a Linux-only path.
 #[cfg(target_os = "linux")]
 #[test]
 fn every_dispatch_path_reports_a_launch_failure_rather_than_a_bare_io_error() {
-    let _guard = OPENCODE_PORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = tempfile::tempdir().expect("tempdir");
     let cwd = root.path().join("work");
     std::fs::create_dir_all(&cwd).expect("create the working directory");
     let environment = stripped(root.path());
 
     // Every `Provider` variant appears, so a variant added later must be added here too.
-    let cases: [DispatchCase<'_>; 4] = [
+    let cases: [DispatchCase<'_>; 3] = [
         (
             Provider::Claude,
             "claude",
@@ -423,21 +323,6 @@ fn every_dispatch_path_reports_a_launch_failure_rather_than_a_bare_io_error() {
                     &cwd,
                     "score this",
                     "Fixture Job",
-                    None,
-                )
-            }),
-        ),
-        (
-            Provider::Opencode,
-            "opencode",
-            OPENCODE_BIN_ENV,
-            Box::new(|| {
-                agent_router_core::dispatch::opencode::dispatch_in(
-                    &environment,
-                    &cwd,
-                    "score this",
-                    "Fixture Job",
-                    None,
                     None,
                 )
             }),
@@ -539,7 +424,7 @@ fn doctor_fails_when_the_binary_resolves_nowhere() {
         "Fail is doctor's exit code and must still be reachable"
     );
 
-    let optional = optional_binary_in(&environment, "opencode_on_path", Provider::Opencode);
+    let optional = optional_binary_in(&environment, "codex_on_path", Provider::Codex);
     assert_eq!(
         optional.health,
         Health::Warn,
@@ -548,7 +433,7 @@ fn doctor_fails_when_the_binary_resolves_nowhere() {
     assert!(
         optional
             .detail
-            .contains("no executable opencode on PATH, so any dispatch to it will error"),
+            .contains("no executable codex on PATH, so any dispatch to it will error"),
         "README quotes this line verbatim, so it is byte-pinned: {}",
         optional.detail
     );

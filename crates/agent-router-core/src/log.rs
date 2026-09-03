@@ -26,7 +26,7 @@ pub struct Entry<'a> {
     pub outcome: &'a str,
     /// What the backend reported this job will actually run its reasoning at, which is a different
     /// fact from the effort the router decided. None where the backend says nothing, which is every
-    /// claude and opencode dispatch and every dry run.
+    /// claude and grok dispatch and every dry run.
     pub effective_effort: Option<&'a str>,
 }
 
@@ -96,7 +96,7 @@ pub struct Row {
     pub note: Option<String>,
     /// The reasoning effort the backend reported this job will run at, as against `effort` above,
     /// which is what the router decided. None means nobody observed one: the backend exposes none
-    /// (claude, opencode), nothing was dispatched (a dry run), or the row predates the column. None
+    /// (claude, grok), nothing was dispatched (a dry run), or the row predates the column. None
     /// of those is the same as a job running at no effort.
     pub effective_effort: Option<String>,
     /// The `agent-router` build that made this decision, from `CARGO_PKG_VERSION` at record time.
@@ -778,7 +778,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let log = DecisionLog::open_at(&dir.path().join("router.db")).expect("opens");
         let decision = crate::decide::decide_explicit(
-            crate::Provider::Opencode,
+            crate::Provider::Codex,
             None,
             None,
             None,
@@ -788,7 +788,7 @@ mod tests {
         log.record(&Entry {
             task: "t",
             dir: Path::new("/tmp"),
-            requested: "opencode",
+            requested: "codex",
             decision: &decision,
             dry_run: false,
             job_id: Some("session-1"),
@@ -798,7 +798,7 @@ mod tests {
         })
         .expect("records");
         let row = &log.recent(1).expect("reads")[0];
-        assert_eq!(row.provider, "opencode");
+        assert_eq!(row.provider, "codex");
         assert_eq!(row.orchestration, None);
         assert_eq!(row.missing_connector, None);
         assert_eq!(row.complexity, None);

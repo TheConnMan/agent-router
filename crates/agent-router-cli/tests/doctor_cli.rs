@@ -48,8 +48,7 @@ const DRY_RUN_TASK: &str = "a task decided without readable credentials";
 ///
 /// Doctor prints the paths it resolved its provider binaries at, so a label reaches stdout and
 /// `check_line` matches on `contains`. A label must therefore carry no token an assertion greps
-/// for, `opencode` above all: `missing-opencode` made the `claude_on_path` line answer the opencode
-/// lookup.
+/// for.
 static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(0);
 
 struct TempDir {
@@ -117,7 +116,6 @@ impl DoctorFixture {
         for child in [
             "home",
             "bin",
-            "extra bin",
             "working directory",
             IDLE_SESSIONS,
             LIVE_SESSIONS,
@@ -126,7 +124,6 @@ impl DoctorFixture {
         }
         write_refusing_stub(&root.path.join("bin"), "claude");
         write_refusing_stub(&root.path.join("bin"), "codex");
-        write_refusing_stub(&root.path.join("extra bin"), "opencode");
         write_live_rollout(&root.path.join(LIVE_SESSIONS));
         Self { root }
     }
@@ -196,13 +193,9 @@ impl DoctorFixture {
         .expect("write the credentials");
     }
 
-    /// The router binary against this fixture's home, rollout directory, and PATH. `with_opencode`
-    /// is the only difference between the two runs the opencode test compares.
-    fn router(&self, sessions: &str, with_opencode: bool) -> Command {
-        let mut path = self.root.path.join("bin").display().to_string();
-        if with_opencode {
-            path = format!("{path}:{}", self.root.path.join("extra bin").display());
-        }
+    /// The router binary against this fixture's home, rollout directory, and PATH.
+    fn router(&self, sessions: &str) -> Command {
+        let path = self.root.path.join("bin").display().to_string();
         let mut command = Command::new(env!("CARGO_BIN_EXE_agent-router"));
         command
             .env("HOME", self.home())
@@ -213,20 +206,20 @@ impl DoctorFixture {
         command
     }
 
-    fn doctor(&self, sessions: &str, with_opencode: bool) -> Output {
-        self.router(sessions, with_opencode)
+    fn doctor(&self, sessions: &str) -> Output {
+        self.router(sessions)
             .arg("doctor")
             .output()
             .expect("run the router")
     }
 
-    fn doctor_stdout(&self, sessions: &str, with_opencode: bool) -> String {
-        String::from_utf8(self.doctor(sessions, with_opencode).stdout).expect("utf8 stdout")
+    fn doctor_stdout(&self, sessions: &str) -> String {
+        String::from_utf8(self.doctor(sessions).stdout).expect("utf8 stdout")
     }
 
     fn usage_stdout(&self, sessions: &str) -> String {
         let output = self
-            .router(sessions, false)
+            .router(sessions)
             .arg("usage")
             .output()
             .expect("run the router");
@@ -242,7 +235,7 @@ impl DoctorFixture {
     /// shared cache is not isolated by HOME, so this is the only honest oracle for Claude here.
     fn claude_is_stale(&self, sessions: &str) -> bool {
         let output = self
-            .router(sessions, false)
+            .router(sessions)
             .args(["usage", "--json"])
             .output()
             .expect("run the router");
@@ -283,7 +276,7 @@ fn provider_line(stdout: &str, provider: &str) -> String {
 fn doctor_exits_nonzero_and_names_credentials_when_they_are_missing() {
     let fixture = DoctorFixture::new("credentials-missing");
 
-    let output = fixture.doctor(LIVE_SESSIONS, true);
+    let output = fixture.doctor(LIVE_SESSIONS);
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
 
     assert_eq!(
@@ -305,7 +298,7 @@ fn doctor_reports_a_fail_open_usage_read_as_such_rather_than_as_idle() {
     let fixture = DoctorFixture::new("read-provenance");
     fixture.write_credentials();
 
-    let fail_open = fixture.doctor_stdout(IDLE_SESSIONS, false);
+    let fail_open = fixture.doctor_stdout(IDLE_SESSIONS);
     let codex_fail_open = check_line(&fail_open, "codex_rate_limits");
     assert!(
         codex_fail_open.contains("fail-open"),
@@ -317,7 +310,7 @@ fn doctor_reports_a_fail_open_usage_read_as_such_rather_than_as_idle() {
          {codex_fail_open}"
     );
 
-    let live = fixture.doctor_stdout(LIVE_SESSIONS, false);
+    let live = fixture.doctor_stdout(LIVE_SESSIONS);
     let codex_live = check_line(&live, "codex_rate_limits");
     assert!(
         codex_live.contains("live") && !codex_live.contains("fail-open"),
@@ -344,40 +337,6 @@ fn doctor_reports_a_fail_open_usage_read_as_such_rather_than_as_idle() {
     }
 }
 
-/// Opencode is a provider the router can route to, not one it needs, so its absence is reported
-/// and then costs nothing. Installing it or not must not move doctor's exit code.
-#[test]
-fn a_missing_opencode_is_not_a_failure() {
-    let fixture = DoctorFixture::new("absent-extra-provider");
-    fixture.write_credentials();
-
-    let without = fixture.doctor(LIVE_SESSIONS, false);
-    let with = fixture.doctor(LIVE_SESSIONS, true);
-    let stdout = String::from_utf8(without.stdout.clone()).expect("utf8 stdout");
-
-    let line = check_line(&stdout, "opencode");
-    assert!(
-        line.to_ascii_lowercase().contains("warn"),
-        "a missing opencode is reported, as a warning: {line}"
-    );
-    assert_eq!(
-        without.status.code(),
-        with.status.code(),
-        "installing opencode moved doctor's exit code, so its absence is a failure after all, \
-         stdout without it:\n{stdout}"
-    );
-
-    // Every other check passes or warns in this fixture, so the exit code is zero, unless this
-    // box's shared claude cache happens to be unreadable and fails the claude usage check.
-    if !fixture.claude_is_stale(LIVE_SESSIONS) {
-        assert_eq!(
-            without.status.code(),
-            Some(0),
-            "a run whose only non passing check is a warning must exit zero, stdout:\n{stdout}"
-        );
-    }
-}
-
 /// The second half of the acceptance criterion, read through the CLI rather than the struct: the
 /// row a dispatch leaves behind records that it was decided on a read nobody could trust.
 #[test]
@@ -385,7 +344,7 @@ fn a_decision_logged_with_unreadable_credentials_carries_the_stale_marker() {
     let fixture = DoctorFixture::new("stale-marker");
 
     let dry_run = fixture
-        .router(IDLE_SESSIONS, false)
+        .router(IDLE_SESSIONS)
         .args(["run", DRY_RUN_TASK, "--dir"])
         .arg(fixture.root.path.join("working directory"))
         .args(["--provider", "codex", "--dry-run"])
@@ -398,7 +357,7 @@ fn a_decision_logged_with_unreadable_credentials_carries_the_stale_marker() {
     );
 
     let logged = fixture
-        .router(IDLE_SESSIONS, false)
+        .router(IDLE_SESSIONS)
         .args(["log", "--json", "--limit", "1"])
         .output()
         .expect("run the router");
@@ -436,7 +395,7 @@ fn doctor_does_not_create_a_config_file_it_was_asked_to_check() {
         "the fixture home starts without a config file"
     );
 
-    let stdout = fixture.doctor_stdout(LIVE_SESSIONS, true);
+    let stdout = fixture.doctor_stdout(LIVE_SESSIONS);
 
     check_line(&stdout, "config_parses");
     assert!(
@@ -458,7 +417,7 @@ fn doctor_reports_grok_binary_and_authoritative_leader_registration() {
         "the fixture home starts without a config file"
     );
 
-    let stdout = fixture.doctor_stdout(LIVE_SESSIONS, false);
+    let stdout = fixture.doctor_stdout(LIVE_SESSIONS);
 
     check_line(&stdout, "grok_binary");
     check_line(&stdout, "grok_leader_registration");
@@ -476,10 +435,7 @@ fn doctor_reports_grok_binary_and_authoritative_leader_registration() {
 fn doctor_reports_isolated_grok_cache_log_and_none_provenance() {
     let cached_fixture = DoctorFixture::new("grok-cache-provenance");
     cached_fixture.write_grok_usage_cache();
-    let cached = check_line(
-        &cached_fixture.doctor_stdout(LIVE_SESSIONS, false),
-        "grok_usage",
-    );
+    let cached = check_line(&cached_fixture.doctor_stdout(LIVE_SESSIONS), "grok_usage");
     assert!(
         cached.contains("cache"),
         "the fixture's cache must be reported as cache: {cached}"
@@ -487,20 +443,14 @@ fn doctor_reports_isolated_grok_cache_log_and_none_provenance() {
 
     let logged_fixture = DoctorFixture::new("grok-log-provenance");
     logged_fixture.write_grok_billing_log();
-    let logged = check_line(
-        &logged_fixture.doctor_stdout(LIVE_SESSIONS, false),
-        "grok_usage",
-    );
+    let logged = check_line(&logged_fixture.doctor_stdout(LIVE_SESSIONS), "grok_usage");
     assert!(
         logged.contains("log"),
         "with no fixture cache, the full billing log is the source: {logged}"
     );
 
     let none_fixture = DoctorFixture::new("grok-none-provenance");
-    let none = check_line(
-        &none_fixture.doctor_stdout(LIVE_SESSIONS, false),
-        "grok_usage",
-    );
+    let none = check_line(&none_fixture.doctor_stdout(LIVE_SESSIONS), "grok_usage");
     assert!(
         none.contains("none"),
         "a separate fixture must not inherit either earlier cache or log: {none}"
@@ -572,7 +522,7 @@ fn the_usage_cache_override_decides_what_the_claude_read_returns() {
 
     let read = |cache: &Path| -> Value {
         let output = fixture
-            .router(IDLE_SESSIONS, false)
+            .router(IDLE_SESSIONS)
             .env(CACHE_ENV, cache)
             .args(["usage", "--json"])
             .output()

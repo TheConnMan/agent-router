@@ -37,7 +37,7 @@ log: row 87 in /home/you/.local/state/agent-router/router.db
    as `GH-123 Sprint 2 Bug Fixes` or `RS-123 Input Box Searching`. A run that names its provider is
    The routing classifier runs whenever provider, model, or effort is omitted for Claude or Codex.
    An explicit Claude or Codex provider therefore pins only the provider: omitted model and effort
-   values still come from classification. Grok and OpenCode skip cross-provider classification;
+   values still come from classification. Grok skips cross-provider classification;
    job naming remains a separate title call when a name was not supplied and dispatch is not a dry
    run.
 2. **Apply capability gates.** A task needing several agents to exchange findings mid-run or a
@@ -75,8 +75,7 @@ log: row 87 in /home/you/.local/state/agent-router/router.db
    Claude or Codex provider preserves that provider while classification fills omitted model and
    effort. An explicit Claude or Codex provider and model preserves both while classification fills
    effort. Three explicit values are exact and skip routing classification. Grok accepts an explicit
-   model and rejects `--effort`; OpenCode has no derived
-   model and receives no derived effort.
+   model and rejects `--effort`.
 5. **Dispatch and log.** The job is spawned detached, its backend job id is resolved, and the whole
    decision lands in a SQLite decision log.
 
@@ -125,7 +124,6 @@ cargo install --path crates/agent-router-cli
 | `claude` | Claude dispatch, Claude usage, and classification on the default engine | Must be on `PATH` and logged in. With the default `engine = "claude"` the classifier runs on every `--provider auto` call, so `claude` is exercised even when every task ends up on Codex. |
 | `codex` | Codex dispatch, Codex usage, and classification when `engine = "codex"` | Dispatch goes through `codex app-server daemon`, which the router starts on demand. |
 | `grok` | Grok dispatch, automatic workhorse routing, and an eligible Grok adversarial review | Optional. Router reuses Agent Viewer's public lifecycle and never configures Grok itself. |
-| `opencode` | OpenCode dispatch | Optional. Only reached via an explicit `--provider opencode`. |
 
 The classifier engine is a budget decision rather than a quality one: scoring is a single small
 strict JSON answer either model can produce, so `[classifier].engine` selects which weekly quota
@@ -183,8 +181,8 @@ agent-router run "Fix the failing test" --dir ~/git/other-project
 | --- | --- | --- |
 | `--dir <PATH>` | current directory | Working directory for the dispatched job. |
 | `--provider <NAME>` | `auto` | `auto` classifies the task, balances ordinary work between Codex and Grok, and pins Claude for capability needs. An explicit provider pins it. |
-| `--model <NAME>` | tier table | Model pin. Requires an explicit `--provider`. With explicit Claude or Codex and no effort, classification fills effort. Pairing it with `--provider auto` is rejected. An explicit Grok model reaches the public lifecycle unchanged. OpenCode does not derive a model. |
-| `--effort <NAME>` | complexity mapping | Effort pin. Requires an explicit provider and model. Low maps to low, medium to medium, and high or ultra maps to high for Codex and Claude. Grok rejects this flag; OpenCode does not receive derived effort. |
+| `--model <NAME>` | tier table | Model pin. Requires an explicit `--provider`. With explicit Claude or Codex and no effort, classification fills effort. Pairing it with `--provider auto` is rejected. An explicit Grok model reaches the public lifecycle unchanged. |
+| `--effort <NAME>` | complexity mapping | Effort pin. Requires an explicit provider and model. Low maps to low, medium to medium, and high or ultra maps to high for Codex and Claude. Grok rejects this flag. |
 | `--name <NAME>` | the model's title, or three to five words derived from the task | Name for the dispatched job. Supplying it skips the naming call. It reaches the `claude --bg --name` argv verbatim, names the Codex thread, and is recorded as `job_name` in the decision log for every provider, so callers that reconcile inflight jobs by exact name depend on it. An empty or whitespace only name is rejected. |
 | `--dry-run` | off | Decide and log, dispatch nothing, and project the weekly draw the job is likely to cost on the provider it landed on. |
 | `--mcp-config <PATH>` | none | MCP config file for the dispatched Claude job. Repeatable. Rejected for every other provider, including Grok, and the check runs after routing, so pairing it with `--provider auto` fails whenever classification lands on a provider other than Claude. |
@@ -297,7 +295,6 @@ pass codex_on_path       codex at /home/you/.local/bin/codex
 pass codex_app_server    the app-server daemon answers
 pass codex_rate_limits   live, read from the provider's own source
 fail grok_usage          none, no billing data available
-warn opencode_on_path    no executable opencode on PATH, so any dispatch to it will error
 pass grok_binary         grok is available through /home/you/.local/bin/grok
 warn grok_leader_registration  no authoritative persistent Grok leader is registered, so Grok dispatch and review are unavailable
 pass config_parses       absent, defaults apply (/home/you/.config/agent-router/config.toml)
@@ -313,18 +310,17 @@ pass log_writable        /home/you/.local/state/agent-router/router.db takes a w
 | `codex_app_server` | Whether the app-server daemon answers, which is the transport every Codex dispatch goes through. Observed only: doctor does not start a daemon, so an absent one is reported rather than created. |
 | `codex_rate_limits` | Whether the Codex usage read was live or fell open. |
 | `grok_usage` | Grok billing provenance: `live` and `cache` are usable capacity readings. `log` is healthy only when its event supplies weekly capacity; without `creditUsagePercent`, it remains `log` but is unknown and unhealthy. `none` means no usable billing data and fails closed for routing. |
-| `opencode_on_path` | An executable `opencode` on `PATH`, or resolvable off it. |
 | `grok_binary` | Resolves `grok` through the same override → `PATH` → fallback chain dispatch uses (`AGENT_ROUTER_GROK_BIN`, then `PATH`, then `$HOME/.local/bin` and `/usr/local/bin`) before running lifecycle diagnostics, so a binary absent from `PATH` still passes when an override or a fallback location finds it. Doctor only observes it and does not create Grok configuration. |
 | `grok_leader_registration` | Whether the public Grok lifecycle reports an authoritative persistent leader. This is separate from the binary check and is required for explicit Grok dispatch and Grok reviewer selection. |
 | `config_parses` | The config file parses, read directly so a diagnostic never creates the file it was asked to report on. An absent file is a pass: the router runs on the same defaults. |
 | `log_writable` | The decision log opens and takes an actual write. Opening alone proves nothing, because the schema batch is all `IF NOT EXISTS` and can succeed on a database the next dispatch cannot write to. |
 
-The three `*_on_path` checks ask two questions, and they are not the same question. The first is
+The two `*_on_path` checks ask two questions, and they are not the same question. The first is
 whether the binary is on `PATH`, which is the fact the check is named after and the one its message
 states. The second is whether a dispatch will actually find it: dispatch resolves through the
 per-provider override, then `PATH`, then `$HOME/.local/bin` and `/usr/local/bin`. A binary that is
 off `PATH` but still resolvable is therefore a **warning** naming where dispatch will find it and
-the `AGENT_ROUTER_CLAUDE_BIN` / `AGENT_ROUTER_CODEX_BIN` / `AGENT_ROUTER_OPENCODE_BIN` variable
+the `AGENT_ROUTER_CLAUDE_BIN` / `AGENT_ROUTER_CODEX_BIN` variable
 that pins it, never a failure — failing there would exit 1 on a box the router handles perfectly
 well. Only a binary that resolves nowhere keeps the old severity and the old `so any dispatch to it
 will error` consequence, which in that case is true.
@@ -335,15 +331,13 @@ One rule decides the severity. **Fail** means the router would keep running on i
 trust, or could not run at all: a missing classifier, unreadable credentials, a usage number that is
 a default rather than a reading, a config file that does not parse, a log that cannot take a row.
 **Warn** means a degraded path that fails loudly at the moment it is used, so nothing routes wrongly
-because of it: a missing `codex` or `opencode` binary, or a daemon that does not answer, all error
+because of it: a missing `codex` binary, or a daemon that does not answer, all error
 at dispatch time rather than quietly changing where work lands. A fail open usage read is a warning
 rather than a failure when that provider's binary is not on PATH, because a box that never routes
 there has nothing to sign in to. A log another writer holds the lock on is a warning too: that is
 contention, and the next dispatch takes the lock on its own.
 
-Exit code is `0` when every check is pass or warn, `1` when any check fails. A missing `opencode` is
-never a failure: it is a provider the router can route to on request, not one it needs, so
-installing it or not never moves the exit code.
+Exit code is `0` when every check is pass or warn, `1` when any check fails.
 
 A missing Grok binary or authoritative leader is also a warning. These checks describe why Grok is
 unavailable without hiding the automatic capacity decision. `grok_usage` is a failure when Grok is
@@ -391,7 +385,7 @@ router requested. For classified Codex and Claude work, low maps to low, medium 
 or ultra to high. `effective_effort` is what the backend reported the job will actually run at, and
 it is recorded only where a backend genuinely says: Codex reports its resolved effort on the
 `thread/start` reply, so a Codex row carries it, and it moves when your `~/.codex/config.toml` moves.
-Claude exposes no effective effort anywhere and OpenCode discards effort entirely, so both stay null
+Claude and Grok expose no effective effort, so those rows stay null
 rather than being filled in from the model, the decision, or a config file. Null also covers a dry
 run, which dispatched nothing, and a row written before the column existed. In every case null means
 nobody observed an effort, which is not the same as a job running at no effort. See

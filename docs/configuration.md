@@ -349,8 +349,8 @@ provider and model. This keeps every omitted value downstream of the values befo
 
 For Codex and Claude, classified complexity maps to fixed effort: `low` to `low`, `medium` to
 `medium`, and both `high` and `ultra` to `high`. The model tier table remains separate because
-complexity chooses the model while the fixed mapping chooses effort. OpenCode is explicit only and
-preserves its existing dispatch contract: it has no derived model and receives no derived effort.
+complexity chooses the model while the fixed mapping chooses effort. Grok has no derived model
+and receives no derived effort from classification.
 
 Complexity never changes which provider a task routes to, and the provider never changes
 complexity. A low complexity task can run on either provider, and so can an ultra one.
@@ -363,12 +363,12 @@ to keep `ultra` deliberately hard to earn.
 
 The router's `effort` value is the requested effort, not necessarily the effort a job reports after
 dispatch. For classified Codex and Claude work it is the fixed complexity mapping above. A fully
-pinned request keeps the supplied value. OpenCode receives no effort and keeps its existing
-dispatch contract.
+pinned request keeps the supplied value. Grok receives no effort from classification and rejects
+an explicit `--effort` pin.
 
 On Claude the router passes the requested value as `--effort`. Claude reports the value it settled on
 nowhere, so there is nothing to record: `effective_effort` on a Claude row is null, permanently. It
-is null on an OpenCode row too, because OpenCode discards effort in both directions.
+is null on a Grok row too, because Grok exposes no effective effort.
 
 On Codex it is whatever your own `~/.codex/config.toml` resolves. Dispatch goes through
 `codex app-server daemon`, and the daemon loads user config, unlike the classifier, which passes
@@ -382,7 +382,7 @@ The two effort columns are different facts and the log keeps them apart on purpo
 the router requested, either from the fixed complexity mapping or an explicit pin; `effective_effort`
 is what the backend reported. Null in the
 second one means nobody observed an effort, which is not the same as a job running at no effort: it
-covers a Claude or OpenCode row, a dry run, and a row written before the column existed.
+covers a Claude or Grok row, a dry run, and a row written before the column existed.
 
 When no pinned effort or `model_reasoning_effort` is present, a Codex job falls through to the
 model's catalogue default, and those defaults are not ordered the way the tier table is. Read them from

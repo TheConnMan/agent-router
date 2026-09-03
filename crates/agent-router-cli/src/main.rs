@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 #[derive(Parser)]
 #[command(
     name = "agent-router",
-    about = "Route a task automatically to codex or claude, or dispatch explicitly to grok or opencode"
+    about = "Route a task automatically to codex or claude, or dispatch explicitly to grok"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -27,8 +27,8 @@ enum Command {
         /// Working directory for the job (defaults to the current directory).
         #[arg(long)]
         dir: Option<PathBuf>,
-        /// auto, or codex, claude, grok, or opencode to pin the provider while omitted values are
-        /// classified. Grok and opencode are explicit only.
+        /// auto, or codex, claude, or grok to pin the provider while omitted values are
+        /// classified. Grok is explicit only.
         #[arg(long, default_value = "auto")]
         provider: String,
         /// Model override, requires an explicit --provider.
@@ -156,7 +156,7 @@ fn adversarial_review_exit(
             return print_adversarial_review(
                 &agent_router_core::adversarial_review::failed_outcome(
                     &primary,
-                    "primary provider must be codex, claude, grok, or opencode",
+                    "primary provider must be codex, claude, or grok",
                 ),
                 json,
             );

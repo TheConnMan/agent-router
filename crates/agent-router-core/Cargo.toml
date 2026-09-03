@@ -8,7 +8,6 @@ repository = "https://github.com/TheConnMan/agent-router"
 
 [dependencies]
 agent-viewer-core = { git = "https://github.com/TheConnMan/agent-viewer", rev = "13c1e5e357afd1f4fef420b855e980bfd0ad33bc" }
-base64 = "0.22.1"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"

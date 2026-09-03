@@ -111,7 +111,7 @@ pub struct Decision {
     /// The model to spawn with. None means the backend resolves its own default.
     pub model: Option<String>,
     /// The reasoning effort the router asks the backend to run at. Dispatch honours it on codex
-    /// (`turn/start` `effort`) and on claude (`--effort`), and opencode discards it.
+    /// (`turn/start` `effort`) and on claude (`--effort`).
     ///
     /// What the backends then resolve is not the same on both. Claude runs at the model's own
     /// default, because nothing else sets one, and it reports that value nowhere. Codex runs at
@@ -121,7 +121,7 @@ pub struct Decision {
     ///
     /// So this is the effort the router decided, and it is not the effort a job ran at. The codex
     /// daemon reports the resolved value on the `thread/start` reply, and that reading is recorded
-    /// separately in the log's `effective_effort` column. Claude and opencode record nothing there,
+    /// separately in the log's `effective_effort` column. Claude and grok record nothing there,
     /// because neither exposes one to read.
     pub effort: Option<String>,
     /// None when provider, model, and effort were all pinned.
@@ -281,9 +281,9 @@ pub fn decide(
         };
         let eligible = |candidate| capability_eligible(candidate) && usage_eligible(candidate);
         // Only Codex and Grok are ever asked about, so only those two can have been excluded.
-        // Claude is unrepresentable as an exclusion here and Opencode is never a candidate; both
-        // are no-ops rather than an unreachable arm, because the field is deserialized from a log
-        // row and a future engine could widen what it names.
+        // Claude is unrepresentable as an exclusion here; it is a no-op rather than an unreachable
+        // arm, because the field is deserialized from a log row and a future engine could widen
+        // what it names.
         if matches!(
             classification.unlaunchable,
             Some(Provider::Codex | Provider::Grok)
@@ -452,13 +452,13 @@ pub fn decide_explicit(
     }
 }
 
-/// PURE: the model the job runs on, scaled by how much reasoning the task needs. Opencode has no
+/// PURE: the model the job runs on, scaled by how much reasoning the task needs. Grok has no
 /// tiers in the MVP, so it resolves its own default.
 fn model_for(provider: Provider, complexity: Complexity, config: &Config) -> Option<String> {
     match provider {
         Provider::Codex => Some(config.models.codex.pick(complexity).to_string()),
         Provider::Claude => Some(config.models.claude.pick(complexity).to_string()),
-        Provider::Grok | Provider::Opencode => None,
+        Provider::Grok => None,
     }
 }
 
@@ -473,18 +473,16 @@ fn effort_for(provider: Provider, complexity: Complexity) -> Option<String> {
             }
             .to_string(),
         ),
-        Provider::Grok | Provider::Opencode => None,
+        Provider::Grok => None,
     }
 }
 
-/// PURE: the snapshot half a provider is judged on. opencode has no usage source in the MVP, so it
-/// reads as the Claude side it rides on.
+/// PURE: the snapshot half a provider is judged on.
 fn headroom(usage: &UsageSnapshot, provider: Provider) -> &Headroom {
     match provider {
         Provider::Codex => &usage.codex,
         Provider::Claude => &usage.claude,
         Provider::Grok => &usage.grok,
-        Provider::Opencode => &usage.claude,
     }
 }
 
@@ -604,14 +602,14 @@ mod tests {
     fn an_explicit_provider_skips_classification_but_keeps_the_usage_snapshot() {
         let config = Config::default();
         let decision = decide_explicit(
-            Provider::Opencode,
+            Provider::Codex,
             None,
             None,
             None,
             usage(71.0, 50.0),
             &config,
         );
-        assert_eq!(decision.provider, Provider::Opencode);
+        assert_eq!(decision.provider, Provider::Codex);
         assert!(decision.classification.is_none());
         assert_eq!(decision.gate_tags(), vec!["explicit_provider"]);
         assert_eq!(decision.usage.codex.weekly_pct, 71.0);

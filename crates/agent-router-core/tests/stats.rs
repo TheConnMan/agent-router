@@ -196,20 +196,13 @@ const SEEDED: [Seed; 5] = [
 ];
 
 /// Eight rows whose every metric can be counted by eye, newest first exactly as the query hands
-/// them over. Four routes to codex, three to claude, one to opencode; six of the eight are auto
+/// them over. Four routes to codex, three to claude, one to grok; six of the eight are auto
 /// routed; two of those six moved off the provider their verdict named; one of them could not be
 /// classified; three of all eight were dry runs.
 #[test]
 fn the_metric_matrix_over_a_hand_countable_row_set() {
     let rows = vec![
-        row(
-            8_000,
-            "opencode",
-            "opencode",
-            None,
-            "explicit_provider",
-            true,
-        ),
+        row(8_000, "grok", "grok", None, "explicit_provider", true),
         row(7_000, "claude", "claude", None, "explicit_provider", false),
         row(6_000, "auto", "codex", Some("low"), "over_ceiling", true),
         row(5_000, "auto", "codex", None, "classifier_failed", false),
@@ -247,7 +240,7 @@ fn the_metric_matrix_over_a_hand_countable_row_set() {
     assert_eq!(stats.oldest_created_at_ms, Some(1_000));
     assert_eq!(
         stats.routes,
-        counts(&[("claude", 3), ("codex", 4), ("opencode", 1)])
+        counts(&[("claude", 3), ("codex", 4), ("grok", 1)])
     );
     assert_eq!(
         stats.gates,
@@ -376,14 +369,7 @@ fn rates_are_denominated_on_auto_routes_only() {
     let rows = vec![
         row(6_000, "claude", "claude", None, "explicit_provider", false),
         row(5_000, "codex", "codex", None, "explicit_provider", false),
-        row(
-            4_000,
-            "opencode",
-            "opencode",
-            None,
-            "explicit_provider",
-            false,
-        ),
+        row(4_000, "grok", "grok", None, "explicit_provider", false),
         row(3_000, "claude", "claude", None, "explicit_provider", true),
         row(
             2_000,
@@ -666,7 +652,7 @@ fn collect_summarizes_exactly_the_window_it_was_asked_for() {
 /// The rows, newest first, as `(provider, complexity, gates, dry run, mark, outcome)`:
 ///
 /// 1. codex, medium, no gate, live, good, `error: dispatch refused`
-/// 2. opencode, unscored, explicit_provider, DRY RUN, bad, dry-run
+/// 2. grok, unscored, explicit_provider, DRY RUN, bad, dry-run
 /// 3. claude, medium, no gate, live, UNMARKED, dispatched
 /// 4. codex, unscored, classifier_failed, live, rerouted, unknown
 /// 5. claude, high, over_ceiling, live, UNMARKED, failed
@@ -693,8 +679,8 @@ fn bad_and_failure_rates_break_down_by_gate_provider_and_complexity() {
         ),
         judged(
             7_000,
-            "opencode",
-            "opencode",
+            "grok",
+            "grok",
             None,
             "explicit_provider",
             true,
@@ -771,7 +757,7 @@ fn bad_and_failure_rates_break_down_by_gate_provider_and_complexity() {
     // grows.
     assert_eq!(
         stats.bad_rate_by_provider,
-        rates(&[("claude", 1, 1), ("codex", 2, 4), ("opencode", 1, 1)])
+        rates(&[("claude", 1, 1), ("codex", 2, 4), ("grok", 1, 1)])
     );
     assert_eq!(
         stats.bad_rate_by_complexity,
@@ -803,7 +789,7 @@ fn bad_and_failure_rates_break_down_by_gate_provider_and_complexity() {
     // nothing to succeed or fail.
     assert_eq!(
         stats.failure_rate_by_provider,
-        rates(&[("claude", 1, 2), ("codex", 2, 3), ("opencode", 0, 0)])
+        rates(&[("claude", 1, 2), ("codex", 2, 3), ("grok", 0, 0)])
     );
     assert_eq!(
         stats.failure_rate_by_complexity,
@@ -829,7 +815,7 @@ fn bad_and_failure_rates_break_down_by_gate_provider_and_complexity() {
     // missing.
     assert_eq!(
         stats.routes,
-        counts(&[("claude", 3), ("codex", 4), ("opencode", 1)])
+        counts(&[("claude", 3), ("codex", 4), ("grok", 1)])
     );
     assert_eq!(
         stats.complexity,
@@ -877,7 +863,7 @@ fn bad_and_failure_rates_break_down_by_gate_provider_and_complexity() {
 
     // Three shares that are three different answers: two in four codex routes judged wrong, one
     // marked `bad` and one marked `rerouted`, a real zero over one judged medium row, and no answer
-    // at all for the opencode row that dispatched nothing. A zero and a null must not collapse into
+    // at all for the grok row that dispatched nothing. A zero and a null must not collapse into
     // each other.
     assert_share(
         stats.bad_rate_by_provider["codex"].share(),
@@ -889,7 +875,7 @@ fn bad_and_failure_rates_break_down_by_gate_provider_and_complexity() {
         0.0,
         "bad rate for medium",
     );
-    assert_eq!(stats.failure_rate_by_provider["opencode"].share(), None);
+    assert_eq!(stats.failure_rate_by_provider["grok"].share(), None);
 }
 
 /// An unmarked row is not evidence of a good route. A window nobody has judged has no bad rate at

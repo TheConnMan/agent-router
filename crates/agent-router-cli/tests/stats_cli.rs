@@ -438,7 +438,7 @@ fn stats_json_reconciles_with_the_log_json_it_summarises() {
     fixture.dry_run(CLASSIFIER_FAILS, None, IDLE);
     fixture.dry_run(ON_EXHAUSTED_CODEX, None, EXHAUSTED);
     fixture.dry_run("explicitly on claude", Some("claude"), IDLE);
-    fixture.dry_run("explicitly on opencode", Some("opencode"), IDLE);
+    fixture.dry_run("explicitly on grok", Some("grok"), IDLE);
 
     let rows: Vec<Value> = fixture
         .json(&["log", "--json", "--limit", "200"])
@@ -539,7 +539,7 @@ fn stats_json_reconciles_with_the_log_json_it_summarises() {
 /// reconcile against the rows `log --json` prints, over a window this fixture marked itself with
 /// `log --mark`.
 ///
-/// Six rows are logged and four are judged: the explicit claude route `bad`, the explicit opencode
+/// Six rows are logged and four are judged: the explicit claude route `bad`, the explicit grok
 /// route `good`, the unclassifiable route `bad`, and the low complexity route `good`. The medium
 /// and ultra routes are left unmarked on purpose, because an unjudged row is the case the whole
 /// denominator rule exists for.
@@ -551,7 +551,7 @@ fn stats_json_emits_a_bad_rate_by_gate_that_reconciles_against_the_marked_rows()
     fixture.dry_run(SCORED_MEDIUM, None, IDLE);
     fixture.dry_run(CLASSIFIER_FAILS, None, IDLE);
     fixture.dry_run("explicitly on claude", Some("claude"), IDLE);
-    fixture.dry_run("explicitly on opencode", Some("opencode"), IDLE);
+    fixture.dry_run("explicitly on grok", Some("grok"), IDLE);
 
     let logged: Vec<Value> = fixture
         .json(&["log", "--json", "--limit", "200"])
@@ -561,7 +561,7 @@ fn stats_json_emits_a_bad_rate_by_gate_that_reconciles_against_the_marked_rows()
     assert_eq!(logged.len(), 6, "the fixture must have recorded six rows");
 
     fixture.mark(row_id(&logged, "explicitly on claude"), "bad");
-    fixture.mark(row_id(&logged, "explicitly on opencode"), "good");
+    fixture.mark(row_id(&logged, "explicitly on grok"), "good");
     fixture.mark(row_id(&logged, CLASSIFIER_FAILS), "bad");
     fixture.mark(row_id(&logged, SCORED_LOW), "good");
 
@@ -587,7 +587,7 @@ fn stats_json_emits_a_bad_rate_by_gate_that_reconciles_against_the_marked_rows()
     // The counts a reader can check by hand. Two rows named their provider, so both carry
     // `explicit_provider` and both are judged, one bad: 1 of 2. One row could not be classified,
     // it is judged bad, and no other row carries that tag: 1 of 1. Claude derives its omitted
-    // downstream settings and reads medium. OpenCode derives nothing and remains unscored.
+    // downstream settings and reads medium. Grok derives nothing and remains unscored.
     let by_gate = rate_map(&stats, "bad_rate_by_gate");
     assert_eq!(by_gate.get("explicit_provider").copied(), Some((1, 2)));
     assert_eq!(by_gate.get("classifier_failed").copied(), Some((1, 1)));
@@ -604,13 +604,14 @@ fn stats_json_emits_a_bad_rate_by_gate_that_reconciles_against_the_marked_rows()
         Value::Null
     );
     assert_eq!(stats["bad_rate_by_gate"]["explicit_provider"]["share"], 0.5);
-    // Only an explicit route reaches opencode, and that one is judged good.
-    assert_eq!(
-        rate_map(&stats, "bad_rate_by_provider")
-            .get("opencode")
-            .copied(),
-        Some((0, 1))
-    );
+    // The explicit grok row is judged good. Auto routes can also land on grok, so the provider
+    // map is reconciled from the log below rather than pinned here.
+    let explicit_grok = rows
+        .iter()
+        .find(|row| row["task"] == "explicitly on grok")
+        .expect("the explicit grok row");
+    assert_eq!(explicit_grok["mark"], "good");
+    assert_eq!(explicit_grok["provider"], "grok");
 
     // The whole of every bad rate, recomputed from the rows the log printed rather than read back
     // out of the report. Which provider each auto row landed on depends on this box's own usage
@@ -680,7 +681,7 @@ fn the_human_report_prints_a_dash_for_a_rate_nobody_has_judged() {
     let fixture = StatsFixture::new("dash-for-unjudged");
     fixture.dry_run("explicitly on claude", Some("claude"), IDLE);
     fixture.dry_run("a second explicit claude route", Some("claude"), IDLE);
-    fixture.dry_run("explicitly on opencode", Some("opencode"), IDLE);
+    fixture.dry_run("explicitly on grok", Some("grok"), IDLE);
 
     let output = fixture.stats();
     assert!(

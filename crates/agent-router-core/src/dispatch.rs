@@ -5,7 +5,6 @@ use crate::run::{Dispatch, Request};
 pub mod claude;
 pub mod codex;
 pub mod grok;
-pub mod opencode;
 
 pub fn dispatch(decision: &crate::decide::Decision, request: &Request) -> Result<Dispatch> {
     if !request.dir.is_dir() {
@@ -39,18 +38,11 @@ pub fn dispatch(decision: &crate::decide::Decision, request: &Request) -> Result
         Provider::Grok => {
             grok::dispatch(request.dir, request.task, &name, decision.model.as_deref())
         }
-        Provider::Opencode => opencode::dispatch(
-            request.dir,
-            request.task,
-            &name,
-            decision.model.as_deref(),
-            decision.effort.as_deref(),
-        ),
     }
 }
 
 /// Only claude takes MCP scoping, so every other provider refuses it here rather than up front in
-/// the CLI: an auto route that lands on codex or opencode must fail exactly like an explicit one,
+/// the CLI: an auto route that lands on codex or grok must fail exactly like an explicit one,
 /// instead of silently running the job with the caller's scoping dropped.
 ///
 /// Claude is exempted inside the helper, so a caller guards nothing itself and a provider added

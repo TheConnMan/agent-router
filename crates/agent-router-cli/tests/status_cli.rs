@@ -636,41 +636,6 @@ fn a_persisted_failure_still_exits_nonzero_once_the_backend_can_no_longer_be_ask
     );
 }
 
-/// Opencode exposes no status API, so the reconciler cannot resolve its rows at all. Rewriting a
-/// row it admits it cannot ask about trades a true fact, that the job was dispatched, for a less
-/// informative one, on every run and with no path back.
-#[test]
-fn an_opencode_row_keeps_its_outcome_because_the_reconciler_cannot_ask() {
-    let fixture = StatusFixture::new("opencode");
-    let id = fixture.seed(
-        Provider::Opencode,
-        Some("ses_a1b2c3"),
-        Some("a routed job"),
-        false,
-        "dispatched",
-    );
-
-    let status = fixture.status_json();
-
-    let row = reported_row(&status, id);
-    assert_eq!(
-        row["observation"], "unsupported",
-        "the report has to say the router has no way to ask: {row}"
-    );
-    assert_eq!(row["state"], "unknown", "the reported row: {row}");
-
-    let logged = fixture.logged(id);
-    assert_eq!(
-        logged["outcome"], "dispatched",
-        "a provider the reconciler cannot resolve had its row degraded anyway: {logged}"
-    );
-    assert_eq!(
-        logged["reconciled_at_ms"],
-        Value::Null,
-        "nothing was read for this row, so nothing may claim it was: {logged}"
-    );
-}
-
 /// Grok has a lifecycle to inspect, even when an isolated home carries no session data. Its
 /// absence or temporary unavailability is an unknown fresh observation, and must not replace
 /// terminal facts a prior lifecycle observation already proved.

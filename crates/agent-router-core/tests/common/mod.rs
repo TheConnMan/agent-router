@@ -44,8 +44,7 @@ const TEXT_FILE_BUSY: i32 = 26;
 /// * The first arguments production actually emits: `-p` and `agents` and `--bg` for claude
 ///   (`src/classify.rs:136`, `src/dispatch/claude.rs:72,187`), `exec` and `app-server` and
 ///   `features` for codex (`src/classify.rs:186`, `src/dispatch/codex.rs:312`,
-///   `src/classify.rs:663`), `run` and `serve` for opencode (`src/dispatch/opencode.rs:321,750`),
-///   plus arbitrary free-text prompts.
+///   `src/classify.rs:663`), plus arbitrary free-text prompts.
 ///
 /// A `--`-prefixed token naming this fixture layer is outside all of it and no production call
 /// site can emit it.
@@ -159,7 +158,7 @@ pub fn write_stub(path: &Path, body: &str) {
 /// this fixture safe if that default ever changes. Every case built from this helper goes on to
 /// DISPATCH a real provider CLI through `execvp`. If a stripped environment ever regained a system
 /// fallback (accidentally or via a "helpful" default change), it could resolve a real `claude` /
-/// `codex` / `grok` / `opencode` binary actually installed on the host box and start a real,
+/// `codex` / `grok` binary actually installed on the host box and start a real,
 /// billable background job from a test run. Do not drop this call, and do not let a future
 /// `Environment::new` default make it look unnecessary.
 pub fn stripped_environment(root: Option<&Path>) -> Environment {

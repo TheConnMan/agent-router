@@ -555,33 +555,31 @@ fn a_verified_claude_granola_connector_is_an_auto_capability_destination() {
     );
 }
 
-/// Grok and OpenCode have no derived model or effort, so naming either provider must not disclose
-/// the task to a different provider merely to compute values that will be discarded.
+/// Grok has no derived model or effort, so naming that provider must not disclose the task to a
+/// different provider merely to compute values that will be discarded.
 #[cfg(unix)]
 #[test]
 fn explicit_providers_without_derived_values_skip_classification() {
-    for provider in ["grok", "opencode"] {
-        let fixture = CliFixture::new(&format!("{provider}-no-classifier"));
-        let output = fixture
-            .run_command()
-            .arg("--provider")
-            .arg(provider)
-            .arg("--dry-run")
-            .arg("--json")
-            .output()
-            .expect("run router");
-        assert!(
-            output.status.success(),
-            "{provider} stderr: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let value: Value = serde_json::from_slice(&output.stdout).expect("router json");
-        assert_eq!(value["provider"], provider);
-        assert_eq!(value["model"], Value::Null);
-        assert_eq!(value["effort"], Value::Null);
-        assert_eq!(value["classification"], Value::Null);
-        assert_eq!(fixture.classifier_calls(), 0, "provider {provider}");
-    }
+    let fixture = CliFixture::new("grok-no-classifier");
+    let output = fixture
+        .run_command()
+        .arg("--provider")
+        .arg("grok")
+        .arg("--dry-run")
+        .arg("--json")
+        .output()
+        .expect("run router");
+    assert!(
+        output.status.success(),
+        "grok stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("router json");
+    assert_eq!(value["provider"], "grok");
+    assert_eq!(value["model"], Value::Null);
+    assert_eq!(value["effort"], Value::Null);
+    assert_eq!(value["classification"], Value::Null);
+    assert_eq!(fixture.classifier_calls(), 0);
 }
 
 #[cfg(unix)]
@@ -820,7 +818,7 @@ fn a_supplied_name_reaches_the_spawned_job_and_the_decision_log_verbatim() {
 /// effort, from the model, or from a config default. It asserts key presence as well as null,
 /// because a missing key and a null value are the same read otherwise, and the missing key is what
 /// an absent feature looks like. The codex control that proves a non null value can be recorded at
-/// all is `a_codex_row_records_the_observed_effort_while_claude_and_opencode_rows_stay_null` in the
+/// all is `a_row_written_with_an_effort_reads_it_back_and_rows_written_without_one_stay_null` in the
 /// core suite.
 #[cfg(unix)]
 #[test]
@@ -1088,7 +1086,7 @@ fn mcp_scoping_with_an_explicit_non_claude_provider_exits_nonzero() {
     };
 
     let config_arg = config.to_string_lossy().to_string();
-    for provider in ["codex", "grok", "opencode"] {
+    for provider in ["codex", "grok"] {
         let output = route(provider, &["--mcp-config", &config_arg]);
         let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -1118,33 +1116,29 @@ fn mcp_scoping_with_an_explicit_non_claude_provider_exits_nonzero() {
         }
     }
 
-    for provider in ["grok", "opencode"] {
-        let output = route(provider, &["--strict-mcp-config"]);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            !output.status.success(),
-            "{provider} accepted --strict-mcp-config: {}",
-            String::from_utf8_lossy(&output.stdout)
-        );
-        assert!(
-            stderr.contains("--strict-mcp-config"),
-            "{provider} did not name the rejected flag: {stderr}"
-        );
-        assert!(
-            !stderr.contains("unexpected argument"),
-            "{provider} does not accept --strict-mcp-config at all: {stderr}"
-        );
-        assert!(
-            !classifier_log.exists(),
-            "{provider} disclosed the rejected task to the classifier"
-        );
-        if provider == "grok" {
-            assert!(
-                !grok_log.exists(),
-                "Grok was invoked before --strict-mcp-config was refused"
-            );
-        }
-    }
+    let output = route("grok", &["--strict-mcp-config"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "grok accepted --strict-mcp-config: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        stderr.contains("--strict-mcp-config"),
+        "grok did not name the rejected flag: {stderr}"
+    );
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "grok does not accept --strict-mcp-config at all: {stderr}"
+    );
+    assert!(
+        !classifier_log.exists(),
+        "grok disclosed the rejected task to the classifier"
+    );
+    assert!(
+        !grok_log.exists(),
+        "Grok was invoked before --strict-mcp-config was refused"
+    );
 }
 
 #[cfg(unix)]
@@ -1303,204 +1297,32 @@ fn a_whitespace_only_name_is_rejected_naming_the_flag() {
     );
 }
 
-#[cfg(target_os = "linux")]
-fn fake_opencode_cli(root: &Path, log: &Path) -> PathBuf {
-    let binary = root.join("opencode");
-    // This stub writes its argv unconditionally and two tests assert the CLI was never run by
-    // checking that the log does not exist, so the probe guard the helper emits ahead of this body
-    // is what keeps a probe from inverting those assertions. No interpreter line here: the helper
-    // supplies exactly one.
-    common::write_stub(
-        &binary,
-        &format!(
-            "printf '%s\\n' \"$@\" > {}\n",
-            shell_quote(&log.to_string_lossy())
-        ),
-    );
-    binary
-}
-
-#[cfg(target_os = "linux")]
+/// OpenCode was removed as a provider. `--provider opencode` must fail at parse time with the
+/// remaining values named, rather than dispatching or treating the name as auto.
+#[cfg(unix)]
 #[test]
-fn managed_opencode_security_failure_does_not_run_the_detached_cli() {
-    let root = TempDir::new("managed-opencode-failure");
-    let bin = root.path.join("bin");
-    let home = root.path.join("home");
-    let cwd = root.path.join("working");
-    let run_log = root.path.join("opencode.run");
-    fs::create_dir_all(&bin).expect("create bin");
-    fs::create_dir_all(&home).expect("create home");
-    fs::create_dir_all(&cwd).expect("create cwd");
-    fake_opencode_cli(&bin, &run_log);
-    let path = format!(
-        "{}:{}",
-        bin.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
-
-    let output = Command::new(env!("CARGO_BIN_EXE_agent-router"))
-        .arg("run")
-        .arg("must stay managed")
-        .arg("--dir")
-        .arg(&cwd)
+fn run_rejects_provider_opencode_with_the_updated_message() {
+    let fixture = CliFixture::new("retired-provider");
+    let output = fixture
+        .run_command()
         .arg("--provider")
         .arg("opencode")
-        .env("HOME", home)
-        .env("GROK_HOME", root.path.join("grok-home"))
-        .env("GROK_USAGE_CACHE", root.path.join("grok-usage-cache.json"))
-        .env("PATH", path)
-        .env("OPENCODE_SERVER_USERNAME", "router test")
-        .env("OPENCODE_SERVER_PASSWORD", "wrong for existing servers")
-        .env("OPENCODE_CONFIG_CONTENT", "not json")
+        .arg("--dry-run")
+        .arg("--json")
         .output()
         .expect("run router");
-
-    if output.status.success() {
-        let invocation = wait_for_text(&run_log);
-        panic!(
-            "managed setup failure silently ran detached OpenCode CLI with argv: {invocation:?}"
-        );
-    }
-    assert!(
-        !run_log.exists(),
-        "detached OpenCode CLI ran after managed setup failed"
-    );
-}
-
-#[cfg(target_os = "linux")]
-fn compile_rejecting_opencode(root: &Path) -> PathBuf {
-    let source = root.join("rejecting_opencode.rs");
-    let binary = root.join("opencode");
-    fs::write(
-        &source,
-        r#"
-use std::fs;
-use std::io::{Read, Write};
-use std::net::TcpListener;
-
-fn main() {
-    let arguments = std::env::args().collect::<Vec<_>>();
-    if arguments.get(1).map(String::as_str) == Some("run") {
-        fs::write(std::env::var("AGENT_ROUTER_FIXTURE_RUN_LOG").unwrap(), "run").unwrap();
-        return;
-    }
-    let port = arguments
-        .windows(2)
-        .find(|pair| pair[0] == "--port")
-        .and_then(|pair| pair[1].parse::<u16>().ok())
-        .unwrap();
-    fs::write(
-        std::env::var("AGENT_ROUTER_FIXTURE_PID_FILE").unwrap(),
-        std::process::id().to_string(),
-    )
-    .unwrap();
-    let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
-    for stream in listener.incoming() {
-        let mut stream = stream.unwrap();
-        stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
-            .unwrap();
-        let mut request = [0_u8; 4096];
-        let size = stream.read(&mut request).unwrap();
-        let authenticated = String::from_utf8_lossy(&request[..size])
-            .lines()
-            .any(|line| line.to_ascii_lowercase().starts_with("authorization:"));
-        let status = if authenticated {
-            "403 Forbidden"
-        } else {
-            "401 Unauthorized"
-        };
-        write!(
-            stream,
-            "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-        )
-        .unwrap();
-    }
-}
-"#,
-    )
-    .expect("write fixture source");
-    let output = Command::new("rustc")
-        .arg("--edition=2021")
-        .arg(&source)
-        .arg("-o")
-        .arg(&binary)
-        .output()
-        .expect("compile rejecting opencode");
-    assert!(
-        output.status.success(),
-        "fixture compiler stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    binary
-}
-
-#[cfg(target_os = "linux")]
-fn process_exists(pid: i32) -> bool {
-    Command::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn router_terminates_a_server_that_fails_authenticated_readiness() {
-    let root = TempDir::new("readiness-rejection");
-    let home = root.path.join("home");
-    let cwd = root.path.join("working");
-    let pid_file = root.path.join("server.pid");
-    let run_log = root.path.join("opencode.run");
-    fs::create_dir_all(&home).expect("create home");
-    fs::create_dir_all(&cwd).expect("create cwd");
-    compile_rejecting_opencode(&root.path);
-    let path = format!(
-        "{}:{}",
-        root.path.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
-    let command = "ip link set lo up && exec \"$@\"";
-    let output = Command::new("unshare")
-        .args(["-Urn", "sh", "-c", command, "sh"])
-        .arg(env!("CARGO_BIN_EXE_agent-router"))
-        .arg("run")
-        .arg("must reject bad readiness")
-        .arg("--dir")
-        .arg(&cwd)
-        .arg("--provider")
-        .arg("opencode")
-        .env("HOME", home)
-        .env("GROK_HOME", root.path.join("grok-home"))
-        .env("GROK_USAGE_CACHE", root.path.join("grok-usage-cache.json"))
-        .env("PATH", path)
-        .env("OPENCODE_CONFIG_CONTENT", "{}")
-        .env("AGENT_ROUTER_FIXTURE_PID_FILE", &pid_file)
-        .env("AGENT_ROUTER_FIXTURE_RUN_LOG", &run_log)
-        .output()
-        .expect("run router in isolated network");
-    let pid = wait_for_text(&pid_file)
-        .trim()
-        .parse::<i32>()
-        .expect("server pid");
-    let still_running = process_exists(pid);
-    if still_running {
-        let _ = Command::new("kill")
-            .arg("-KILL")
-            .arg(pid.to_string())
-            .status();
-    }
-
-    assert!(
-        !still_running,
-        "router left rejected managed server process {pid} running"
-    );
     assert!(
         !output.status.success(),
-        "rejected managed server fell through to detached CLI"
+        "retired --provider opencode must not exit zero, stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("expected auto, codex, claude, or grok"),
+        "stderr must name the remaining providers: {stderr}"
     );
     assert!(
-        !run_log.exists(),
-        "detached OpenCode CLI ran after readiness rejection"
+        !stderr.contains("or opencode"),
+        "stderr still lists the retired provider: {stderr}"
     );
 }

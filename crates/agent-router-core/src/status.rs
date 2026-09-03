@@ -42,7 +42,7 @@ pub enum Observation {
     Ambiguous,
     /// We could not ask: no daemon answered, `claude` is not on PATH, or the call errored.
     Unavailable,
-    /// We have no way to ask. Opencode exposes no status API.
+    /// We have no way to ask. Historical or unknown provider names have no status API.
     Unsupported,
 }
 
@@ -100,7 +100,7 @@ pub struct Reconciled {
     pub observation: Observation,
     pub state: State,
     /// Whether a claude session transcript exists for this job. `Some(false)` is a sweep that ran
-    /// and found nothing, and `None` is a row that was never swept: a codex or opencode row, or a
+    /// and found nothing, and `None` is a row that was never swept: a codex or grok row, or a
     /// sweep that could not run. Evidence about whether there is anything to go read, never a
     /// verdict.
     pub traced: Option<bool>,

@@ -55,18 +55,18 @@ fn a_row_written_with_an_effort_reads_it_back_and_rows_written_without_one_stay_
 
     let codex = decision(Provider::Codex);
     let claude = decision(Provider::Claude);
-    let opencode = decision(Provider::Opencode);
+    let grok = decision(Provider::Grok);
     log.record(&entry("routed to codex", "codex", &codex, Some("high")))
         .expect("records the codex row");
     log.record(&entry("routed to claude", "claude", &claude, None))
         .expect("records the claude row");
-    log.record(&entry("routed to opencode", "opencode", &opencode, None))
-        .expect("records the opencode row");
+    log.record(&entry("routed to grok", "grok", &grok, None))
+        .expect("records the grok row");
 
     let rows = log.recent(3).expect("reads all three rows back");
     assert_eq!(
         rows.iter().map(|row| row.task.as_str()).collect::<Vec<_>>(),
-        vec!["routed to opencode", "routed to claude", "routed to codex"],
+        vec!["routed to grok", "routed to claude", "routed to codex"],
         "newest first"
     );
 
@@ -81,7 +81,7 @@ fn a_row_written_with_an_effort_reads_it_back_and_rows_written_without_one_stay_
     );
     assert_eq!(
         rows[0].effective_effort, None,
-        "opencode discards effort, so the row must not invent one either"
+        "grok exposes no effective effort, so the row must not invent one either"
     );
 }
 

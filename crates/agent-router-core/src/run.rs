@@ -37,14 +37,14 @@ pub struct Request<'a> {
 /// What the dispatch produced.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Dispatch {
-    /// The backend's own identity: codex thread id, claude short id, opencode session id.
+    /// The backend's own identity: codex thread id, claude short id, grok session id.
     pub job_id: Option<String>,
     /// The name the job is findable by, which is how a claude job with no resolved short id is
     /// still locatable.
     pub job_name: String,
     /// The reasoning effort the backend reported the job will run at, which is a different fact
     /// from the effort the router decided. Populated by codex alone, from the `thread/start`
-    /// reply. None for claude and opencode, permanently: neither exposes one, so there is nothing
+    /// reply. None for claude and grok, permanently: neither exposes one, so there is nothing
     /// observed to record and an inferred value here would read as an observed one.
     pub effective_effort: Option<String>,
 }
@@ -286,9 +286,8 @@ pub fn parse_provider(value: &str) -> Result<Option<Provider>> {
         "codex" => Ok(Some(Provider::Codex)),
         "claude" => Ok(Some(Provider::Claude)),
         "grok" => Ok(Some(Provider::Grok)),
-        "opencode" => Ok(Some(Provider::Opencode)),
         other => Err(Error::Command(format!(
-            "unknown provider {other:?}: expected auto, codex, claude, grok, or opencode"
+            "unknown provider {other:?}: expected auto, codex, claude, or grok"
         ))),
     }
 }
@@ -308,9 +307,13 @@ mod tests {
             parse_provider("claude").expect("claude"),
             Some(Provider::Claude)
         );
-        assert_eq!(
-            parse_provider("opencode").expect("opencode"),
-            Some(Provider::Opencode)
+        assert_eq!(parse_provider("grok").expect("grok"), Some(Provider::Grok));
+        let retired = parse_provider("opencode").expect_err("opencode is no longer a provider");
+        assert!(
+            retired
+                .to_string()
+                .contains("expected auto, codex, claude, or grok"),
+            "retired provider must name the remaining values: {retired}"
         );
         assert!(parse_provider("gpt").is_err());
     }

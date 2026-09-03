@@ -18,8 +18,8 @@
 #![cfg(unix)]
 
 use agent_router_core::binary::{
-    CLAUDE_BIN_ENV, CODEX_BIN_ENV, Environment, GROK_BIN_ENV, OPENCODE_BIN_ENV, launch_error,
-    resolve, resolve_named, search_path,
+    CLAUDE_BIN_ENV, CODEX_BIN_ENV, Environment, GROK_BIN_ENV, launch_error, resolve, resolve_named,
+    search_path,
 };
 use agent_router_core::{Error, Provider};
 use std::collections::BTreeMap;
@@ -446,9 +446,9 @@ fn every_resolution_source_returns_an_absolute_path() {
     let home = root.path().join("home");
     let on_path_dir = root.path().join("bin");
 
-    let from_fallback = stub_in(&home.join(".local/bin"), "opencode");
-    let from_path = stub_in(&on_path_dir, "opencode");
-    let from_override = stub_in(&root.path().join("opt"), "opencode");
+    let from_fallback = stub_in(&home.join(".local/bin"), "grok");
+    let from_path = stub_in(&on_path_dir, "grok");
+    let from_override = stub_in(&root.path().join("opt"), "grok");
     let override_text = from_override.to_string_lossy().into_owned();
 
     for (label, environment, expected) in [
@@ -467,12 +467,12 @@ fn every_resolution_source_returns_an_absolute_path() {
             env_with(
                 &[&on_path_dir],
                 Some(&home),
-                &[(OPENCODE_BIN_ENV, override_text.as_str())],
+                &[(GROK_BIN_ENV, override_text.as_str())],
             ),
             from_override.clone(),
         ),
     ] {
-        let resolved = resolve(Provider::Opencode, &environment)
+        let resolved = resolve(Provider::Grok, &environment)
             .unwrap_or_else(|error| panic!("{label} must resolve: {error}"));
         assert!(
             resolved.is_absolute(),

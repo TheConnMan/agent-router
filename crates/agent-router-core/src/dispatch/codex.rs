@@ -260,7 +260,7 @@ pub fn dispatch(
 
 /// IMPURE in `environment` only: the resolution seam.
 ///
-/// Codex resolves at the top, unlike opencode: `probe_daemon` always execs `codex app-server daemon
+/// Codex resolves at the top: `probe_daemon` always execs `codex app-server daemon
 /// version`, so a daemon that is already running does not spare this path the binary. Resolving
 /// once here also keeps `daemon_command`'s poll loop from re-resolving on every iteration.
 pub fn dispatch_in(

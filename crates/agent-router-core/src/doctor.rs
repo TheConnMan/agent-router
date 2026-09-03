@@ -65,11 +65,7 @@ pub fn run() -> Report {
         grok_usage_source(grok_source, usage.grok, grok_installed),
     ];
     checks.extend(grok_checks(&environment));
-    checks.extend([
-        optional_binary_in(&environment, "opencode_on_path", Provider::Opencode),
-        config_parses(),
-        log_writable(),
-    ]);
+    checks.extend([config_parses(), log_writable()]);
     Report { checks }
 }
 

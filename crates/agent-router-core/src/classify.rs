@@ -692,8 +692,7 @@ impl ClassifierFailure {
 /// reads as a conjunct of eligibility, so a healthy provider would be excluded from automatic
 /// routing by a fault that says nothing about its CLI. `Ran` still marks the classifier failed and
 /// still falls back; it just leaves routing eligibility alone. This mirrors the variant match
-/// every other post-resolution spawn site already does (`dispatch/grok.rs`, `dispatch/codex.rs`,
-/// `dispatch/opencode.rs`).
+/// every other post-resolution spawn site already does (`dispatch/grok.rs`, `dispatch/codex.rs`).
 fn spawn_failure(
     program: &std::path::Path,
     engine: ClassifierEngine,

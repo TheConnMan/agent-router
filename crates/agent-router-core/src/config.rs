@@ -368,7 +368,6 @@ impl Config {
                         "codex" => Some(crate::provider::Provider::Codex),
                         "claude" => Some(crate::provider::Provider::Claude),
                         "grok" => Some(crate::provider::Provider::Grok),
-                        "opencode" => Some(crate::provider::Provider::Opencode),
                         _ => None,
                     })
                     .flatten()
@@ -788,7 +787,7 @@ mod tests {
     fn an_unknown_classifier_engine_is_an_error() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
-        std::fs::write(&path, "[classifier]\nengine = \"opencode\"\n").expect("write");
+        std::fs::write(&path, "[classifier]\nengine = \"not-a-real-engine\"\n").expect("write");
         assert!(Config::load_from(&path).is_err());
     }
 
@@ -803,7 +802,7 @@ mod tests {
     fn an_invalid_policy_provider_is_rejected() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
-        assert!(load_config("[policy]\ndefault_provider = \"opencode\"\n", &path).is_err());
+        assert!(load_config("[policy]\ndefault_provider = \"not-a-provider\"\n", &path).is_err());
     }
 
     /// A parity exception silences a real difference, so an incomplete one is a difference nobody
