@@ -1,7 +1,8 @@
 //! One routed task end to end: read usage, classify any omitted routing values, decide, dispatch,
-//! and log.
+//! and log. When classification runs, the usage snapshot is taken concurrently with it.
 
-use crate::classify::classify_with_name;
+use crate::binary::Environment;
+use crate::classify::classify_with_name_in;
 use crate::config::Config;
 use crate::decide::{Decision, decide, decide_explicit};
 use crate::error::{Error, Result};
@@ -69,6 +70,46 @@ pub struct Outcome {
 
 /// IMPURE: run one task through the router.
 pub fn run(request: &Request, config: &Config) -> Result<Outcome> {
+    run_inner(
+        request,
+        config,
+        &Environment::from_process(),
+        UsageSnapshot::read,
+        DecisionLog::open,
+        true,
+    )
+}
+
+/// IMPURE: the same pipeline as [`run`], with the usage reader, classifier environment, and log
+/// opener injected so a test can overlap a slow usage read with a stub classifier without
+/// mutating process-global `HOME` / `PATH` / `AGENT_ROUTER_*_BIN`. Does not pin a live Codex
+/// snapshot, because the injected reader owns the whole `UsageSnapshot`.
+pub fn run_with<R, L>(
+    request: &Request,
+    config: &Config,
+    environment: &Environment,
+    read_usage: R,
+    open_log: L,
+) -> Result<Outcome>
+where
+    R: FnOnce() -> UsageSnapshot + Send,
+    L: FnOnce() -> Result<DecisionLog>,
+{
+    run_inner(request, config, environment, read_usage, open_log, false)
+}
+
+fn run_inner<R, L>(
+    request: &Request,
+    config: &Config,
+    environment: &Environment,
+    read_usage: R,
+    open_log: L,
+    pin_codex_before_classify: bool,
+) -> Result<Outcome>
+where
+    R: FnOnce() -> UsageSnapshot + Send,
+    L: FnOnce() -> Result<DecisionLog>,
+{
     match (
         request.provider.is_some(),
         request.model.is_some(),
@@ -123,14 +164,36 @@ pub fn run(request: &Request, config: &Config) -> Result<Outcome> {
     if let Some(provider) = request.provider {
         crate::dispatch::reject_mcp_scoping(request, provider)?;
     }
-    let usage = UsageSnapshot::read();
     let derives_routing_values = matches!(
         request.provider,
         None | Some(Provider::Codex | Provider::Claude)
     );
     let needs_classification = request.provider.is_none()
         || (derives_routing_values && (request.model.is_none() || request.effort.is_none()));
-    let classified = needs_classification.then(|| classify_with_name(request.task, config));
+    let (usage, classified) = if needs_classification {
+        // Classification consumes only the task text and config; the usage snapshot is an
+        // independent input to decide(). Overlapping them makes dispatch wall time
+        // max(usage, classify) instead of their sum.
+        //
+        // The Codex slice is captured on this thread before the classifier is spawned, so
+        // there is a happens-before: this call's own Codex rollout cannot enter the
+        // snapshot. Grok/Claude HTTP (the slow part of the live reader) still overlaps
+        // with the classifier. Tests that inject a whole snapshot skip the pin, or the
+        // live Codex read would overwrite their numbers.
+        let pinned_codex = pin_codex_before_classify.then(crate::usage::codex_headroom);
+        std::thread::scope(|scope| {
+            let usage = scope.spawn(read_usage);
+            let classified =
+                scope.spawn(|| classify_with_name_in(environment, request.task, config));
+            let mut usage = join_thread(usage, "usage reader");
+            if let Some(codex) = pinned_codex {
+                usage.codex = codex;
+            }
+            (usage, Some(join_thread(classified, "classifier")))
+        })
+    } else {
+        (read_usage(), None)
+    };
     let generated_name = if request.name.is_none() && !request.dry_run {
         match &classified {
             Some(classified) => classified.job_name.clone(),
@@ -162,7 +225,7 @@ pub fn run(request: &Request, config: &Config) -> Result<Outcome> {
         .provider
         .map(|provider| provider.name())
         .unwrap_or("auto");
-    let log = DecisionLog::open()?;
+    let log = open_log()?;
 
     if decision.capability_blocked {
         let capability_blocked = "required capability is absent from every configured provider inventory; no provider was dispatched".to_string();
@@ -259,6 +322,12 @@ pub fn run(request: &Request, config: &Config) -> Result<Outcome> {
         log_error,
         estimate: None,
     })
+}
+
+fn join_thread<T>(handle: std::thread::ScopedJoinHandle<'_, T>, name: &str) -> T {
+    handle
+        .join()
+        .unwrap_or_else(|payload| panic!("{name} thread panicked: {payload:?}"))
 }
 
 /// PURE: the job id, job name, effective effort, and outcome one dispatch result contributes to

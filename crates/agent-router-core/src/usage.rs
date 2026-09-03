@@ -140,12 +140,19 @@ impl UsageSnapshot {
     }
 
     /// IMPURE: read all providers once and retain the Grok snapshot's provenance for diagnostics.
+    ///
+    /// Codex is scanned first on purpose. `run` overlaps this read with the classifier, and the
+    /// classifier's own Codex rollout only gains `rate_limits` when that call completes. Capturing
+    /// Codex before the Grok/Claude HTTP work (the slow part) keeps that rollout out of the
+    /// snapshot even when those fetches outlast the classifier. Reordering the two HTTP reads is
+    /// a separate change and is not done here.
     pub fn read_with_grok_source() -> (UsageSnapshot, GrokUsageSource) {
+        let codex = codex_headroom();
         let grok = grok_usage();
         (
             UsageSnapshot {
                 claude: claude_headroom(),
-                codex: codex_headroom(),
+                codex,
                 grok: grok.headroom,
             },
             grok.source,
