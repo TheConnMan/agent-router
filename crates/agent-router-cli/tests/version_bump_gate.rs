@@ -71,10 +71,25 @@ fn write_file(repo: &Path, relative: &str, contents: &str) {
     fs::write(path, contents).expect("write fixture file");
 }
 
+/// Strip parent-repo git identity so fixtures can `git init` their own trees.
+///
+/// A pre-push hook exports GIT_DIR pointing at this repository. Without this, fixture `git init`
+/// tries to reconfigure the parent instead of creating a throwaway repo.
+fn isolate_from_parent_git(command: &mut Command) -> &mut Command {
+    command
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_COMMON_DIR")
+}
+
 /// Identity is passed inline on every invocation so the fixture works on a box with no git identity
 /// configured, and signing is disabled so a globally configured signing key cannot block a commit.
 fn git(repo: &Path, args: &[&str]) {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    isolate_from_parent_git(&mut command);
+    let output = command
         .current_dir(repo)
         .args([
             "-c",
@@ -100,7 +115,9 @@ fn commit_all(repo: &Path, message: &str) {
 }
 
 fn head_sha(repo: &Path) -> String {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    isolate_from_parent_git(&mut command);
+    let output = command
         .current_dir(repo)
         .args(["rev-parse", "HEAD"])
         .output()
@@ -123,6 +140,7 @@ fn script() -> PathBuf {
 /// parallel threads inside one process.
 fn run_gate(repo: &Path, base: Option<&str>) -> Output {
     let mut command = Command::new(script());
+    isolate_from_parent_git(&mut command);
     command.current_dir(repo).env_remove("GITHUB_BASE_REF");
     if let Some(base) = base {
         command.arg(base);
@@ -134,7 +152,9 @@ fn run_gate(repo: &Path, base: Option<&str>) -> Output {
 /// removed: the shape CI hands the gate on every pull request. Set on the child for the same reason
 /// `run_gate` removes it there, since `std::env::set_var` would race across these parallel tests.
 fn run_gate_with_github_base_ref(repo: &Path, base_ref: &str) -> Output {
-    Command::new(script())
+    let mut command = Command::new(script());
+    isolate_from_parent_git(&mut command);
+    command
         .current_dir(repo)
         .env("GITHUB_BASE_REF", base_ref)
         .output()
@@ -402,7 +422,9 @@ fn a_shallow_clone_of_a_merge_fails_loudly_rather_than_skipping() {
         "the clone's HEAD must be the merge commit"
     );
     for parent in ["HEAD^1", "HEAD^2"] {
-        let resolved = Command::new("git")
+        let mut command = Command::new("git");
+        isolate_from_parent_git(&mut command);
+        let resolved = command
             .current_dir(&clone)
             .args(["rev-parse", "--verify", "-q", parent])
             .output()
@@ -453,7 +475,9 @@ fn renaming_a_gated_file_away_still_requires_a_version_bump() {
 
     // Assert the fixture's premise rather than trusting it, the same way the shallow-clone test
     // does: if git reported a delete plus an add here, the gate would fire for the wrong reason.
-    let diff = Command::new("git")
+    let mut command = Command::new("git");
+    isolate_from_parent_git(&mut command);
+    let diff = command
         .current_dir(&temp.path)
         .args(["diff", "--name-only", &format!("{base}...HEAD")])
         .output()
@@ -506,7 +530,9 @@ fn a_merge_with_a_large_commit_message_does_not_die_silently() {
 
     // The premise is a commit object past the 64 KiB pipe buffer. Well past, so the test does not
     // sit on the boundary where the race can go either way.
-    let size = Command::new("git")
+    let mut command = Command::new("git");
+    isolate_from_parent_git(&mut command);
+    let size = command
         .current_dir(&repo)
         .args(["cat-file", "-s", "HEAD"])
         .output()
