@@ -158,7 +158,7 @@ const SEEDED: [Seed; 5] = [
         "auto",
         "claude",
         Some("high"),
-        "headroom_tiebreak",
+        "legacy_flip",
         false,
         Some("bad"),
         "failed",
@@ -206,22 +206,8 @@ fn the_metric_matrix_over_a_hand_countable_row_set() {
         row(7_000, "claude", "claude", None, "explicit_provider", false),
         row(6_000, "auto", "codex", Some("low"), "over_ceiling", true),
         row(5_000, "auto", "codex", None, "classifier_failed", false),
-        row(
-            4_000,
-            "auto",
-            "claude",
-            Some("ultra"),
-            "headroom_tiebreak",
-            false,
-        ),
-        row(
-            3_000,
-            "auto",
-            "claude",
-            Some("high"),
-            "claude_signals",
-            true,
-        ),
+        row(4_000, "auto", "claude", Some("ultra"), "legacy_flip", false),
+        row(3_000, "auto", "claude", Some("high"), "legacy_pin", true),
         row(
             2_000,
             "auto",
@@ -245,11 +231,11 @@ fn the_metric_matrix_over_a_hand_countable_row_set() {
     assert_eq!(
         stats.gates,
         counts(&[
-            ("claude_signals", 1),
+            ("legacy_pin", 1),
             ("classifier_failed", 1),
             ("explicit_provider", 2),
             ("flipped_on_exhaustion", 1),
-            ("headroom_tiebreak", 1),
+            ("legacy_flip", 1),
             ("over_ceiling", 1),
         ])
     );
@@ -409,55 +395,38 @@ fn rates_are_denominated_on_auto_routes_only() {
 }
 
 /// The flip rate counts routes that moved, not tags that fired. A row carrying two provider moving
-/// gates is one flipped route: the task moved once. `five_hour_pacing` moves a task off the
-/// provider its verdict named exactly as the other two do, so a paced route is a flipped route;
-/// leaving it out of the numerator shrinks the measured flip rate the moment the rule starts
-/// firing. Eight flip tags fire across these six rows and five routes moved, so dropping any tag
-/// from the numerator's gate list fails this, and so does counting tags instead of rows.
+/// gates is one flipped route: the task moved once. `legacy_flip` is the folded form of the retired
+/// provider-moving tags, so a migrated corpus still counts in the numerator. Four flip tags fire
+/// across these five rows and four routes moved, so dropping either remaining flip gate from the
+/// numerator's list fails this, and so does counting tags instead of rows.
 #[test]
 fn every_provider_moving_gate_counts_toward_the_flip_rate() {
     let rows = vec![
-        row(6_000, "auto", "codex", Some("high"), "over_ceiling", false),
-        row(
-            5_000,
-            "auto",
-            "codex",
-            Some("high"),
-            "headroom_tiebreak,flipped_on_exhaustion",
-            false,
-        ),
+        row(5_000, "auto", "codex", Some("high"), "over_ceiling", false),
         row(
             4_000,
             "auto",
-            "claude",
+            "codex",
             Some("high"),
-            "headroom_tiebreak",
+            "legacy_flip,flipped_on_exhaustion",
             false,
         ),
+        row(3_000, "auto", "claude", Some("high"), "legacy_flip", false),
         row(
-            3_000,
+            2_000,
             "auto",
             "claude",
             Some("high"),
             "flipped_on_exhaustion",
             false,
         ),
-        row(
-            2_000,
-            "auto",
-            "codex",
-            Some("high"),
-            "five_hour_pacing",
-            false,
-        ),
-        // The reachable double fire the engine produces: a headroom tiebreak to claude that the
-        // pacing rule sends straight back to codex. One route, two provider moving tags.
+        // One route, two provider moving tags: the task moved once.
         row(
             1_000,
             "auto",
             "codex",
             Some("high"),
-            "headroom_tiebreak,five_hour_pacing",
+            "legacy_flip,flipped_on_exhaustion",
             false,
         ),
     ];
@@ -466,14 +435,13 @@ fn every_provider_moving_gate_counts_toward_the_flip_rate() {
 
     assert_eq!(
         (stats.flip_rate.numerator, stats.flip_rate.denominator),
-        (5, 6)
+        (4, 5)
     );
     assert_eq!(
         stats.gates,
         counts(&[
-            ("five_hour_pacing", 2),
-            ("flipped_on_exhaustion", 2),
-            ("headroom_tiebreak", 3),
+            ("flipped_on_exhaustion", 3),
+            ("legacy_flip", 3),
             ("over_ceiling", 1),
         ])
     );
@@ -491,7 +459,7 @@ fn a_gate_tag_that_is_a_substring_of_another_is_counted_separately() {
             "auto",
             "claude",
             Some("high"),
-            "headroom_tiebreak,headroom_tiebreak_wide",
+            "legacy_flip,legacy_flip_wide",
             false,
         ),
         row(
@@ -499,28 +467,21 @@ fn a_gate_tag_that_is_a_substring_of_another_is_counted_separately() {
             "auto",
             "codex",
             Some("high"),
-            "headroom_tiebreak_wide",
+            "legacy_flip_wide",
             false,
         ),
-        row(
-            1_000,
-            "auto",
-            "claude",
-            Some("high"),
-            "headroom_tiebreak",
-            false,
-        ),
+        row(1_000, "auto", "claude", Some("high"), "legacy_flip", false),
     ];
 
     let stats = summarize(&rows);
 
     assert_eq!(
         stats.gates,
-        counts(&[("headroom_tiebreak", 2), ("headroom_tiebreak_wide", 2)])
+        counts(&[("legacy_flip", 2), ("legacy_flip_wide", 2)])
     );
     // An empty gates string is no gate at all, not a tag whose name is empty.
     assert!(!stats.gates.contains_key(""));
-    // The same hazard in the flip numerator: `headroom_tiebreak_wide` is not a provider moving
+    // The same hazard in the flip numerator: `legacy_flip_wide` is not a provider moving
     // gate, so the row carrying only it did not flip.
     assert_eq!(
         (stats.flip_rate.numerator, stats.flip_rate.denominator),
@@ -1298,7 +1259,7 @@ fn collect_reads_the_mark_and_the_outcome_from_the_database() {
         rates(&[
             ("classifier_failed", 0, 1),
             ("explicit_provider", 0, 0),
-            ("headroom_tiebreak", 1, 1),
+            ("legacy_flip", 1, 1),
         ])
     );
     assert_eq!(

@@ -1094,15 +1094,8 @@ fn row_json(row: &Row) -> serde_json::Value {
         // null wherever no backend reported one.
         "effort": row.effort,
         "effective_effort": row.effective_effort,
-        "verdict": row.verdict,
-        "confidence": row.confidence,
         "complexity": row.complexity,
         "task_context_horizon": row.task_context_horizon,
-        // Null on every row written since the classifier stopped scoring them. Still printed
-        // because the rows recorded under them are the corpus every backtest replays, and this is
-        // the only way to read one back through the tool.
-        "codex_ready_count": row.codex_ready_count,
-        "claude_signal_count": row.claude_signal_count,
         "orchestration": row.orchestration,
         "missing_connector": row.missing_connector,
         "claude_projected_draw": row.claude_projected_draw,

@@ -11,7 +11,7 @@ data instead of memory.
 ```
 $ agent-router run "Port usage.sh to Rust with the same fail-open semantics"
 codex complexity medium model gpt-5.6-terra job 019c3f2a name "Port usage.sh to Rust with the same fail"
-why: codex ready on all six criteria, no claude signals, weekly headroom codex 41% claude 12%
+why: codex: bounded rust port, fail-open usage (orchestration no, claude weekly 12%, codex weekly 41%, grok weekly 8%, claude 5h 3%)
 log: row 87 in /home/you/.local/state/agent-router/router.db
 ```
 
@@ -31,8 +31,8 @@ log: row 87 in /home/you/.local/state/agent-router/router.db
    `CLAUDE.md`, `AGENTS.md`, skill, plugin, hook, or MCP server can shift the score. The Codex
    engine additionally runs with its shell, browser, computer use, image, app, and skill search
    tools disabled: scoring needs no tool, and a task carrying an injected instruction must have
-   nothing to reach for. If the call fails or times out, the configured default provider stays in
-   force and the decision is tagged `classifier_failed`. The same classifier model also generates
+   nothing to reach for. If the call fails or times out, automatic capacity routing still selects
+   between Codex and Grok and the decision is tagged `classifier_failed`. The same classifier model also generates
    the job title. A ticket ID leads the title, followed by two to six concise Title Case words, such
    as `GH-123 Sprint 2 Bug Fixes` or `RS-123 Input Box Searching`. A run that names its provider is
    The routing classifier runs whenever provider, model, or effort is omitted for Claude or Codex.
@@ -202,7 +202,8 @@ them. That interacts badly with routing: a task sent to Claude precisely because
 a connector can lose the very connector it was routed for. Pass it only when the job genuinely
 needs nothing beyond the files given.
 
-An explicit Grok dispatch reuses `agent-viewer-core`'s public `GrokLifecycle`. Router does not
+An explicit Grok dispatch reuses `agent-viewer-core`'s public `GrokLifecycle`. That crate is a git
+dependency pinned by rev, so Grok behaviour changes ship in lockstep with agent-viewer. Router does not
 implement an ACP client or durable Grok session parser. The lifecycle's nonempty official session
 identity is copied unchanged into the dispatch result and decision log as `job_id`; use that exact
 identity with `agent-router status`.
@@ -372,10 +373,7 @@ agent-router log --mark 87 bad --note "routed to codex, needed connectors"
 | `--json` | off | Emit the full decision, including gates, classification, and usage. Rejected alongside `--mark`, which prints a confirmation line rather than a listing. |
 
 `--json` emits every recorded column, including the full task text, the rationale, and the
-dispatch outcome. It also still prints the scores the classifier no longer produces
-(`verdict`, `confidence`, and the two rubric counts), because the rows already in the log carry
-them and this is the only way to read one back through the tool; they are null on every row
-written since. It also carries `router_version`, stamped from the router's own build on every
+dispatch outcome. It also carries `router_version`, stamped from the router's own build on every
 write; null there means the row predates the column, so its provenance is genuinely unknown
 rather than absent. The log is the tuning surface: each gate tag names a specific rule that fired,
 so routing behaviour can be audited against outcomes rather than recalled.
@@ -417,9 +415,8 @@ Reported over the window: the rows considered and their oldest and newest timest
 provider, the count per gate tag, the complexity distribution (with a row that was never scored
 counted as `unscored`), the router version distribution (with a row carrying no version counted as
 `unknown`), the number of auto routes, and three rates. The flip rate is the auto routed
-rows carrying a provider moving gate (`flipped_on_exhaustion`, `projected_overdraw`,
-`five_hour_pacing`, or the retired `pace_flip` and `headroom_tiebreak`, which rows already in the
-log may still carry) over all auto routes. A
+rows carrying a provider moving gate (`flipped_on_exhaustion`, or `legacy_flip` for tags folded
+from a pre-v2 log) over all auto routes. A
 row carrying more than one of them counts once, because
 the route moved once. The classifier failure rate is the auto routed rows carrying `classifier_failed` over the
 same denominator. Both are denominated on auto routes only, because a row that named its provider

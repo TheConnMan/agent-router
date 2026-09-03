@@ -22,14 +22,9 @@ mod common;
 
 /// The gates that move a task off the provider it started on, as the router defines them.
 /// Restated here rather than imported so the reconciliation below is an independent count rather
-/// than the implementation agreeing with itself. `headroom_tiebreak` is retired but still counted,
-/// because rows carrying it remain in the log.
-const FLIP_GATES: [&str; 4] = [
-    "flipped_on_exhaustion",
-    "headroom_tiebreak",
-    "pace_flip",
-    "five_hour_pacing",
-];
+/// than the implementation agreeing with itself. `legacy_flip` is the folded form of the retired
+/// provider-moving tags, so a migrated corpus still counts.
+const FLIP_GATES: [&str; 2] = ["flipped_on_exhaustion", "legacy_flip"];
 
 /// Every metric `stats --json` is contracted to publish. The CLI writes that object field by
 /// field, so a metric added to the report and not surfaced there is otherwise invisible: it

@@ -22,47 +22,28 @@ Two rules govern the whole file:
 
 ## `config_version` and in-place migrations
 
-Because the file is generated rather than hand-authored, a value this tool once wrote can go stale
-in every existing install while the default constant in the source moves on. `config_version` is
-the marker that lets those be corrected exactly once.
+`config_version` is the stamp that says this file has already been rewritten to the current schema.
+On load, a file stamped below 5 is rewritten once and stamped 5. The rewrite is what drops keys the
+router no longer has (`policy.default_provider`, `projection_overdraw_pct`,
+`claude_five_hour_pacing_pct`, and older aliases such as `pace_flip_gap`): serde already ignores
+unknown keys on parse, so routing does not change, and the one rewrite stops the file from naming
+them.
 
-On load, a file stamped below the current version is migrated and rewritten in place, then stamped.
-A migration only ever touches a value still equal to the default this tool used to generate;
-anything else is left alone.
-
-**On a file with no stamp, that test is a guess, and it can guess wrong.** A `30` you typed
-yourself is indistinguishable from the `30` the tool generated, so a v1 migration will move it. It
-is a one-time, one-value cost, and it errs toward more headroom rather than less, but it is real:
-if you had deliberately pinned the old default before upgrading, re-pin it after.
-
-After that first stamp the ambiguity is gone for good. A migration runs once per file, so setting a
-migrated value back is permanent, and nothing will move it again. That is the whole reason migrations
-are keyed on the stamp and not on the value: a value-keyed migration would re-apply on every single
-load, and restoring the old default would be impossible rather than merely inconvenient.
+Operator-chosen values are left alone. A file already stamped `config_version = 5` is not rewritten.
 
 Two consequences worth knowing. The rewrite serializes the whole config, so hand-added comments in
 the file are lost the one time a migration runs. And a file with no `config_version` key is treated
 as predating versioning, so do not delete the key to "reset" anything.
 
-| version | migration |
-| --- | --- |
-| 1 | `classifier_timeout_secs` of `30`, the old generated default, becomes `60`. Any other value is left alone. |
-| 2 | `headroom_flip_gap` is gone and `pace_flip_gap` replaces it. Nothing is carried across: the two keys threshold different comparisons, so a number tuned for the old one means nothing under the new one. The rewrite drops the stale key from the file. |
-| 3 | A file stamped below version 3 with `hard_ceiling_pct = 97.0`, the old generated default, is corrected to `98.0`. Any other value is left alone. |
-| 4 | `pace_flip_gap` is gone and `projection_overdraw_pct` replaces it. Nothing is carried across, and here that is not a convenience: the old key's value existed to clear a chronic band produced by one pair of plan sizes, so reading a `70` as a projection threshold would let a provider run to 70 percent OVER its allowance before anything moved. The rewrite drops the stale key from the file. |
-
-A file already stamped `config_version = 4` is not migrated, so its chosen ceiling remains in force.
-
 ## Defaults in full
 
 ```toml
-config_version = 4
+config_version = 5
 hard_ceiling_pct = 98.0
 classifier_timeout_secs = 60
 connectors = ["local shell"]
 
 [policy]
-default_provider = "codex"
 weekly_routing = true
 
 [classifier]
@@ -157,10 +138,6 @@ provider down to its reserve projects to finish INSIDE its allowance whenever it
 elapsed (98 percent used against 99 percent elapsed projects to 99), so a pace comparison allowed
 to run first would see nothing wrong and route into a provider that is out of budget.
 
-### `projection_overdraw_pct`
-
-Default `100.0`. Retained for compatibility; automatic workhorse selection does not consult it.
-
 A provider's projected draw is `weekly_pct` divided by the fraction of its own weekly window that
 has elapsed: what its spending so far extrapolates to by the time its window resets. 80 percent
 spent with half the window gone projects to 160, meaning it runs out with days to spare. The two
@@ -181,41 +158,8 @@ comparison runs only with both providers eligible and eligibility already requir
 window, so that decision carries `weekly_unknown` instead, which names the reason rather than the
 consequence.
 
-The retired `projected_overdraw` gate and this threshold named a later override that only moved
-work once a provider projected past 100. Rows already in the log carry that tag, which is why it
-stays documented. The key is not read as an alias for a gap and is not a second ceiling.
-
-Neither `pace_flip_gap` nor `headroom_flip_gap` is read as an alias. Both named rules that
-thresholded a difference between two providers' numbers, and `pace_flip_gap` in particular had to be
-tuned above whatever chronic band the two plan sizes happened to produce. That made it a plan sized
-constant wearing the clothes of a policy: it was set to 70 points to clear the band a 5x Codex plan
-against 20x Claude plans produced, the Codex plan grew on 2026-08-01, the band collapsed to under 38
-points, and the configured value then sat above every reading the box could produce. The override
-stopped firing entirely and nothing reported that it had. A ratio against each provider's own
-allowance has no such dependency, which is why the selector compares those ratios directly.
-
-### `claude_five_hour_pacing_pct` (observational)
-
-Default `90.0`. Retained for compatibility and reporting; Claude's 5-hour usage does not pace
-automatic routing.
-
-No automatic decision uses this threshold. Normal work balances Codex and Grok by projected
-weekly draw; Claude is selected only by capability/context pins.
-
-Codex having room is judged by `hard_ceiling_pct`, the same threshold the exhaustion flip uses,
-rather than by a second key that could drift away from it. Codex sitting exactly on that ceiling has
-no room, so no pacing happens: moving the job would relocate the stall rather than avoid it.
-
-A capability pin overrides this entirely. A task requiring several agents exchanging findings
-mid-run stays on Claude however exhausted its 5 hour window is. A named connector instead first
-filters providers to inventories that establish it, then applies the ordinary policy within that
-eligible set; it is blocked only if no provider qualifies.
-
 Setting `weekly_routing = false` disables weekly balancing along with every other usage-driven rule.
-
-Codex's own 5 hour number is deliberately ignored, in both directions: it never paces a task away
-from Codex and it never keeps one on Claude. Only Claude has a 5 hour window that constrains a
-stream of jobs on this box.
+Claude's 5-hour usage does not pace automatic routing; Claude is selected only by capability pins.
 
 ### `classifier_timeout_secs`
 
@@ -273,16 +217,6 @@ inventory entry are excluded before the existing capacity policy runs. Explicit 
 requests remain exact and do not use this automatic eligibility filter.
 
 ## `[policy]`
-
-### `default_provider`
-
-Default `"codex"`. Either `"codex"` or `"grok"` for the workhorse fallback. The provider used when
-both workhorses are unavailable (Codex by default).
-
-Claude is selected by capability/context pins and is not a workhorse usage-routing destination.
-
-Still parsed, defaulted, and validated on load, but no longer consulted by routing, which selects
-between Codex and Grok by capacity instead.
 
 ### `weekly_routing`
 

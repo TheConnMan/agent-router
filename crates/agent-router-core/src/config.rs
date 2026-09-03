@@ -10,25 +10,14 @@ use std::path::{Path, PathBuf};
 /// Weekly percent at which a provider counts as exhausted: within 2 points of the weekly limit is
 /// close enough that the provider is no longer a routing destination.
 const DEFAULT_HARD_CEILING_PCT: f64 = 98.0;
-/// Projected weekly draw, as a percent of a provider's own allowance, above which the provider is
-/// treated as overdrawing its window. 100 is the definition of overdrawing rather than a tuned
-/// number: see the field's own doc comment.
-const DEFAULT_PROJECTION_OVERDRAW_PCT: f64 = 100.0;
-/// Claude five hour percent used at or above which a task is paced away from Claude.
-const DEFAULT_CLAUDE_FIVE_HOUR_PACING_PCT: f64 = 90.0;
 /// Ceiling on the classifier call. Headroom over the measured worst case rather than a target:
 /// the fast path is 3.4-7.0s, so this only has to be generous enough that a slow tail falls back
 /// far less often than it did at 30s, where 6 of 18 measured calls lost the deadline.
 const DEFAULT_CLASSIFIER_TIMEOUT_SECS: u64 = 60;
-/// The classifier timeout this tool used to generate into new config files.
-const PRE_MIGRATION_CLASSIFIER_TIMEOUT_SECS: u64 = 30;
-/// The hard ceiling this tool used to generate into new config files, which left a provider a
-/// routing destination until it was within 3 points of its weekly limit.
-const PRE_MIGRATION_HARD_CEILING_PCT: f64 = 97.0;
 
-/// The migration level a config file written by this build carries. Raise this, and add a step to
-/// `migrate`, whenever a stale generated value has to be corrected in place.
-const CURRENT_CONFIG_VERSION: u32 = 4;
+/// The migration level a config file written by this build carries. A file stamped below this is
+/// rewritten once so dead keys drop off disk; serde already ignores them on parse.
+const CURRENT_CONFIG_VERSION: u32 = 5;
 
 /// The level a file that predates versioning reads as. This is deliberately NOT
 /// `CURRENT_CONFIG_VERSION`: an absent key has to be distinguishable from a stamped one, or every
@@ -37,34 +26,15 @@ fn pre_versioning() -> u32 {
     0
 }
 
-/// The value `Policy::default_provider` accepts and validates. Still parsed and defaulted, but no
-/// longer consulted by routing; see the field's own doc comment for why.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum DefaultProvider {
-    Codex,
-    Claude,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Policy {
-    /// Accepted, defaulted, and validated at load time, but no longer read by routing:
-    /// `Classification::fallback` used to compose "defaulting to {provider}" from this field, and
-    /// no longer takes it at all. Routing now selects between Codex and Grok by capacity, with
-    /// Claude reserved for capability pins, so there is no live "default provider" decision left
-    /// for this field to answer. Kept because it is a documented user-facing config key: removing
-    /// it would either break existing config files or start silently ignoring them, and its
-    /// parse-time validation is still worth keeping. Do not assume the next reader added here
-    /// makes it live again without checking that assumption first.
-    pub default_provider: DefaultProvider,
     pub weekly_routing: bool,
 }
 
 impl Default for Policy {
     fn default() -> Policy {
         Policy {
-            default_provider: DefaultProvider::Codex,
             weekly_routing: true,
         }
     }
@@ -287,22 +257,10 @@ pub struct Config {
     /// consulting this ceiling, so a router that spends down to the limit leaves nothing for the
     /// work a person is doing by hand.
     pub hard_ceiling_pct: f64,
-    /// Retained for compatibility with generated config files. Automatic workhorse selection
-    /// compares projected weekly draws directly and does not consult this threshold.
-    ///
-    /// The previous key, `pace_flip_gap`, compared how far ahead of pace each provider was in
-    /// points, and its value had to clear whatever chronic band the two plan sizes happened to
-    /// produce. That made it a plan-sized constant wearing the clothes of a policy: when the Codex
-    /// plan grew on 2026-08-01 the band collapsed and the configured 70 became unreachable, so
-    /// the override silently stopped existing. Neither `pace_flip_gap` nor `headroom_flip_gap` is
-    /// read as an alias.
-    pub projection_overdraw_pct: f64,
-    /// Claude five hour percent used at or above which a task is paced away from Claude, provided
-    /// Codex has weekly room. Codex's own five hour number never influences routing. Declared here
-    /// rather than below `policy`, because a scalar after a table typed field makes
-    /// `toml::to_string_pretty` fail when the default file is written on first run.
-    pub claude_five_hour_pacing_pct: f64,
     /// How long the classifier call may take before it counts as failed.
+    ///
+    /// Declared here rather than below `policy`, because a scalar after a table typed field makes
+    /// `toml::to_string_pretty` fail when the default file is written on first run.
     pub classifier_timeout_secs: u64,
     /// What the local shell can actually reach on this box. Human-maintained: gate 5 of the
     /// rubric is scored against exactly this list. An absent capability blocks dispatch unless a
@@ -327,8 +285,6 @@ impl Default for Config {
         Config {
             config_version: CURRENT_CONFIG_VERSION,
             hard_ceiling_pct: DEFAULT_HARD_CEILING_PCT,
-            projection_overdraw_pct: DEFAULT_PROJECTION_OVERDRAW_PCT,
-            claude_five_hour_pacing_pct: DEFAULT_CLAUDE_FIVE_HOUR_PACING_PCT,
             classifier_timeout_secs: DEFAULT_CLASSIFIER_TIMEOUT_SECS,
             // Local shell is one capability, not a duplicated inventory of every executable,
             // file, or authenticated endpoint that the shell can reach.
@@ -430,50 +386,19 @@ impl Config {
         }
     }
 
-    /// PURE-ish: bring a file written by an older build up to `CURRENT_CONFIG_VERSION`, returning
-    /// whether it now needs rewriting. A step may only touch a value still equal to the default
-    /// this tool used to generate, which is what keeps this compatible with the file's stated
-    /// contract that the operator's config is authoritative.
+    /// PURE-ish: stamp a file written by an older build to `CURRENT_CONFIG_VERSION`, returning
+    /// whether it now needs rewriting. The rewrite is what drops dead keys from disk: serde
+    /// already ignores unknown keys on parse, so a v4 file still carrying `default_provider` or
+    /// `projection_overdraw_pct` keeps routing the same either way, and the one rewrite is what
+    /// stops the file from naming keys the router no longer has.
     ///
-    /// KNOWN LIMIT, on an unstamped file only: "still equal to the old generated default" cannot
-    /// distinguish a value the operator deliberately typed from the one the tool wrote, so a v1
-    /// migration will move a hand-pinned 30. That is accepted rather than solved, because there is
-    /// no evidence in the file to solve it with: the cost is one value, once, in the direction of
-    /// more headroom, and it is documented in `docs/configuration.md`.
-    ///
-    /// After the stamp the ambiguity is gone, and that is why steps are keyed on the version and
-    /// not on the value. Migrating on the value alone would re-apply on every load, so an operator
-    /// who set the old default back deliberately would have it overwritten every time, forever.
+    /// Operator-chosen values are left alone. The v1–v4 steps that used to correct generated
+    /// defaults this tool itself wrote are gone: those corrections already ran on every stamped
+    /// file, and collapsing them is the point of this cut.
     fn migrate(&mut self) -> bool {
         if self.config_version >= CURRENT_CONFIG_VERSION {
             return false;
         }
-        // v1: the classifier timeout was generated as 30s, which the measured call time then
-        // outgrew (see `classify.rs`). A file still carrying the old generated value gets the new
-        // one; anything else is a choice and is left alone.
-        if self.config_version < 1
-            && self.classifier_timeout_secs == PRE_MIGRATION_CLASSIFIER_TIMEOUT_SECS
-        {
-            self.classifier_timeout_secs = DEFAULT_CLASSIFIER_TIMEOUT_SECS;
-        }
-        // v2: `headroom_flip_gap` became `pace_flip_gap`, and the rule behind it changed from a
-        // raw percentage comparison to a run rate one. There is nothing to carry across: a number
-        // tuned for the old comparison means nothing under the new one, so the old key is simply
-        // no longer read and the rewrite below is what drops it from the file. Leaving it on disk
-        // would be a config that names a key the router ignores.
-        //
-        // v3: a file written before version 3 can carry the generated 97 ceiling. Correct that
-        // value to this build's default; any other ceiling belongs to the operator.
-        if self.config_version < 3 && self.hard_ceiling_pct == PRE_MIGRATION_HARD_CEILING_PCT {
-            self.hard_ceiling_pct = DEFAULT_HARD_CEILING_PCT;
-        }
-        // v4: `pace_flip_gap` became `projection_overdraw_pct`, and the rule behind it changed
-        // from a points difference between two run rates to each provider's projected draw against
-        // its own allowance. As at v2 there is nothing to carry across, and here that is not a
-        // convenience: the old number's whole job was to clear a chronic band produced by one pair
-        // of plan sizes, so a file carrying 70 is carrying a fact about plans that no longer holds.
-        // Reading it as a projection threshold would set the bar at 70 percent of allowance and
-        // move nearly every task. The key is simply not read, and the rewrite below drops it.
         self.config_version = CURRENT_CONFIG_VERSION;
         true
     }
@@ -553,44 +478,59 @@ mod tests {
         assert_eq!(Config::load_from(&path).expect("re-reads"), created);
     }
 
-    /// The whole point of the migration: a file this tool generated before the timeout changed
-    /// still says 30, and changing only the default constant would never reach it.
+    /// A file stamped below 5 is rewritten once. Operator-chosen values stay put: the collapsed
+    /// migration no longer corrects generated defaults this tool itself wrote weeks earlier.
     #[test]
-    fn a_pre_versioning_file_carrying_the_old_generated_timeout_is_migrated_on_disk() {
+    fn a_pre_versioning_file_is_rewritten_and_stamped_without_correcting_values() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "classifier_timeout_secs = 30\n").expect("write");
 
         let config = Config::load_from(&path).expect("loads");
-        assert_eq!(
-            config.classifier_timeout_secs,
-            DEFAULT_CLASSIFIER_TIMEOUT_SECS
-        );
+        assert_eq!(config.classifier_timeout_secs, 30);
         assert_eq!(config.config_version, CURRENT_CONFIG_VERSION);
 
-        // The new value must be on disk, not merely in memory: a file that still reads 30 while
-        // the router behaves as 60 is a config that lies about what is running.
         let text = std::fs::read_to_string(&path).expect("re-read");
-        assert!(text.contains("classifier_timeout_secs = 60"), "{text}");
-        assert!(text.contains("config_version = 4"), "{text}");
+        assert!(text.contains("classifier_timeout_secs = 30"), "{text}");
+        assert!(text.contains("config_version = 5"), "{text}");
     }
 
-    /// The v3 step recognizes its former generated ceiling and writes this build's default once.
+    /// A v4 file carrying the three dead keys parses, is rewritten without them, and is stamped 5.
     #[test]
-    fn a_file_carrying_the_old_generated_ceiling_is_migrated_on_disk() {
+    fn a_v4_file_carrying_dead_keys_is_rewritten_without_them_and_stamped_five() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
-        std::fs::write(&path, "config_version = 2\nhard_ceiling_pct = 97.0\n").expect("write");
+        std::fs::write(
+            &path,
+            "config_version = 4\n\
+             projection_overdraw_pct = 100.0\n\
+             claude_five_hour_pacing_pct = 90.0\n\
+             \n\
+             [policy]\n\
+             default_provider = \"codex\"\n\
+             weekly_routing = true\n",
+        )
+        .expect("write");
 
         let config = Config::load_from(&path).expect("loads");
-        assert_eq!(config.hard_ceiling_pct, DEFAULT_HARD_CEILING_PCT);
         assert_eq!(config.config_version, CURRENT_CONFIG_VERSION);
+        assert!(config.policy.weekly_routing);
 
-        // On disk, not merely in memory: a file that still reads 97 while the router refuses a
-        // provider at 98 is a config that lies about what is running.
         let text = std::fs::read_to_string(&path).expect("re-read");
-        assert!(text.contains("hard_ceiling_pct = 98.0"), "{text}");
-        assert!(text.contains("config_version = 4"), "{text}");
+        assert!(text.contains("config_version = 5"), "{text}");
+        assert!(
+            !text.contains("default_provider"),
+            "dead policy key must leave the file: {text}"
+        );
+        assert!(
+            !text.contains("projection_overdraw_pct"),
+            "dead key must leave the file: {text}"
+        );
+        assert!(
+            !text.contains("claude_five_hour_pacing_pct"),
+            "dead key must leave the file: {text}"
+        );
+        assert!(text.contains("weekly_routing = true"), "{text}");
     }
 
     /// A ceiling the operator chose is theirs. 90 is not the value this tool generated, so the v3
@@ -691,10 +631,6 @@ mod tests {
         std::fs::write(&path, "hard_ceiling_pct = 90.0\n").expect("write");
         let config = Config::load_from(&path).expect("loads");
         assert_eq!(config.hard_ceiling_pct, 90.0);
-        assert_eq!(
-            config.projection_overdraw_pct,
-            Config::default().projection_overdraw_pct
-        );
         assert_eq!(config.connectors, Config::default().connectors);
     }
 
@@ -796,15 +732,6 @@ mod tests {
         Config::load_from(path)
     }
 
-    /// A provider name that is not one of the two the policy can default to is an error rather
-    /// than a silent fall back, for the same reason an unknown classifier engine is.
-    #[test]
-    fn an_invalid_policy_provider_is_rejected() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("config.toml");
-        assert!(load_config("[policy]\ndefault_provider = \"not-a-provider\"\n", &path).is_err());
-    }
-
     /// A parity exception silences a real difference, so an incomplete one is a difference nobody
     /// is looking at. Each way of writing one badly must be rejected rather than half-applied.
     #[test]
@@ -836,39 +763,6 @@ mod tests {
                 "{label} must be rejected"
             );
         }
-    }
-
-    /// The pacing threshold is one scalar key with its own default, so an operator can lower it
-    /// without restating every other ceiling. Writing the defaults and reading them back also
-    /// proves the key is declared above `policy`: a scalar after a table typed field makes the
-    /// TOML serializer fail when the default file is written on first run.
-    #[test]
-    fn the_pacing_threshold_defaults_when_absent_and_overrides_on_its_own() {
-        assert_eq!(Config::default().claude_five_hour_pacing_pct, 90.0);
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let written_path = dir.path().join("written/config.toml");
-        let created = Config::load_from(&written_path).expect("create the default config");
-        assert_eq!(created.claude_five_hour_pacing_pct, 90.0);
-        let document: toml::Value = toml::from_str(
-            &std::fs::read_to_string(&written_path).expect("read the written config"),
-        )
-        .expect("parse the written config");
-        assert_eq!(
-            document["claude_five_hour_pacing_pct"].as_float(),
-            Some(90.0)
-        );
-
-        let path = dir.path().join("partial.toml");
-        let config = load_config("claude_five_hour_pacing_pct = 55.0\n", &path)
-            .expect("load the partial config");
-        assert_eq!(config.claude_five_hour_pacing_pct, 55.0);
-        assert_eq!(config.hard_ceiling_pct, Config::default().hard_ceiling_pct);
-        assert_eq!(
-            config.projection_overdraw_pct,
-            Config::default().projection_overdraw_pct
-        );
-        assert!(config.policy.weekly_routing);
     }
 
     #[test]

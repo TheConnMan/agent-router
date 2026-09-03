@@ -6,6 +6,7 @@ use crate::decide::Decision;
 use crate::error::{Error, Result};
 use crate::runtime::{home_dir, now_ms};
 use rusqlite::Connection;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 /// One row to write: the decision plus what the caller asked for and what dispatch did.
@@ -71,13 +72,6 @@ pub struct Row {
     /// The reasoning effort the router decided. Not the effort the job ran at: that is
     /// `effective_effort` below.
     pub effort: Option<String>,
-    /// The four scores the classifier no longer produces. Kept on the read model because the rows
-    /// already in the database carry them and are the corpus every backtest replays; None on
-    /// every row written since, and on an explicit provider.
-    pub verdict: Option<String>,
-    pub confidence: Option<String>,
-    pub codex_ready_count: Option<i64>,
-    pub claude_signal_count: Option<i64>,
     /// None for a row written before complexity scaling, and for a fully pinned route.
     pub complexity: Option<String>,
     /// The classifier predicted working context horizon. None on a historical row and on an
@@ -226,14 +220,8 @@ CREATE TABLE IF NOT EXISTS decisions (
     provider            TEXT    NOT NULL,
     model               TEXT,
     effort              TEXT,
-    verdict             TEXT,
-    confidence          TEXT,
     complexity          TEXT,
     task_context_horizon TEXT,
-    codex_ready         TEXT,
-    codex_ready_count   INTEGER,
-    claude_signals      TEXT,
-    claude_signal_count INTEGER,
     orchestration       INTEGER,
     missing_connector   INTEGER,
     claude_projected_draw REAL,
@@ -283,16 +271,12 @@ CREATE TABLE IF NOT EXISTS reviews (
 );
 ";
 
-/// The retired score columns are still selected, because the rows written under them are the
-/// corpus and reading them back through the tool is the only way to see one.
 const SELECT_COLUMNS: &str = "\
-id, created_at_ms, task, dir, requested, provider, model, effort, verdict, confidence, \
-codex_ready_count, claude_signal_count, missing_connector, gates, claude_weekly_pct, \
-codex_weekly_pct, dry_run, job_id, job_name, outcome, rationale, complexity, \
-task_context_horizon, claude_usage_stale, codex_usage_stale, orchestration, \
-claude_projected_draw, codex_projected_draw, \
-reconciled_at_ms, mark, note, effective_effort, router_version, grok_weekly_pct, \
-grok_projected_draw";
+id, created_at_ms, task, dir, requested, provider, model, effort, missing_connector, \
+gates, claude_weekly_pct, codex_weekly_pct, dry_run, job_id, job_name, outcome, \
+rationale, complexity, task_context_horizon, claude_usage_stale, codex_usage_stale, \
+orchestration, claude_projected_draw, codex_projected_draw, reconciled_at_ms, mark, \
+note, effective_effort, router_version, grok_weekly_pct, grok_projected_draw";
 
 /// The narrower list the stats reader needs, so a report never pays for columns it drops.
 const STATS_COLUMNS: &str = "created_at_ms, requested, provider, complexity, gates, dry_run, \
@@ -332,6 +316,7 @@ impl DecisionLog {
         }
         let conn = Connection::open(path)?;
         conn.busy_timeout(std::time::Duration::from_millis(500))?;
+        migrate_schema(&conn)?;
         conn.execute_batch(SCHEMA)?;
         conn.execute_batch(REVIEWS_SCHEMA)?;
         add_missing_columns(&conn)?;
@@ -367,9 +352,6 @@ impl DecisionLog {
         let decision = entry.decision;
         let classification = decision.classification.as_ref();
         let usage = &decision.usage;
-        // The retired score columns are not in this list on purpose. They stay in the table so the
-        // recorded corpus keeps its scores, but writing a placeholder into them would make a new
-        // row indistinguishable from an old one that genuinely scored zero.
         self.conn.execute(
             "INSERT INTO decisions (
                 created_at_ms, task, dir, requested, provider, model, effort,
@@ -606,33 +588,29 @@ impl DecisionLog {
                     provider: row.get(5)?,
                     model: row.get(6)?,
                     effort: row.get(7)?,
-                    verdict: row.get(8)?,
-                    confidence: row.get(9)?,
-                    codex_ready_count: row.get(10)?,
-                    claude_signal_count: row.get(11)?,
-                    missing_connector: row.get(12)?,
-                    gates: row.get(13)?,
-                    claude_weekly_pct: row.get(14)?,
-                    codex_weekly_pct: row.get(15)?,
-                    dry_run: row.get(16)?,
-                    job_id: row.get(17)?,
-                    job_name: row.get(18)?,
-                    outcome: row.get(19)?,
-                    rationale: row.get(20)?,
-                    complexity: row.get(21)?,
-                    task_context_horizon: row.get(22)?,
-                    claude_usage_stale: row.get(23)?,
-                    codex_usage_stale: row.get(24)?,
-                    orchestration: row.get(25)?,
-                    claude_projected_draw: row.get(26)?,
-                    codex_projected_draw: row.get(27)?,
-                    reconciled_at_ms: row.get(28)?,
-                    mark: row.get(29)?,
-                    note: row.get(30)?,
-                    effective_effort: row.get(31)?,
-                    router_version: row.get(32)?,
-                    grok_weekly_pct: row.get(33)?,
-                    grok_projected_draw: row.get(34)?,
+                    missing_connector: row.get(8)?,
+                    gates: row.get(9)?,
+                    claude_weekly_pct: row.get(10)?,
+                    codex_weekly_pct: row.get(11)?,
+                    dry_run: row.get(12)?,
+                    job_id: row.get(13)?,
+                    job_name: row.get(14)?,
+                    outcome: row.get(15)?,
+                    rationale: row.get(16)?,
+                    complexity: row.get(17)?,
+                    task_context_horizon: row.get(18)?,
+                    claude_usage_stale: row.get(19)?,
+                    codex_usage_stale: row.get(20)?,
+                    orchestration: row.get(21)?,
+                    claude_projected_draw: row.get(22)?,
+                    codex_projected_draw: row.get(23)?,
+                    reconciled_at_ms: row.get(24)?,
+                    mark: row.get(25)?,
+                    note: row.get(26)?,
+                    effective_effort: row.get(27)?,
+                    router_version: row.get(28)?,
+                    grok_weekly_pct: row.get(29)?,
+                    grok_projected_draw: row.get(30)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<Row>>>()?;
@@ -666,29 +644,55 @@ impl DecisionLog {
     }
 }
 
-/// Every column added to `decisions` after the first shipped schema, with its declared type. Each
-/// one is nullable, so the fresh schema and the migration below produce the same table shape and a
-/// row written before the column reads back as "this row does not know".
-///
-/// Same columns, different physical order: `SCHEMA` places these mid table while `ALTER TABLE ADD
-/// COLUMN` can only append them, so a fresh and a migrated database disagree on every ordinal and
-/// every read must name the columns it wants rather than `SELECT *` or a `pragma_table_info` index.
-const MISSING_COLUMNS: [(&str, &str); 15] = [
-    ("complexity", "TEXT"),
-    ("task_context_horizon", "TEXT"),
-    ("claude_usage_stale", "INTEGER"),
-    ("codex_usage_stale", "INTEGER"),
-    ("orchestration", "INTEGER"),
-    ("claude_projected_draw", "REAL"),
-    ("codex_projected_draw", "REAL"),
-    ("reconciled_at_ms", "INTEGER"),
-    ("mark", "TEXT"),
-    ("note", "TEXT"),
-    ("effective_effort", "TEXT"),
-    ("router_version", "TEXT"),
-    ("grok_weekly_pct", "REAL"),
-    ("grok_weekly_reset", "INTEGER"),
-    ("grok_projected_draw", "REAL"),
+/// Columns added after schema v2. Empty after the v2 rewrite, which creates every current column
+/// in `SCHEMA`. Keep the mechanism: a later column goes here as `ALTER TABLE ADD COLUMN` so an
+/// existing v2 database picks it up on open without another table rewrite.
+const MISSING_COLUMNS: [(&str, &str); 0] = [];
+
+/// `PRAGMA user_version` stamped once the v2 rewrite has run. 0 is an unstamped pre-v2 database.
+const SCHEMA_VERSION: i64 = 2;
+
+/// Every column `SCHEMA` currently declares, in CREATE TABLE order, used by the v2 copy so a
+/// source table missing some of them still yields a full v2 row (NULL for the absences).
+const V2_COLUMNS: [&str; 38] = [
+    "id",
+    "created_at_ms",
+    "task",
+    "dir",
+    "requested",
+    "provider",
+    "model",
+    "effort",
+    "complexity",
+    "task_context_horizon",
+    "orchestration",
+    "missing_connector",
+    "claude_projected_draw",
+    "codex_projected_draw",
+    "grok_projected_draw",
+    "gates",
+    "rationale",
+    "claude_five_hour_pct",
+    "claude_five_hour_reset",
+    "claude_weekly_pct",
+    "claude_weekly_reset",
+    "codex_five_hour_pct",
+    "codex_five_hour_reset",
+    "codex_weekly_pct",
+    "codex_weekly_reset",
+    "grok_weekly_pct",
+    "grok_weekly_reset",
+    "claude_usage_stale",
+    "codex_usage_stale",
+    "dry_run",
+    "job_id",
+    "job_name",
+    "reconciled_at_ms",
+    "mark",
+    "note",
+    "effective_effort",
+    "router_version",
+    "outcome",
 ];
 
 /// IMPURE: bring a database written before any of those columns up to the current schema. Guarded
@@ -706,6 +710,118 @@ fn add_missing_columns(conn: &Connection) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// IMPURE: one-time v2 rewrite. Guarded by `PRAGMA user_version`, so a database already at 2 is
+/// left alone. A v1 `decisions` table is copied into the current shape without the retired score
+/// columns, its gate tags are folded, then the old table is dropped. The orphaned `router_secret`
+/// table left by the deleted OpenCode provider is dropped either way.
+fn migrate_schema(conn: &Connection) -> Result<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version >= SCHEMA_VERSION {
+        return Ok(());
+    }
+    if table_exists(conn, "decisions")? {
+        rewrite_decisions_v2(conn)?;
+    }
+    conn.execute("DROP TABLE IF EXISTS router_secret", [])?;
+    conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
+    Ok(())
+}
+
+fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
+    Ok(conn
+        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1")?
+        .exists([name])?)
+}
+
+fn table_columns(conn: &Connection, table: &str) -> Result<HashSet<String>> {
+    let mut statement = conn.prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))?;
+    let names = statement.query_map([], |row| row.get(0))?;
+    Ok(names.collect::<rusqlite::Result<HashSet<String>>>()?)
+}
+
+fn rewrite_decisions_v2(conn: &Connection) -> Result<()> {
+    let existing = table_columns(conn, "decisions")?;
+    let create_v2 = SCHEMA
+        .replace(
+            "CREATE TABLE IF NOT EXISTS decisions (",
+            "CREATE TABLE decisions_v2 (",
+        )
+        .lines()
+        .filter(|line| !line.contains("CREATE INDEX"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    conn.execute_batch(&create_v2)?;
+
+    let select_list = V2_COLUMNS
+        .iter()
+        .map(|column| {
+            if existing.contains(*column) {
+                (*column).to_string()
+            } else {
+                format!("NULL AS {column}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    conn.execute(
+        &format!(
+            "INSERT INTO decisions_v2 ({}) SELECT {select_list} FROM decisions",
+            V2_COLUMNS.join(", ")
+        ),
+        [],
+    )?;
+
+    let rewritten: Vec<(i64, String)> = {
+        let mut statement = conn.prepare("SELECT id, gates FROM decisions_v2")?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (id, gates) in rewritten {
+        let folded = rewrite_legacy_gates(&gates);
+        if folded != gates {
+            conn.execute(
+                "UPDATE decisions_v2 SET gates = ?1 WHERE id = ?2",
+                rusqlite::params![folded, id],
+            )?;
+        }
+    }
+
+    conn.execute_batch(
+        "DROP TABLE decisions;
+         ALTER TABLE decisions_v2 RENAME TO decisions;
+         CREATE INDEX IF NOT EXISTS decisions_created_at ON decisions(created_at_ms);",
+    )?;
+    Ok(())
+}
+
+/// PURE: fold retired gate tags so flip rate over an old window is unchanged. The four provider
+/// moving tags become one `legacy_flip` (deduped, so a row that carried two of them still counts
+/// once). `claude_signals` becomes `legacy_pin`. Token-aware: `headroom_tiebreak_wide` is left
+/// alone.
+fn rewrite_legacy_gates(gates: &str) -> String {
+    let mut folded = Vec::new();
+    let mut saw_flip = false;
+    let mut saw_pin = false;
+    for tag in gates.split(',').filter(|tag| !tag.is_empty()) {
+        match tag {
+            "headroom_tiebreak" | "pace_flip" | "projected_overdraw" | "five_hour_pacing" => {
+                if !saw_flip {
+                    folded.push("legacy_flip");
+                    saw_flip = true;
+                }
+            }
+            "claude_signals" => {
+                if !saw_pin {
+                    folded.push("legacy_pin");
+                    saw_pin = true;
+                }
+            }
+            other => folded.push(other),
+        }
+    }
+    folded.join(",")
 }
 
 /// PURE: the column a provider's own weekly percentage is recorded in. None for a provider the log
@@ -744,6 +860,32 @@ mod tests {
     use crate::classify::{Classification, Complexity, TaskContextHorizon};
     use crate::config::Config;
     use crate::usage::{Headroom, UsageSnapshot};
+
+    #[test]
+    fn rewrite_legacy_gates_folds_tokens_without_touching_prefixes() {
+        assert_eq!(rewrite_legacy_gates(""), "");
+        assert_eq!(rewrite_legacy_gates("claude_signals"), "legacy_pin");
+        assert_eq!(
+            rewrite_legacy_gates("headroom_tiebreak,flipped_on_exhaustion"),
+            "legacy_flip,flipped_on_exhaustion"
+        );
+        assert_eq!(
+            rewrite_legacy_gates("headroom_tiebreak,five_hour_pacing"),
+            "legacy_flip"
+        );
+        assert_eq!(
+            rewrite_legacy_gates("headroom_tiebreak_wide,headroom_tiebreak"),
+            "headroom_tiebreak_wide,legacy_flip"
+        );
+        assert_eq!(
+            rewrite_legacy_gates("pace_flip,projected_overdraw,claude_signals"),
+            "legacy_flip,legacy_pin"
+        );
+        assert_eq!(
+            rewrite_legacy_gates("explicit_provider"),
+            "explicit_provider"
+        );
+    }
 
     /// The instant the fixture decision is made at, chosen to sit before both recorded resets so
     /// each provider's weekly window is genuinely part elapsed. The percentages below then put the

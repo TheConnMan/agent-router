@@ -14,21 +14,10 @@ use std::collections::BTreeMap;
 /// The gates that move a task off the provider it started on. Any new provider moving gate belongs
 /// here, or the flip rate silently under reports the moment it starts firing.
 ///
-/// `headroom_tiebreak` is retired and no decision made since carries it, but it stays in this list
-/// because 45 rows already in the log do, and a report over a window that reaches back into them
-/// must count the routes that really did move.
-/// `pace_flip` is retired too, and unlike `headroom_tiebreak` it is not known to have ever fired:
-/// its threshold was calibrated against plan sizes that changed underneath it, and a count over
-/// every row this box has logged returns zero. It stays listed anyway, because the cost of a gate
-/// that matches nothing is nothing, and the cost of omitting one that some older database does
-/// carry is a flip rate that under reports without saying so.
-const FLIP_GATES: [&str; 5] = [
-    "flipped_on_exhaustion",
-    "headroom_tiebreak",
-    "pace_flip",
-    "projected_overdraw",
-    "five_hour_pacing",
-];
+/// `legacy_flip` is the folded form of the four retired provider-moving tags (`headroom_tiebreak`,
+/// `pace_flip`, `projected_overdraw`, `five_hour_pacing`). Schema v2 rewrites those tags on open
+/// so a report over an old window still counts the routes that really did move.
+const FLIP_GATES: [&str; 2] = ["flipped_on_exhaustion", "legacy_flip"];
 
 /// The gate a row carries when the classifier could not answer and the default provider was used.
 const CLASSIFIER_FAILED: &str = "classifier_failed";

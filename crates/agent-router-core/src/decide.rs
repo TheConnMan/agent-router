@@ -71,15 +71,11 @@ pub enum Gate {
     /// common case, since `GrokUnavailable` makes Grok ineligible whenever its weekly window is
     /// unread — it would count a flip that never happened.
     ClassifierUnlaunchable,
-    /// Retained for compatibility with legacy decision logs.
-    ProjectedOverdraw,
     /// Both workhorses are eligible but at least one projected weekly draw could not be computed,
     /// so the comparison fell back to raw weekly percent used. Typically this is a window with
     /// less than a twentieth elapsed, where dividing by that fraction would turn a couple of jobs
     /// into a four-figure projection.
     ProjectionUnavailable,
-    /// Retained for compatibility with legacy decision logs.
-    FiveHourPacing,
 }
 
 impl Gate {
@@ -97,9 +93,7 @@ impl Gate {
             Gate::GrokUnavailable => "grok_unavailable",
             Gate::WeeklyRoutingDisabled => "weekly_routing_disabled",
             Gate::ClassifierUnlaunchable => "classifier_unlaunchable",
-            Gate::ProjectedOverdraw => "projected_overdraw",
             Gate::ProjectionUnavailable => "projection_unavailable",
-            Gate::FiveHourPacing => "five_hour_pacing",
         }
     }
 }
