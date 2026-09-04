@@ -278,6 +278,13 @@ rationale, complexity, task_context_horizon, claude_usage_stale, codex_usage_sta
 orchestration, claude_projected_draw, codex_projected_draw, reconciled_at_ms, mark, \
 note, effective_effort, router_version, grok_weekly_pct, grok_projected_draw";
 
+/// Outcomes whose fate is known. Same set `stats` denominates a failure rate on: `completed`,
+/// `failed`, or a dispatch error. A dry run's outcome is `dry-run`, so it does not match; live
+/// jobs (`dispatched`, `running`) and `unknown` stay out because a review pass cannot judge a
+/// route whose job has not finished.
+const SETTLED_OUTCOME_SQL: &str =
+    "outcome = 'completed' OR outcome = 'failed' OR outcome LIKE 'error: %'";
+
 /// The narrower list the stats reader needs, so a report never pays for columns it drops.
 const STATS_COLUMNS: &str = "created_at_ms, requested, provider, complexity, gates, dry_run, \
 mark, outcome, router_version";
@@ -576,43 +583,26 @@ impl DecisionLog {
     /// The `limit` newest decisions, newest first.
     pub fn recent(&self, limit: usize) -> Result<Vec<Row>> {
         let sql = format!("SELECT {SELECT_COLUMNS} FROM decisions ORDER BY id DESC LIMIT ?1");
-        let mut statement = self.conn.prepare(&sql)?;
+        self.query_decision_rows(&sql, limit)
+    }
+
+    /// IMPURE: the `limit` newest settled rows nobody has judged, newest first.
+    ///
+    /// A review pass's worklist. Marked rows are already judged; unsettled rows have no fate to
+    /// judge against yet.
+    pub fn recent_unmarked(&self, limit: usize) -> Result<Vec<Row>> {
+        let sql = format!(
+            "SELECT {SELECT_COLUMNS} FROM decisions \
+             WHERE mark IS NULL AND ({SETTLED_OUTCOME_SQL}) \
+             ORDER BY id DESC LIMIT ?1"
+        );
+        self.query_decision_rows(&sql, limit)
+    }
+
+    fn query_decision_rows(&self, sql: &str, limit: usize) -> Result<Vec<Row>> {
+        let mut statement = self.conn.prepare(sql)?;
         let rows = statement
-            .query_map([i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
-                Ok(Row {
-                    id: row.get(0)?,
-                    created_at_ms: row.get(1)?,
-                    task: row.get(2)?,
-                    dir: row.get(3)?,
-                    requested: row.get(4)?,
-                    provider: row.get(5)?,
-                    model: row.get(6)?,
-                    effort: row.get(7)?,
-                    missing_connector: row.get(8)?,
-                    gates: row.get(9)?,
-                    claude_weekly_pct: row.get(10)?,
-                    codex_weekly_pct: row.get(11)?,
-                    dry_run: row.get(12)?,
-                    job_id: row.get(13)?,
-                    job_name: row.get(14)?,
-                    outcome: row.get(15)?,
-                    rationale: row.get(16)?,
-                    complexity: row.get(17)?,
-                    task_context_horizon: row.get(18)?,
-                    claude_usage_stale: row.get(19)?,
-                    codex_usage_stale: row.get(20)?,
-                    orchestration: row.get(21)?,
-                    claude_projected_draw: row.get(22)?,
-                    codex_projected_draw: row.get(23)?,
-                    reconciled_at_ms: row.get(24)?,
-                    mark: row.get(25)?,
-                    note: row.get(26)?,
-                    effective_effort: row.get(27)?,
-                    router_version: row.get(28)?,
-                    grok_weekly_pct: row.get(29)?,
-                    grok_projected_draw: row.get(30)?,
-                })
-            })?
+            .query_map([i64::try_from(limit).unwrap_or(i64::MAX)], map_decision_row)?
             .collect::<rusqlite::Result<Vec<Row>>>()?;
         Ok(rows)
     }
@@ -642,6 +632,42 @@ impl DecisionLog {
             .collect::<rusqlite::Result<Vec<ReviewRow>>>()?;
         Ok(rows)
     }
+}
+
+fn map_decision_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
+    Ok(Row {
+        id: row.get(0)?,
+        created_at_ms: row.get(1)?,
+        task: row.get(2)?,
+        dir: row.get(3)?,
+        requested: row.get(4)?,
+        provider: row.get(5)?,
+        model: row.get(6)?,
+        effort: row.get(7)?,
+        missing_connector: row.get(8)?,
+        gates: row.get(9)?,
+        claude_weekly_pct: row.get(10)?,
+        codex_weekly_pct: row.get(11)?,
+        dry_run: row.get(12)?,
+        job_id: row.get(13)?,
+        job_name: row.get(14)?,
+        outcome: row.get(15)?,
+        rationale: row.get(16)?,
+        complexity: row.get(17)?,
+        task_context_horizon: row.get(18)?,
+        claude_usage_stale: row.get(19)?,
+        codex_usage_stale: row.get(20)?,
+        orchestration: row.get(21)?,
+        claude_projected_draw: row.get(22)?,
+        codex_projected_draw: row.get(23)?,
+        reconciled_at_ms: row.get(24)?,
+        mark: row.get(25)?,
+        note: row.get(26)?,
+        effective_effort: row.get(27)?,
+        router_version: row.get(28)?,
+        grok_weekly_pct: row.get(29)?,
+        grok_projected_draw: row.get(30)?,
+    })
 }
 
 /// Columns added after schema v2. Empty after the v2 rewrite, which creates every current column
@@ -1068,6 +1094,46 @@ mod tests {
             rows.iter().map(|row| row.task.as_str()).collect::<Vec<_>>(),
             vec!["third", "second"]
         );
+    }
+
+    /// `log --unmarked` is a worklist, not a window filter: it must return the settled unmarked
+    /// rows even when newer unmarked rows are still live or dry runs, and it must drop a settled
+    /// row a human already judged.
+    #[test]
+    fn recent_unmarked_keeps_settled_null_marks_and_drops_the_rest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = DecisionLog::open_at(&dir.path().join("router.db")).expect("opens");
+        let record = |task: &str, dry_run: bool, outcome: &str| {
+            log.record(&Entry {
+                task,
+                dir: Path::new("/tmp"),
+                requested: "auto",
+                decision: &decision(),
+                dry_run,
+                job_id: None,
+                job_name: None,
+                outcome,
+                effective_effort: None,
+            })
+            .expect("records")
+        };
+
+        let completed = record("completed-unmarked", false, "completed");
+        let failed = record("failed-unmarked", false, "failed");
+        let errored = record("error-unmarked", false, "error: dispatch refused");
+        let marked = record("completed-marked", false, "completed");
+        log.mark(marked, Mark::Good, None).expect("marks");
+        record("dispatched-unmarked", false, "dispatched");
+        record("running-unmarked", false, "running");
+        record("unknown-unmarked", false, "unknown");
+        record("dry-run-unmarked", true, "dry-run");
+
+        let rows = log.recent_unmarked(10).expect("reads");
+        assert_eq!(
+            rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![errored, failed, completed]
+        );
+        assert!(rows.iter().all(|row| row.mark.is_none()));
     }
 
     #[cfg(unix)]

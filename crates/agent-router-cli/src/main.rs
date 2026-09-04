@@ -86,6 +86,9 @@ enum Command {
         /// What the judgement was, in free text. Requires --mark.
         #[arg(long)]
         note: Option<String>,
+        /// Settled rows nobody has judged yet, newest first. A review pass's worklist.
+        #[arg(long)]
+        unmarked: bool,
         #[arg(long)]
         json: bool,
     },
@@ -506,8 +509,9 @@ fn run(cli: Cli, ctx: &mut agent_router_core::Context) -> agent_router_core::Res
             limit,
             mark,
             note,
+            unmarked,
             json,
-        } => log(ctx, limit, &mark, note.as_deref(), json),
+        } => log(ctx, limit, &mark, note.as_deref(), unmarked, json),
         Command::Stats { limit, since, json } => stats(ctx, limit, since, json),
         Command::AdversarialReview { .. } => {
             unreachable!("adversarial review has a command specific exit path")
@@ -850,16 +854,24 @@ fn log(
     limit: usize,
     mark: &[String],
     note: Option<&str>,
+    unmarked: bool,
     json: bool,
 ) -> agent_router_core::Result<()> {
     if !mark.is_empty() {
-        // --mark short circuits the listing, so there is no listing for --json to shape. The
-        // combination is refused rather than accepted and ignored, on the same rule as --note
-        // below: a caller passing a flag believes it did something.
+        // --mark short circuits the listing, so there is no listing for --json or --unmarked to
+        // shape. The combination is refused rather than accepted and ignored, on the same rule as
+        // --note below: a caller passing a flag believes it did something.
         if json {
             return Err(agent_router_core::Error::Command(
                 "--json cannot be combined with --mark: a mark prints one confirmation line, not \
                  a listing"
+                    .to_string(),
+            ));
+        }
+        if unmarked {
+            return Err(agent_router_core::Error::Command(
+                "--unmarked cannot be combined with --mark: a mark prints one confirmation line, \
+                 not a listing"
                     .to_string(),
             ));
         }
@@ -872,7 +884,12 @@ fn log(
             "--note requires --mark: a note is the reason for one row's judgement".to_string(),
         ));
     }
-    let rows = DecisionLog::open_in(&ctx.home)?.recent(limit)?;
+    let log = DecisionLog::open_in(&ctx.home)?;
+    let rows = if unmarked {
+        log.recent_unmarked(limit)?
+    } else {
+        log.recent(limit)?
+    };
     if json {
         let rows: Vec<serde_json::Value> = rows.iter().map(row_json).collect();
         println!("{}", serde_json::to_string_pretty(&rows)?);

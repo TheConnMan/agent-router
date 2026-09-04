@@ -363,6 +363,9 @@ $ agent-router log --limit 3
 
 # Judge a decision: was routing it there the right call.
 agent-router log --mark 87 bad --note "routed to codex, needed connectors"
+
+# Settled rows nobody has judged yet: a review pass's worklist.
+agent-router log --unmarked --limit 50
 ```
 
 | Flag | Default | Meaning |
@@ -370,6 +373,7 @@ agent-router log --mark 87 bad --note "routed to codex, needed connectors"
 | `--limit <N>` | `10` | Newest rows to print. |
 | `--mark <ROW_ID> <MARK>` | none | Record the human judgement on one row: `good`, `bad`, or `rerouted`. Any other value is rejected and exits nonzero naming the accepted three. An unknown `ROW_ID` also exits nonzero, without writing anything. Short circuits: it prints one confirmation line instead of the listing. |
 | `--note <TEXT>` | none | Free text alongside `--mark`. Requires `--mark`; a note with no mark is rejected. An empty or whitespace only note is rejected rather than stored. |
+| `--unmarked` | off | List only settled rows (`completed`, `failed`, or a dispatch error) whose mark is still NULL, newest first. A review pass's worklist. Rejected alongside `--mark`, which prints a confirmation line rather than a listing. |
 | `--json` | off | Emit the full decision, including gates, classification, and usage. Rejected alongside `--mark`, which prints a confirmation line rather than a listing. |
 
 `--json` emits every recorded column, including the full task text, the rationale, and the
@@ -391,9 +395,10 @@ nobody observed an effort, which is not the same as a job running at no effort. 
 
 Marking a row is the human half of the loop: `status` can only say whether a job ran, never whether
 routing it to that provider was the right call, and the mark is what makes the log tunable against
-outcomes rather than intuition. Marking a row again replaces the earlier judgement outright. Because
-the mark and the note are written together as one annotation, re marking without a note clears any
-note stored from an earlier mark on that row.
+outcomes rather than intuition. `log --unmarked` lists the settled rows still waiting for that
+judgement. Marking a row again replaces the earlier judgement outright. Because the mark and the
+note are written together as one annotation, re marking without a note clears any note stored from
+an earlier mark on that row.
 
 ### `stats`
 

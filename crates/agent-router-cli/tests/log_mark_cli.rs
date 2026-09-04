@@ -503,3 +503,96 @@ fn a_dry_run_row_can_be_marked() {
         "marking a row rewrote what became of the job: {logged}"
     );
 }
+
+/// Row ids printed on listing lines (`#{id} ...`), not the indented task line under each.
+fn listed_ids(stdout: &str) -> Vec<i64> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let rest = line.strip_prefix('#')?;
+            rest.split_whitespace().next()?.parse().ok()
+        })
+        .collect()
+}
+
+/// The review-pass worklist: settled rows (`completed`, `failed`, or `error: ...`) whose mark is
+/// still NULL. A marked settled row, a still-live unmarked row, and a dry run are the three
+/// neighbours that used to make `log --limit N` unusable as that worklist.
+#[test]
+fn unmarked_lists_only_settled_unmarked_rows_and_refuses_a_combined_mark() {
+    let fixture = MarkFixture::new("unmarked-worklist");
+    let settled_unmarked = fixture.seed(Provider::Codex, false, "completed");
+    let settled_marked = fixture.seed(Provider::Claude, false, "completed");
+    let marked = fixture.log(&["--mark", &settled_marked.to_string(), "good"]);
+    assert!(
+        marked.status.success(),
+        "seeding the marked neighbour failed, stderr: {}",
+        String::from_utf8_lossy(&marked.stderr)
+    );
+    let unsettled_unmarked = fixture.seed(Provider::Codex, false, "dispatched");
+    let dry_run = fixture.seed(Provider::Claude, true, "dry-run");
+
+    let listed = fixture.log(&["--unmarked", "--limit", "50"]);
+    assert!(
+        listed.status.success(),
+        "log --unmarked failed, stderr: {}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    assert_eq!(
+        listed_ids(&stdout),
+        vec![settled_unmarked],
+        "log --unmarked must list only the settled unmarked row, stdout: {stdout}"
+    );
+    for leaked in [settled_marked, unsettled_unmarked, dry_run] {
+        assert!(
+            !listed_ids(&stdout).contains(&leaked),
+            "log --unmarked leaked row {leaked}, stdout: {stdout}"
+        );
+    }
+
+    let json = fixture.log(&["--unmarked", "--json", "--limit", "50"]);
+    assert!(
+        json.status.success(),
+        "log --unmarked --json failed, stderr: {}",
+        String::from_utf8_lossy(&json.stderr)
+    );
+    let rows: Value = serde_json::from_slice(&json.stdout).expect("unmarked json");
+    let rows = rows
+        .as_array()
+        .expect("log --unmarked --json prints an array");
+    assert_eq!(
+        rows.iter().map(|row| &row["id"]).collect::<Vec<_>>(),
+        vec![&json!(settled_unmarked)],
+        "log --unmarked --json must list only the settled unmarked row: {rows:?}"
+    );
+    assert_eq!(
+        field(&rows[0], "mark"),
+        &Value::Null,
+        "an unmarked listing row carried a judgement: {}",
+        rows[0]
+    );
+
+    let refused = fixture.log(&[
+        "--unmarked",
+        "--mark",
+        &settled_unmarked.to_string(),
+        "good",
+    ]);
+    assert!(
+        !refused.status.success(),
+        "--unmarked alongside --mark was accepted, stdout: {}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("--unmarked") && stderr.contains("--mark"),
+        "the rejection must name both flags: {stderr}"
+    );
+    let logged = fixture.logged(settled_unmarked);
+    assert_eq!(
+        field(&logged, "mark"),
+        &Value::Null,
+        "a rejected --unmarked --mark wrote a judgement anyway: {logged}"
+    );
+}
