@@ -213,8 +213,13 @@ codex = ["Granola"]
 ```
 
 For an Auto route whose classifier observes a missing connector, providers without a matching
-inventory entry are excluded before the existing capacity policy runs. Explicit `--provider`
-requests remain exact and do not use this automatic eligibility filter.
+inventory entry are excluded before the existing capacity policy runs. Matching looks at the
+task text and the classifier rationale together: a one-sentence rationale that omits "Slack"
+still recovers Slack-capable providers when the task already named Slack. Names are whole
+words, and a Title-Case inventory name such as `Notion` does not match English `notion`.
+Grok stays out of that pool unless it is listed here. Explicit `--provider` requests remain
+exact and do not use this automatic eligibility filter. The decision log records which names
+hit and whether they came from the task, the rationale, or both.
 
 ## `[policy]`
 

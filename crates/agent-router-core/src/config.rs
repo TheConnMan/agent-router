@@ -278,6 +278,42 @@ pub struct Config {
     pub parity: ParityConfig,
 }
 
+/// One inventory name the missing-connector recovery found in the task and/or the rationale.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MatchedCapability {
+    /// The configured spelling, not a case-folded copy.
+    pub name: String,
+    pub in_task: bool,
+    pub in_rationale: bool,
+}
+
+impl MatchedCapability {
+    /// Stable log encoding: `Slack@task`, `Granola@rationale`, or `Airtable@task+rationale`.
+    pub fn tag(&self) -> String {
+        let source = match (self.in_task, self.in_rationale) {
+            (true, true) => "task+rationale",
+            (true, false) => "task",
+            (false, true) => "rationale",
+            (false, false) => "none",
+        };
+        format!("{}@{source}", self.name)
+    }
+
+    pub fn encode_list(matched: &[MatchedCapability]) -> Option<String> {
+        if matched.is_empty() {
+            None
+        } else {
+            Some(
+                matched
+                    .iter()
+                    .map(MatchedCapability::tag)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            )
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Config {
         Config {
@@ -305,17 +341,53 @@ impl Config {
         Ok(config)
     }
 
-    /// Return providers whose declared inventory names the capability described by classifier
-    /// rationale. Discovery is deliberately additive and only trusts parsed local config names;
-    /// an unreadable or malformed Codex config establishes nothing.
-    pub fn capability_providers(&self, rationale: &str) -> Vec<crate::provider::Provider> {
-        let rationale = rationale.to_ascii_lowercase();
+    /// Inventory names mentioned in the task text and/or the classifier rationale.
+    ///
+    /// Matching is whole-word. A Title-Case inventory name such as `Notion` does not match the
+    /// English word `notion`: searching the full task would otherwise recover a Notion-capable
+    /// provider from "the notion that…".
+    pub fn matched_capabilities(&self, task: &str, rationale: &str) -> Vec<MatchedCapability> {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut matched = Vec::new();
+        for names in self.provider_capabilities.values() {
+            for name in names {
+                let name = name.trim();
+                if name.is_empty() || !seen.insert(name.to_ascii_lowercase()) {
+                    continue;
+                }
+                let in_task = mentions_capability(task, name);
+                let in_rationale = mentions_capability(rationale, name);
+                if in_task || in_rationale {
+                    matched.push(MatchedCapability {
+                        name: name.to_string(),
+                        in_task,
+                        in_rationale,
+                    });
+                }
+            }
+        }
+        matched
+    }
+
+    /// Return providers whose declared inventory includes any of `matched`.
+    /// Discovery is additive and only trusts parsed local config names; an unreadable Codex
+    /// config establishes nothing.
+    pub fn capability_providers(
+        &self,
+        matched: &[MatchedCapability],
+    ) -> Vec<crate::provider::Provider> {
+        if matched.is_empty() {
+            return Vec::new();
+        }
         self.provider_capabilities
             .iter()
             .filter_map(|(provider, capabilities)| {
                 let supported = capabilities.iter().any(|capability| {
-                    let capability = capability.trim().to_ascii_lowercase();
-                    !capability.is_empty() && rationale.contains(&capability)
+                    let capability = capability.trim();
+                    !capability.is_empty()
+                        && matched
+                            .iter()
+                            .any(|hit| hit.name.eq_ignore_ascii_case(capability))
                 });
                 supported
                     .then_some(match provider.as_str() {
@@ -412,6 +484,48 @@ impl Config {
     }
 }
 
+/// Whole-word mention of a configured capability name.
+///
+/// Case-insensitive, except a Title-Case inventory name must not match an all-lowercase English
+/// word: `Notion` matches `Notion` and `NOTION`, not `the notion that`.
+fn mentions_capability(text: &str, capability: &str) -> bool {
+    let capability = capability.trim();
+    if capability.is_empty() {
+        return false;
+    }
+    let require_capital = capability.chars().any(|c| c.is_ascii_uppercase());
+    let needle = capability.to_ascii_lowercase();
+    let haystack = text.to_ascii_lowercase();
+    let mut from = 0;
+    while let Some(rel) = haystack[from..].find(&needle) {
+        let start = from + rel;
+        let end = start + needle.len();
+        if is_word_span(text, start, end) {
+            let original = &text[start..end];
+            if !(require_capital && original.chars().all(|c| !c.is_ascii_uppercase())) {
+                return true;
+            }
+        }
+        from = start + 1;
+    }
+    false
+}
+
+fn is_word_span(text: &str, start: usize, end: usize) -> bool {
+    let before_ok = start == 0
+        || text[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_token_char(c));
+    let after_ok =
+        end == text.len() || text[end..].chars().next().is_none_or(|c| !is_token_char(c));
+    before_ok && after_ok
+}
+
+fn is_token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
 /// Safe, name-only discovery. Both enabled plugins and MCP servers establish Codex capabilities;
 /// their configuration bodies can contain secrets and are deliberately never retained.
 fn codex_capabilities(document: &toml::Value) -> Vec<String> {
@@ -464,6 +578,74 @@ mod tests {
             "claudeAiMcpEverConnected": ["claude.ai Granola", "claude.ai Notion"]
         });
         assert_eq!(claude_capabilities(&claude), vec!["Granola", "Notion"]);
+    }
+
+    /// A one-sentence classifier rationale often omits the product the task already named.
+    /// Recovery must see the task text, and must not credit Grok unless Grok is in the inventory.
+    #[test]
+    fn capability_providers_match_a_name_in_the_task_when_the_rationale_omits_it() {
+        use crate::provider::Provider;
+        let config = Config {
+            provider_capabilities: BTreeMap::from([
+                ("claude".to_string(), vec!["Slack".to_string()]),
+                ("codex".to_string(), vec!["Slack".to_string()]),
+            ]),
+            ..Config::default()
+        };
+        let missed =
+            config.matched_capabilities("", "cross-system triage without the product name");
+        assert!(missed.is_empty());
+        assert!(config.capability_providers(&missed).is_empty());
+
+        let hit = config.matched_capabilities(
+            "Use the client specific Slack MCP connection",
+            "cross-system triage without the product name",
+        );
+        assert_eq!(
+            hit,
+            vec![MatchedCapability {
+                name: "Slack".to_string(),
+                in_task: true,
+                in_rationale: false,
+            }]
+        );
+        assert_eq!(
+            config.capability_providers(&hit),
+            vec![Provider::Claude, Provider::Codex]
+        );
+    }
+
+    #[test]
+    fn english_notion_does_not_match_inventory_notion() {
+        let config = Config {
+            provider_capabilities: BTreeMap::from([(
+                "codex".to_string(),
+                vec!["Notion".to_string()],
+            )]),
+            ..Config::default()
+        };
+        assert!(
+            config
+                .matched_capabilities("the notion that we should wait", "fixture")
+                .is_empty()
+        );
+        assert_eq!(
+            config
+                .matched_capabilities("Update the Notion database", "fixture")
+                .as_slice(),
+            [MatchedCapability {
+                name: "Notion".to_string(),
+                in_task: true,
+                in_rationale: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn capability_names_are_whole_words() {
+        assert!(!mentions_capability("slacken the rope", "Slack"));
+        assert!(mentions_capability("the Slack thread", "Slack"));
+        assert!(mentions_capability("requires Granola notes", "Granola"));
     }
 
     #[test]

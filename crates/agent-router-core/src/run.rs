@@ -3,7 +3,7 @@
 
 use crate::classify::classify_with_name;
 use crate::context::Context;
-use crate::decide::{Decision, decide, decide_explicit};
+use crate::decide::{Decision, decide_explicit, decide_with_task};
 use crate::error::{Error, Result};
 use crate::estimate::Estimate;
 use crate::log::{DecisionLog, Entry};
@@ -207,7 +207,8 @@ where
             usage,
             &ctx.config,
         ),
-        None => decide(
+        None => decide_with_task(
+            request.task,
             classified
                 .expect("an automatic route always requires classification")
                 .classification,

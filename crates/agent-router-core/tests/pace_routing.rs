@@ -15,7 +15,7 @@ use agent_router_core::classify::{
     Classification, Complexity, TaskContextHorizon, parse_classification,
 };
 use agent_router_core::config::Config;
-use agent_router_core::decide::{Gate, decide, decide_explicit};
+use agent_router_core::decide::{Gate, decide, decide_explicit, decide_with_task};
 use agent_router_core::{Headroom, Provider, UsageSnapshot};
 use std::collections::BTreeMap;
 
@@ -191,6 +191,81 @@ fn a_provider_scoped_capability_keeps_auto_routing_inside_the_eligible_pool() {
     assert!(decision.gates.contains(&Gate::MissingConnector));
     assert!(!decision.gates.contains(&Gate::CapabilityBlocked));
     assert!(!decision.capability_blocked);
+}
+
+/// The same Slack inventory recovers when the product name is in the task and the one-sentence
+/// rationale omits it. Grok stays ineligible because it is not in the inventory.
+#[test]
+fn a_task_named_capability_recovers_when_the_rationale_omits_the_product() {
+    let config = Config {
+        provider_capabilities: BTreeMap::from([
+            ("claude".to_string(), vec!["Slack".to_string()]),
+            ("codex".to_string(), vec!["Slack".to_string()]),
+        ]),
+        ..Config::default()
+    };
+    let classification = Classification {
+        rationale: "cross-system triage and judgment".to_string(),
+        ..scored(false, true, Complexity::High)
+    };
+    let usage = usage_with_grok(
+        window(8.0, HALF_WEEK, 1.0),
+        window(25.0, HALF_WEEK, 0.0),
+        window(76.0, HALF_WEEK, 0.0),
+    );
+
+    let blocked = decide(classification.clone(), usage, NOW, &config);
+    assert!(blocked.capability_blocked);
+    assert!(blocked.gates.contains(&Gate::CapabilityBlocked));
+
+    let recovered = decide_with_task(
+        "Use the client specific Slack MCP connection for each linked Slack task.",
+        classification,
+        usage,
+        NOW,
+        &config,
+    );
+    assert!(!recovered.capability_blocked);
+    assert_eq!(recovered.provider, Provider::Codex);
+    assert!(recovered.gates.contains(&Gate::MissingConnector));
+    assert!(!recovered.gates.contains(&Gate::CapabilityBlocked));
+    assert_eq!(
+        recovered.matched_capabilities,
+        vec![agent_router_core::config::MatchedCapability {
+            name: "Slack".to_string(),
+            in_task: true,
+            in_rationale: false,
+        }]
+    );
+    assert_eq!(recovered.requested_model, None);
+}
+
+/// English "notion" in a task must not recover a Notion-capable provider.
+#[test]
+fn english_notion_does_not_unblock_a_missing_connector() {
+    let config = Config {
+        provider_capabilities: BTreeMap::from([
+            ("claude".to_string(), vec!["Notion".to_string()]),
+            ("codex".to_string(), vec!["Notion".to_string()]),
+        ]),
+        ..Config::default()
+    };
+    let decision = decide_with_task(
+        "the notion that we should wait and report only",
+        Classification {
+            rationale: "cross-system triage and judgment".to_string(),
+            ..scored(false, true, Complexity::High)
+        },
+        usage_with_grok(
+            window(8.0, HALF_WEEK, 1.0),
+            window(25.0, HALF_WEEK, 0.0),
+            window(76.0, HALF_WEEK, 0.0),
+        ),
+        NOW,
+        &config,
+    );
+    assert!(decision.capability_blocked);
+    assert!(decision.matched_capabilities.is_empty());
 }
 
 /// Capability eligibility is an Auto-only preflight. An explicit caller continues to own the

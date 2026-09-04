@@ -124,6 +124,13 @@ pub struct Row {
     /// None on a row written before this column, which is not the same as a version that is
     /// genuinely empty: an aggregate spanning both a None and a real version is mixed regardless.
     pub router_version: Option<String>,
+    /// Inventory names that recovered a missing-connector route, encoded as
+    /// `Slack@task,Granola@rationale`. None on a row written before this column, on an explicit
+    /// route, and on an auto route that did not report a miss.
+    pub matched_capabilities: Option<String>,
+    /// The caller's `--model` pin. None when the caller omitted `--model` (auto, or explicit
+    /// provider with complexity-scaled assignment), and on a row written before this column.
+    pub requested_model: Option<String>,
 }
 
 /// The human judgement on one routing decision: whether sending the task there was the right call.
@@ -248,6 +255,8 @@ CREATE TABLE IF NOT EXISTS decisions (
     note                TEXT,
     effective_effort    TEXT,
     router_version      TEXT,
+    matched_capabilities TEXT,
+    requested_model     TEXT,
     outcome             TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS decisions_created_at ON decisions(created_at_ms);
@@ -275,7 +284,8 @@ id, created_at_ms, task, dir, requested, provider, model, effort, missing_connec
 gates, claude_weekly_pct, codex_weekly_pct, dry_run, job_id, job_name, outcome, \
 rationale, complexity, task_context_horizon, claude_usage_stale, codex_usage_stale, \
 orchestration, claude_projected_draw, codex_projected_draw, reconciled_at_ms, mark, \
-note, effective_effort, router_version, grok_weekly_pct, grok_projected_draw";
+note, effective_effort, router_version, grok_weekly_pct, grok_projected_draw, \
+matched_capabilities, requested_model";
 
 /// Outcomes whose fate is known. Same set `stats` denominates a failure rate on: `completed`,
 /// `failed`, or a dispatch error. A dry run's outcome is `dry-run`, so it does not match; live
@@ -368,7 +378,8 @@ impl DecisionLog {
                 codex_weekly_pct, codex_weekly_reset, dry_run, job_id, job_name, outcome,
                 complexity, task_context_horizon, claude_usage_stale, codex_usage_stale,
                 claude_projected_draw, codex_projected_draw, grok_projected_draw,
-                effective_effort, router_version, grok_weekly_pct, grok_weekly_reset
+                effective_effort, router_version, grok_weekly_pct, grok_weekly_reset,
+                matched_capabilities, requested_model
             ) VALUES (
                 :created_at_ms, :task, :dir, :requested, :provider, :model, :effort,
                 :orchestration, :missing_connector, :gates, :rationale,
@@ -378,7 +389,7 @@ impl DecisionLog {
                 :outcome, :complexity, :task_context_horizon, :claude_usage_stale,
                 :codex_usage_stale, :claude_projected_draw, :codex_projected_draw,
                 :grok_projected_draw, :effective_effort, :router_version, :grok_weekly_pct,
-                :grok_weekly_reset
+                :grok_weekly_reset, :matched_capabilities, :requested_model
             )",
             rusqlite::named_params! {
                 ":created_at_ms": now_ms(),
@@ -415,6 +426,10 @@ impl DecisionLog {
                 ":router_version": ROUTER_VERSION,
                 ":grok_weekly_pct": usage.grok.weekly_known().then_some(usage.grok.weekly_pct),
                 ":grok_weekly_reset": usage.grok.weekly_reset_epoch,
+                ":matched_capabilities": crate::config::MatchedCapability::encode_list(
+                    &decision.matched_capabilities,
+                ),
+                ":requested_model": decision.requested_model,
             },
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -673,20 +688,25 @@ fn map_decision_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
         router_version: row.get(28)?,
         grok_weekly_pct: row.get(29)?,
         grok_projected_draw: row.get(30)?,
+        matched_capabilities: row.get(31)?,
+        requested_model: row.get(32)?,
     })
 }
 
 /// Columns added after schema v2. Empty after the v2 rewrite, which creates every current column
 /// in `SCHEMA`. Keep the mechanism: a later column goes here as `ALTER TABLE ADD COLUMN` so an
 /// existing v2 database picks it up on open without another table rewrite.
-const MISSING_COLUMNS: [(&str, &str); 0] = [];
+const MISSING_COLUMNS: [(&str, &str); 2] = [
+    ("matched_capabilities", "TEXT"),
+    ("requested_model", "TEXT"),
+];
 
 /// `PRAGMA user_version` stamped once the v2 rewrite has run. 0 is an unstamped pre-v2 database.
 const SCHEMA_VERSION: i64 = 2;
 
 /// Every column `SCHEMA` currently declares, in CREATE TABLE order, used by the v2 copy so a
 /// source table missing some of them still yields a full v2 row (NULL for the absences).
-const V2_COLUMNS: [&str; 38] = [
+const V2_COLUMNS: [&str; 40] = [
     "id",
     "created_at_ms",
     "task",
@@ -724,6 +744,8 @@ const V2_COLUMNS: [&str; 38] = [
     "note",
     "effective_effort",
     "router_version",
+    "matched_capabilities",
+    "requested_model",
     "outcome",
 ];
 
@@ -1000,6 +1022,8 @@ mod tests {
         assert!(!row.dry_run);
         assert!(row.created_at_ms > 0);
         assert!(row.rationale.contains("bounded contract"));
+        assert_eq!(row.matched_capabilities, None);
+        assert_eq!(row.requested_model, None);
     }
 
     #[test]
@@ -1538,6 +1562,118 @@ mod tests {
             "the rejected note carried a mark in with it"
         );
         assert_eq!(row.note, None);
+    }
+
+    /// A live v2 database must pick up the new columns on open without a table rewrite.
+    #[test]
+    fn a_v2_database_gains_matched_capabilities_and_requested_model() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("router.db");
+        let older = SCHEMA
+            .replace("    matched_capabilities TEXT,\n", "")
+            .replace("    requested_model     TEXT,\n", "");
+        assert!(
+            !older.contains("matched_capabilities"),
+            "the older schema fixture"
+        );
+        assert!(
+            !older.contains("requested_model"),
+            "the older schema fixture"
+        );
+        {
+            let conn = rusqlite::Connection::open(&path).expect("create older database");
+            conn.execute_batch(&older).expect("older schema");
+            conn.execute_batch("PRAGMA user_version = 2")
+                .expect("stamp v2");
+            conn.execute(
+                "INSERT INTO decisions (
+                    created_at_ms, task, dir, requested, provider, gates, rationale,
+                    claude_five_hour_pct, claude_five_hour_reset, claude_weekly_pct,
+                    claude_weekly_reset, codex_five_hour_pct, codex_five_hour_reset,
+                    codex_weekly_pct, codex_weekly_reset, dry_run, outcome
+                ) VALUES (1, 'older row', '/tmp', 'auto', 'codex', '', 'why', 0, 0, 0, 0, 0, 0, \
+                 0, 0, 1, 'dry-run')",
+                [],
+            )
+            .expect("older row");
+        }
+
+        let log = DecisionLog::open_at(&path).expect("migrates on open");
+        let rows = log.recent(10).expect("reads the older row back");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].matched_capabilities, None);
+        assert_eq!(rows[0].requested_model, None);
+        DecisionLog::open_at(&path).expect("reopens");
+    }
+
+    #[test]
+    fn a_recovered_capability_and_a_model_pin_round_trip() {
+        use crate::decide::decide_with_task;
+        use std::collections::BTreeMap;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = DecisionLog::open_at(&dir.path().join("router.db")).expect("opens");
+        let config = Config {
+            provider_capabilities: BTreeMap::from([
+                ("claude".to_string(), vec!["Slack".to_string()]),
+                ("codex".to_string(), vec!["Slack".to_string()]),
+            ]),
+            ..Config::default()
+        };
+        let recovered = decide_with_task(
+            "Use the Slack MCP connection",
+            Classification {
+                orchestration: false,
+                missing_connector: true,
+                complexity: Complexity::High,
+                task_context_horizon: TaskContextHorizon::Ordinary,
+                rationale: "cross-system triage".to_string(),
+                classifier_failed: false,
+                invokes_implement: false,
+                unlaunchable: None,
+            },
+            decision().usage,
+            NOW,
+            &config,
+        );
+        log.record(&Entry {
+            task: "Use the Slack MCP connection",
+            dir: Path::new("/tmp"),
+            requested: "auto",
+            decision: &recovered,
+            dry_run: true,
+            job_id: None,
+            job_name: None,
+            outcome: "dry-run",
+            effective_effort: None,
+        })
+        .expect("records recovered");
+        let pinned = crate::decide::decide_explicit(
+            crate::Provider::Claude,
+            Some("fable".to_string()),
+            Some("high".to_string()),
+            None,
+            decision().usage,
+            &config,
+        );
+        log.record(&Entry {
+            task: "pinned",
+            dir: Path::new("/tmp"),
+            requested: "claude",
+            decision: &pinned,
+            dry_run: true,
+            job_id: None,
+            job_name: None,
+            outcome: "dry-run",
+            effective_effort: None,
+        })
+        .expect("records pin");
+
+        let rows = log.recent(2).expect("reads back");
+        assert_eq!(rows[0].requested_model.as_deref(), Some("fable"));
+        assert_eq!(rows[0].model.as_deref(), Some("fable"));
+        assert_eq!(rows[0].matched_capabilities, None);
+        assert_eq!(rows[1].matched_capabilities.as_deref(), Some("Slack@task"));
+        assert_eq!(rows[1].requested_model, None);
     }
 
     /// The predicate the whole in place update rests on: a dry run and a dispatch error are outside

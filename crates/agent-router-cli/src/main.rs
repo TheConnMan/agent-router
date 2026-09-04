@@ -529,6 +529,10 @@ fn outcome_json(outcome: &Outcome) -> serde_json::Value {
     serde_json::json!({
         "provider": decision.provider.name(),
         "model": decision.model,
+        "requested_model": decision.requested_model,
+        "matched_capabilities": agent_router_core::config::MatchedCapability::encode_list(
+            &decision.matched_capabilities,
+        ),
         "effort": decision.effort,
         "gates": decision.gate_tags(),
         "classification": decision.classification,
@@ -938,6 +942,8 @@ fn row_json(row: &Row) -> serde_json::Value {
         "requested": row.requested,
         "provider": row.provider,
         "model": row.model,
+        "requested_model": row.requested_model,
+        "matched_capabilities": row.matched_capabilities,
         // What the router decided, which is not what the job ran at: that is `effective_effort`,
         // null wherever no backend reported one.
         "effort": row.effort,

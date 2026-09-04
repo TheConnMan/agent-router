@@ -28,6 +28,12 @@ destination was `missing_connector`: false positives treated Claude skills,
 local SQLite, local files, `gh`, and later-named systems as missing connectors;
 false negatives left Granola transcripts and a Slack URL on Codex.
 
+Measured 2026-08-29 to 2026-09-04 over 397 decisions, 15 auto routes were
+`capability_blocked`. Four were Slack/Airtable/Granola jobs whose rationale
+omitted the product name the task already used; recovery now searches the task
+text. The other eleven were classifier false positives on ntfy, ZLog, Twitter
+or public web, and git/gh release work; the prompt now names those as local-shell.
+
 ## Decision
 
 Claude is selected only by capability pins: `orchestration`,

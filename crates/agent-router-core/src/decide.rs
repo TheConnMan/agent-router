@@ -4,7 +4,7 @@
 //! docs/decisions/0007-claude-capability-only.md.
 
 use crate::classify::{Classification, Complexity};
-use crate::config::Config;
+use crate::config::{Config, MatchedCapability};
 use crate::provider::Provider;
 use crate::usage::{Headroom, UsageSnapshot};
 
@@ -135,6 +135,14 @@ pub struct Decision {
     pub codex_projected_draw: Option<f64>,
     pub grok_projected_draw: Option<f64>,
     pub rationale: String,
+    /// Inventory names that recovered a missing-connector route, and whether each came from the
+    /// task, the rationale, or both. Empty when the classifier did not report a miss, and on the
+    /// explicit path which does not run this filter.
+    pub matched_capabilities: Vec<MatchedCapability>,
+    /// The caller's `--model` pin. None on auto and on an explicit provider that omitted `--model`,
+    /// which is not the same as `model` above: that field is the assigned spawn model after
+    /// complexity scaling fills an omitted pin.
+    pub requested_model: Option<String>,
 }
 
 impl Decision {
@@ -182,12 +190,28 @@ pub fn decide(
     now_epoch_secs: i64,
     config: &Config,
 ) -> Decision {
+    decide_with_task("", classification, usage, now_epoch_secs, config)
+}
+
+/// Automatic routing for a scored task. `task` is searched together with the classifier
+/// rationale when recovering a missing connector against `provider_capabilities`, so a
+/// one-sentence rationale that omits "Slack" still recovers Slack-capable providers when
+/// the task already named Slack. An unmatched miss still blocks rather than pinning Claude
+/// (docs/decisions/0007-claude-capability-only.md).
+pub fn decide_with_task(
+    task: &str,
+    classification: Classification,
+    usage: UsageSnapshot,
+    now_epoch_secs: i64,
+    config: &Config,
+) -> Decision {
     let mut gates = Vec::new();
-    let capability_providers = if classification.missing_connector {
-        config.capability_providers(&classification.rationale)
+    let matched_capabilities = if classification.missing_connector {
+        config.matched_capabilities(task, &classification.rationale)
     } else {
         Vec::new()
     };
+    let capability_providers = config.capability_providers(&matched_capabilities);
     let mut capability_blocked =
         classification.missing_connector && capability_providers.is_empty();
     let mut capability_pin = false;
@@ -339,6 +363,8 @@ pub fn decide(
         codex_projected_draw,
         grok_projected_draw,
         rationale,
+        matched_capabilities,
+        requested_model: None,
     }
 }
 
@@ -373,6 +399,7 @@ pub fn decide_explicit(
     let complexity = classification
         .as_ref()
         .map(|classification| classification.complexity);
+    let requested_model = model.clone();
     let model = model.or_else(|| complexity.and_then(|value| model_for(provider, value, config)));
     let effort = effort.or_else(|| complexity.and_then(|value| effort_for(provider, value)));
     let rationale = classification
@@ -405,6 +432,8 @@ pub fn decide_explicit(
         codex_projected_draw: None,
         grok_projected_draw: None,
         rationale,
+        matched_capabilities: Vec::new(),
+        requested_model,
     }
 }
 
@@ -586,7 +615,9 @@ mod tests {
             &config,
         );
         assert_eq!(pinned.model.as_deref(), Some("sonnet"));
+        assert_eq!(pinned.requested_model.as_deref(), Some("sonnet"));
         assert_eq!(pinned.effort.as_deref(), Some("low"));
+        assert_eq!(decision.requested_model, None);
     }
 
     /// The rationale is the one line the CLI prints and the viewer shows, so it names the provider,
