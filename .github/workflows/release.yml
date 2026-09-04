@@ -37,7 +37,7 @@ jobs:
       - name: Build
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
-        run: cargo build --release --locked --target ${{ matrix.target }} --bin agent-router
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin agent-router --bin agent-parity
 
       - name: Package
         run: |
@@ -45,6 +45,7 @@ jobs:
           staging="agent-router-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir -p "dist/$staging"
           cp "target/${{ matrix.target }}/release/agent-router" "dist/$staging/"
+          cp "target/${{ matrix.target }}/release/agent-parity" "dist/$staging/"
           cp README.md LICENSE "dist/$staging/"
           tar -C dist -czf "dist/$staging.tar.gz" "$staging"
           (cd dist && sha256sum "$staging.tar.gz" > "$staging.tar.gz.sha256")

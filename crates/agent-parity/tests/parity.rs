@@ -1,6 +1,6 @@
+use agent_parity::{Status, check};
 use agent_router_core::Config;
 use agent_router_core::config::{ParityException, ParityKind};
-use agent_router_core::parity::{Status, check};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 

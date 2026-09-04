@@ -1,5 +1,5 @@
 //! Routing machinery for `agent-router`: usage readers, the decision engine, the decision log,
-//! and provider dispatch.
+//! and provider dispatch. MCP declaration linting lives in the `agent-parity` crate.
 
 pub mod adversarial_review;
 pub mod binary;
@@ -12,7 +12,6 @@ pub mod doctor;
 pub mod error;
 pub mod estimate;
 pub mod log;
-pub mod parity;
 pub mod provider;
 pub mod run;
 pub mod runtime;
@@ -27,6 +26,5 @@ pub use config::{
 pub use context::Context;
 pub use decide::{Decision, Gate};
 pub use error::{Error, Result};
-pub use parity::{Difference, GlobalReport, ParityReport, ServerProjection, Status};
 pub use provider::Provider;
 pub use usage::{Headroom, UsageSnapshot};

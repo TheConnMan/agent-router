@@ -1,8 +1,8 @@
 //! Regressions found in review, over the parity scanner. The routing regression this file also
 //! carried is now in `pace_routing.rs`, where the whole ceiling rule lives.
 
+use agent_parity::{Status, check};
 use agent_router_core::config::Config;
-use agent_router_core::parity::{Status, check};
 use std::path::{Path, PathBuf};
 
 fn write(path: &Path, contents: &str) {

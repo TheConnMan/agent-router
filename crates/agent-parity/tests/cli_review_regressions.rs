@@ -52,7 +52,7 @@ fn write_empty_router_config(home: &Path) {
 }
 
 fn router_command(home: &Path, current_dir: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_agent-router"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agent-parity"));
     command
         .current_dir(current_dir)
         .env("HOME", home)
@@ -64,11 +64,10 @@ fn router_command(home: &Path, current_dir: &Path) -> Command {
 
 fn run_parity(home: &Path, current_dir: &Path, root: &Path) -> Output {
     router_command(home, current_dir)
-        .arg("parity")
         .arg("--root")
         .arg(root)
         .output()
-        .expect("run agent-router parity")
+        .expect("run agent-parity")
 }
 
 fn output_text(bytes: &[u8]) -> String {

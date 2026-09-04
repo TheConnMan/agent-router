@@ -337,7 +337,8 @@ rung that `luna` does not, and no Codex rung above `max` is a value Claude accep
 
 ## `[parity]`
 
-Inputs for the `agent-router parity` command.
+Inputs for the `agent-parity` binary. It still reads this section from
+`~/.config/agent-router/config.toml`; there is no second config file.
 
 ### `roots`
 
@@ -346,7 +347,7 @@ directory. There is no tilde expansion: `~` is only expanded by your shell, so a
 this file must be absolute or relative, never `~/git`.
 
 Precedence is explicit flags first, then this list, then the current directory. So
-`agent-router parity --root ~/git` ignores this setting, and `agent-router parity` with an empty
+`agent-parity --root ~/git` ignores this setting, and `agent-parity` with an empty
 list scans only where it was run from. Nested roots are collapsed: if both `~/git` and
 `~/git/project` are listed, only `~/git` is scanned.
 

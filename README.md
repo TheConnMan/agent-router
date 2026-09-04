@@ -102,6 +102,7 @@ curl -fsSLO https://github.com/TheConnMan/agent-router/releases/download/$VERSIO
 sha256sum -c $ASSET.tar.gz.sha256
 tar xzf $ASSET.tar.gz
 install -Dm755 $ASSET/agent-router ~/.local/bin/agent-router
+install -Dm755 $ASSET/agent-parity ~/.local/bin/agent-parity
 ```
 
 Every asset ships with a `.sha256` companion file, as used above.
@@ -115,6 +116,7 @@ via `rusqlite`'s bundled feature, so a C compiler is needed but no system SQLite
 git clone https://github.com/TheConnMan/agent-router.git
 cd agent-router
 cargo install --path crates/agent-router-cli
+cargo install --path crates/agent-parity
 ```
 
 ## Prerequisites
@@ -513,20 +515,21 @@ level, plus a `rows` array where each row carries `id`, `provider`, `job_id`, `o
 have failed, `1` when something is, `2` when the command could not run at all. An `unknown` never
 moves it, since an absence of information is not a finding.
 
-### `parity`
+### `agent-parity`
 
 Compare project scoped Claude and Codex declarations, so either provider can take over a project
-without an unexpected capability or instruction gap.
+without an unexpected capability or instruction gap. This is a separate binary; it is no longer an
+`agent-router` subcommand.
 
 ```bash
 # Scan the current directory.
-agent-router parity
+agent-parity
 
 # Scan explicit roots.
-agent-router parity --root ~/git --root ~/work
+agent-parity --root ~/git --root ~/work
 
 # Machine readable, for a scheduled drift check.
-agent-router parity --json
+agent-parity --json
 ```
 
 The scan walks each root for directories containing any of `.mcp.json`, `.codex/config.toml`,
@@ -586,8 +589,8 @@ path once:
 git config core.hooksPath .githooks
 ```
 
-The hook runs `~/.cargo/bin/cargo build --release --workspace` and copies the resulting binary to
-`~/.local/bin/agent-router`. It skips commits on other branches.
+The hook runs `~/.cargo/bin/cargo build --release --workspace` and copies `agent-router` and
+`agent-parity` to `~/.local/bin`. It skips commits on other branches.
 
 ```bash
 cargo test --workspace --locked
@@ -595,10 +598,11 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 ```
 
-The workspace is two crates. `agent-router-core` holds the routing machinery: usage readers, the
-classifier, the decision engine, the decision log, the parity scanner, and provider dispatch.
-`agent-router-cli` is the `agent-router` binary and holds argument parsing and output formatting
-only.
+The workspace is three crates. `agent-router-core` holds the routing machinery: usage readers, the
+classifier, the decision engine, the decision log, and provider dispatch. `agent-router-cli` is the
+`agent-router` binary and holds argument parsing and output formatting only. `agent-parity` is the
+`agent-parity` binary: a dotfiles linter for Claude and Codex MCP declarations. It still reads the
+`[parity]` section of `~/.config/agent-router/config.toml`; there is no second config file.
 
 Functions are marked `PURE` or `IMPURE` in their doc comments. The decision engine is pure given
 its inputs, which is what makes the routing policy testable without touching a network, a provider

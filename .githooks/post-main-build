@@ -53,13 +53,16 @@ trap 'rm -f "${install_tmp_files[@]}"' EXIT
 
 install_binary() {
     local dest_dir="$1"
+    local name="$2"
     local tmp
-    tmp="$(mktemp "${dest_dir}/.agent-router.new.XXXXXX")"
+    tmp="$(mktemp "${dest_dir}/.${name}.new.XXXXXX")"
     install_tmp_files+=("$tmp")
-    cp target/release/agent-router "$tmp"
+    cp "target/release/${name}" "$tmp"
     chmod +x "$tmp"
-    mv -f "$tmp" "${dest_dir}/agent-router"
+    mv -f "$tmp" "${dest_dir}/${name}"
 }
 
-install_binary ~/.cargo/bin
-install_binary ~/.local/bin
+install_binary ~/.cargo/bin agent-router
+install_binary ~/.cargo/bin agent-parity
+install_binary ~/.local/bin agent-router
+install_binary ~/.local/bin agent-parity

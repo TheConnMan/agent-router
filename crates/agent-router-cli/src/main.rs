@@ -1,6 +1,5 @@
 use agent_router_core::doctor::Health;
 use agent_router_core::log::{DecisionLog, ReviewEntry, Row};
-use agent_router_core::parity::{Difference, GlobalReport, ParityReport, ServerProjection, Status};
 use agent_router_core::run::{Outcome, Request};
 use agent_router_core::stats::{Rate, Stats, Window};
 use agent_router_core::status::Report;
@@ -116,13 +115,6 @@ enum Command {
     },
     /// Preflight the provider binaries, credentials, usage provenance, config, and decision log.
     Doctor,
-    /// Compare the global and project scoped Claude and Codex declarations.
-    Parity {
-        #[arg(long = "root")]
-        roots: Vec<PathBuf>,
-        #[arg(long)]
-        json: bool,
-    },
 }
 
 enum CliStatus {
@@ -146,7 +138,6 @@ fn main() -> std::process::ExitCode {
     let mut ctx = agent_router_core::Context::from_process();
     let status = match cli.command {
         Command::Doctor => doctor_status(&ctx),
-        Command::Parity { roots, json } => parity_status(&mut ctx, roots, json),
         Command::Status { limit, since, json } => status_status(&ctx, limit, since, json),
         Command::AdversarialReview {
             request,
@@ -308,7 +299,7 @@ fn print_adversarial_review(
     }
 }
 
-/// Doctor owns its exit code the same way parity does: a failing check is reported by exiting
+/// Doctor owns its exit code the same way status does: a failing check is reported by exiting
 /// nonzero, not by an error, since the report itself is the output.
 fn doctor_status(ctx: &agent_router_core::Context) -> CliStatus {
     let report = agent_router_core::doctor::run(ctx);
@@ -335,47 +326,7 @@ fn health_label(health: Health) -> &'static str {
     }
 }
 
-fn parity_status(
-    ctx: &mut agent_router_core::Context,
-    roots: Vec<PathBuf>,
-    json: bool,
-) -> CliStatus {
-    if let Err(error) = ctx.load_config() {
-        eprintln!(
-            "agent-router: parity configuration error: {}",
-            escape_terminal_controls(&error.to_string())
-        );
-        return CliStatus::Unrunnable;
-    }
-    let report = match agent_router_core::parity::check(&roots, &ctx.config, &ctx.home) {
-        Ok(report) => report,
-        Err(error) => {
-            eprintln!(
-                "agent-router: parity scan error while reading .mcp.json, .claude.json, or \
-                 .codex/config.toml: {}",
-                escape_terminal_controls(&error.to_string())
-            );
-            return CliStatus::Unrunnable;
-        }
-    };
-
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&parity_json(&report))
-                .expect("serializing a JSON value cannot fail")
-        );
-    } else {
-        print_parity(&report);
-    }
-
-    match report.status() {
-        Status::Aligned | Status::Intentional => CliStatus::Success,
-        Status::Drift => CliStatus::Failure,
-    }
-}
-
-/// Status owns its exit code the way doctor and parity do, because the report is the output: 0 when
+/// Status owns its exit code the way doctor does, because the report is the output: 0 when
 /// nothing in the window is known to have failed, 1 when something is, and 2 when the command could
 /// not run at all. An `unknown` never moves it, since an absence of information is not a finding.
 fn status_status(
@@ -517,117 +468,8 @@ fn run(cli: Cli, ctx: &mut agent_router_core::Context) -> agent_router_core::Res
             unreachable!("adversarial review has a command specific exit path")
         }
         Command::Doctor => unreachable!("doctor has a command specific exit path"),
-        Command::Parity { .. } => unreachable!("parity has a command specific exit path"),
         Command::Status { .. } => unreachable!("status has a command specific exit path"),
     }
-}
-
-fn print_parity(report: &ParityReport) {
-    println!("parity: {}", status_label(report.status()));
-    print_global(&report.global);
-    for project in &report.projects {
-        let differences = project_differences(report, project);
-        println!(
-            "{}: {}",
-            escape_terminal_controls(&project.to_string_lossy()),
-            status_label(difference_status(&differences))
-        );
-        print_differences(&differences);
-    }
-}
-
-/// The global entry prints first, because it is the ambient configuration every project inherits.
-fn print_global(global: &GlobalReport) {
-    let differences = global.differences.iter().collect::<Vec<_>>();
-    println!("global: {}", status_label(difference_status(&differences)));
-    println!(
-        "  claude: {}",
-        escape_terminal_controls(&global.claude_path.to_string_lossy())
-    );
-    println!(
-        "  codex: {}",
-        escape_terminal_controls(&global.codex_path.to_string_lossy())
-    );
-    print_differences(&differences);
-}
-
-fn print_differences(differences: &[&Difference]) {
-    for difference in differences {
-        match &difference.server {
-            Some(server) => {
-                println!(
-                    "  {} server {}",
-                    kind_label(difference),
-                    escape_terminal_controls(server)
-                );
-            }
-            None => println!("  {}", kind_label(difference)),
-        }
-        print_projection("claude", difference.claude.as_ref());
-        print_projection("codex", difference.codex.as_ref());
-        if let Some(reason) = &difference.intentional_reason {
-            println!("    reason: {}", escape_terminal_controls(reason));
-        }
-    }
-}
-
-fn print_projection(label: &str, projection: Option<&ServerProjection>) {
-    let Some(projection) = projection else {
-        return;
-    };
-    println!(
-        "    {label}: command {} args {} env keys {}",
-        escape_terminal_controls(projection.command.as_deref().unwrap_or("(unset)")),
-        escaped_string_list(&projection.args),
-        escaped_string_list(&projection.env_keys)
-    );
-}
-
-fn parity_json(report: &ParityReport) -> serde_json::Value {
-    let projects = report
-        .projects
-        .iter()
-        .map(|project| {
-            let differences = project_differences(report, project);
-            serde_json::json!({
-                "root": project,
-                "status": difference_status(&differences),
-                "differences": differences_json(&differences),
-            })
-        })
-        .collect::<Vec<_>>();
-
-    let global_differences = report.global.differences.iter().collect::<Vec<_>>();
-    serde_json::json!({
-        "status": report.status(),
-        "global": serde_json::json!({
-            "claude_path": report.global.claude_path,
-            "codex_path": report.global.codex_path,
-            "status": difference_status(&global_differences),
-            "differences": differences_json(&global_differences),
-        }),
-        "projects": projects,
-    })
-}
-
-fn differences_json(differences: &[&Difference]) -> Vec<serde_json::Value> {
-    differences
-        .iter()
-        .map(|difference| {
-            serde_json::json!({
-                "server": difference.server.as_deref(),
-                "kind": difference.kind,
-                "claude": &difference.claude,
-                "codex": &difference.codex,
-                "intentional_reason": difference.intentional_reason.as_deref(),
-            })
-        })
-        .collect()
-}
-
-fn escaped_string_list(values: &[String]) -> String {
-    let json = serde_json::to_string(values).expect("serializing string lists cannot fail");
-    escape_terminal_controls(&json)
 }
 
 fn escape_terminal_controls(value: &str) -> String {
@@ -640,48 +482,6 @@ fn escape_terminal_controls(value: &str) -> String {
         }
     }
     escaped
-}
-
-fn project_differences<'a>(report: &'a ParityReport, project: &Path) -> Vec<&'a Difference> {
-    report
-        .differences
-        .iter()
-        .filter(|difference| difference.root == project)
-        .collect()
-}
-
-fn difference_status(differences: &[&Difference]) -> Status {
-    if differences.is_empty() {
-        Status::Aligned
-    } else if differences
-        .iter()
-        .all(|difference| difference.intentional_reason.is_some())
-    {
-        Status::Intentional
-    } else {
-        Status::Drift
-    }
-}
-
-fn status_label(status: Status) -> &'static str {
-    match status {
-        Status::Aligned => "aligned",
-        Status::Intentional => "intentional",
-        Status::Drift => "drift",
-    }
-}
-
-fn kind_label(difference: &Difference) -> &'static str {
-    match difference.kind {
-        agent_router_core::ParityKind::MissingInCodex => "missing_in_codex",
-        agent_router_core::ParityKind::MissingInClaude => "missing_in_claude",
-        agent_router_core::ParityKind::TransportDiffers => "transport_differs",
-        agent_router_core::ParityKind::EndpointDiffers => "endpoint_differs",
-        agent_router_core::ParityKind::CommandDiffers => "command_differs",
-        agent_router_core::ParityKind::ArgsDiffer => "args_differ",
-        agent_router_core::ParityKind::EnvKeysDiffer => "env_keys_differ",
-        agent_router_core::ParityKind::StandaloneClaudeMd => "standalone_claude_md",
-    }
 }
 
 // Parameters are the run subcommand's clap flags passed straight through, so the count tracks the CLI surface.

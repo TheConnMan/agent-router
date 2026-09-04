@@ -2,9 +2,9 @@
 //! each scan root for candidate directories; the global scope compares the two ambient files every
 //! project inherits, `~/.claude.json` and `~/.codex/config.toml`, and is reported as its own entry.
 
-use crate::Config;
-use crate::config::{ParityException, ParityKind};
-use crate::error::{Error, Result};
+use agent_router_core::Config;
+use agent_router_core::config::{ParityException, ParityKind};
+use agent_router_core::error::{Error, Result};
 use serde::de::{IgnoredAny, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use std::collections::{BTreeMap, BTreeSet};
@@ -245,7 +245,7 @@ pub fn check(roots: &[PathBuf], config: &Config, home: &Path) -> Result<ParityRe
 /// home still matches. Only the MCP server kinds apply: `standalone_claude_md` has no global
 /// counterpart in these two files.
 fn compare_global(home: &Path, exceptions: &[ResolvedException<'_>]) -> Result<GlobalReport> {
-    let root = crate::runtime::canonicalize_dir(home);
+    let root = agent_router_core::runtime::canonicalize_dir(home);
     let claude_path = root.join(".claude.json");
     let codex_path = root.join(".codex/config.toml");
     let claude = read_claude_servers_at(&claude_path)?;
