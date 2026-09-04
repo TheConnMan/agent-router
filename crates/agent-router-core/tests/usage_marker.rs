@@ -2,7 +2,7 @@
 //! across the schema migration that older databases take, and the writability probe that doctor's
 //! `log_writable` check reports from.
 //!
-//! The plan puts these in inline `mod tests` blocks inside `usage.rs` and `log.rs`; they live here
+//! The plan puts these in inline `mod tests` blocks inside `usage/` and `log.rs`; they live here
 //! instead so the marker is exercised through the public API a caller actually has, and so the
 //! test pass touches no production source.
 

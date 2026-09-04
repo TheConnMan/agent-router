@@ -59,9 +59,10 @@ run_gate() {
 }
 
 # The tests run against Claude and Grok usage caches that are not there, because a runner does not
-# have either one. `usage.rs` otherwise reads machine-wide files under `/tmp` that no fixture HOME
-# can unset, so usage tests can see live reads locally and no read at all in CI. Claude's version of
-# that divergence turned main red on 2026-08-06, on a merge every box it was built on called green.
+# have either one. The usage readers otherwise read machine-wide files under `/tmp` that no
+# fixture HOME can unset, so usage tests can see live reads locally and no read at all in CI.
+# Claude's version of that divergence turned main red on 2026-08-06, on a merge every box it
+# was built on called green.
 # Credentials need no equivalent, since both readers already resolve credentials from the fixture
 # HOME or GROK_HOME and find nothing.
 #

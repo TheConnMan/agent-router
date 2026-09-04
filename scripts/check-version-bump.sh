@@ -17,7 +17,11 @@ GATED_PATHS=(
     "crates/agent-router-core/src/classify.rs"
     "crates/agent-router-core/src/decide.rs"
     "crates/agent-router-core/src/config.rs"
-    "crates/agent-router-core/src/usage.rs"
+    "crates/agent-router-core/src/usage/mod.rs"
+    "crates/agent-router-core/src/usage/claude.rs"
+    "crates/agent-router-core/src/usage/codex.rs"
+    "crates/agent-router-core/src/usage/grok.rs"
+    "crates/agent-router-core/src/usage/time.rs"
     "crates/agent-router-core/src/run.rs"
     "crates/agent-router-core/src/runtime.rs"
 )

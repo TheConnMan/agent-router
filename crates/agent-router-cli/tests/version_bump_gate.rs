@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::SystemTime;
 
-/// One of the six paths the gate filters against, standing in for "routing behavior changed". The
+/// One of the gated paths, standing in for "routing behavior changed". The
 /// tests assert the script names it back, because a failure that does not say which file tripped
 /// it sends the developer looking.
 const GATED: &str = "crates/agent-router-core/src/decide.rs";
