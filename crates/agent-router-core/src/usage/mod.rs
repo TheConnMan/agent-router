@@ -2,18 +2,13 @@
 //! bonus-drain readers' semantics.
 //!
 //! Claude fails open, but Codex and Grok fail closed: an unreadable capacity source for either
-//! must not become a dispatch target.
+//! must not become a dispatch target. See docs/decisions/0004-fail-closed-weekly-unknown.md
+//! and docs/decisions/0008-grok-four-source-usage-provenance.md.
 //!
 //! Every unreadable value carries `stale = true`, while a usable parsed payload carries
-//! `stale = false`. `agent-router doctor` reports that provenance and the decision log records it
-//! per provider on every row.
-//!
-//! The flag reads freshness but means provenance, and there is one path where the two diverge:
-//! `claude_headroom`'s last resort reads the shared cache regardless of its age, and a cache that
-//! parses carries `stale = false` however old it is. So an expired but parseable cache, read
-//! because the API was unreachable, is reported `live` rather than fail open. That is deliberate:
-//! the numbers came from a real reading of the provider rather than from a default, which is the
-//! distinction routing acts on, and `usage.sh` reports the same cache the same way.
+//! `stale = false`. The flag reads freshness but means provenance, and they diverge on
+//! `claude_headroom`'s last-resort cache: an expired but parseable cache is reported live
+//! because the numbers came from a real reading rather than a default.
 
 mod claude;
 mod codex;
@@ -30,15 +25,8 @@ pub const CLAUDE_USAGE_CACHE_DEFAULT: &str = "/tmp/claude-usage-cache.json";
 /// The Grok usage cache agent-router writes for other local consumers.
 pub const GROK_USAGE_CACHE_DEFAULT: &str = "/tmp/grok-usage-cache.json";
 /// Points the Claude reader at a different cache. Empty or unset means the shared default.
-///
-/// It exists so a test can decide what Claude's usage read returns. The default is a machine wide
-/// path that no fixture can unset: a test with no credentials in its temp HOME still gets a live
-/// read off whatever the statusline last wrote there, so a Claude usage assertion passes on a
-/// developer box and fails on a runner that has neither the cache nor credentials. That divergence
-/// turned `main` red on 2026-08-06, on a merge that was green on every box it was built on.
-///
-/// Pointed at a path that does not exist, this reproduces a runner exactly: no cache to read, and
-/// `claude_oauth_token` already finds nothing under a temp HOME, so the read fails open.
+/// Tests must not inherit a machine-wide cache. See
+/// docs/decisions/0008-grok-four-source-usage-provenance.md.
 pub const CLAUDE_USAGE_CACHE_ENV: &str = "CLAUDE_USAGE_CACHE";
 /// Points the Grok reader at a different cache. Empty or unset means the shared default.
 ///
@@ -124,11 +112,9 @@ impl UsageSnapshot {
 
     /// IMPURE: read all providers once and retain the Grok snapshot's provenance for diagnostics.
     ///
-    /// Codex is scanned first on purpose. `run` overlaps this read with the classifier, and the
-    /// classifier's own Codex rollout only gains `rate_limits` when that call completes. Capturing
-    /// Codex before the Grok/Claude HTTP work (the slow part) keeps that rollout out of the
-    /// snapshot even when those fetches outlast the classifier. Reordering the two HTTP reads is
-    /// a separate change and is not done here.
+    /// Codex is scanned first: `run` overlaps this read with the classifier, and the classifier's
+    /// Codex rollout only gains `rate_limits` when that call completes. See
+    /// docs/decisions/0008-grok-four-source-usage-provenance.md.
     pub fn read_with_grok_source(ctx: &Context) -> (UsageSnapshot, GrokUsageSource) {
         let codex = codex_headroom(ctx);
         let grok = grok_usage(ctx);

@@ -209,8 +209,8 @@ fn codex_scan_skips_a_newer_rollout_without_limits_and_takes_the_newest_that_has
     assert_eq!(got.weekly_pct, 63.0, "newest rollout WITH limits wins");
 }
 
-/// The `premium` bucket as codex-cli actually writes it, verbatim from a 2026-08-06 rollout.
-/// Both windows null, so it states nothing about the weekly plan.
+/// The `premium` bucket as codex-cli writes it. Both windows null, so it states nothing about
+/// the weekly plan.
 const PREMIUM_NO_WINDOWS: &str = r#"{"timestamp":"2026-08-06T09:36:39.958Z","type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"limit_id":"premium","limit_name":null,"primary":null,"secondary":null,"credits":{"has_credits":false,"unlimited":false,"balance":"0"},"individual_limit":null,"spend_control_reached":null,"plan_type":null,"rate_limit_reached_type":null}}}"#;
 
 /// Credits are newer than the old plan window and are the authoritative capacity verdict.

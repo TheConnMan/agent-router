@@ -47,15 +47,11 @@ log: row 87 in /home/you/.local/state/agent-router/router.db
    connector registrations and other providers can be
    registered in `provider_capabilities`; unavailable providers are removed before ordinary policy
    chooses the route. Only a capability absent from every provider inventory is
-   `capability_blocked`. The context-window gate is a fact rather than a
-   feature gap:
-   Codex's window is 258,400 tokens, and measured 2026-08-11 across 37 Claude and 13 Codex
-   `/implement` runs, the median Claude run peaks at 262,017 tokens of resident context with 51
-   percent of runs peaking above the whole Codex window. It fires only when the task text actually
-   dispatches `/implement` (read literally, never scored) **and** complexity is `high` or `ultra`,
-   which is the build tier; `low` and `medium` implement runs are the direct and quick tiers, they
-   fit comfortably, and they stay on ordinary routing. An unscored task reads as `high`, so a
-   classifier failure on an implement run pins rather than gambles.
+   `capability_blocked`. The context-window gate is a capability pin: Codex's window is
+   258,400 tokens. It fires only when the task text actually dispatches `/implement` (read
+   literally, never scored) **and** complexity is `high` or `ultra`; `low` and `medium`
+   implement runs stay on ordinary routing. See
+   [`docs/decisions/0003-implement-context-window.md`](docs/decisions/0003-implement-context-window.md).
 3. **Balance the workhorses by weekly pace.** Auto normal work considers Codex and Grok only. A
    provider at or above `hard_ceiling_pct`, or whose weekly usage is unknown or non-authoritative,
    is excluded. When both are available, each provider's current weekly percent is divided by the

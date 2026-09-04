@@ -11,9 +11,9 @@ pub enum Error {
     #[error("{0}")]
     Command(String),
     /// A provider CLI could not be turned into a runnable path, or could not be exec'd once it
-    /// was. Distinct from `Io` on purpose: `Io`'s `Display` is `No such file or directory (os
-    /// error 2)`, which is the useless string the lost production rows recorded. This variant's
-    /// message names the binary, the override that pins it, and where the resolver looked.
+    /// was. Distinct from `Io` on purpose: this variant names the binary, the override that pins
+    /// it, and where the resolver looked. See
+    /// docs/decisions/0005-launch-error-and-binary-resolver.md.
     #[error("launch failed: {0}")]
     Launch(String),
 }

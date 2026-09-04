@@ -1,18 +1,9 @@
 //! What `decide` does with a provider whose CLI could not be launched.
 //!
-//! Unlaunchability is an ELIGIBILITY input, not a re-route instruction. A provider the router
-//! could not start is ineligible in exactly the same sense as one over its hard ceiling or one
-//! carrying a weekly window nobody read, and the existing capacity machinery then decides what to
-//! do about it. No new destination is invented: `decide.rs` states "Claude is a capability
-//! destination only; automatic capacity routing chooses between Codex and Grok", and a bug fix does
-//! not get to change that.
-//!
-//! The consequence is a real and deliberate limit, pinned below rather than left implicit: when
-//! Grok is not eligible — which is its normal state on this box, because its weekly window is
-//! usually unread — an unlaunchable Codex is NOT re-routed. It stays on Codex, the row carries the
-//! diagnostic gate, and the dispatch fails loudly with a named launch error. That is the outcome
-//! this ticket buys: the incident's defect was a SILENT loss with a LYING rationale, and a named,
-//! diagnosable failure is the fix.
+//! Unlaunchability is an eligibility input, not a re-route instruction and not a pin to Claude.
+//! When nothing eligible remains, the task stays put and dispatch fails with a named launch
+//! error. See docs/decisions/0005-launch-error-and-binary-resolver.md and
+//! docs/decisions/0007-claude-capability-only.md.
 
 use agent_router_core::classify::{Classification, Complexity, TaskContextHorizon};
 use agent_router_core::config::Config;
@@ -269,14 +260,8 @@ fn an_unlaunchable_claude_does_not_disturb_automatic_routing() {
     );
 }
 
-// ------------------------------------------------------------------ #21: the incident string
-
-/// Plan test #21, and the most direct encoding of the reported defect.
-///
-/// The production line was `claude requested explicitly: classifier failed (could not run codex:
-/// ...), defaulting to codex` — a job that ran on Claude claiming it defaulted to the Codex that
-/// had just failed to execute. The explicit path never consults the eligibility rules and must not
-/// start; all that changes is that the rationale stops naming a destination nothing chose.
+/// The explicit path never consults the eligibility rules and must not start; the rationale
+/// must not name a destination nothing chose. See docs/decisions/0007-claude-capability-only.md.
 #[test]
 fn an_explicitly_requested_provider_is_not_told_it_defaulted_elsewhere() {
     let decision = decide_explicit(

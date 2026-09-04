@@ -83,10 +83,9 @@ pub struct Row {
     pub missing_connector: Option<bool>,
     /// What each provider's weekly draw projected to at its own window's reset when this decision
     /// was made, as a percent of that provider's own allowance. None on a row written before the
-    /// projection override, on an explicit provider, and on a row whose projection could not be
-    /// computed. Rows written before router 0.5.0 instead carry a run rate difference in the
-    /// retired `claude_pace_delta`/`codex_pace_delta` columns, which are a different measurement on
-    /// a different scale; the two series must not be read as one.
+    /// projection, on an explicit provider, and on a row whose projection could not be computed.
+    /// Retired `*_pace_delta` columns are a different measurement on a different scale; do not
+    /// read the two series as one. See docs/decisions/0006-projected-draw-replaces-pace-flip-gap.md.
     pub claude_projected_draw: Option<f64>,
     pub codex_projected_draw: Option<f64>,
     pub grok_projected_draw: Option<f64>,
@@ -336,11 +335,10 @@ impl DecisionLog {
     /// so against a database whose objects all already exist it satisfies every statement without
     /// ever taking a write lock, and returns `Ok` on a database the next `record()` fails on.
     ///
-    /// A lock only probe does not prove it either, which is why this writes. Measured against a
-    /// 0o444 database file: `CREATE TABLE IF NOT EXISTS` succeeds, `BEGIN IMMEDIATE` succeeds, and
-    /// only an actual write raises "attempt to write a readonly database". So the probe creates a
-    /// throwaway table inside a transaction and rolls it back, which is a genuine write against a
-    /// database that leaves behind no table, no row, and no schema change.
+    /// A lock-only probe does not prove it either, which is why this writes. Against a 0o444
+    /// database, `CREATE TABLE IF NOT EXISTS` and `BEGIN IMMEDIATE` both succeed; only an actual
+    /// write raises "attempt to write a readonly database". The probe creates a throwaway table
+    /// inside a transaction and rolls it back.
     pub fn probe_writable(&self) -> Result<()> {
         let probe = self.conn.execute_batch(
             "BEGIN IMMEDIATE; CREATE TABLE agent_router_write_probe (id INTEGER); ROLLBACK;",

@@ -28,9 +28,9 @@ struct GrokUsageCache {
     source_ts: String,
 }
 
-/// IMPURE: one Grok capacity read, retaining whether it came from live billing, cache, log, or no
-/// usable source. A fresh cache avoids the provider calls; a stale cache remains the fallback when
-/// the calls fail.
+/// IMPURE: one Grok capacity read, retaining whether it came from live billing, cache, log, or
+/// no usable source. Order is fresh cache, live fetch, stale cache, log, closed. See
+/// docs/decisions/0008-grok-four-source-usage-provenance.md.
 pub fn grok_usage(ctx: &Context) -> GrokUsage {
     let grok_home = ctx.grok_home().to_path_buf();
     let cache = ctx.grok_usage_cache.clone();

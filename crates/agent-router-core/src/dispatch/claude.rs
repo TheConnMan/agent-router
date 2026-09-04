@@ -202,8 +202,8 @@ fn list_agents(binary: &Path, timeout: Duration) -> Result<Vec<AgentRow>> {
         .arg("--all")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    // Not `?`: that conversion is `Error::Io`, whose `Display` is the production string. A binary
-    // that resolved and then vanished before the exec is still a launch failure.
+    // Not `?`: that conversion is `Error::Io`. A binary that resolved and then vanished is still
+    // a launch failure. See docs/decisions/0005-launch-error-and-binary-resolver.md.
     let mut child = command
         .spawn()
         .map_err(|error| crate::binary::launch_error(binary, CLAUDE_BIN_ENV, error))?;

@@ -96,13 +96,10 @@ fn exact_session_id(
 ) -> Result<String> {
     spawned
         .map_err(|error| match error {
-            // The residue after resolution: the binary was there and the lifecycle's own exec then
-            // failed. `binary::launch_error` owns which io kinds that covers — ENOENT, and the
-            // `EACCES` a lost exec bit or a `noexec` mount raises, since the mode heuristic that
-            // selected the binary cannot tell whether THIS process may execute it. Formatting
-            // either into the existing string would report the production io text wearing a
-            // prefix. Every io kind it declines, and every non-io lifecycle failure, keeps the
-            // existing message byte-identically, because other tests assert on it.
+            // Post-resolution exec failure. `binary::launch_error` owns which io kinds that
+            // covers — ENOENT, and the `EACCES` a lost exec bit or a `noexec` mount raises.
+            // Declined kinds keep the existing message; tests assert on it. See
+            // docs/decisions/0005-launch-error-and-binary-resolver.md.
             agent_viewer_core::Error::Io(error) => {
                 match crate::binary::launch_error(binary, GROK_BIN_ENV, error) {
                     launch @ Error::Launch(_) => launch,
@@ -135,10 +132,9 @@ mod tests {
         Err(agent_viewer_core::Error::Io(std::io::Error::from(kind)))
     }
 
-    /// The half B10 missed: a resolved binary that lost its exec bit, or that sits on a `noexec`
-    /// mount, fails the exec with `EACCES` rather than `ENOENT`. It is the same event — the CLI
-    /// never ran — so it must reach the decision row as `Launch`, not flattened into `Command`.
-    /// The variant is the assertion: the `Command` message reads plausibly either way.
+    /// A resolved binary that lost its exec bit, or that sits on a `noexec` mount, fails the
+    /// exec with `EACCES` rather than `ENOENT`. Same event: the CLI never ran, so it must be
+    /// `Launch`, not `Command`. See docs/decisions/0005-launch-error-and-binary-resolver.md.
     #[test]
     fn a_lifecycle_permission_denied_after_resolution_is_a_launch_failure() {
         let error = dispatch_with_lifecycle(

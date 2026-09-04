@@ -9,9 +9,8 @@ use std::path::{Path, PathBuf};
 /// Weekly percent at which a provider counts as exhausted: within 2 points of the weekly limit is
 /// close enough that the provider is no longer a routing destination.
 const DEFAULT_HARD_CEILING_PCT: f64 = 98.0;
-/// Ceiling on the classifier call. Headroom over the measured worst case rather than a target:
-/// the fast path is 3.4-7.0s, so this only has to be generous enough that a slow tail falls back
-/// far less often than it did at 30s, where 6 of 18 measured calls lost the deadline.
+/// Ceiling on the classifier call. Headroom over the fast-path worst case rather than a target;
+/// 30s lost the slow tail. See docs/decisions/0001-classifier-hermeticity.md.
 const DEFAULT_CLASSIFIER_TIMEOUT_SECS: u64 = 60;
 
 /// The migration level a config file written by this build carries. A file stamped below this is

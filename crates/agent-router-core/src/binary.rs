@@ -1,24 +1,15 @@
 //! The one place a provider CLI turns into a path on disk.
 //!
-//! Every provider spawn used to name its binary as a bare string and hand it to `Command::new`,
-//! which delegates to `execvp` and therefore to whatever `$PATH` the calling process inherited.
-//! Under systemd and cron that `PATH` is `/usr/bin:/bin`, `$HOME/.local/bin` — where every
-//! provider CLI on these boxes actually installs — is absent, and the spawn died `ENOENT` before a
-//! job id or a session existed. The decision log recorded `No such file or directory (os error 2)`
-//! and the queued work behind it was lost silently.
+//! Two entry points over one search:
 //!
-//! Two entry points over one search, deliberately:
+//! - [`search_path`] answers about `$PATH` alone. `doctor`'s checks are named `*_on_path` and
+//!   its messages say `on PATH`, so it must keep asking the narrow question.
+//! - [`resolve`] / [`resolve_named`] try the per-provider env override, then `$PATH`, then a
+//!   two-entry user-local fallback list. The system half rides on the [`Environment`] rather
+//!   than on a constant, so an environment built from data has no path to a host directory.
 //!
-//! - [`search_path`] answers about `$PATH` alone. `doctor`'s checks are *named* `claude_on_path`
-//!   and its messages say `on PATH`, so it must keep asking the narrow question or start lying.
-//! - [`resolve`] / [`resolve_named`] answer the question a spawn actually has: the per-provider
-//!   env override first, then `$PATH`, then a two-entry user-local fallback list. The system half
-//!   of that list rides on the [`Environment`] rather than on a constant, so an environment built
-//!   from data has no path to a host directory at all.
-//!
-//! [`launch_error`] is the backstop for the gap the search cannot close: a binary that resolved
-//! and then vanished, or lost its exec bit, before the exec. `Error::Io`'s `Display` *is* the
-//! production string, so every provider spawn maps its io error through here instead.
+//! [`launch_error`] is the backstop for a binary that resolved and then vanished, or lost its
+//! exec bit, before the exec. See docs/decisions/0005-launch-error-and-binary-resolver.md.
 
 use crate::error::{Error, Result};
 use crate::provider::Provider;
@@ -26,9 +17,9 @@ use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
-/// Per-provider overrides. These are the contract: the fallback directory list is a convenience
-/// for the one install shape that caused the incident, and every install layout it does not cover
-/// is covered by pinning the binary here. That is why every failure message names one.
+/// Per-provider overrides. The fallback directory list is a convenience for one install shape;
+/// every other layout is covered by pinning the binary here. That is why every failure message
+/// names one. See docs/decisions/0005-launch-error-and-binary-resolver.md.
 pub const CLAUDE_BIN_ENV: &str = "AGENT_ROUTER_CLAUDE_BIN";
 pub const CODEX_BIN_ENV: &str = "AGENT_ROUTER_CODEX_BIN";
 pub const GROK_BIN_ENV: &str = "AGENT_ROUTER_GROK_BIN";
@@ -39,16 +30,14 @@ pub const GROK_BIN_ENV: &str = "AGENT_ROUTER_GROK_BIN";
 const OVERRIDE_PREFIX: &str = "AGENT_ROUTER_";
 const OVERRIDE_SUFFIX: &str = "_BIN";
 
-/// The system half of the fallback list. On systemd's built-in default `PATH` this is already
-/// present; on cron's `/usr/bin:/bin` it is not, which is the case it earns its place for.
-///
-/// It is not consulted unconditionally. [`Environment::from_process`] puts it into the environment
-/// as data, so it is searched exactly when the environment under test is the real one — see
-/// [`Environment::system_fallbacks`] for why that distinction is load-bearing.
+/// The system half of the fallback list. Present on systemd's default `PATH`, absent on cron's
+/// `/usr/bin:/bin`. [`Environment::from_process`] puts it into the environment as data, so a
+/// constructed environment never searches a host directory. See
+/// docs/decisions/0005-launch-error-and-binary-resolver.md.
 pub const SYSTEM_FALLBACK_DIR: &str = "/usr/local/bin";
 
-/// The user half of the fallback list, relative to `$HOME`. This single directory is what closes
-/// the reported defect: it is the directory a login shell adds and a service manager does not.
+/// The user half of the fallback list, relative to `$HOME`: the directory a login shell adds and
+/// a service manager does not.
 const USER_FALLBACK_SUFFIX: &str = ".local/bin";
 
 /// PURE: the override variable that pins `provider`'s binary.
@@ -248,14 +237,9 @@ fn is_exec_format_error(error: &std::io::Error) -> bool {
 
 /// PURE: an `io::Error` from a provider spawn, classified.
 ///
-/// This is the backstop for every spawn site, including any the enumeration missed. `Error::Io`'s
-/// `Display` is literally `No such file or directory (os error 2)` — the string the lost
-/// production rows recorded — so a `NotFound` reaching the log unmapped recreates the defect after
-/// a correct resolution. It also closes the TOCTOU window between resolving and exec'ing.
-///
-/// Everything that is not the binary being missing or unusable passes through unchanged: a broken
-/// pipe or a full disk is a different event, and flattening it into a launch failure would make
-/// every unrelated spawn fault read as a missing CLI.
+/// Closes the TOCTOU window between resolving and exec'ing. Everything that is not the binary
+/// being missing or unusable passes through unchanged: a broken pipe or a full disk is not a
+/// missing CLI. See docs/decisions/0005-launch-error-and-binary-resolver.md.
 pub fn launch_error(binary: &Path, override_env: &str, error: std::io::Error) -> Error {
     match error.kind() {
         std::io::ErrorKind::NotFound => Error::Launch(format!(
@@ -332,20 +316,11 @@ fn path_directories(environment: &Environment) -> Vec<PathBuf> {
 
 /// PURE: the fallback list, in order. In production it is exactly two entries.
 ///
-/// `$HOME/.local/bin` is derived from the environment's own `HOME`, because that derivation IS the
-/// fix: it is where every provider CLI here installs and the directory a service manager's `PATH`
-/// omits. The system half comes from the environment as data — `/usr/local/bin` under
-/// [`Environment::from_process`], and nothing at all under [`Environment::new`], so no constructed
-/// environment can reach a real install.
-///
-/// `/usr/bin` and `/bin` are deliberately absent. They are already on the incident `PATH`, so they
-/// contribute nothing to the failure being fixed, and the only situation they would ever fire in
-/// is a deliberately emptied `PATH` — an operator isolating a process, whose intent the resolver
-/// has no business overriding. The list is not complete against every install layout and is not
-/// trying to be; the per-provider override is the complete answer.
-///
-/// `HOME` is genuinely unset under some systemd units, and it can name something that is not a
-/// directory. Either way the user-local entry is dropped from the search *and* from the message.
+/// `$HOME/.local/bin` is derived from the environment's own `HOME`. `/usr/bin` and `/bin` are
+/// deliberately absent: they are already on a service manager's `PATH`, and adding them would
+/// override an operator who emptied `PATH` on purpose. `HOME` unset or not a directory drops
+/// the user-local entry from the search and from the message. See
+/// docs/decisions/0005-launch-error-and-binary-resolver.md.
 fn fallback_directories(environment: &Environment) -> Vec<PathBuf> {
     let mut directories = Vec::with_capacity(1 + environment.system_fallbacks().len());
     if let Some(home) = environment.home()

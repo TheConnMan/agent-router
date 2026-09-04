@@ -1,14 +1,8 @@
 //! Which build of the router wrote each decision row.
 //!
-//! On 2026-08-01 a routing quality review pooled 114 rows written by four mutually incompatible
-//! routers, read them as one population, and drew conclusions from it. Nothing in the 38 column
-//! table said which code wrote a row, so the pooling was invisible to the reader and to the tool.
-//! `router_version` is the column that makes an aggregate spanning several builds visibly mixed
-//! rather than silently pooled.
-//!
-//! These assertions go through SQL rather than the flattened read model wherever the contract under
-//! test is the shape of the table, exactly as `decision_log_pace_columns.rs` does: what a later
-//! analysis reads is the table, not the display model.
+//! `router_version` makes an aggregate spanning several builds visibly mixed rather than
+//! silently pooled. These assertions go through SQL rather than the flattened read model
+//! wherever the contract under test is the shape of the table.
 
 use agent_router_core::config::Config;
 use agent_router_core::decide::decide_explicit;

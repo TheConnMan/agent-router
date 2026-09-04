@@ -1,22 +1,14 @@
-//! Every dispatch path, driven off a stripped `Environment`, must report a NAMED launch failure.
-//!
-//! The whole defect this file guards is that a provider CLI resolved through `execvp` against
-//! whatever `PATH` the calling process inherited. Under systemd and cron that is `/usr/bin:/bin`,
-//! the spawn died `ENOENT`, and the decision log recorded `error: No such file or directory (os
-//! error 2)` with no job id and no session — silent loss with a useless diagnosis.
+//! Every dispatch path, driven off a stripped `Environment`, must report a named launch failure.
+//! See docs/decisions/0005-launch-error-and-binary-resolver.md.
 //!
 //! Two rules govern every case here, and both are load-bearing.
 //!
 //! **Each case drives the production `_in(&Environment, …)` seam, never `*_with_binary` alone.**
-//! A test that injects a binary path proves the argv is right and proves NOTHING about whether
-//! production resolves: someone could leave `Path::new("claude")` at the top of `dispatch` and a
-//! `dispatch_with_binary` test would stay green. The `_in` seam runs the real `resolve` on the
-//! real code path, which is what makes these regression tests rather than fixtures.
+//! A test that injects a binary path proves the argv is right and proves nothing about whether
+//! production resolves.
 //!
-//! **Each case matches on the `Error::Launch` VARIANT, not on a message substring.** The message
-//! is the easy half. `dispatch/codex.rs` maps its daemon failure into `Error::Command` and
-//! `runtime.rs`'s `spawn_detached` yields `Error::Io`, so a correctly-worded failure of the wrong
-//! variant is invisible to a substring test and is exactly the shape AC4 exists to catch.
+//! **Each case matches on the `Error::Launch` VARIANT, not on a message substring.** A
+//! correctly-worded failure of the wrong variant is invisible to a substring test.
 //!
 //! **No fixture here can reach a host binary, and that is structural.** These cases DISPATCH: an
 //! environment that resolved a real provider CLI would not merely fail an assertion, it would
@@ -209,10 +201,9 @@ fn a_grok_dispatch_off_a_stripped_path_reports_a_launch_failure() {
     assert_named_launch_failure("grok dispatch", error, "grok", GROK_BIN_ENV);
 }
 
-/// The residue B10 covers: the binary resolved and the lifecycle's own exec then failed ENOENT.
-/// That is a genuine TOCTOU event and must still be a named `Launch`, not
-/// `Grok lifecycle spawn failed: No such file or directory (os error 2)` — the production string
-/// wearing a prefix.
+/// The binary resolved and the lifecycle's own exec then failed ENOENT. That is a genuine
+/// TOCTOU event and must still be a named `Launch`. See
+/// docs/decisions/0005-launch-error-and-binary-resolver.md.
 #[test]
 fn a_grok_lifecycle_enoent_after_resolution_is_still_a_launch_failure() {
     let error = dispatch_with_lifecycle(
@@ -231,8 +222,7 @@ fn a_grok_lifecycle_enoent_after_resolution_is_still_a_launch_failure() {
     assert_named_launch_failure("grok lifecycle enoent", error, "grok", GROK_BIN_ENV);
 }
 
-/// The other half of B10, and the reason it is a `NotFound` inspection rather than a blanket
-/// rewrite: a lifecycle failure that is NOT about a missing binary must keep its existing
+/// A lifecycle failure that is not about a missing binary must keep its existing
 /// `Grok lifecycle spawn failed: …` text byte-identically, because other tests assert on it.
 #[test]
 fn a_grok_lifecycle_failure_that_is_not_a_missing_binary_keeps_its_existing_message() {

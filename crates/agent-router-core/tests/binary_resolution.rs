@@ -117,12 +117,9 @@ fn a_bare_name_override_is_searched_rather_than_used_verbatim() {
     );
 }
 
-/// Plan test #6, and edge case E1. An override naming a path that does not exist, or one that
-/// exists and is not executable, must FAIL rather than fall through to `PATH`.
-///
-/// An operator who pinned a binary has stated an intention. Silently routing around a typo runs
-/// the job on a different binary than the one that was named, which is a worse defect than the
-/// ENOENT this ticket fixes, and it is invisible in the log.
+/// An override naming a path that does not exist, or one that exists and is not executable,
+/// must fail rather than fall through to `PATH`. See
+/// docs/decisions/0005-launch-error-and-binary-resolver.md.
 #[test]
 fn an_override_naming_a_missing_or_unexecutable_file_fails_rather_than_falling_through_to_path() {
     let root = tempfile::tempdir().expect("tempdir");

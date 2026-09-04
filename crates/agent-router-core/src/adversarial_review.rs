@@ -738,9 +738,9 @@ fn run_review(mut command: Command, binary: &Path, provider: Provider) -> Result
         stderr,
     } = command
         .output()
-        // The binary resolved, so a NotFound here means it vanished or lost its exec bit in the
-        // window before the exec. `Error::Io`'s Display is the production `os error 2` string, so
-        // it must not reach the log unmapped.
+        // The binary resolved, so a NotFound here means it vanished or lost its exec bit before
+        // the exec. Map through `launch_error` so it does not reach the log as `Error::Io`. See
+        // docs/decisions/0005-launch-error-and-binary-resolver.md.
         .map_err(|error| binary::launch_error(binary, override_env, error))?;
     if !status.success() {
         let detail = String::from_utf8_lossy(&stderr).trim().to_string();

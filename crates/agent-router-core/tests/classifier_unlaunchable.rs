@@ -1,11 +1,6 @@
-//! The classifier's new discrimination: a CLI the router could not LAUNCH, against a CLI that ran
-//! and answered badly.
-//!
-//! The incident string was `claude requested explicitly: classifier failed (could not run codex:
-//! ...), defaulting to codex` — a job that ran on Claude, claiming it defaulted to the Codex that
-//! had just failed to execute. Two separate defects: the rationale claimed a destination it did
-//! not choose, and nothing recorded WHICH provider could not be launched, so routing had no signal
-//! to act on.
+//! The classifier's discrimination: a CLI the router could not LAUNCH, against a CLI that ran
+//! and answered badly. A fallback names no destination; only a launch failure sets
+//! `unlaunchable`. See docs/decisions/0005-launch-error-and-binary-resolver.md.
 //!
 //! Every case drives `classify` / `job_name` with an explicit `Context`. No
 //! process-environment mutation and no user-namespace isolation: see `binary_resolution.rs`.
@@ -272,11 +267,8 @@ fn an_answer_without_unlaunchable_still_parses_and_round_trips() {
 
 // ------------------------------------------------------------------ #13: no invented destination
 
-/// Plan test #13, replacing the `defaulting to claude` assertion the fallback's own unit test
-/// carried. A fallback chooses nothing, so it must claim nothing.
-///
-/// The production string this replaces was the visible half of the incident: the router printed a
-/// destination that contradicted where the job actually ran.
+/// A fallback chooses nothing, so it must claim nothing. See
+/// docs/decisions/0007-claude-capability-only.md.
 #[test]
 fn the_fallback_claims_no_destination_and_still_says_why() {
     let got = Classification::fallback("timed out after 30s");

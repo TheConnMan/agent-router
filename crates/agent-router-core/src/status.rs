@@ -1,11 +1,9 @@
 //! Reconcile logged decisions against the backends that ran them: what the router dispatched
 //! against what actually happened to it.
 //!
-//! The split here is the whole design. The IMPURE layer asks the backends and produces an
-//! `Observation`, the PURE `classify` turns one observation into a `State`, and the PURE `settle`
-//! decides whether that state may be written over what the row already holds. Nothing that talks to
-//! a process, a socket, or a disk sits inside either pure function, so the mapping table and the
-//! monotonicity rule are both testable with no backend at all.
+//! The IMPURE layer asks the backends and produces an `Observation`, the PURE `classify` turns
+//! one observation into a `State`, and the PURE `settle` decides whether that state may be
+//! written over what the row already holds. See docs/decisions/0009-reconcile-monotonicity.md.
 
 use crate::context::Context;
 use crate::error::Result;
@@ -30,7 +28,8 @@ pub enum Observation {
     /// The job is not in the claude list. The list is a bounded recent window, so this is not
     /// completion.
     Absent,
-    /// The status of the routed turn, which is turn 0 of the codex thread.
+    /// The status of the routed turn, which is turn 0 of the codex thread. Index 0 by design
+    /// and never the last turn. See docs/decisions/0009-reconcile-monotonicity.md.
     CodexTurn(String),
     /// The thread's own status, read only when the thread carries no turn record at all.
     CodexThread(String),
@@ -121,13 +120,8 @@ pub struct Report {
 
 impl Report {
     /// PURE: whether any job in the window is known to have failed, read from what the log holds
-    /// rather than from the fresh reading alone. An unknown never counts: an absence of information
-    /// is not a finding.
-    ///
-    /// The two are not the same question. A job proven failed ages out of its backend's window and
-    /// reads `Unknown` on the next run, `settle` keeps the stored `failed`, and a verdict taken
-    /// from the fresh reading would then report a clean window over a database that records a
-    /// failure. Reading the settled value is what keeps the two from ever disagreeing.
+    /// rather than from the fresh reading alone. An unknown never counts. See
+    /// docs/decisions/0009-reconcile-monotonicity.md.
     pub fn failed(&self) -> bool {
         self.rows
             .iter()
@@ -182,15 +176,10 @@ pub fn classify(observation: Observation) -> State {
 
 /// PURE: the state to write over `current`, or None to leave the row alone.
 ///
-/// A job can reconcile to `completed` today, age out of the bounded claude window tomorrow, and be
-/// read as absent by the next run. Writing `unknown` then would be a permanent retroactive loss of
-/// a fact the router had already proven, so `unknown` writes over a whitelist of exactly three
-/// values and every other outcome, including one a later version of this router invents, is kept.
-///
-/// Two arms look like bugs and are not. Writing `unknown` over `unknown` is intentional: it
-/// refreshes `reconciled_at_ms`, which means the time of the last reading that landed. And
-/// `completed` moving to `running` is permitted because a live backend saying the job is running
-/// now is fresh evidence, which beats stored history.
+/// `unknown` writes over a whitelist of exactly three values (`dispatched`, `running`,
+/// `unknown`); every other stored outcome is kept. Writing `unknown` over `unknown` refreshes
+/// `reconciled_at_ms`. `completed` → `running` is permitted: a live backend is fresh evidence.
+/// See docs/decisions/0009-reconcile-monotonicity.md.
 pub fn settle(current: &str, observed: State) -> Option<State> {
     match observed {
         State::Unknown => match current {
@@ -271,10 +260,9 @@ pub fn reconcile(ctx: &Context, log: &DecisionLog, window: Window) -> Result<Rep
             }),
             _ => None,
         };
-        // A provider the reconciler cannot ask about is never offered to `settle`, so its row is
-        // left exactly as it stands. `Unsupported` classifies `Unknown`, which `settle` would write
-        // over `dispatched`, and that trades a true fact about the row for a less informative one
-        // on every run and for good, on behalf of a reading that never happened.
+        // A provider the reconciler cannot ask about is never offered to `settle`.
+        // `Unsupported` classifies `Unknown`, which would overwrite `dispatched`. See
+        // docs/decisions/0009-reconcile-monotonicity.md.
         let written = match observation {
             Observation::Unsupported => None,
             _ => settle(&row.outcome, classify(observation.clone())),
@@ -359,12 +347,11 @@ fn list_claude_transcripts(projects_dir: &std::path::Path) -> Option<Vec<String>
     Some(names)
 }
 
-/// PURE: whether a claude session left a transcript on disk, which answers whether there is
-/// anything to go read about a job the router cannot otherwise resolve.
+/// PURE: whether a claude session left a transcript on disk.
 ///
 /// The hyphen anchors the match to the end of a session UUID's first segment, so a short id that
-/// is a prefix of another cannot match it. The transcript is never opened, because a finished job
-/// and a running one end their files the same way, so existence is the entire signal.
+/// is a prefix of another cannot match it. The transcript is never opened: existence is the
+/// entire signal. See docs/decisions/0009-reconcile-monotonicity.md.
 fn transcript_exists(names: &[String], short_id: &str) -> bool {
     let prefix = format!("{short_id}-");
     names

@@ -68,12 +68,8 @@ impl TaskContextHorizon {
 ///
 /// Four scored fields and no verdict. The provider is decided by capability and usage alone;
 /// complexity chooses the model, while the context horizon is logged only for later analysis.
-/// Measured over the 108 recorded decisions, the retired `claude_signals >= 2` pin fired 45 times
-/// and every one of those rows already carried a claude verdict, so it decided nothing.
-///
-/// Neither pin carries a serde default, deliberately. An answer in the retired fourteen field
-/// shape must fail the parse rather than read as "no orchestration": a defaulted pin would route
-/// silently on a field the model never scored.
+/// Neither pin carries a serde default: an answer in a retired field shape must fail the parse
+/// rather than read as "no orchestration". See docs/decisions/0007-claude-capability-only.md.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Classification {
     /// Several agents must exchange findings with each other partway through the run. The one
@@ -110,15 +106,9 @@ pub struct Classification {
 
 /// PURE: does this task dispatch the `/implement` skill?
 ///
-/// The invocation must be in the DISPATCHER POSITION: the first line of the task that is neither
-/// blank nor the `BACKGROUND_RUN=1` marker. Both orderings of that marker occur in the recorded
-/// dispatches, so it is skipped rather than assumed to trail.
-///
-/// Position is what separates a dispatch from a mention. Scanning every line instead matched a
-/// kickoff task that merely LISTED the `/implement` commands it wanted issued for a ticket set,
-/// which is orchestration rather than an implement run, and pinning it here would bypass the usage
-/// rules for a job that never needed the window. Measured over the 283 recorded dispatches,
-/// position costs nothing: it keeps all 47 real runs and drops exactly that one.
+/// The invocation must be in the dispatcher position: the first line that is neither blank nor
+/// `BACKGROUND_RUN=1`. Scanning every line would treat a mention as a dispatch. See
+/// docs/decisions/0003-implement-context-window.md.
 pub fn invokes_implement(task: &str) -> bool {
     task.lines()
         .map(str::trim)
@@ -129,18 +119,9 @@ pub fn invokes_implement(task: &str) -> bool {
 
 impl Classification {
     /// The classification used when the classifier could not answer. It pins nothing, so ordinary
-    /// capacity routing still decides where the task goes.
-    ///
-    /// The rationale names no destination, deliberately. It used to compose
-    /// `classifier failed ({why}), defaulting to {provider}` off `default_provider`, a setting
-    /// routing stopped consulting long ago, and the observed production line was
-    /// `claude requested explicitly: classifier failed (could not run codex: ...), defaulting to
-    /// codex` — a job that ran on Claude, claiming it defaulted to the Codex that had just failed
-    /// to execute. Nothing is lost by dropping the clause: every composed rationale already names
-    /// the provider actually chosen, first.
-    ///
-    /// `unlaunchable` is left `None` here. A bare fallback knows only that no answer arrived; only
-    /// the launch path has the evidence to say a CLI never started.
+    /// capacity routing still decides where the task goes. The rationale names no destination;
+    /// `unlaunchable` stays `None` because a bare fallback has no launch evidence. See
+    /// docs/decisions/0007-claude-capability-only.md.
     pub fn fallback(why: &str) -> Classification {
         Classification {
             orchestration: false,
@@ -290,31 +271,13 @@ pub fn classifier_command_with_binary(
     }
 }
 
-/// PURE builder: the claude classifier invocation. Two separate costs are stripped here: the
-/// CLI's own startup, and the model's thinking tokens. Either one alone loses the deadline.
+/// PURE builder: the claude classifier invocation. Strips CLI startup and thinking tokens so
+/// scoring stays under the deadline and does not load project customizations.
 ///
-/// Measured on this box 2026-07-30: plain `claude -p --model haiku --output-format json` spent
-/// ~14s before it even issued the API request (hooks, plugin sync, auto-memory, CLAUDE.md
-/// discovery) and took 29-38s wall, so it lost a 30s deadline about half the time.
-/// `CLAUDE_SUBPROCESS=1` plus `--safe-mode` (all customizations off: CLAUDE.md, skills, plugins,
-/// hooks, MCP servers, commands, agents) took time-to-request to ~27ms. `--bare` would do the same
-/// but is unusable here: it never reads OAuth or the keychain, so it answers "Not logged in". This
-/// is the same posture the compound-learning hooks use for their own haiku calls.
-///
-/// `MAX_THINKING_TOKENS=0` is the larger win and was found later. With startup already at ~30ms,
-/// wall time is entirely API time, and API time is close to linear in OUTPUT tokens at ~90 tok/s.
-/// Scoring emits one ~100-token JSON object, but haiku was generating 1104-4154 tokens per call
-/// because extended thinking is on by default, and every one of those tokens is discarded before
-/// `parse_classification` ever sees the object. Re-measured 2026-08-01 over the nine tasks that had
-/// actually timed out in the decision log, two runs each: 12.5-48.6s (mean 26.7s, 6 of 18 past 30s)
-/// with thinking on, against 3.4-7.0s (mean 4.5s, 0 of 18 past 30s) and 97-127 output tokens with
-/// it off. Codex on the same nine was 6.3-12.4s, so the fast claude path beats it by about half.
-///
-/// Input is ~22k tokens regardless (Claude Code's own system prompt, cached); that is not the
-/// lever, and no prompt-shortening here would have mattered.
-///
-/// `--safe-mode` also makes the scoring hermetic, which matters independently of speed: the
-/// verdict must not shift because a project's CLAUDE.md or a skill happened to load.
+/// `--bare` would also skip customizations but answers "Not logged in". `--safe-mode` plus
+/// `CLAUDE_SUBPROCESS=1` is the logged-in equivalent. `MAX_THINKING_TOKENS=0` is required
+/// because haiku otherwise emits discarded thinking tokens. See
+/// docs/decisions/0001-classifier-hermeticity.md.
 pub fn claude_classifier_command_with_binary(
     binary: &std::path::Path,
     prompt: &str,
@@ -336,13 +299,9 @@ pub fn claude_classifier_command_with_binary(
 }
 
 /// The capabilities the classifier is stripped of. Scoring reads a prompt and answers with one
-/// JSON object, so it needs no tool at all, and a tool left in the set is both prompt tokens and
-/// something an injected task could reach for: the read-only sandbox stops writes but not reads,
-/// and the call runs from home. Dropping the shell is what makes "the classifier cannot read your
-/// files" true by construction rather than by the model's good behaviour.
-///
-/// Measured on this box 2026-07-30: 15.2k prompt tokens and 2.5s against 18.3k and 6.7s with the
-/// full tool set.
+/// JSON object, so it needs no tool: a tool left in the set is prompt tokens and something an
+/// injected task could reach. The read-only sandbox stops writes but not reads, and the call
+/// runs from home. See docs/decisions/0001-classifier-hermeticity.md.
 const DISABLED_FEATURES: [&str; 6] = [
     "shell_tool",
     "browser_use",
@@ -352,24 +311,13 @@ const DISABLED_FEATURES: [&str; 6] = [
     "skill_search",
 ];
 
-/// PURE builder: the codex classifier invocation. Same posture as the claude one, expressed in
-/// codex's own flags: every customization off, so the score depends on the rubric and the task
-/// and on nothing else this box happens to have configured.
-///
-/// Measured on this box 2026-07-30, scoring the fixed prompt from home: 4-8s wall against
-/// claude haiku's 12-16s, so it clears the same 30s deadline with room to spare.
-/// `--ignore-user-config` is the load-bearing one (it drops `~/.codex/config.toml` and with it
-/// every MCP server, which was ~3.7k of prompt and most of the wall time); `--ignore-rules` drops
-/// execpolicy, `-c project_doc_max_bytes=0` suppresses AGENTS.md discovery, and
-/// `--skip-git-repo-check` is required because home is not a repository. The sandbox is read-only:
-/// scoring reads a prompt and answers, and must never be able to touch the box.
-///
-/// Deliberately NOT `--ephemeral`, though it would suit a throwaway call: `codex_headroom` reads
-/// the newest rollout carrying a `rate_limits` event, and an ephemeral run writes no rollout. On
-/// this engine the classifier fires on every auto-routed task, so suppressing those rollouts would
-/// let scoring burn codex quota while the router kept deciding against the last dispatched job's
-/// percentage, and a codex at its ceiling would keep reading as having headroom. Persisting the
-/// rollout costs a session file per task and keeps the routing input honest.
+/// PURE builder: the codex classifier invocation. Every customization off, so the score depends
+/// on the rubric and the task. `--ignore-user-config` drops `~/.codex/config.toml`;
+/// `--ignore-rules` drops execpolicy; `-c project_doc_max_bytes=0` suppresses AGENTS.md;
+/// `--skip-git-repo-check` is required because home is not a repository. The sandbox is
+/// read-only. Deliberately not `--ephemeral`: `codex_headroom` reads the newest rollout. See
+/// docs/decisions/0001-classifier-hermeticity.md and
+/// docs/decisions/0002-codex-classifier-non-ephemeral.md.
 pub fn codex_classifier_command_with_binary(
     binary: &std::path::Path,
     prompt: &str,
@@ -408,29 +356,10 @@ const JOB_NAME_INSTRUCTION: &str = "create a concise human-readable session titl
 
 /// PURE: the classifier prompt. Four scored fields, each judged on its own evidence; the
 /// connector inventory is the config's, because `missing_connector` is scored against exactly
-/// that list.
-///
-/// Most of the wording here is a brake rather than a rubric, and the reason is measured. Under the
-/// retired twelve criterion rubric the orchestration signal NEVER fired below four total signals
-/// lit, across all 108 recorded decisions: the model was halo scoring the whole array off an
-/// overall impression of difficulty rather than judging each criterion, so orchestration read as
-/// "this task feels hard" instead of "these agents must talk to each other". That was harmless
-/// while it was one of twelve signals feeding a verdict. It is not harmless now that orchestration
-/// is the ONLY route to Claude, so the halo has to be attacked directly: the prompt names the
-/// specific things orchestration must not be inferred from, and says the test out loud twice.
-///
-/// The degenerate input paragraph is the second measured failure. An empty prompt, a greeting, or
-/// an unintelligible fragment gives the model nothing to score, and under the old rubric those
-/// answered claude, because "I cannot tell what this is" reads as "requirements still being
-/// discovered". Unscoreable input has to land on the default provider, not on the pin.
-///
-/// The missing_connector anti-halo is the third. Measured 2026-08-21 over 282 automatic routes,
-/// every likely-incorrect destination was this boolean: false positives treated Claude skills,
-/// local SQLite, local files, gh, and later-named systems as missing connectors, and false
-/// negatives left Granola transcripts and a Slack URL on Codex. The inventory sentence was
-/// already in the prompt and was not enough, including a recorded rationale that Airtable was
-/// "not in inventory" while it was listed. Orchestration already names the things it must not
-/// be inferred from; missing_connector now does the same.
+/// that list. Most of the wording is a brake against halo scoring: orchestration is the only
+/// automatic route to Claude, so the prompt names what must not be inferred from difficulty,
+/// and the same for `missing_connector`. Unscoreable input must not pin. See
+/// docs/decisions/0007-claude-capability-only.md.
 pub fn classifier_prompt(task: &str, connectors: &[String]) -> String {
     let inventory = connectors.join(", ");
     format!(
@@ -596,14 +525,9 @@ fn parse_classifier_value(text: &str) -> Option<serde_json::Value> {
 
 /// Why the classifier produced no answer, split by whether its CLI ever started.
 ///
-/// The split is the whole routing signal. A CLI that ran and timed out says nothing about the
-/// provider's health; a CLI that never started says the provider cannot take work on this box at
-/// all. Flattening both to one string is what left `decide` with nothing to act on while 13
-/// dispatches were lost to a `PATH` that did not carry the binary.
-///
-/// It is a sentence first and a kind second — the sentence is what reaches the fallback's
-/// rationale and the decision log — so it derefs to that sentence and every caller reads it as the
-/// `String` this used to be.
+/// A CLI that ran and timed out says nothing about the provider's health; a CLI that never
+/// started says the provider cannot take work on this box. Flattening both to one string left
+/// `decide` with nothing to act on. See docs/decisions/0005-launch-error-and-binary-resolver.md.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ClassifierFailure {
     /// The CLI was never launched: it resolved nowhere, or the exec itself failed.
@@ -629,37 +553,12 @@ impl ClassifierFailure {
     }
 }
 
-/// IMPURE: run `cmd` to completion within `timeout`, returning stdout. The failure is a
-/// sentence naming what went wrong, since it lands in the fallback's rationale and in the
-/// decision log. `engine` names the CLI in those messages, so a fallback says which classifier
-/// failed rather than always blaming claude.
+/// PURE: the classifier spawn's io error, classified.
 ///
-/// Every `Ran` message below is byte-identical to the one it carried before the failure kind was
-/// split out: the rationales are recorded, and the tests that pin them are pinning production
-/// strings.
-///
-/// The spawn failure is the exception, and deliberately. Its `{e}` rendered as `No such file or
-/// directory (os error 2)` — the production string from the incident, stored verbatim into the
-/// classification rationale after a *correct* resolution. It goes through
-/// [`crate::binary::launch_error`] instead, which names the resolved binary and the override that
-/// would pin a working one; an io kind that mapper declines still renders its own text, because
-/// a full disk during a fork is not a missing CLI.
-/// PURE: the classifier respawn's io error, classified.
-///
-/// The spawn is a second chance to lose the diagnosis: resolution already produced an absolute
-/// path, and if the binary is unlinked or loses its exec bit before the fork, this is where the
-/// bare `No such file or directory (os error 2)` used to enter the classification rationale and
-/// the decision log. `binary::launch_error` owns which io kinds are launch faults, so the two
-/// spawn sites cannot drift.
-///
-/// The returned VARIANT is the load-bearing half, not just its text. `Error::Launch` means the
-/// binary is missing or unusable; every other kind is an unrelated spawn fault after a correct
-/// resolution — `EMFILE`, a fork that lost to memory pressure, a broken pipe — and those are
-/// transient. Reporting one as `Launch` would set `Classification::unlaunchable`, which `decide`
-/// reads as a conjunct of eligibility, so a healthy provider would be excluded from automatic
-/// routing by a fault that says nothing about its CLI. `Ran` still marks the classifier failed and
-/// still falls back; it just leaves routing eligibility alone. This mirrors the variant match
-/// every other post-resolution spawn site already does (`dispatch/grok.rs`, `dispatch/codex.rs`).
+/// Post-resolution spawn failures go through [`crate::binary::launch_error`]. `Error::Launch`
+/// means the binary is missing or unusable and sets `Classification::unlaunchable`; every other
+/// kind (`EMFILE`, memory pressure, broken pipe) is `Ran` so a healthy provider is not excluded
+/// from routing. See docs/decisions/0005-launch-error-and-binary-resolver.md.
 fn spawn_failure(
     program: &std::path::Path,
     engine: ClassifierEngine,
@@ -670,8 +569,7 @@ fn spawn_failure(
         crate::binary::override_env(engine_provider(engine)),
         error,
     );
-    // Composed once: the sentence is byte-identical in both arms, because it is a recorded
-    // production string and the tests that pin it are pinning that string.
+    // Composed once so both arms stay byte-identical; tests pin this sentence.
     let why = format!("could not run {}: {diagnosis}", engine.name());
     match diagnosis {
         crate::error::Error::Launch(_) => ClassifierFailure::Launch(why),
@@ -681,6 +579,10 @@ fn spawn_failure(
     }
 }
 
+/// IMPURE: run `cmd` to completion within `timeout`, returning stdout. The failure is a
+/// sentence naming what went wrong, since it lands in the fallback's rationale and in the
+/// decision log. `engine` names the CLI in those messages, so a fallback says which classifier
+/// failed rather than always blaming claude.
 fn capture(
     mut cmd: Command,
     engine: ClassifierEngine,
@@ -922,14 +824,8 @@ mod tests {
     }
 
     /// A failure is not a capability pin: it scores no orchestration and no missing connector, so
-    /// ordinary capacity routing still applies to it.
-    ///
-    /// The destination assertion here is INVERTED rather than deleted, and it is the guard against
-    /// the reported defect re-landing. The rationale used to compose
-    /// `classifier failed ({why}), defaulting to {provider}`, and the observed production line was
-    /// `claude requested explicitly: classifier failed (could not run codex: ...), defaulting to
-    /// codex` — a job that ran on Claude, claiming it defaulted to the Codex that had just failed
-    /// to execute. A fallback picks no provider, so it must name none.
+    /// ordinary capacity routing still applies. A fallback picks no provider, so it must name
+    /// none. See docs/decisions/0007-claude-capability-only.md.
     #[test]
     fn the_fallback_pins_nothing_claims_no_destination_and_says_why() {
         let got = Classification::fallback("timed out after 30s");
@@ -981,8 +877,8 @@ mod tests {
         );
     }
 
-    /// The prompt is the whole classifier, so the instructions that are there for a measured
-    /// reason are pinned rather than left to survive the next edit by luck.
+    /// The prompt is the whole classifier; the anti-halo wording is load-bearing. See
+    /// docs/decisions/0007-claude-capability-only.md.
     #[test]
     fn the_prompt_carries_the_rubric_and_the_configured_inventory() {
         let prompt = classifier_prompt(
@@ -993,9 +889,8 @@ mod tests {
         assert!(prompt.contains(
             "several agents must exchange findings with each other partway through the run"
         ));
-        // The anti-halo instructions. Under the old rubric the orchestration signal never once
-        // fired below four signals lit, which is the model scoring an impression of difficulty
-        // rather than this criterion, so each thing it must NOT be inferred from is named.
+        // Anti-halo: orchestration must not be inferred from difficulty. See
+        // docs/decisions/0007-claude-capability-only.md.
         assert!(prompt.contains("Judge it independently"));
         assert!(prompt.contains(
             "orchestration is never inferred from how difficult the task is, how large its scope \
@@ -1004,7 +899,7 @@ mod tests {
         ));
         assert!(prompt.contains("One agent working alone is not orchestration"));
         assert!(prompt.contains("When in any doubt, answer false."));
-        // Degenerate input has nothing to score, and nothing to score used to read as claude.
+        // Unscoreable input must not pin to Claude.
         assert!(prompt.contains(
             "an empty task, a greeting, a single word, or a fragment nobody could act on"
         ));
@@ -1014,9 +909,7 @@ mod tests {
             "Set missing_connector true ONLY when the task must now reach a named system absent \
              from that list"
         ));
-        // Anti-halo for missing_connector. Measured 2026-08-21: every likely-incorrect auto
-        // route was this boolean, both false positives (skills, local sqlite, gh) and false
-        // negatives (Granola, Slack). The inventory sentence alone did not hold.
+        // Anti-halo for missing_connector. See docs/decisions/0007-claude-capability-only.md.
         assert!(prompt.contains("Judge it independently"));
         assert!(prompt.contains("A Claude Code skill is not a connector"));
         assert!(prompt.contains(
@@ -1215,9 +1108,8 @@ mod tests {
         // treating this as a fresh interactive session.
         assert_eq!(env_of(&cmd, "CLAUDE_SUBPROCESS").as_deref(), Some("1"));
 
-        // Thinking tokens dominate the call: they are 10x the answer and are thrown away. Losing
-        // this var takes the mean from ~4.5s back to ~27s and past the deadline on a third of
-        // tasks, silently, because the call still succeeds when it fits.
+        // Thinking tokens dominate the call and are thrown away. See
+        // docs/decisions/0001-classifier-hermeticity.md.
         assert_eq!(env_of(&cmd, "MAX_THINKING_TOKENS").as_deref(), Some("0"));
     }
 
@@ -1255,8 +1147,8 @@ mod tests {
             assert_eq!(args[at - 1], "--disable");
         }
 
-        // `--ephemeral` would suppress the rollout that `codex_headroom` reads, so scoring would
-        // spend codex quota invisibly and the router would keep deciding on a stale percentage.
+        // `--ephemeral` would suppress the rollout that `codex_headroom` reads. See
+        // docs/decisions/0002-codex-classifier-non-ephemeral.md.
         assert!(
             !args.contains(&"--ephemeral".to_string()),
             "the classifier rollout is what keeps the codex usage reading fresh"
@@ -1425,11 +1317,8 @@ mod tests {
         assert!(err.why().contains("codex"), "got {err:?}");
     }
 
-    /// The classifier's own residue after a correct resolution: the binary is unlinked between
-    /// `binary::resolve` and the fork. This used to store `No such file or directory (os error 2)`
-    /// — the incident string, verbatim — into the classification rationale and from there into the
-    /// decision row. The variant assertions are the guard: `Launch` plus an `unlaunchable`
-    /// provider is what the row's `error: launch failed:` prefix and the headroom accounting read.
+    /// Post-resolution ENOENT is `Launch` plus `unlaunchable`, not a raw io string. See
+    /// docs/decisions/0005-launch-error-and-binary-resolver.md.
     #[test]
     fn a_classifier_that_vanishes_between_resolution_and_spawn_is_a_named_launch_failure() {
         let missing = Path::new("/nonexistent/agent-router-classifier");

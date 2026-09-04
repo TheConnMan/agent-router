@@ -1,5 +1,7 @@
 //! The decision engine: capability pins select Claude; ordinary work selects the eligible Codex or
 //! Grok provider with the lower projected weekly draw. Pure given its inputs.
+//! See docs/decisions/0006-projected-draw-replaces-pace-flip-gap.md and
+//! docs/decisions/0007-claude-capability-only.md.
 
 use crate::classify::{Classification, Complexity};
 use crate::config::Config;
@@ -45,11 +47,9 @@ pub enum Gate {
     /// `over_ceiling` alongside a weekly reading of 14 percent tells a reviewer the opposite of
     /// what happened.
     OverCeiling,
-    /// At least one provider's weekly window was never read, so its percentage is a default rather
-    /// than a reading. Such a provider is ineligible: an unread window reports 0 percent used, and
-    /// treating that as headroom routes work into a provider that may be out of budget, which is
-    /// what an exhausted Codex looked like before this gate existed. Recorded whenever eligibility
-    /// was decided against a missing number, whether or not it changed the destination.
+    /// At least one provider's weekly window was never read, so its percentage is a default
+    /// rather than a reading. Such a provider is ineligible. See
+    /// docs/decisions/0004-fail-closed-weekly-unknown.md.
     WeeklyUnknown,
     /// Grok is excluded from automatic routing because its official weekly telemetry is unknown.
     GrokUnavailable,
@@ -145,27 +145,12 @@ impl Decision {
 
 /// PURE: is this a `/implement` run whose working set does not fit Codex's context window?
 ///
-/// A capability pin, in the same sense as `orchestration`: the task is not cheaper on Codex, it is
-/// failed there. Codex's window is 258,400 tokens. Measured 2026-08-11 across 37 Claude and 13
-/// Codex `/implement` runs, the median Claude run peaks at 262,017 tokens of resident context and
-/// 51 percent of runs peak above the whole Codex window, so a build-tier run routed to Codex
-/// compacts by construction. All four of the heaviest recorded Codex runs compacted 2 to 5 times;
-/// one ground for four days across 222M input tokens, and another stalled unfinished at 100M.
-///
-/// Two conditions, both required.
-///
-/// The task must actually dispatch `/implement`, read from the text rather than scored, because
-/// this is a fact about the destination rather than a judgement about the work.
-///
-/// And it must be the build-tier shape, for which `complexity` is the available proxy: `high` and
-/// `ultra` are "spans several files" and "architecture or design judgement", which is what triage
-/// routes to `build`. Every one of the four heavy runs scored `high` or `ultra`; the runs that
-/// finished cleanly on Codex scored `medium` or `low`. An unscored task reads as `high` by
-/// `Complexity`'s default, so a classifier failure on an implement run pins rather than gambles.
-///
-/// `low` and `medium` implement runs stay on automatic routing. Those are the `direct` and `quick`
-/// tiers, they fit the window comfortably, and pinning them would hand Codex's whole share of this
-/// workload back to Claude for no measured gain.
+/// A capability pin, in the same sense as `orchestration`: the task is not cheaper on Codex, it
+/// is failed there. Codex's window is 258,400 tokens. Both conditions are required: the task
+/// must dispatch `/implement` (read from the text), and complexity must be `high` or `ultra`
+/// (the build-tier proxy). An unscored task reads as `high`, so a classifier failure pins rather
+/// than gambles. `low` and `medium` stay on automatic routing. See
+/// docs/decisions/0003-implement-context-window.md.
 fn implement_exceeds_codex_window(classification: &Classification) -> bool {
     classification.invokes_implement
         && matches!(
@@ -249,22 +234,11 @@ pub fn decide(
             gates.push(Gate::CapabilityBlocked);
         }
     } else if !capability_pin {
-        // Fail closed on a weekly number nobody read. The percentage of an unread window is 0,
-        // which is the same reading as a genuinely idle provider, so trusting it hands every job
-        // to whichever provider failed to report.
-        //
-        // Closing here rather than in the reader keeps the reader's fail open contract intact. It
-        // also cannot block a dispatch: both providers unknown fall through to `over_ceiling`.
-        //
-        // A provider whose CLI could not be launched is ineligible in exactly the same sense. It
-        // is an eligibility input rather than a re-route instruction, deliberately: Claude is a
-        // capability destination only, and moving work there for a launch failure would invent an
-        // automatic destination this policy does not have. When that leaves nothing eligible the
-        // task stays put and fails loudly at dispatch with a named launch error, which is the
-        // diagnosable outcome the incident lacked.
-        //
-        // Capability and capacity are split so the gates can name which one emptied the field.
-        // They are one predicate for routing and two for the log.
+        // Fail closed on a weekly number nobody read: an unread window reports 0 percent, the
+        // same as idle. Closing here keeps the reader's fail-open contract intact; both
+        // unknown fall through to `over_ceiling`. A launch failure is ineligible the same way
+        // and is not a pin to Claude. See docs/decisions/0004-fail-closed-weekly-unknown.md
+        // and docs/decisions/0007-claude-capability-only.md.
         let capability_eligible = |candidate| {
             !classification.missing_connector || capability_providers.contains(&candidate)
         };
@@ -318,9 +292,9 @@ pub fn decide(
             // Exactly Codex eligible: the task stays on Codex.
             (true, false) => {}
             (true, true) => {
-                // Pace, not current percent: a provider further into its week can sit at a higher
-                // used percentage and still be the one under-burning. A tie, and a missing
-                // projection, stay on the weekly-percent comparison, which itself ties to Codex.
+                // Pace, not current percent. A tie or a missing projection stays on weekly
+                // percent, which itself ties to Codex. See
+                // docs/decisions/0006-projected-draw-replaces-pace-flip-gap.md.
                 provider = match (codex_projected_draw, grok_projected_draw) {
                     (Some(codex_draw), Some(grok_draw)) => {
                         if grok_draw < codex_draw {
@@ -369,23 +343,11 @@ pub fn decide(
 }
 
 /// PURE: what a provider's weekly draw projects to by the time its window resets, as a percent of
-/// that provider's own weekly allowance. Spending 20 percent in the first tenth of the week
-/// projects to 200: at this rate the allowance runs out with most of the week still to go.
-///
-/// Each provider is measured against its OWN reset and its OWN allowance, which is what makes the
-/// two numbers comparable across providers on different plans. The percent is already normalized by
-/// allowance, so no plan sizes appear here and none need maintaining.
-///
-/// None in two cases:
-///
-/// - The reset epoch is 0, which `usage.rs` documents as "not known" rather than as a window
-///   resetting at the epoch. The recorded value is therefore an honest absence rather than a
-///   number derived from a zero epoch.
-/// - Less than `MIN_PROJECTION_ELAPSED` of the window has gone. Dividing by a small elapsed
-///   fraction turns one job into a four-figure projection, so the diagnostic is not useful.
-///
-/// The elapsed fraction is clamped at the top, because a reset outside the window (a stale rollout,
-/// a clock skew) would otherwise read as more than a full window elapsed.
+/// that provider's own weekly allowance. Each provider is measured against its own reset and
+/// allowance; no plan sizes appear here. None when the reset epoch is 0 or less than
+/// `MIN_PROJECTION_ELAPSED` of the window has gone. The elapsed fraction is clamped at the top
+/// so a stale reset cannot read as more than a full window. See
+/// docs/decisions/0006-projected-draw-replaces-pace-flip-gap.md.
 fn projected_draw(headroom: &Headroom, now_epoch_secs: i64) -> Option<f64> {
     if headroom.weekly_reset_epoch == 0 {
         return None;
@@ -659,10 +621,8 @@ mod tests {
         assert!(decision.rationale.contains("grok weekly unknown"));
     }
 
-    /// Regression, decision log 2026-08-24 to 2026-08-29: six rows recorded
-    /// `missing_connector,capability_blocked,over_ceiling` while their own usage columns read
-    /// claude 14% / codex 1% against a 98% ceiling. `over_ceiling` is a capacity verdict, and a
-    /// field emptied by the capability filter alone must not borrow it.
+    /// `over_ceiling` is a capacity verdict; a field emptied by the capability filter alone must
+    /// not borrow it.
     #[test]
     fn a_capability_emptied_field_is_not_labelled_over_ceiling() {
         let config = Config::default();

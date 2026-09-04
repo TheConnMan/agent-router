@@ -201,11 +201,10 @@ pub(crate) fn router_log_path(home: &Path, prefix: &str) -> PathBuf {
 
 /// Spawn a process in its own session and append its output to `log_path`.
 ///
-/// `override_env` names the `AGENT_ROUTER_*_BIN` variable that pins the program being spawned, and
-/// is what turns an `ENOENT` here into a named `Error::Launch`. Without it this line converts the
-/// io error straight into `Error::Io`, whose `Display` **is** `No such file or directory (os error
-/// 2)` — the literal string the lost production rows recorded. `None` is for the spawns that are
-/// not provider CLIs: those keep `Error::Io` and nothing about them changes.
+/// `override_env` names the `AGENT_ROUTER_*_BIN` variable that pins the program being spawned,
+/// and is what turns an `ENOENT` here into a named `Error::Launch`. `None` is for spawns that
+/// are not provider CLIs: those keep `Error::Io`. See
+/// docs/decisions/0005-launch-error-and-binary-resolver.md.
 pub fn spawn_detached(
     mut command: Command,
     log_path: &Path,

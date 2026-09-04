@@ -280,18 +280,9 @@ fn the_metric_matrix_over_a_hand_countable_row_set() {
     assert_share(stats.dry_run_share.share(), 3.0 / 8.0, "dry_run_share");
 }
 
-/// The pooling regression, as a fold. A window spanning several builds of the router reports each
-/// build's own count rather than one undifferentiated total, so a reader can see at a glance that
-/// the population is mixed.
-///
-/// On 2026-08-01 a routing quality review read 114 rows written by four incompatible routers as one
-/// population and drew conclusions about a router that never existed. Nothing in the report said
-/// the window was mixed, and nothing could: there was no version on a row to count.
-///
-/// A row written before the column knows nothing about its writer, and `unknown` is the honest key
-/// for it, matching how an unscored complexity is counted rather than dropped. Counted that way the
-/// distribution still sums to the row count, so the share of the window that cannot be attributed
-/// is on the screen instead of quietly missing from it.
+/// A window spanning several builds reports each build's own count rather than one
+/// undifferentiated total. A row written before the column counts as `unknown` so the
+/// distribution still sums to the row count.
 #[test]
 fn the_router_version_distribution_separates_a_window_spanning_several_builds() {
     let versioned = |created_at_ms: i64, provider: &str, version: Option<&str>| {
