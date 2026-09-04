@@ -359,6 +359,8 @@ impl DecisionLog {
         let decision = entry.decision;
         let classification = decision.classification.as_ref();
         let usage = &decision.usage;
+        let dir = entry.dir.to_string_lossy();
+        let gates = decision.gate_tags().join(",");
         self.conn.execute(
             "INSERT INTO decisions (
                 created_at_ms, task, dir, requested, provider, model, effort,
@@ -370,46 +372,52 @@ impl DecisionLog {
                 claude_projected_draw, codex_projected_draw, grok_projected_draw,
                 effective_effort, router_version, grok_weekly_pct, grok_weekly_reset
             ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30,
-                ?31, ?32, ?33, ?34
+                :created_at_ms, :task, :dir, :requested, :provider, :model, :effort,
+                :orchestration, :missing_connector, :gates, :rationale,
+                :claude_five_hour_pct, :claude_five_hour_reset, :claude_weekly_pct,
+                :claude_weekly_reset, :codex_five_hour_pct, :codex_five_hour_reset,
+                :codex_weekly_pct, :codex_weekly_reset, :dry_run, :job_id, :job_name,
+                :outcome, :complexity, :task_context_horizon, :claude_usage_stale,
+                :codex_usage_stale, :claude_projected_draw, :codex_projected_draw,
+                :grok_projected_draw, :effective_effort, :router_version, :grok_weekly_pct,
+                :grok_weekly_reset
             )",
-            rusqlite::params![
-                now_ms(),
-                entry.task,
-                entry.dir.to_string_lossy(),
-                entry.requested,
-                decision.provider.name(),
-                decision.model,
-                decision.effort,
-                classification.map(|c| c.orchestration),
-                classification.map(|c| c.missing_connector),
-                decision.gate_tags().join(","),
-                decision.rationale,
-                usage.claude.five_hour_pct,
-                usage.claude.five_hour_reset_epoch,
-                usage.claude.weekly_pct,
-                usage.claude.weekly_reset_epoch,
-                usage.codex.five_hour_pct,
-                usage.codex.five_hour_reset_epoch,
-                usage.codex.weekly_pct,
-                usage.codex.weekly_reset_epoch,
-                entry.dry_run,
-                entry.job_id,
-                entry.job_name,
-                entry.outcome,
-                classification.map(|c| c.complexity.tag()),
-                classification.map(|c| c.task_context_horizon.tag()),
-                usage.claude.stale,
-                usage.codex.stale,
-                decision.claude_projected_draw,
-                decision.codex_projected_draw,
-                decision.grok_projected_draw,
-                entry.effective_effort,
-                ROUTER_VERSION,
-                usage.grok.weekly_known().then_some(usage.grok.weekly_pct),
-                usage.grok.weekly_reset_epoch,
-            ],
+            rusqlite::named_params! {
+                ":created_at_ms": now_ms(),
+                ":task": entry.task,
+                ":dir": dir,
+                ":requested": entry.requested,
+                ":provider": decision.provider.name(),
+                ":model": decision.model,
+                ":effort": decision.effort,
+                ":orchestration": classification.map(|c| c.orchestration),
+                ":missing_connector": classification.map(|c| c.missing_connector),
+                ":gates": gates,
+                ":rationale": decision.rationale,
+                ":claude_five_hour_pct": usage.claude.five_hour_pct,
+                ":claude_five_hour_reset": usage.claude.five_hour_reset_epoch,
+                ":claude_weekly_pct": usage.claude.weekly_pct,
+                ":claude_weekly_reset": usage.claude.weekly_reset_epoch,
+                ":codex_five_hour_pct": usage.codex.five_hour_pct,
+                ":codex_five_hour_reset": usage.codex.five_hour_reset_epoch,
+                ":codex_weekly_pct": usage.codex.weekly_pct,
+                ":codex_weekly_reset": usage.codex.weekly_reset_epoch,
+                ":dry_run": entry.dry_run,
+                ":job_id": entry.job_id,
+                ":job_name": entry.job_name,
+                ":outcome": entry.outcome,
+                ":complexity": classification.map(|c| c.complexity.tag()),
+                ":task_context_horizon": classification.map(|c| c.task_context_horizon.tag()),
+                ":claude_usage_stale": usage.claude.stale,
+                ":codex_usage_stale": usage.codex.stale,
+                ":claude_projected_draw": decision.claude_projected_draw,
+                ":codex_projected_draw": decision.codex_projected_draw,
+                ":grok_projected_draw": decision.grok_projected_draw,
+                ":effective_effort": entry.effective_effort,
+                ":router_version": ROUTER_VERSION,
+                ":grok_weekly_pct": usage.grok.weekly_known().then_some(usage.grok.weekly_pct),
+                ":grok_weekly_reset": usage.grok.weekly_reset_epoch,
+            },
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -1134,6 +1142,89 @@ mod tests {
             vec![errored, failed, completed]
         );
         assert!(rows.iter().all(|row| row.mark.is_none()));
+    }
+
+    /// SCHEMA's decisions column definitions in reverse physical order.
+    fn reversed_schema_column_defs() -> Vec<&'static str> {
+        let open = SCHEMA.find('(').expect("CREATE TABLE open paren");
+        let close = SCHEMA.find(')').expect("CREATE TABLE close paren");
+        let mut defs: Vec<&str> = SCHEMA[open + 1..close]
+            .split(',')
+            .map(str::trim)
+            .filter(|def| !def.is_empty())
+            .collect();
+        defs.reverse();
+        defs
+    }
+
+    /// Stamp `PRAGMA user_version = 2` before `open_at` so `migrate_schema` does not rewrite the
+    /// shuffled table back into SCHEMA order.
+    #[test]
+    fn record_binds_by_name_across_physical_column_orders() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let decision = decision();
+        let entry = Entry {
+            task: "audit the airtable records",
+            dir: Path::new("/tmp"),
+            requested: "auto",
+            decision: &decision,
+            dry_run: false,
+            job_id: Some("thread-abc"),
+            job_name: None,
+            outcome: "dispatched",
+            effective_effort: None,
+        };
+
+        let schema_path = dir.path().join("schema.db");
+        let schema_log = DecisionLog::open_at(&schema_path).expect("opens");
+        schema_log.record(&entry).expect("records");
+
+        let shuffled_path = dir.path().join("shuffled.db");
+        let reversed = reversed_schema_column_defs();
+        {
+            let conn =
+                rusqlite::Connection::open(&shuffled_path).expect("create shuffled database");
+            conn.execute_batch(&format!(
+                "CREATE TABLE IF NOT EXISTS decisions (\n    {}\n);",
+                reversed.join(",\n    ")
+            ))
+            .expect("shuffled schema");
+            conn.execute_batch("PRAGMA user_version = 2")
+                .expect("stamp v2");
+        }
+        let shuffled_log = DecisionLog::open_at(&shuffled_path).expect("opens shuffled");
+
+        let physical: Vec<String> = {
+            let conn = rusqlite::Connection::open(&shuffled_path).expect("reopen shuffled");
+            conn.prepare("SELECT name FROM pragma_table_info('decisions') ORDER BY cid")
+                .expect("pragma")
+                .query_map([], |row| row.get(0))
+                .expect("query")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("names")
+        };
+        let shuffled_names: Vec<&str> = reversed
+            .iter()
+            .map(|def| def.split_whitespace().next().expect("column name"))
+            .collect();
+        assert_eq!(
+            physical.iter().map(String::as_str).collect::<Vec<_>>(),
+            shuffled_names
+        );
+        assert_ne!(
+            physical.iter().map(String::as_str).collect::<Vec<_>>(),
+            V2_COLUMNS.to_vec()
+        );
+
+        shuffled_log.record(&entry).expect("records shuffled");
+
+        let mut from_schema = schema_log.recent(1).expect("reads schema-order")[0].clone();
+        let mut from_shuffled = shuffled_log.recent(1).expect("reads shuffled")[0].clone();
+        from_schema.id = 0;
+        from_schema.created_at_ms = 0;
+        from_shuffled.id = 0;
+        from_shuffled.created_at_ms = 0;
+        assert_eq!(from_schema, from_shuffled);
     }
 
     #[cfg(unix)]
