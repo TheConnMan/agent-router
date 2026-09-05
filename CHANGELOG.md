@@ -3,6 +3,15 @@
 All notable changes to this project are documented here. Versions are the
 workspace `package.version` stamped on every decision-log row.
 
+## 0.22.2 - 2026-09-05
+
+- `adversarial-review` accepts `--provider` and `--model` to pin the reviewer
+  and its model. A pin must differ from `--primary`, passes the same
+  eligibility gates as automatic selection with the Claude reserve applied as
+  a floor, and is reported as skipped rather than rerouted when ineligible.
+  JSON output gains `requested_provider` and `requested_model`. Automatic
+  selection is unchanged.
+
 ## 0.21.9 - 2026-09-04
 
 - Record measured routing decisions as ADRs under `docs/decisions/` and trim

@@ -617,3 +617,477 @@ fn a_read_only_reviews_db_does_not_change_the_review_exit_status() {
         .expect("read reviews");
     assert!(reviews.is_empty());
 }
+
+/// The `--provider`/`--model` pin surface. Every case here runs through the same fixture as the
+/// automatic policy above, so a pin that leaked into the automatic path would fail those tests.
+fn pinned(fixture: &ReviewFixture, primary: &str, args: &[&str]) -> Output {
+    let mut command = fixture.command_for(primary, &fixture.cwd);
+    command.arg("--json");
+    for arg in args {
+        command.arg(arg);
+    }
+    command.output().expect("run pinned adversarial review")
+}
+
+fn flag_value(invocation: &[String], flag: &str) -> Option<String> {
+    invocation
+        .iter()
+        .position(|arg| arg == flag)
+        .and_then(|index| invocation.get(index + 1).cloned())
+}
+
+#[test]
+fn automatic_selection_records_no_pin_and_keeps_the_configured_high_tier() {
+    let fixture = ReviewFixture::new("automatic unchanged", Some(23.0));
+    let output = fixture.run_json();
+    assert_exit(&output, 0);
+    let value = parse_json(&output);
+    assert_eq!(value["requested_provider"], Value::Null);
+    assert_eq!(value["requested_model"], Value::Null);
+    assert_eq!(value["reviewer_provider"], "claude");
+    assert_eq!(value["reviewer_model"], "opus[1m]");
+    assert_eq!(
+        flag_value(&argv(&fixture.claude_log), "--model").as_deref(),
+        Some("opus[1m]")
+    );
+}
+
+#[test]
+fn an_explicit_fable_pin_reaches_the_claude_argv_exactly_and_stays_ephemeral() {
+    let fixture = ReviewFixture::new("fable pin", Some(35.0));
+    let output = pinned(
+        &fixture,
+        "codex",
+        &["--provider", "claude", "--model", "fable"],
+    );
+
+    assert_exit(&output, 0);
+    let value = parse_json(&output);
+    assert_eq!(value["status"], "completed");
+    assert_eq!(value["primary_provider"], "codex");
+    assert_eq!(value["requested_provider"], "claude");
+    assert_eq!(value["requested_model"], "fable");
+    assert_eq!(value["reviewer_provider"], "claude");
+    assert_eq!(value["reviewer_model"], "fable");
+    assert_eq!(value["usage"]["weekly_pct"], 35.0);
+    assert_eq!(value["result"], "completed review body");
+    assert!(
+        value["rationale"]
+            .as_str()
+            .is_some_and(|why| why.contains("requested explicitly") && why.contains("codex")),
+        "{}",
+        value["rationale"]
+    );
+
+    assert!(!fixture.codex_log.exists(), "the pin invoked codex");
+    let invocation = argv(&fixture.claude_log);
+    assert_eq!(flag_value(&invocation, "--model").as_deref(), Some("fable"));
+    assert!(invocation.iter().any(|arg| arg == "-p"));
+    assert!(
+        invocation
+            .iter()
+            .any(|arg| arg == "--no-session-persistence")
+    );
+    assert!(!invocation.iter().any(|arg| arg == "--bg"));
+    assert!(!invocation.iter().any(|arg| arg == "--name"));
+    assert!(
+        !invocation
+            .iter()
+            .any(|arg| arg == "--dangerously-skip-permissions")
+    );
+    assert_eq!(
+        flag_value(&invocation, "--permission-mode").as_deref(),
+        Some("plan")
+    );
+    assert_eq!(
+        flag_value(&invocation, "--tools").as_deref(),
+        Some("Read,Glob,Grep")
+    );
+    assert!(invocation.iter().any(|arg| arg == "--strict-mcp-config"));
+
+    let rows = fixture.reviews();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].exit_status, 0);
+    assert_eq!(rows[0].reviewer_provider.as_deref(), Some("claude"));
+    assert_eq!(rows[0].reviewer_model.as_deref(), Some("fable"));
+    assert!(rows[0].rationale.contains("requested explicitly"));
+}
+
+#[test]
+fn a_provider_pin_without_a_model_runs_the_configured_high_tier() {
+    let fixture = ReviewFixture::new("provider only pin", Some(35.0));
+    let output = pinned(&fixture, "codex", &["--provider", "claude"]);
+
+    assert_exit(&output, 0);
+    let value = parse_json(&output);
+    assert_eq!(value["requested_provider"], "claude");
+    assert_eq!(value["requested_model"], Value::Null);
+    assert_eq!(value["reviewer_model"], "opus[1m]");
+}
+
+#[test]
+fn a_pinned_codex_reviewer_keeps_the_read_only_ephemeral_sandbox_with_the_exact_model() {
+    let fixture = ReviewFixture::new("codex pin", None);
+    write_codex_usage(&fixture.sessions, 17);
+    let output = pinned(
+        &fixture,
+        "claude",
+        &["--provider", "codex", "--model", "gpt-5.6-terra"],
+    );
+
+    assert_exit(&output, 0);
+    let value = parse_json(&output);
+    assert_eq!(value["status"], "completed");
+    assert_eq!(value["reviewer_provider"], "codex");
+    assert_eq!(value["reviewer_model"], "gpt-5.6-terra");
+    assert_eq!(value["requested_model"], "gpt-5.6-terra");
+    assert!(!fixture.claude_log.exists());
+    let invocation = argv(&fixture.codex_log);
+    assert_eq!(
+        flag_value(&invocation, "--model").as_deref(),
+        Some("gpt-5.6-terra")
+    );
+    assert_eq!(
+        flag_value(&invocation, "--sandbox").as_deref(),
+        Some("read-only")
+    );
+    assert!(invocation.iter().any(|arg| arg == "--ephemeral"));
+    assert!(!invocation.iter().any(|arg| arg == "--bg"));
+}
+
+#[test]
+fn pinning_the_primary_provider_fails_before_any_invocation() {
+    let fixture = ReviewFixture::new("primary pin", Some(35.0));
+    let output = pinned(
+        &fixture,
+        "claude",
+        &["--provider", "claude", "--model", "fable"],
+    );
+
+    assert_exit(&output, 1);
+    let value = parse_json(&output);
+    assert_eq!(value["status"], "failed");
+    assert_eq!(value["primary_provider"], "claude");
+    assert_eq!(value["requested_provider"], "claude");
+    assert_eq!(value["requested_model"], "fable");
+    assert_eq!(value["reviewer_provider"], Value::Null);
+    assert_eq!(value["reviewer_model"], Value::Null);
+    assert!(
+        value["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("primary")),
+        "{}",
+        value["reason"]
+    );
+    assert!(!fixture.claude_log.exists());
+    assert!(!fixture.codex_log.exists());
+    let rows = fixture.reviews();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].exit_status, 1);
+    assert_eq!(rows[0].reviewer_provider, None);
+    // The reviews table has no requested_* columns, so the rationale is where a rejected pin has
+    // to be distinguishable from an automatic failure.
+    assert!(
+        rows[0]
+            .rationale
+            .contains("claude requested explicitly with model fable"),
+        "{}",
+        rows[0].rationale
+    );
+}
+
+#[test]
+fn a_pin_is_still_reported_when_the_config_fails_to_load() {
+    let fixture = ReviewFixture::new("config failure pin", Some(35.0));
+    write_file(
+        &fixture
+            .root
+            .path
+            .join("home/.config/agent-router/config.toml"),
+        "this is not toml = = =\n",
+    );
+    let output = pinned(
+        &fixture,
+        "codex",
+        &["--provider", "claude", "--model", "fable"],
+    );
+
+    assert_exit(&output, 1);
+    let value = parse_json(&output);
+    assert_eq!(value["status"], "failed");
+    assert_eq!(value["requested_provider"], "claude");
+    assert_eq!(value["requested_model"], "fable");
+    assert_eq!(value["reviewer_provider"], Value::Null);
+    assert!(
+        value["rationale"]
+            .as_str()
+            .is_some_and(|why| why.contains("claude requested explicitly with model fable")),
+        "{}",
+        value["rationale"]
+    );
+    assert!(!fixture.claude_log.exists());
+    assert!(!fixture.codex_log.exists());
+}
+
+#[test]
+fn a_model_without_an_explicit_provider_is_rejected() {
+    let fixture = ReviewFixture::new("orphan model", Some(35.0));
+    for args in [
+        vec!["--model", "fable"],
+        vec!["--provider", "auto", "--model", "fable"],
+    ] {
+        let output = pinned(&fixture, "codex", &args);
+        assert_exit(&output, 1);
+        let value = parse_json(&output);
+        assert_eq!(value["status"], "failed");
+        assert_eq!(value["requested_model"], "fable");
+        assert!(
+            value["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("--model requires an explicit --provider")),
+            "{}",
+            value["reason"]
+        );
+    }
+    assert!(!fixture.claude_log.exists());
+    assert!(!fixture.codex_log.exists());
+}
+
+#[test]
+fn a_model_pin_on_grok_and_a_malformed_model_are_rejected() {
+    let fixture = ReviewFixture::new("bad model pins", Some(35.0));
+
+    let output = pinned(
+        &fixture,
+        "codex",
+        &["--provider", "grok", "--model", "grok-4"],
+    );
+    assert_exit(&output, 1);
+    let value = parse_json(&output);
+    assert_eq!(value["status"], "failed");
+    assert!(
+        value["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("grok")),
+        "{}",
+        value["reason"]
+    );
+
+    for malformed in ["--model=--bg", "--model=", "--model=fable opus"] {
+        let output = pinned(&fixture, "codex", &["--provider", "claude", malformed]);
+        assert_exit(&output, 1);
+        let value = parse_json(&output);
+        assert_eq!(value["status"], "failed", "{malformed}");
+        assert_eq!(value["reviewer_model"], Value::Null, "{malformed}");
+        assert!(
+            value["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("model")),
+            "{malformed}: {}",
+            value["reason"]
+        );
+    }
+
+    let output = pinned(&fixture, "codex", &["--provider", "opencode"]);
+    assert_exit(&output, 1);
+    let value = parse_json(&output);
+    assert_eq!(value["status"], "failed");
+
+    assert!(!fixture.claude_log.exists());
+    assert!(!fixture.codex_log.exists());
+}
+
+#[test]
+fn an_ineligible_pin_skips_with_exit_three_and_never_falls_back() {
+    // Grok is the primary, so codex is the eligible automatic alternative the pin must not use.
+    for (label, weekly_pct, expected) in [("ceiling", Some(90.0), "90"), ("stale", None, "stale")] {
+        let fixture = ReviewFixture::new(label, weekly_pct);
+        write_codex_usage(&fixture.sessions, 17);
+        let output = pinned(
+            &fixture,
+            "grok",
+            &["--provider", "claude", "--model", "fable"],
+        );
+
+        assert_exit(&output, 3);
+        let value = parse_json(&output);
+        assert_eq!(value["status"], "skipped", "{label}");
+        assert_eq!(value["primary_provider"], "grok");
+        assert_eq!(value["requested_provider"], "claude");
+        assert_eq!(value["requested_model"], "fable");
+        assert_eq!(value["reviewer_provider"], Value::Null, "{label}");
+        assert_eq!(value["reviewer_model"], Value::Null, "{label}");
+        assert_eq!(value["result"], Value::Null, "{label}");
+        assert!(
+            value["reason"].as_str().is_some_and(|reason| {
+                reason.starts_with("requested reviewer claude is not eligible: ")
+                    && reason.contains(expected)
+            }),
+            "{label}: {}",
+            value["reason"]
+        );
+        assert!(
+            value["rationale"]
+                .as_str()
+                .is_some_and(|why| why.contains(expected)),
+            "{label}: {}",
+            value["rationale"]
+        );
+        let claude = candidate_provenance(&value, "claude");
+        assert_eq!(claude["eligible"], false);
+        assert!(
+            !fixture.codex_log.exists(),
+            "{label}: the pin fell back to codex"
+        );
+        assert!(!fixture.claude_log.exists(), "{label}");
+        let rows = fixture.reviews();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].exit_status, 3);
+        assert_eq!(rows[0].reviewer_provider, None);
+    }
+}
+
+#[test]
+fn a_pinned_grok_reviewer_still_needs_the_authoritative_leader() {
+    let fixture = ReviewFixture::new("grok pin", Some(35.0));
+    write_grok_usage(&fixture.grok_state_dir(), 1.0);
+    let output = pinned(&fixture, "codex", &["--provider", "grok"]);
+
+    assert_exit(&output, 3);
+    let value = parse_json(&output);
+    assert_eq!(value["status"], "skipped");
+    assert_eq!(value["requested_provider"], "grok");
+    assert_eq!(value["reviewer_provider"], Value::Null);
+    let grok = candidate_provenance(&value, "grok");
+    assert_eq!(grok["eligible"], false);
+    // The authoritative probe fails one step earlier on a box with no grok binary (CI runners),
+    // so the reason is either the missing leader or the unresolvable executable. Both are the
+    // grok availability gate refusing the pin; neither may become a fallback.
+    assert!(
+        grok["rejection_reason"].as_str().is_some_and(|reason| {
+            reason.contains("leader") || reason.contains("grok executable")
+        }),
+        "{grok}"
+    );
+    assert!(
+        value["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.starts_with("requested reviewer grok is not eligible: ")),
+        "{}",
+        value["reason"]
+    );
+    assert!(
+        !fixture.claude_log.exists(),
+        "the grok pin fell back to claude"
+    );
+}
+
+#[test]
+fn a_pinned_claude_reviewer_honors_the_reserve_as_a_floor() {
+    let fixture = ReviewFixture::new("reserve floor", Some(70.0));
+    let output = pinned(
+        &fixture,
+        "codex",
+        &["--provider", "claude", "--model", "fable"],
+    );
+
+    assert_exit(&output, 3);
+    let value = parse_json(&output);
+    assert_eq!(value["status"], "skipped");
+    assert!(
+        value["rationale"]
+            .as_str()
+            .is_some_and(|why| why.contains("reserve") && why.contains("70.0")),
+        "{}",
+        value["rationale"]
+    );
+    assert!(!fixture.claude_log.exists());
+
+    // Text mode prints the reason alone, so the reason itself has to carry the refusing gate.
+    let output = fixture
+        .command()
+        .arg("--provider")
+        .arg("claude")
+        .arg("--model")
+        .arg("fable")
+        .output()
+        .expect("run text mode pinned review");
+    assert_exit(&output, 3);
+    assert!(text(&output.stdout).is_empty());
+    let stderr = text(&output.stderr);
+    assert!(
+        stderr.contains("requested reviewer claude is not eligible")
+            && stderr.contains("reserve")
+            && stderr.contains("70.0"),
+        "{stderr}"
+    );
+
+    // The operator's reserve setting is what decides it: zero the reserve and the same reading
+    // passes, so the refusal above is the configured reserve rather than the raw ceiling.
+    write_file(
+        &fixture
+            .root
+            .path
+            .join("home/.config/agent-router/config.toml"),
+        "config_version = 4\n\n[classifier]\nengine = \"codex\"\n\n[adversarial_review]\nclaude_usage_reserve_pct = 0.0\n",
+    );
+    let output = pinned(
+        &fixture,
+        "codex",
+        &["--provider", "claude", "--model", "fable"],
+    );
+    assert_exit(&output, 0);
+    let value = parse_json(&output);
+    assert_eq!(value["status"], "completed");
+    assert_eq!(value["reviewer_model"], "fable");
+}
+
+#[test]
+fn a_pinned_reviewer_failure_is_reported_with_the_pin_and_no_fallback() {
+    let fixture = ReviewFixture::new("pinned failure", Some(35.0));
+    let output = fixture
+        .command_for("grok", &fixture.cwd)
+        .arg("--json")
+        .arg("--provider")
+        .arg("claude")
+        .arg("--model")
+        .arg("fable")
+        .env("AGENT_ROUTER_FIXTURE_REVIEW_FAIL", "1")
+        .output()
+        .expect("run failing pinned review");
+
+    assert_exit(&output, 1);
+    let value = parse_json(&output);
+    assert_eq!(value["status"], "failed");
+    assert_eq!(value["requested_model"], "fable");
+    assert_eq!(value["reviewer_provider"], "claude");
+    assert_eq!(value["reviewer_model"], "fable");
+    assert!(
+        value["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("review provider failed"))
+    );
+    assert_eq!(value["result"], Value::Null);
+    assert!(
+        !fixture.codex_log.exists(),
+        "the failed pin fell back to codex"
+    );
+    let rows = fixture.reviews();
+    assert_eq!(rows[0].exit_status, 1);
+    assert_eq!(rows[0].reviewer_model.as_deref(), Some("fable"));
+}
+
+#[test]
+fn help_documents_the_pin_flags_honestly() {
+    let output = Command::new(env!("CARGO_BIN_EXE_agent-router"))
+        .arg("adversarial-review")
+        .arg("--help")
+        .output()
+        .expect("print help");
+    assert_exit(&output, 0);
+    let help = text(&output.stdout);
+    assert!(help.contains("--provider"), "{help}");
+    assert!(help.contains("--model"), "{help}");
+    assert!(help.contains("primary"), "{help}");
+    assert!(help.contains("eligib"), "{help}");
+}
