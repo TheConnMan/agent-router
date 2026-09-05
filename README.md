@@ -229,17 +229,41 @@ capacity: Claude is selected only when its raw weekly usage is at least 25 point
 other eligible reviewer. Set the reserve to `0.0` for raw-usage-only selection. The reserve never
 makes an ineligible provider eligible.
 
+`--provider` pins the reviewer instead of letting headroom choose it, and `--model` pins the model
+that reviewer runs. A pin chooses among the same registered reviewers; it bypasses nothing. It must
+name a provider other than `--primary`, and the pinned reviewer still passes every eligibility gate:
+authoritative availability, a fresh known weekly reading, and usage below the 90 percent ceiling.
+Because a pin removes the comparison the Claude reserve normally biases, the reserve becomes a floor
+on the pinned path: a pinned Claude reviewer is refused once its weekly usage plus
+`claude_usage_reserve_pct` reaches the ceiling, even at a reading the automatic policy would still
+have selected. An ineligible pin is reported as `skipped` with exit `3` and a reason that names the
+refusing gate; it is never rerouted to another provider. `--model` requires an explicit `--provider` other than `grok`, whose
+review lifecycle has no model selection, and is passed to the reviewer verbatim: a model the
+provider rejects fails the review with exit `1` rather than being replaced. Without `--model` a pin
+runs the provider's configured `high` review tier. A pinned reviewer is launched exactly like an
+automatic one: the same ephemeral read only invocation for Claude and Codex, with no background job
+and no persisted session, and for Grok the same disposable lifecycle session that is removed after
+the review.
+
 ```bash
 # Have a provider other than Codex review the request and wait for the result.
 agent-router adversarial-review --primary codex "Review the proposed authentication change"
 
 # Return the decision and review body as machine-readable JSON.
 agent-router adversarial-review --primary codex --json "Review the proposed authentication change"
+
+# Pin the reviewer to Claude Fable, or be told exactly why it cannot run. Same gates, no fallback.
+agent-router adversarial-review --primary codex --provider claude --model fable --json \
+    "Review the proposed authentication change"
 ```
 
 Text mode prints the completed review body. JSON reports `status`, `primary_provider`,
-`reviewer_provider`, `reviewer_model`, usage provenance, the selection rationale, and `result` when
-the review completes. When no eligible alternative exists, it reports the reason and exits `3`.
+`requested_provider` and `requested_model` (what a pin asked for, `null` under the automatic
+policy), `reviewer_provider` and `reviewer_model` (what actually ran), usage provenance, the
+selection rationale, and `result` when the review completes. The reviews table records the
+reviewer that ran; it has no requested columns, so its rationale names the pin instead, whether the
+pin was selected, refused by a gate, or rejected before selection. When no eligible alternative
+exists, or the pinned reviewer is ineligible, it reports the reason and exits `3`.
 A completed review exits `0`; an invocation or infrastructure failure exits `1`. Review execution
 uses the provider's review contract and is never routed through an ordinary task. Claude and Codex
 are launched with enforced read only restrictions. Grok's persistent lifecycle currently registers

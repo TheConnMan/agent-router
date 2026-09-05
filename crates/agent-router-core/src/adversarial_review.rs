@@ -43,6 +43,12 @@ pub enum ReviewStatus {
 pub struct ReviewOutcome {
     pub status: ReviewStatus,
     pub primary_provider: String,
+    /// The reviewer the caller pinned with `--provider`, None under the automatic policy. What was
+    /// asked for, as distinct from `reviewer_provider`, which is what ran.
+    pub requested_provider: Option<String>,
+    /// The model the caller pinned with `--model`. None when the pin left the model to the
+    /// configured tier and under the automatic policy.
+    pub requested_model: Option<String>,
     pub reviewer_provider: Option<String>,
     pub reviewer_model: Option<String>,
     pub reviewer_session_id: Option<String>,
@@ -60,6 +66,82 @@ pub struct CandidateUsage {
     pub stale: bool,
     pub eligible: bool,
     pub rejection_reason: Option<String>,
+}
+
+/// An explicit reviewer the caller pinned. The pin chooses among the registered reviewers; it does
+/// not bypass any eligibility gate and is never substituted: a pin that cannot run as asked is
+/// reported as skipped or failed rather than routed elsewhere.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewerPin {
+    pub provider: Provider,
+    /// None runs the provider's configured review tier, exactly as the automatic policy would.
+    pub model: Option<String>,
+}
+
+/// PURE: the caller's `--provider` / `--model` pair as a pin, or None for the automatic policy.
+///
+/// Mirrors the `run` pin rule that a model needs an explicit provider. Beyond that it rejects what
+/// no review could honestly satisfy: the primary provider reviewing its own work, a model on grok
+/// (whose review lifecycle has no model selection), and a model that is not a single plain token,
+/// since the value is handed to the reviewer binary as the next argument after `--model`.
+pub fn reviewer_pin(
+    primary_provider: &str,
+    provider: Option<Provider>,
+    model: Option<&str>,
+) -> Result<Option<ReviewerPin>> {
+    let Some(provider) = provider else {
+        return match model {
+            None => Ok(None),
+            Some(_) => Err(Error::Command(
+                "--model requires an explicit --provider".to_string(),
+            )),
+        };
+    };
+    if provider.name().eq_ignore_ascii_case(primary_provider) {
+        return Err(Error::Command(format!(
+            "reviewer provider {} is the primary provider; an adversarial review needs a provider \
+             other than the one that produced the work",
+            provider.name()
+        )));
+    }
+    let model = match model {
+        None => None,
+        Some(_) if provider == Provider::Grok => {
+            return Err(Error::Command(
+                "--model is not supported with --provider grok: the grok review lifecycle has no \
+                 model selection"
+                    .to_string(),
+            ));
+        }
+        Some(model) => {
+            validate_model(model)?;
+            Some(model.to_string())
+        }
+    };
+    Ok(Some(ReviewerPin { provider, model }))
+}
+
+/// PURE: a model is one plain token. The provider decides whether it names a real model; this only
+/// keeps the value from being read as a flag or splitting into more than one argument.
+fn validate_model(model: &str) -> Result<()> {
+    if model.is_empty() {
+        return Err(Error::Command("--model must not be empty".to_string()));
+    }
+    if model.starts_with('-') {
+        return Err(Error::Command(format!(
+            "invalid model {model:?}: a model must not start with '-'"
+        )));
+    }
+    if model
+        .chars()
+        .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return Err(Error::Command(format!(
+            "invalid model {model:?}: a model must be a single token without whitespace or \
+             control characters"
+        )));
+    }
+    Ok(())
 }
 
 pub trait ReviewProvider {
@@ -91,6 +173,9 @@ enum Selection<'a> {
         rationale: String,
         usage_provenance: Vec<CandidateUsage>,
     },
+    /// The pinned path alone: the request cannot be honored as asked, which is a failure and not a
+    /// capacity skip.
+    Failed { reason: String },
 }
 
 pub fn review_with_providers(
@@ -107,9 +192,31 @@ pub fn review_with_claude_usage_reserve(
     providers: &[&dyn ReviewProvider],
     claude_usage_reserve_pct: f64,
 ) -> Result<ReviewOutcome> {
-    match select_provider(
+    review_selected(request, providers, None, claude_usage_reserve_pct)
+}
+
+/// Run a review on the pinned provider. The pin narrows the candidate set to one; every gate the
+/// automatic policy applies still applies, and the reserve becomes a floor because there is no
+/// alternative left for it to bias the choice against.
+pub fn review_pinned_with_providers(
+    request: &ReviewRequest<'_>,
+    providers: &[&dyn ReviewProvider],
+    pin: &ReviewerPin,
+    claude_usage_reserve_pct: f64,
+) -> Result<ReviewOutcome> {
+    review_selected(request, providers, Some(pin), claude_usage_reserve_pct)
+}
+
+fn review_selected(
+    request: &ReviewRequest<'_>,
+    providers: &[&dyn ReviewProvider],
+    pin: Option<&ReviewerPin>,
+    claude_usage_reserve_pct: f64,
+) -> Result<ReviewOutcome> {
+    match select(
         request.primary_provider,
         providers,
+        pin,
         claude_usage_reserve_pct,
     ) {
         Selection::Selected {
@@ -121,6 +228,7 @@ pub fn review_with_claude_usage_reserve(
             let result = provider.review_with_identity(request)?;
             Ok(completed_outcome(
                 request,
+                pin,
                 provider,
                 usage,
                 usage_provenance,
@@ -131,32 +239,77 @@ pub fn review_with_claude_usage_reserve(
         Selection::Skipped {
             rationale,
             usage_provenance,
-        } => Ok(skipped_outcome(request, usage_provenance, rationale)),
+        } => Ok(skipped_outcome(request, pin, usage_provenance, rationale)),
+        Selection::Failed { reason } => Ok(with_pin(
+            failed_outcome(request.primary_provider, reason),
+            pin,
+        )),
+    }
+}
+
+/// PURE: the automatic selection, or the pinned one when a pin is present.
+fn select<'a>(
+    primary_provider: &str,
+    providers: &[&'a dyn ReviewProvider],
+    pin: Option<&ReviewerPin>,
+    claude_usage_reserve_pct: f64,
+) -> Selection<'a> {
+    match pin {
+        None => select_provider(primary_provider, providers, claude_usage_reserve_pct),
+        Some(pin) => select_pinned(primary_provider, providers, pin, claude_usage_reserve_pct),
     }
 }
 
 pub fn review_registered(request: &ReviewRequest<'_>, ctx: &Context) -> ReviewOutcome {
+    review_registered_selected(request, None, ctx)
+}
+
+/// The registered reviewers with the caller's pin applied. A pinned model replaces the configured
+/// review tier for that provider alone and is passed to the reviewer binary verbatim.
+pub fn review_registered_pinned(
+    request: &ReviewRequest<'_>,
+    pin: &ReviewerPin,
+    ctx: &Context,
+) -> ReviewOutcome {
+    review_registered_selected(request, Some(pin), ctx)
+}
+
+fn review_registered_selected(
+    request: &ReviewRequest<'_>,
+    pin: Option<&ReviewerPin>,
+    ctx: &Context,
+) -> ReviewOutcome {
     if !request.dir.is_dir() {
-        return failed_outcome(
-            request.primary_provider,
-            format!("target directory does not exist: {}", request.dir.display()),
+        return with_pin(
+            failed_outcome(
+                request.primary_provider,
+                format!("target directory does not exist: {}", request.dir.display()),
+            ),
+            pin,
         );
     }
 
+    let pinned_model = |provider: Provider| {
+        pin.filter(|pin| pin.provider == provider)
+            .and_then(|pin| pin.model.as_deref())
+    };
     let claude = ClaudeReviewProvider {
-        model: ctx.config.models.claude.pick(Complexity::High),
+        model: pinned_model(Provider::Claude)
+            .unwrap_or_else(|| ctx.config.models.claude.pick(Complexity::High)),
         ctx,
     };
     let codex = CodexReviewProvider {
-        model: ctx.config.models.codex.pick(Complexity::High),
+        model: pinned_model(Provider::Codex)
+            .unwrap_or_else(|| ctx.config.models.codex.pick(Complexity::High)),
         ctx,
     };
     let grok = GrokReviewProvider { ctx };
     let providers: [&dyn ReviewProvider; 3] = [&claude, &codex, &grok];
 
-    match select_provider(
+    match select(
         request.primary_provider,
         &providers,
+        pin,
         ctx.config.adversarial_review.claude_usage_reserve_pct,
     ) {
         Selection::Selected {
@@ -167,29 +320,38 @@ pub fn review_registered(request: &ReviewRequest<'_>, ctx: &Context) -> ReviewOu
         } => match provider.review_with_identity(request) {
             Ok(result) => completed_outcome(
                 request,
+                pin,
                 provider,
                 usage,
                 usage_provenance,
                 rationale,
                 result,
             ),
-            Err(error) => ReviewOutcome {
-                status: ReviewStatus::Failed,
-                primary_provider: request.primary_provider.to_string(),
-                reviewer_provider: Some(provider.provider_name().to_string()),
-                reviewer_model: Some(provider.reviewer_model().to_string()),
-                reviewer_session_id: None,
-                usage: Some(usage),
-                usage_provenance,
-                rationale,
-                reason: Some(error.to_string()),
-                result: None,
-            },
+            Err(error) => with_pin(
+                ReviewOutcome {
+                    status: ReviewStatus::Failed,
+                    primary_provider: request.primary_provider.to_string(),
+                    requested_provider: None,
+                    requested_model: None,
+                    reviewer_provider: Some(provider.provider_name().to_string()),
+                    reviewer_model: Some(provider.reviewer_model().to_string()),
+                    reviewer_session_id: None,
+                    usage: Some(usage),
+                    usage_provenance,
+                    rationale,
+                    reason: Some(error.to_string()),
+                    result: None,
+                },
+                pin,
+            ),
         },
         Selection::Skipped {
             rationale,
             usage_provenance,
-        } => skipped_outcome(request, usage_provenance, rationale),
+        } => skipped_outcome(request, pin, usage_provenance, rationale),
+        Selection::Failed { reason } => {
+            with_pin(failed_outcome(request.primary_provider, reason), pin)
+        }
     }
 }
 
@@ -197,6 +359,8 @@ pub fn failed_outcome(primary_provider: &str, reason: impl Into<String>) -> Revi
     ReviewOutcome {
         status: ReviewStatus::Failed,
         primary_provider: primary_provider.to_string(),
+        requested_provider: None,
+        requested_model: None,
         reviewer_provider: None,
         reviewer_model: None,
         reviewer_session_id: None,
@@ -208,8 +372,17 @@ pub fn failed_outcome(primary_provider: &str, reason: impl Into<String>) -> Revi
     }
 }
 
+/// PURE: stamp what the caller asked for onto an outcome. `reviewer_*` stay what actually ran (or
+/// None when nothing did), so a reader can always compare the request against the result.
+fn with_pin(mut outcome: ReviewOutcome, pin: Option<&ReviewerPin>) -> ReviewOutcome {
+    outcome.requested_provider = pin.map(|pin| pin.provider.name().to_string());
+    outcome.requested_model = pin.and_then(|pin| pin.model.clone());
+    outcome
+}
+
 fn completed_outcome(
     request: &ReviewRequest<'_>,
+    pin: Option<&ReviewerPin>,
     provider: &dyn ReviewProvider,
     usage: Headroom,
     usage_provenance: Vec<CandidateUsage>,
@@ -217,37 +390,180 @@ fn completed_outcome(
     result: (String, Option<String>),
 ) -> ReviewOutcome {
     let (result, reviewer_session_id) = result;
-    ReviewOutcome {
-        status: ReviewStatus::Completed,
-        primary_provider: request.primary_provider.to_string(),
-        reviewer_provider: Some(provider.provider_name().to_string()),
-        reviewer_model: Some(provider.reviewer_model().to_string()),
-        reviewer_session_id,
-        usage: Some(usage),
-        usage_provenance,
-        rationale,
-        reason: None,
-        result: Some(result),
-    }
+    with_pin(
+        ReviewOutcome {
+            status: ReviewStatus::Completed,
+            primary_provider: request.primary_provider.to_string(),
+            requested_provider: None,
+            requested_model: None,
+            reviewer_provider: Some(provider.provider_name().to_string()),
+            reviewer_model: Some(provider.reviewer_model().to_string()),
+            reviewer_session_id,
+            usage: Some(usage),
+            usage_provenance,
+            rationale,
+            reason: None,
+            result: Some(result),
+        },
+        pin,
+    )
 }
 
 fn skipped_outcome(
     request: &ReviewRequest<'_>,
+    pin: Option<&ReviewerPin>,
     usage_provenance: Vec<CandidateUsage>,
     rationale: String,
 ) -> ReviewOutcome {
-    ReviewOutcome {
-        status: ReviewStatus::Skipped,
-        primary_provider: request.primary_provider.to_string(),
-        reviewer_provider: None,
-        reviewer_model: None,
-        reviewer_session_id: None,
-        usage: None,
-        usage_provenance,
-        rationale,
-        reason: Some("no eligible alternative provider".to_string()),
-        result: None,
+    // A pinned skip names the gate that refused the pin, because text mode prints `reason` alone
+    // and "not eligible" by itself leaves the caller guessing between stale capacity, the ceiling,
+    // and the reserve floor. The automatic wording is unchanged.
+    let reason = match pin {
+        None => "no eligible alternative provider".to_string(),
+        Some(pin) => {
+            let name = pin.provider.name();
+            let cause = usage_provenance
+                .iter()
+                .find(|candidate| candidate.provider.eq_ignore_ascii_case(name))
+                .and_then(|candidate| candidate.rejection_reason.as_deref())
+                .map(|cause| format!(": {cause}"))
+                .unwrap_or_default();
+            format!("requested reviewer {name} is not eligible{cause}")
+        }
+    };
+    with_pin(
+        ReviewOutcome {
+            status: ReviewStatus::Skipped,
+            primary_provider: request.primary_provider.to_string(),
+            requested_provider: None,
+            requested_model: None,
+            reviewer_provider: None,
+            reviewer_model: None,
+            reviewer_session_id: None,
+            usage: None,
+            usage_provenance,
+            rationale,
+            reason: Some(reason),
+            result: None,
+        },
+        pin,
+    )
+}
+
+/// PURE: one candidate through the eligibility gates, in the order the automatic policy has
+/// always applied them: not the primary, authoritatively available, capacity present, fresh, known,
+/// below the ceiling. Appends its rationale and provenance and returns the reading plus the reserve
+/// the caller weighs it with, or None when it was rejected.
+fn judge_candidate(
+    provider: &dyn ReviewProvider,
+    primary_provider: &str,
+    claude_usage_reserve_pct: f64,
+    rationale: &mut Vec<String>,
+    usage_provenance: &mut Vec<CandidateUsage>,
+) -> Option<(Headroom, f64)> {
+    let name = provider.provider_name();
+    if name.eq_ignore_ascii_case(primary_provider) {
+        rationale.push(format!("{name} excluded as primary provider"));
+        usage_provenance.push(CandidateUsage {
+            provider: name.to_string(),
+            weekly_pct: None,
+            stale: true,
+            eligible: false,
+            rejection_reason: Some("primary provider excluded".to_string()),
+        });
+        return None;
     }
+
+    if let Err(reason) = provider.authoritative_availability() {
+        rationale.push(format!("{name} rejected because {reason}"));
+        usage_provenance.push(CandidateUsage {
+            provider: name.to_string(),
+            weekly_pct: None,
+            stale: true,
+            eligible: false,
+            rejection_reason: Some(reason),
+        });
+        return None;
+    }
+
+    let Some(usage) = provider.usage() else {
+        rationale.push(format!("{name} rejected because capacity is unavailable"));
+        usage_provenance.push(CandidateUsage {
+            provider: name.to_string(),
+            weekly_pct: None,
+            stale: true,
+            eligible: false,
+            rejection_reason: Some("capacity unavailable".to_string()),
+        });
+        return None;
+    };
+    if usage.stale {
+        let reason = if name.eq_ignore_ascii_case("grok") && !usage.weekly_capacity_known {
+            "no billing data available".to_string()
+        } else {
+            format!(
+                "capacity is stale at {:.1} percent weekly usage",
+                usage.weekly_pct
+            )
+        };
+        rationale.push(format!("{name} rejected because {reason}"));
+        usage_provenance.push(CandidateUsage {
+            provider: name.to_string(),
+            weekly_pct: None,
+            stale: true,
+            eligible: false,
+            rejection_reason: Some(reason),
+        });
+        return None;
+    }
+    if !usage.weekly_capacity_known || !usage.weekly_pct.is_finite() {
+        let reason = format!(
+            "weekly capacity is unknown at {:.1} percent usage",
+            usage.weekly_pct
+        );
+        rationale.push(format!("{name} rejected because {reason}"));
+        usage_provenance.push(CandidateUsage {
+            provider: name.to_string(),
+            weekly_pct: None,
+            stale: false,
+            eligible: false,
+            rejection_reason: Some(reason),
+        });
+        return None;
+    }
+    if usage.weekly_pct >= WEEKLY_USAGE_CEILING {
+        let reason = format!(
+            "weekly usage {:.1} reaches the {:.1} ceiling",
+            usage.weekly_pct, WEEKLY_USAGE_CEILING
+        );
+        rationale.push(format!("{name} rejected because {reason}"));
+        usage_provenance.push(CandidateUsage {
+            provider: name.to_string(),
+            weekly_pct: Some(usage.weekly_pct),
+            stale: false,
+            eligible: false,
+            rejection_reason: Some(reason),
+        });
+        return None;
+    }
+
+    usage_provenance.push(CandidateUsage {
+        provider: name.to_string(),
+        weekly_pct: Some(usage.weekly_pct),
+        stale: false,
+        eligible: true,
+        rejection_reason: None,
+    });
+    let reserve = if name.eq_ignore_ascii_case("claude") {
+        claude_usage_reserve_pct
+    } else {
+        0.0
+    };
+    rationale.push(format!(
+        "{name} eligible at {:.1} percent weekly usage with {:.1} point reserve",
+        usage.weekly_pct, reserve
+    ));
+    Some((usage, reserve))
 }
 
 fn select_provider<'a>(
@@ -260,109 +576,15 @@ fn select_provider<'a>(
     let mut usage_provenance = Vec::with_capacity(providers.len());
 
     for provider in providers {
-        let name = provider.provider_name();
-        if name.eq_ignore_ascii_case(primary_provider) {
-            rationale.push(format!("{name} excluded as primary provider"));
-            usage_provenance.push(CandidateUsage {
-                provider: name.to_string(),
-                weekly_pct: None,
-                stale: true,
-                eligible: false,
-                rejection_reason: Some("primary provider excluded".to_string()),
-            });
-            continue;
+        if let Some((usage, reserve)) = judge_candidate(
+            *provider,
+            primary_provider,
+            claude_usage_reserve_pct,
+            &mut rationale,
+            &mut usage_provenance,
+        ) {
+            eligible.push((*provider, usage, reserve));
         }
-
-        if let Err(reason) = provider.authoritative_availability() {
-            rationale.push(format!("{name} rejected because {reason}"));
-            usage_provenance.push(CandidateUsage {
-                provider: name.to_string(),
-                weekly_pct: None,
-                stale: true,
-                eligible: false,
-                rejection_reason: Some(reason),
-            });
-            continue;
-        }
-
-        let Some(usage) = provider.usage() else {
-            rationale.push(format!("{name} rejected because capacity is unavailable"));
-            usage_provenance.push(CandidateUsage {
-                provider: name.to_string(),
-                weekly_pct: None,
-                stale: true,
-                eligible: false,
-                rejection_reason: Some("capacity unavailable".to_string()),
-            });
-            continue;
-        };
-        if usage.stale {
-            let reason = if name.eq_ignore_ascii_case("grok") && !usage.weekly_capacity_known {
-                "no billing data available".to_string()
-            } else {
-                format!(
-                    "capacity is stale at {:.1} percent weekly usage",
-                    usage.weekly_pct
-                )
-            };
-            rationale.push(format!("{name} rejected because {reason}"));
-            usage_provenance.push(CandidateUsage {
-                provider: name.to_string(),
-                weekly_pct: None,
-                stale: true,
-                eligible: false,
-                rejection_reason: Some(reason),
-            });
-            continue;
-        }
-        if !usage.weekly_capacity_known || !usage.weekly_pct.is_finite() {
-            let reason = format!(
-                "weekly capacity is unknown at {:.1} percent usage",
-                usage.weekly_pct
-            );
-            rationale.push(format!("{name} rejected because {reason}"));
-            usage_provenance.push(CandidateUsage {
-                provider: name.to_string(),
-                weekly_pct: None,
-                stale: false,
-                eligible: false,
-                rejection_reason: Some(reason),
-            });
-            continue;
-        }
-        if usage.weekly_pct >= WEEKLY_USAGE_CEILING {
-            let reason = format!(
-                "weekly usage {:.1} reaches the {:.1} ceiling",
-                usage.weekly_pct, WEEKLY_USAGE_CEILING
-            );
-            rationale.push(format!("{name} rejected because {reason}"));
-            usage_provenance.push(CandidateUsage {
-                provider: name.to_string(),
-                weekly_pct: Some(usage.weekly_pct),
-                stale: false,
-                eligible: false,
-                rejection_reason: Some(reason),
-            });
-            continue;
-        }
-
-        usage_provenance.push(CandidateUsage {
-            provider: name.to_string(),
-            weekly_pct: Some(usage.weekly_pct),
-            stale: false,
-            eligible: true,
-            rejection_reason: None,
-        });
-        let reserve = if name.eq_ignore_ascii_case("claude") {
-            claude_usage_reserve_pct
-        } else {
-            0.0
-        };
-        rationale.push(format!(
-            "{name} eligible at {:.1} percent weekly usage with {:.1} point reserve",
-            usage.weekly_pct, reserve
-        ));
-        eligible.push((*provider, usage, reserve));
     }
 
     eligible.sort_by(
@@ -402,6 +624,87 @@ fn select_provider<'a>(
             ),
             usage_provenance,
         },
+    }
+}
+
+/// PURE: the pinned selection. One candidate, the same gates, plus the reserve as a floor: under
+/// the automatic policy the Claude reserve biases a comparison against another eligible reviewer,
+/// and a pin removes that comparison, so here it protects the reserved band outright. A pin at a
+/// reading the automatic policy would still have selected can therefore be refused; that is the
+/// documented asymmetry, not an accident.
+fn select_pinned<'a>(
+    primary_provider: &str,
+    providers: &[&'a dyn ReviewProvider],
+    pin: &ReviewerPin,
+    claude_usage_reserve_pct: f64,
+) -> Selection<'a> {
+    let name = pin.provider.name();
+    let Some(provider) = providers
+        .iter()
+        .copied()
+        .find(|provider| provider.provider_name().eq_ignore_ascii_case(name))
+    else {
+        return Selection::Failed {
+            reason: format!("requested reviewer {name} is not registered as review capable"),
+        };
+    };
+    if let Some(model) = pin.model.as_deref()
+        && provider.reviewer_model() != model
+    {
+        return Selection::Failed {
+            reason: format!(
+                "requested model {model} but the registered {name} reviewer would run {}",
+                provider.reviewer_model()
+            ),
+        };
+    }
+
+    let mut rationale = vec![format!(
+        "{name} requested explicitly as the reviewer for primary {primary_provider}"
+    )];
+    let mut usage_provenance = Vec::with_capacity(1);
+    let Some((usage, reserve)) = judge_candidate(
+        provider,
+        primary_provider,
+        claude_usage_reserve_pct,
+        &mut rationale,
+        &mut usage_provenance,
+    ) else {
+        return Selection::Skipped {
+            rationale: rationale.join("; "),
+            usage_provenance,
+        };
+    };
+    if reserve > 0.0 && usage.weekly_pct + reserve >= WEEKLY_USAGE_CEILING {
+        let reason = format!(
+            "weekly usage {:.1} plus the {:.1} point reserve reaches the {:.1} ceiling",
+            usage.weekly_pct, reserve, WEEKLY_USAGE_CEILING
+        );
+        rationale.push(format!("{name} rejected because {reason}"));
+        // judge_candidate recorded the candidate as eligible; the reserve floor is the last word.
+        usage_provenance.pop();
+        usage_provenance.push(CandidateUsage {
+            provider: name.to_string(),
+            weekly_pct: Some(usage.weekly_pct),
+            stale: false,
+            eligible: false,
+            rejection_reason: Some(reason),
+        });
+        return Selection::Skipped {
+            rationale: rationale.join("; "),
+            usage_provenance,
+        };
+    }
+
+    rationale.push(format!(
+        "selected {name} at {:.1} percent weekly usage with {:.1} point reserve as the requested reviewer for primary {primary_provider}",
+        usage.weekly_pct, reserve
+    ));
+    Selection::Selected {
+        provider,
+        usage,
+        rationale: rationale.join("; "),
+        usage_provenance,
     }
 }
 

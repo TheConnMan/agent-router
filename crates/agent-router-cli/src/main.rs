@@ -65,6 +65,18 @@ enum Command {
         /// Working directory for the review. Defaults to the current directory.
         #[arg(long)]
         dir: Option<PathBuf>,
+        /// auto selects the eligible alternative with the most headroom. codex, claude, or grok
+        /// pins the reviewer instead. A pin must differ from --primary and still passes every
+        /// eligibility gate (authoritative fresh capacity below the ceiling, and for claude the
+        /// configured reserve as a floor). An ineligible pin is reported as skipped, never
+        /// rerouted.
+        #[arg(long, default_value = "auto")]
+        provider: String,
+        /// Reviewer model, passed to the pinned provider verbatim. Requires an explicit
+        /// --provider other than grok. Without it a pin runs the provider's configured review
+        /// tier. A model the provider rejects fails the review rather than being substituted.
+        #[arg(long)]
+        model: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -143,8 +155,10 @@ fn main() -> std::process::ExitCode {
             request,
             primary,
             dir,
+            provider,
+            model,
             json,
-        } => adversarial_review_status(&mut ctx, request, primary, dir, json),
+        } => adversarial_review_status(&mut ctx, request, primary, dir, provider, model, json),
         command => match run(Cli { command }, &mut ctx) {
             Ok(()) => CliStatus::Success,
             Err(e) => {
@@ -161,16 +175,36 @@ fn adversarial_review_status(
     body: String,
     primary: String,
     dir: Option<PathBuf>,
+    provider: String,
+    model: Option<String>,
     json: bool,
 ) -> CliStatus {
+    // Every early failure below still reports what the caller asked for, so a `--provider claude
+    // --model fable` that never reached selection is distinguishable from an automatic request in
+    // the JSON and, through the rationale, in the reviews log, which has no requested_* columns.
+    let requested = |mut outcome: agent_router_core::adversarial_review::ReviewOutcome| {
+        outcome.requested_provider = (provider != "auto").then(|| provider.clone());
+        outcome.requested_model = model.clone();
+        if outcome.requested_provider.is_some() || outcome.requested_model.is_some() {
+            let model = model
+                .as_deref()
+                .map(|model| format!(" with model {model}"))
+                .unwrap_or_default();
+            outcome.rationale = format!(
+                "{provider} requested explicitly{model} and rejected before selection; {}",
+                outcome.rationale
+            );
+        }
+        outcome
+    };
     let primary_provider = match agent_router_core::run::parse_provider(&primary) {
         Ok(Some(provider)) => provider.name(),
         Ok(None) => {
             return finish_adversarial_review(
-                &agent_router_core::adversarial_review::failed_outcome(
+                &requested(agent_router_core::adversarial_review::failed_outcome(
                     &primary,
                     "primary provider must be codex, claude, or grok",
-                ),
+                )),
                 None,
                 json,
                 ctx,
@@ -178,7 +212,30 @@ fn adversarial_review_status(
         }
         Err(error) => {
             return finish_adversarial_review(
-                &agent_router_core::adversarial_review::failed_outcome(&primary, error.to_string()),
+                &requested(agent_router_core::adversarial_review::failed_outcome(
+                    &primary,
+                    error.to_string(),
+                )),
+                None,
+                json,
+                ctx,
+            );
+        }
+    };
+    let pin = match agent_router_core::run::parse_provider(&provider).and_then(|provider| {
+        agent_router_core::adversarial_review::reviewer_pin(
+            primary_provider,
+            provider,
+            model.as_deref(),
+        )
+    }) {
+        Ok(pin) => pin,
+        Err(error) => {
+            return finish_adversarial_review(
+                &requested(agent_router_core::adversarial_review::failed_outcome(
+                    primary_provider,
+                    error.to_string(),
+                )),
                 None,
                 json,
                 ctx,
@@ -191,10 +248,10 @@ fn adversarial_review_status(
             Ok(dir) => dir,
             Err(error) => {
                 return finish_adversarial_review(
-                    &agent_router_core::adversarial_review::failed_outcome(
+                    &requested(agent_router_core::adversarial_review::failed_outcome(
                         primary_provider,
                         error.to_string(),
-                    ),
+                    )),
                     None,
                     json,
                     ctx,
@@ -204,10 +261,10 @@ fn adversarial_review_status(
     };
     if let Err(error) = ctx.load_config() {
         return finish_adversarial_review(
-            &agent_router_core::adversarial_review::failed_outcome(
+            &requested(agent_router_core::adversarial_review::failed_outcome(
                 primary_provider,
                 error.to_string(),
-            ),
+            )),
             Some(&dir),
             json,
             ctx,
@@ -218,7 +275,12 @@ fn adversarial_review_status(
         body: &body,
         dir: &dir,
     };
-    let outcome = agent_router_core::adversarial_review::review_registered(&request, ctx);
+    let outcome = match &pin {
+        None => agent_router_core::adversarial_review::review_registered(&request, ctx),
+        Some(pin) => {
+            agent_router_core::adversarial_review::review_registered_pinned(&request, pin, ctx)
+        }
+    };
     finish_adversarial_review(&outcome, Some(&dir), json, ctx)
 }
 
