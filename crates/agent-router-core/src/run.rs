@@ -42,10 +42,8 @@ pub struct Dispatch {
     /// The name the job is findable by, which is how a claude job with no resolved short id is
     /// still locatable.
     pub job_name: String,
-    /// The reasoning effort the backend reported the job will run at, which is a different fact
-    /// from the effort the router decided. Populated by codex alone, from the `thread/start`
-    /// reply. None for claude and grok, permanently: neither exposes one, so there is nothing
-    /// observed to record and an inferred value here would read as an observed one.
+    /// The reasoning effort Codex accepted as a turn override, or its reported thread default when
+    /// no override was sent. None for Claude and Grok: neither exposes an effective value.
     pub effective_effort: Option<String>,
 }
 

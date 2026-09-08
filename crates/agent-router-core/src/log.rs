@@ -115,10 +115,9 @@ pub struct Row {
     pub mark: Option<String>,
     /// What the human said alongside the mark. None means nothing was said.
     pub note: Option<String>,
-    /// The reasoning effort the backend reported this job will run at, as against `effort` above,
-    /// which is what the router decided. None means nobody observed one: the backend exposes none
-    /// (claude, grok), nothing was dispatched (a dry run), or the row predates the column. None
-    /// of those is the same as a job running at no effort.
+    /// The effective reasoning effort established through the backend: Codex's accepted turn
+    /// override, or its reported thread default when no override was sent. None means nobody
+    /// established one (Claude/Grok, dry run, or a historical row).
     pub effective_effort: Option<String>,
     /// The `agent-router` build that made this decision, from `CARGO_PKG_VERSION` at record time.
     /// None on a row written before this column, which is not the same as a version that is

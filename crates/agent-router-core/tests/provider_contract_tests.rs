@@ -389,11 +389,7 @@ fn codex_partial_creation_is_one_visible_failure_without_a_retry() {
     assert!(rpc.replies.is_empty());
 }
 
-/// The effort a codex job runs at is the daemon's answer, not the router's: the daemon loads
-/// `~/.codex/config.toml` and reports the resolved value on the `thread/start` response the spawn
-/// already reads for the thread id. Two cases, not one, because a single case is satisfied by an
-/// implementation that hardcodes the value. The recorded value has to move when the reported value
-/// moves, which is what separates reading it from assuming it.
+/// With no turn override, the effort a codex job runs at is the daemon's thread default.
 #[test]
 fn a_codex_dispatch_records_the_effort_the_thread_start_response_reported() {
     for reported in ["high", "low"] {
@@ -443,12 +439,39 @@ fn a_codex_dispatch_records_the_effort_the_thread_start_response_reported() {
     }
 }
 
-/// A `thread/start` reply that says nothing about effort is not evidence of an effort. The decided
-/// effort is deliberately supplied here and provably reaches the turn, so it is sitting in scope
-/// waiting to be borrowed; borrowing it, or the model, or a config default, would put an inferred
-/// value in a column whose whole purpose is to hold an observed one.
+/// `turn/start.effort` is explicitly a turn-and-subsequent-turns override in the app-server
+/// protocol. A global low default reported while creating the thread must therefore not be logged
+/// as the effective effort after the daemon accepts a high-effort turn.
 #[test]
-fn a_codex_response_without_a_reasoning_effort_records_null_rather_than_a_guess() {
+fn an_accepted_turn_effort_overrides_the_threads_configured_default() {
+    let mut rpc = ScriptedRpc::with_replies(vec![
+        Ok(r#"{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread override"},"reasoningEffort":"low"}}"#.to_string()),
+        Ok(r#"{"jsonrpc":"2.0","id":3,"result":{}}"#.to_string()),
+        Ok(r#"{"jsonrpc":"2.0","id":4,"result":{"turn":{"id":"turn 1","items":[],"status":"inProgress"}}}"#.to_string()),
+    ]);
+
+    let attempt = spawn_on_initialized_rpc(
+        &mut rpc,
+        Path::new("/tmp"),
+        "perform one task",
+        "Bonus: abc 123",
+        Some("gpt-6-astra"),
+        Some("high"),
+    );
+
+    match attempt {
+        SpawnAttempt::Started {
+            effective_effort, ..
+        } => assert_eq!(effective_effort.as_deref(), Some("high")),
+        other => panic!("expected a started thread, got {other:?}"),
+    }
+    assert_eq!(rpc.requests[2]["params"]["effort"], "high");
+}
+
+/// A successfully accepted turn override is the effective effort even when thread creation did
+/// not report a default.
+#[test]
+fn a_codex_response_without_a_reasoning_effort_records_the_accepted_turn_override() {
     let mut rpc = ScriptedRpc::with_replies(vec![
         Ok(r#"{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread silent"}}}"#.to_string()),
         Ok(r#"{"jsonrpc":"2.0","id":3,"result":{}}"#.to_string()),
@@ -470,10 +493,7 @@ fn a_codex_response_without_a_reasoning_effort_records_null_rather_than_a_guess(
             effective_effort,
         } => {
             assert_eq!(thread_id, "thread silent");
-            assert_eq!(
-                effective_effort, None,
-                "a silent daemon means the router does not know, not that it may guess"
-            );
+            assert_eq!(effective_effort.as_deref(), Some("xhigh"));
         }
         other => panic!("expected a started thread, got {other:?}"),
     }

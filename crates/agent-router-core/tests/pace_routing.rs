@@ -554,9 +554,9 @@ fn complexity_picks_codex_tiers_without_overruling_workhorse_headroom() {
     let config = Config::default();
     let cases = [
         (Complexity::Low, "gpt-5.6-luna", "low"),
-        (Complexity::Medium, "gpt-5.6-terra", "medium"),
-        (Complexity::High, "gpt-5.6-sol", "high"),
-        (Complexity::Ultra, "gpt-5.6-sol", "high"),
+        (Complexity::Medium, "gpt-5.6-terra", "low"),
+        (Complexity::High, "gpt-5.6-sol", "low"),
+        (Complexity::Ultra, "gpt-5.6-sol", "medium"),
     ];
 
     for (complexity, codex_model, effort) in cases {
@@ -573,6 +573,40 @@ fn complexity_picks_codex_tiers_without_overruling_workhorse_headroom() {
         assert_eq!(decision.provider, Provider::Codex, "{complexity:?}");
         assert_eq!(decision.model.as_deref(), Some(codex_model));
         assert_eq!(decision.effort.as_deref(), Some(effort));
+    }
+}
+
+/// Effort is a small gear within the selected model: changing models resets it to low, while a
+/// repeated model at the next complexity tier raises it one step. This also proves the policy
+/// follows operator-configured tiers rather than recognizing hard-coded model names.
+#[test]
+fn codex_effort_resets_when_the_model_changes_and_ramps_when_it_stays() {
+    let mut config = Config::default();
+    config.models.codex.low = "gpt-5.6-terra".to_string();
+    config.models.codex.medium = "gpt-5.6-terra".to_string();
+    config.models.codex.high = "gpt-6-astra".to_string();
+    config.models.codex.ultra = "gpt-6-astra".to_string();
+
+    let cases = [
+        (Complexity::Low, "gpt-5.6-terra", "low"),
+        (Complexity::Medium, "gpt-5.6-terra", "medium"),
+        (Complexity::High, "gpt-6-astra", "low"),
+        (Complexity::Ultra, "gpt-6-astra", "medium"),
+    ];
+
+    for (complexity, model, effort) in cases {
+        let decision = decide(
+            scored(false, false, complexity),
+            usage_with_grok(
+                window(99.0, HALF_WEEK, 0.0),
+                window(10.0, HALF_WEEK, 0.0),
+                window(60.0, HALF_WEEK, 0.0),
+            ),
+            NOW,
+            &config,
+        );
+        assert_eq!(decision.model.as_deref(), Some(model), "{complexity:?}");
+        assert_eq!(decision.effort.as_deref(), Some(effort), "{complexity:?}");
     }
 }
 

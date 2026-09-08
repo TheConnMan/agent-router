@@ -1043,7 +1043,7 @@ fn a_claude_dispatch_records_no_effective_effort() {
 
 #[cfg(unix)]
 #[test]
-fn pinned_codex_maps_low_and_high_without_moving_provider() {
+fn pinned_codex_provider_uses_the_geared_model_and_effort_mapping() {
     for (label, task, complexity, model, effort) in [
         ("codex-low", "say hi", "low", "gpt-5.6-luna", "low"),
         (
@@ -1051,7 +1051,7 @@ fn pinned_codex_maps_low_and_high_without_moving_provider() {
             "/implement redesign the router architecture",
             "high",
             "gpt-5.6-sol",
-            "high",
+            "low",
         ),
     ] {
         let fixture = CliFixture::new(label).with_task(task);

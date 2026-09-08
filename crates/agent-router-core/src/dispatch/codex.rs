@@ -31,9 +31,8 @@ pub trait CodexRpc {
 pub enum SpawnAttempt {
     Started {
         thread_id: String,
-        /// The effort the daemon reported the thread resolved to, straight off the `thread/start`
-        /// reply. None when that reply said nothing, which means the router does not know rather
-        /// than that the job runs at no effort.
+        /// The accepted turn override, or the thread default reported by `thread/start` when no
+        /// override was supplied. None means the router observed neither.
         effective_effort: Option<String>,
     },
     TurnFailed {
@@ -234,15 +233,15 @@ pub fn spawn_on_initialized_rpc(
             "app-server thread/start returned no thread id: {thread_response}"
         )));
     };
-    // Read off the reply already in hand rather than asking again: the daemon loads the operator's
-    // own config, so this is the resolved effort the turn will actually run at.
-    let effective_effort = parse_reasoning_effort(&thread_response, 2);
+    // This is the thread default. `turn/start.effort`, when present and accepted below, overrides
+    // it for this turn and subsequent turns according to the app-server protocol.
+    let thread_effort = parse_reasoning_effort(&thread_response, 2);
     // The thread is already running, so a rejected name must not cost the caller its identity.
     let _ = rpc.request(3, &thread_set_name_request(3, &thread_id, name));
     match rpc.request(4, &turn_start_request(4, &thread_id, task, effort)) {
         Ok(_) => SpawnAttempt::Started {
             thread_id,
-            effective_effort,
+            effective_effort: effort.map(str::to_string).or(thread_effort),
         },
         Err(error) => SpawnAttempt::TurnFailed { thread_id, error },
     }

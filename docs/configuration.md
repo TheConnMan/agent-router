@@ -288,10 +288,17 @@ The routing inputs form a contiguous hierarchy. These four forms are valid:
 Any noncontiguous combination is rejected. A model requires a provider, and an effort requires both
 provider and model. This keeps every omitted value downstream of the values before it.
 
-For Codex and Claude, classified complexity maps to fixed effort: `low` to `low`, `medium` to
-`medium`, and both `high` and `ultra` to `high`. The model tier table remains separate because
-complexity chooses the model while the fixed mapping chooses effort. Grok has no derived model
-and receives no derived effort from classification.
+Codex uses the model table as a gear train. A model change resets effort to `low`; consecutive
+complexity tiers that keep the same model ramp to `medium`, then `high`. With the default table this
+produces Luna/low, Terra/low, Sol/low, and Sol/medium. If an operator configures Terra for low and
+medium and Astra for high and ultra, the result is Terra/low, Terra/medium, Astra/low, and
+Astra/medium. The model names themselves are not special; equality between adjacent configured
+tiers drives the reset.
+
+Claude retains the direct complexity mapping: `low` to `low`, `medium` to `medium`, and both `high`
+and `ultra` to `high`. An explicit provider and model with omitted effort also uses this direct
+mapping because the router has no model-transition history for a caller-selected model. Grok has
+no derived model and receives no derived effort from classification.
 
 Complexity never changes which provider a task routes to, and the provider never changes
 complexity. A low complexity task can run on either provider, and so can an ultra one.
@@ -302,30 +309,29 @@ to keep `ultra` deliberately hard to earn.
 
 ### What reasoning effort a dispatched job actually runs at
 
-The router's `effort` value is the requested effort, not necessarily the effort a job reports after
-dispatch. For classified Codex and Claude work it is the fixed complexity mapping above. A fully
-pinned request keeps the supplied value. Grok receives no effort from classification and rejects
-an explicit `--effort` pin.
+The router's `effort` value is the requested effort. Classified Codex work uses the geared mapping
+above; Claude and an explicitly pinned model use the direct complexity mapping. A fully pinned
+request keeps the supplied value. Grok receives no effort from classification and rejects an
+explicit `--effort` pin.
 
 On Claude the router passes the requested value as `--effort`. Claude reports the value it settled on
 nowhere, so there is nothing to record: `effective_effort` on a Claude row is null, permanently. It
 is null on a Grok row too, because Grok exposes no effective effort.
 
-On Codex it is whatever your own `~/.codex/config.toml` resolves. Dispatch goes through
-`codex app-server daemon`, and the daemon loads user config, unlike the classifier, which passes
-`--ignore-user-config`. So a `model_reasoning_effort` in that file applies to every routed Codex
-job at every tier. The daemon reports the value it resolved on the `thread/start` reply, and the
-router records that reading in the decision log's `effective_effort` column, so a Codex row says
-what the job will actually run at and follows that file when you change it. A pinned effort is sent
-to the turn, while the daemon still reports the effective value it resolved.
+Codex dispatch goes through `codex app-server daemon`, which loads `~/.codex/config.toml`. The
+daemon reports that thread default on `thread/start`. The router then sends its selected effort on
+`turn/start`; the app-server protocol defines that value as an override for this turn and subsequent
+turns. Once the daemon accepts the turn, `effective_effort` records the override. If no override was
+sent, it records the reported thread default instead. A global `model_reasoning_effort` therefore
+remains the fallback, not an override of the router's explicit turn setting.
 
 The two effort columns are different facts and the log keeps them apart on purpose. `effort` is what
-the router requested, either from the fixed complexity mapping or an explicit pin; `effective_effort`
-is what the backend reported. Null in the
+the router requested; `effective_effort` is what Codex established through an accepted override or
+reported thread default. Null in the
 second one means nobody observed an effort, which is not the same as a job running at no effort: it
 covers a Claude or Grok row, a dry run, and a row written before the column existed.
 
-When no pinned effort or `model_reasoning_effort` is present, a Codex job falls through to the
+When no routed effort or `model_reasoning_effort` is present, a Codex job falls through to the
 model's catalogue default, and those defaults are not ordered the way the tier table is. Read them from
 the running daemon rather than assuming:
 

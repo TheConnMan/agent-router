@@ -3,6 +3,13 @@
 All notable changes to this project are documented here. Versions are the
 workspace `package.version` stamped on every decision-log row.
 
+## 0.23.0 - 2026-09-08
+
+- Treat Codex model and reasoning effort as two gears: reset effort to low when the configured
+  model tier changes, then ramp it only while that model remains selected.
+- Record an accepted Codex turn-level effort override as effective instead of the superseded
+  thread default from user configuration.
+
 ## 0.21.9 - 2026-09-04
 
 - Record measured routing decisions as ADRs under `docs/decisions/` and trim
