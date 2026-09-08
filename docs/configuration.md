@@ -52,15 +52,15 @@ claude_model = "haiku"
 codex_model = "gpt-5.6-luna"
 
 [models.codex]
-low = "gpt-5.6-luna"
-medium = "gpt-5.6-terra"
-high = "gpt-5.6-sol"
-ultra = "gpt-5.6-sol"
+low = "gpt-5.6-terra"
+medium = "gpt-5.6-sol"
+high = "gpt-6-astra"
+ultra = "gpt-6-astra"
 
 [models.claude]
 low = "sonnet"
 medium = "opus[1m]"
-high = "opus[1m]"
+high = "fable"
 ultra = "fable"
 
 [parity]
@@ -288,29 +288,23 @@ The routing inputs form a contiguous hierarchy. These four forms are valid:
 Any noncontiguous combination is rejected. A model requires a provider, and an effort requires both
 provider and model. This keeps every omitted value downstream of the values before it.
 
-Codex uses the model table as a gear train. A model change resets effort to `low`; consecutive
-complexity tiers that keep the same model ramp to `medium`, then `high`. With the default table this
-produces Luna/low, Terra/low, Sol/low, and Sol/medium. If an operator configures Terra for low and
-medium and Astra for high and ultra, the result is Terra/low, Terra/medium, Astra/low, and
-Astra/medium. The model names themselves are not special; equality between adjacent configured
-tiers drives the reset.
-
-Claude retains the direct complexity mapping: `low` to `low`, `medium` to `medium`, and both `high`
-and `ultra` to `high`. An explicit provider and model with omitted effort also uses this direct
-mapping because the router has no model-transition history for a caller-selected model. Grok has
-no derived model and receives no derived effort from classification.
+Codex and Claude share one four-position effort ladder: low complexity uses `high`, medium uses
+`medium`, high uses `low`, and ultra uses `high`. Their model tables remain provider-specific. With
+the defaults this produces Terra/high, Sol/medium, Astra/low, and Astra/high for Codex, and
+Sonnet/high, Opus/medium, Fable/low, and Fable/high for Claude. An explicit provider and model with
+omitted effort uses the same ladder. Grok has no derived model and receives no derived effort from
+classification.
 
 Complexity never changes which provider a task routes to, and the provider never changes
 complexity. A low complexity task can run on either provider, and so can an ultra one.
 
-The Codex defaults point `high` and `ultra` at the same model because `sol` is the top of the Codex
-catalogue. The Claude defaults reserve `fable` for `ultra` alone, which is why the rubric is written
-to keep `ultra` deliberately hard to earn.
+The defaults point `high` and `ultra` at the same top model for each provider; ultra is deliberately
+hard to earn because it raises that model from low to high effort.
 
 ### What reasoning effort a dispatched job actually runs at
 
-The router's `effort` value is the requested effort. Classified Codex work uses the geared mapping
-above; Claude and an explicitly pinned model use the direct complexity mapping. A fully pinned
+The router's `effort` value is the requested effort. Classified Codex and Claude work, including an
+explicitly pinned model with omitted effort, use the shared complexity ladder above. A fully pinned
 request keeps the supplied value. Grok receives no effort from classification and rejects an
 explicit `--effort` pin.
 

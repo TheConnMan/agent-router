@@ -67,10 +67,10 @@ log: row 87 in /home/you/.local/state/agent-router/router.db
    5-hour window does not pace automatic routing; Claude is reserved for the capability pins
    above. Grok remains available for explicit dispatch with `--provider grok`.
 4. **Complete the provider, model, and effort pins.** With no pins, classification chooses the
-   provider through usage routing, then complexity walks the Codex model tier table. Effort is the
-   smaller gear inside that model: it resets to low when the configured model changes and rises to
-   medium, then high, only across consecutive tiers that retain the same model. Grok uses its
-   lifecycle default model and effort. An explicit
+   provider through usage routing, then complexity walks that provider's model tier table and
+   shared effort ladder: low uses the workhorse at high effort, medium uses the stronger model at
+   medium, high uses the top model at low, and ultra keeps the top model but raises effort to high.
+   Grok uses its lifecycle default model and effort. An explicit
    Claude or Codex provider preserves that provider while classification fills omitted model and
    effort. An explicit Claude or Codex provider and model preserves both while classification fills
    effort. Three explicit values are exact and skip routing classification. Grok accepts an explicit
@@ -183,7 +183,7 @@ agent-router run "Fix the failing test" --dir ~/git/other-project
 | `--dir <PATH>` | current directory | Working directory for the dispatched job. |
 | `--provider <NAME>` | `auto` | `auto` classifies the task, balances ordinary work between Codex and Grok, and pins Claude for capability needs. An explicit provider pins it. |
 | `--model <NAME>` | tier table | Model pin. Requires an explicit `--provider`. With explicit Claude or Codex and no effort, classification fills effort. Pairing it with `--provider auto` is rejected. An explicit Grok model reaches the public lifecycle unchanged. |
-| `--effort <NAME>` | geared mapping | Effort pin. Requires an explicit provider and model. Derived Codex effort resets to low on a model change and ramps while that model repeats; Claude uses the direct complexity mapping. Grok rejects this flag. |
+| `--effort <NAME>` | complexity ladder | Effort pin. Requires an explicit provider and model. Derived Codex and Claude effort is high, medium, low, or high for low, medium, high, or ultra complexity respectively. Grok rejects this flag. |
 | `--name <NAME>` | the model's title, recovered if it omitted a ticket, or one title-only retry; three to five words derived from the task only if both fail | Name for the dispatched job. Supplying it skips the naming call. It reaches the `claude --bg --name` argv verbatim, names the Codex thread, and is recorded as `job_name` in the decision log for every provider, so callers that reconcile inflight jobs by exact name depend on it. An empty or whitespace only name is rejected. |
 | `--dry-run` | off | Decide and log, dispatch nothing, and project the weekly draw the job is likely to cost on the provider it landed on. |
 | `--mcp-config <PATH>` | none | MCP config file for the dispatched Claude job. Repeatable. Rejected for every other provider, including Grok, and the check runs after routing, so pairing it with `--provider auto` fails whenever classification lands on a provider other than Claude. |
@@ -450,8 +450,8 @@ rather than absent. The log is the tuning surface: each gate tag names a specifi
 so routing behaviour can be audited against outcomes rather than recalled.
 
 Two of those columns are about reasoning effort and they are not the same fact. `effort` is what the
-router requested. For classified Codex work it follows the geared model-tier mapping; Claude uses
-the direct complexity mapping. `effective_effort` is what Codex established for the dispatched
+router requested. For classified Codex and Claude work it follows the shared complexity ladder.
+`effective_effort` is what Codex established for the dispatched
 turn: the accepted turn override, or the thread default reported by `thread/start` when no override
 was supplied. Claude and Grok expose no effective effort, so those rows stay null
 rather than being filled in from the model, the decision, or a config file. Null also covers a dry

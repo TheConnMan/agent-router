@@ -99,7 +99,7 @@ pub struct Models {
     pub claude: ClaudeModels,
 }
 
-/// Ultra and high share sol, because sol is the top of the codex catalogue on this box.
+/// High and ultra share Astra; ultra increases effort within that top model.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct CodexModels {
@@ -112,10 +112,10 @@ pub struct CodexModels {
 impl Default for CodexModels {
     fn default() -> CodexModels {
         CodexModels {
-            low: "gpt-5.6-luna".to_string(),
-            medium: "gpt-5.6-terra".to_string(),
-            high: "gpt-5.6-sol".to_string(),
-            ultra: "gpt-5.6-sol".to_string(),
+            low: "gpt-5.6-terra".to_string(),
+            medium: "gpt-5.6-sol".to_string(),
+            high: "gpt-6-astra".to_string(),
+            ultra: "gpt-6-astra".to_string(),
         }
     }
 }
@@ -131,7 +131,7 @@ impl CodexModels {
     }
 }
 
-/// Ultra is the only tier that reaches fable, which is why the classifier rubric keeps ultra rare.
+/// High and ultra share Fable; ultra increases effort within that top model.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct ClaudeModels {
@@ -146,7 +146,7 @@ impl Default for ClaudeModels {
         ClaudeModels {
             low: "sonnet".to_string(),
             medium: "opus[1m]".to_string(),
-            high: "opus[1m]".to_string(),
+            high: "fable".to_string(),
             ultra: "fable".to_string(),
         }
     }
@@ -822,16 +822,16 @@ mod tests {
         let path = dir.path().join("config.toml");
 
         let defaults = Config::default();
-        assert_eq!(defaults.models.codex.pick(Complexity::Low), "gpt-5.6-luna");
+        assert_eq!(defaults.models.codex.pick(Complexity::Low), "gpt-5.6-terra");
         assert_eq!(
             defaults.models.codex.pick(Complexity::Medium),
-            "gpt-5.6-terra"
+            "gpt-5.6-sol"
         );
-        assert_eq!(defaults.models.codex.pick(Complexity::High), "gpt-5.6-sol");
-        assert_eq!(defaults.models.codex.pick(Complexity::Ultra), "gpt-5.6-sol");
+        assert_eq!(defaults.models.codex.pick(Complexity::High), "gpt-6-astra");
+        assert_eq!(defaults.models.codex.pick(Complexity::Ultra), "gpt-6-astra");
         assert_eq!(defaults.models.claude.pick(Complexity::Low), "sonnet");
         assert_eq!(defaults.models.claude.pick(Complexity::Medium), "opus[1m]");
-        assert_eq!(defaults.models.claude.pick(Complexity::High), "opus[1m]");
+        assert_eq!(defaults.models.claude.pick(Complexity::High), "fable");
         assert_eq!(defaults.models.claude.pick(Complexity::Ultra), "fable");
 
         // No models section at all.
@@ -846,12 +846,12 @@ mod tests {
         .expect("write");
         let partial = Config::load_from(&path).expect("loads");
         assert_eq!(partial.models.codex.low, "gpt-5.6-tiny");
-        assert_eq!(partial.models.codex.medium, "gpt-5.6-terra");
-        assert_eq!(partial.models.codex.high, "gpt-5.6-sol");
-        assert_eq!(partial.models.codex.ultra, "gpt-5.6-sol");
+        assert_eq!(partial.models.codex.medium, "gpt-5.6-sol");
+        assert_eq!(partial.models.codex.high, "gpt-6-astra");
+        assert_eq!(partial.models.codex.ultra, "gpt-6-astra");
         assert_eq!(partial.models.claude.ultra, "opus[1m]");
         assert_eq!(partial.models.claude.low, "sonnet");
-        assert_eq!(partial.models.claude.high, "opus[1m]");
+        assert_eq!(partial.models.claude.high, "fable");
     }
 
     /// The classifier engine is the setting that decides which weekly budget the per-task scoring

@@ -3,6 +3,11 @@
 All notable changes to this project are documented here. Versions are the
 workspace `package.version` stamped on every decision-log row.
 
+## 0.24.0 - 2026-09-08
+
+- Route Codex complexity through Terra/high, Sol/medium, Astra/low, and Astra/high.
+- Apply the same effort ladder to Claude with Sonnet, Opus, Fable, and Fable.
+
 ## 0.23.1 - 2026-09-08
 
 - `adversarial-review` persists a review id and prints
@@ -22,6 +27,7 @@ workspace `package.version` stamped on every decision-log row.
   has a NULL `status`; its state is derived from `exit_status` instead of
   ever reading as pending.
 - `runtime::spawn_detached` now returns the spawned `Child`.
+
 ## 0.23.0 - 2026-09-08
 
 - Treat Codex model and reasoning effort as two gears: reset effort to low when the configured

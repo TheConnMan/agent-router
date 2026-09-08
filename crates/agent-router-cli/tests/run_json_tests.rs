@@ -1043,14 +1043,14 @@ fn a_claude_dispatch_records_no_effective_effort() {
 
 #[cfg(unix)]
 #[test]
-fn pinned_codex_provider_uses_the_geared_model_and_effort_mapping() {
+fn pinned_codex_provider_uses_the_complexity_model_and_effort_mapping() {
     for (label, task, complexity, model, effort) in [
-        ("codex-low", "say hi", "low", "gpt-5.6-luna", "low"),
+        ("codex-low", "say hi", "low", "gpt-5.6-terra", "high"),
         (
             "codex-high",
             "/implement redesign the router architecture",
             "high",
-            "gpt-5.6-sol",
+            "gpt-6-astra",
             "low",
         ),
     ] {
@@ -1107,7 +1107,7 @@ fn pinned_claude_classifies_but_stays_on_claude() {
 
     assert_eq!(value["provider"], "claude");
     assert_eq!(value["model"], "sonnet");
-    assert_eq!(value["effort"], "low");
+    assert_eq!(value["effort"], "high");
     assert_eq!(value["classification"]["complexity"], "low");
     assert_eq!(fixture.classifier_calls(), 1);
 }
@@ -1168,7 +1168,7 @@ fn provider_and_model_pins_preserve_model_and_derive_only_effort() {
 
     assert_eq!(value["provider"], "claude");
     assert_eq!(value["model"], "claude-custom-model");
-    assert_eq!(value["effort"], "high");
+    assert_eq!(value["effort"], "low");
     assert_eq!(value["classification"]["complexity"], "high");
     assert_eq!(fixture.classifier_calls(), 1);
 
@@ -1181,7 +1181,7 @@ fn provider_and_model_pins_preserve_model_and_derive_only_effort() {
             "--model",
             "claude-custom-model",
             "--effort",
-            "high",
+            "low",
             "--name",
             name,
             &fixture.task

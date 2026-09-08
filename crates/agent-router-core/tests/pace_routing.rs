@@ -135,7 +135,8 @@ fn an_orchestration_task_pins_to_claude_past_every_usage_rule() {
     );
 
     assert_eq!(decision.provider, Provider::Claude);
-    assert_eq!(decision.model.as_deref(), Some("opus[1m]"));
+    assert_eq!(decision.model.as_deref(), Some("fable"));
+    assert_eq!(decision.effort.as_deref(), Some("low"));
     assert!(decision.gates.contains(&Gate::Orchestration));
 }
 
@@ -553,10 +554,10 @@ fn both_workhorse_weekly_windows_unknown_still_route_to_codex() {
 fn complexity_picks_codex_tiers_without_overruling_workhorse_headroom() {
     let config = Config::default();
     let cases = [
-        (Complexity::Low, "gpt-5.6-luna", "low"),
-        (Complexity::Medium, "gpt-5.6-terra", "low"),
-        (Complexity::High, "gpt-5.6-sol", "low"),
-        (Complexity::Ultra, "gpt-5.6-sol", "medium"),
+        (Complexity::Low, "gpt-5.6-terra", "high"),
+        (Complexity::Medium, "gpt-5.6-sol", "medium"),
+        (Complexity::High, "gpt-6-astra", "low"),
+        (Complexity::Ultra, "gpt-6-astra", "high"),
     ];
 
     for (complexity, codex_model, effort) in cases {
@@ -576,11 +577,9 @@ fn complexity_picks_codex_tiers_without_overruling_workhorse_headroom() {
     }
 }
 
-/// Effort is a small gear within the selected model: changing models resets it to low, while a
-/// repeated model at the next complexity tier raises it one step. This also proves the policy
-/// follows operator-configured tiers rather than recognizing hard-coded model names.
+/// Model selection remains configurable while effort is fixed by the four complexity positions.
 #[test]
-fn codex_effort_resets_when_the_model_changes_and_ramps_when_it_stays() {
+fn codex_effort_follows_the_complexity_ladder_with_custom_models() {
     let mut config = Config::default();
     config.models.codex.low = "gpt-5.6-terra".to_string();
     config.models.codex.medium = "gpt-5.6-terra".to_string();
@@ -588,10 +587,10 @@ fn codex_effort_resets_when_the_model_changes_and_ramps_when_it_stays() {
     config.models.codex.ultra = "gpt-6-astra".to_string();
 
     let cases = [
-        (Complexity::Low, "gpt-5.6-terra", "low"),
+        (Complexity::Low, "gpt-5.6-terra", "high"),
         (Complexity::Medium, "gpt-5.6-terra", "medium"),
         (Complexity::High, "gpt-6-astra", "low"),
-        (Complexity::Ultra, "gpt-6-astra", "medium"),
+        (Complexity::Ultra, "gpt-6-astra", "high"),
     ];
 
     for (complexity, model, effort) in cases {
@@ -603,6 +602,40 @@ fn codex_effort_resets_when_the_model_changes_and_ramps_when_it_stays() {
                 window(60.0, HALF_WEEK, 0.0),
             ),
             NOW,
+            &config,
+        );
+        assert_eq!(decision.model.as_deref(), Some(model), "{complexity:?}");
+        assert_eq!(decision.effort.as_deref(), Some(effort), "{complexity:?}");
+    }
+}
+
+/// Claude uses the same effort ladder as Codex, against its own configured model table.
+#[test]
+fn claude_effort_follows_the_complexity_ladder() {
+    let mut config = Config::default();
+    config.models.claude.low = "sonnet".to_string();
+    config.models.claude.medium = "opus[1m]".to_string();
+    config.models.claude.high = "fable".to_string();
+    config.models.claude.ultra = "fable".to_string();
+
+    let cases = [
+        (Complexity::Low, "sonnet", "high"),
+        (Complexity::Medium, "opus[1m]", "medium"),
+        (Complexity::High, "fable", "low"),
+        (Complexity::Ultra, "fable", "high"),
+    ];
+
+    for (complexity, model, effort) in cases {
+        let decision = agent_router_core::decide::decide_explicit(
+            Provider::Claude,
+            None,
+            None,
+            Some(scored(false, false, complexity)),
+            usage_with_grok(
+                window(10.0, HALF_WEEK, 0.0),
+                window(99.0, HALF_WEEK, 0.0),
+                window(60.0, HALF_WEEK, 0.0),
+            ),
             &config,
         );
         assert_eq!(decision.model.as_deref(), Some(model), "{complexity:?}");

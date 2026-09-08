@@ -26,8 +26,8 @@ pub enum Complexity {
     /// errs toward capability, so it is high rather than the middle of the ladder.
     #[default]
     High,
-    /// The rare top tier. On claude it is the only tier that reaches fable, so the rubric keeps
-    /// it deliberately hard to earn.
+    /// The rare top tier. It retains the top model from high and raises its effort, so the rubric
+    /// keeps it deliberately hard to earn.
     Ultra,
 }
 
@@ -968,8 +968,8 @@ mod tests {
             "Never let complexity change orchestration or missing_connector, and never let either \
              of them change complexity."
         ));
-        // Ultra is the only tier that reaches fable, so the brake on over-assigning it is
-        // load-bearing rather than decorative.
+        // Ultra raises the top model's effort, so the brake on over-assigning it is load-bearing
+        // rather than decorative.
         assert!(prompt.contains("when torn between high and ultra, answer high"));
         // Context horizon predicts the amount of retained working context, not how hard the task
         // feels. The three positive cases are deliberately narrow and ordinary is the default.

@@ -348,7 +348,7 @@ pub fn decide_with_task(
     Decision {
         provider,
         model,
-        effort: effort_for(provider, complexity, config),
+        effort: effort_for(provider, complexity),
         classification: Some(classification),
         gates,
         capability_blocked,
@@ -400,7 +400,7 @@ pub fn decide_explicit(
             if requested_model.is_some() && provider != Provider::Grok {
                 Some(complexity_effort(value).to_string())
             } else {
-                effort_for(provider, value, config)
+                effort_for(provider, value)
             }
         })
     });
@@ -449,53 +449,24 @@ fn model_for(provider: Provider, complexity: Complexity, config: &Config) -> Opt
     }
 }
 
-/// PURE: the effort policy for providers that accept an effort value.
+/// PURE: the shared effort policy for providers that accept an effort value.
 ///
-/// Codex treats model and effort as two gears. Moving to a different configured model resets the
-/// effort to low; consecutive complexity tiers on the same model ramp low, medium, then high. A
-/// stronger model therefore gets its efficient setting before the router spends more reasoning on
-/// it. Claude retains the direct complexity mapping because its catalogue and effort semantics are
-/// provider-specific rather than Codex model-family generations.
-fn effort_for(provider: Provider, complexity: Complexity, config: &Config) -> Option<String> {
+/// Each stronger model enters at a lower reasoning setting: low-complexity work uses the workhorse
+/// at high effort, medium uses the stronger model at medium, and high uses the top model at low.
+/// Ultra keeps the top model and raises its effort to high.
+fn effort_for(provider: Provider, complexity: Complexity) -> Option<String> {
     match provider {
-        Provider::Codex => Some(codex_geared_effort(complexity, config).to_string()),
-        Provider::Claude => Some(complexity_effort(complexity).to_string()),
+        Provider::Codex | Provider::Claude => Some(complexity_effort(complexity).to_string()),
         Provider::Grok => None,
     }
 }
 
 fn complexity_effort(complexity: Complexity) -> &'static str {
     match complexity {
-        Complexity::Low => "low",
+        Complexity::Low => "high",
         Complexity::Medium => "medium",
-        Complexity::High | Complexity::Ultra => "high",
-    }
-}
-
-/// PURE: the small-gear position within the current configured Codex model.
-fn codex_geared_effort(complexity: Complexity, config: &Config) -> &'static str {
-    let tiers = [
-        Complexity::Low,
-        Complexity::Medium,
-        Complexity::High,
-        Complexity::Ultra,
-    ];
-    let selected = match complexity {
-        Complexity::Low => 0,
-        Complexity::Medium => 1,
-        Complexity::High => 2,
-        Complexity::Ultra => 3,
-    };
-    let model = config.models.codex.pick(complexity);
-    let same_model_steps = tiers[..=selected]
-        .iter()
-        .rev()
-        .take_while(|tier| config.models.codex.pick(**tier) == model)
-        .count();
-    match same_model_steps {
-        1 => "low",
-        2 => "medium",
-        _ => "high",
+        Complexity::High => "low",
+        Complexity::Ultra => "high",
     }
 }
 
@@ -605,7 +576,7 @@ mod tests {
             usage(0.0, 0.0),
             &config,
         );
-        assert_eq!(codex.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(codex.model.as_deref(), Some("gpt-6-astra"));
         assert_eq!(codex.effort.as_deref(), Some("low"));
 
         let claude = decide_explicit(
@@ -616,8 +587,8 @@ mod tests {
             usage(0.0, 0.0),
             &config,
         );
-        assert_eq!(claude.model.as_deref(), Some("opus[1m]"));
-        assert_eq!(claude.effort.as_deref(), Some("high"));
+        assert_eq!(claude.model.as_deref(), Some("fable"));
+        assert_eq!(claude.effort.as_deref(), Some("low"));
     }
 
     #[test]
