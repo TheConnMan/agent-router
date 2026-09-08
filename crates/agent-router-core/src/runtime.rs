@@ -193,7 +193,7 @@ pub fn canonicalize_dir(path: &Path) -> PathBuf {
     })
 }
 
-pub(crate) fn router_log_path(home: &Path, prefix: &str) -> PathBuf {
+pub fn router_log_path(home: &Path, prefix: &str) -> PathBuf {
     home.join(".local/state/agent-router/logs")
         .join(format!("{prefix}-{}.log", now_ms()))
 }
@@ -204,11 +204,15 @@ pub(crate) fn router_log_path(home: &Path, prefix: &str) -> PathBuf {
 /// and is what turns an `ENOENT` here into a named `Error::Launch`. `None` is for spawns that
 /// are not provider CLIs: those keep `Error::Io`. See
 /// docs/decisions/0005-launch-error-and-binary-resolver.md.
+///
+/// The `Child` is returned so a caller can observe the process exit. `setsid` detaches the
+/// session, not the parent-child relationship, which is why `try_wait()` on this handle is
+/// meaningful; a caller that only wants the pid still has `child.id()`.
 pub fn spawn_detached(
     mut command: Command,
     log_path: &Path,
     override_env: Option<&str>,
-) -> Result<u32> {
+) -> Result<std::process::Child> {
     if let Some(parent) = log_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -247,13 +251,10 @@ pub fn spawn_detached(
     // The program is read before the spawn so the failure can name it: `Command` is consumed by
     // the borrow the spawn takes, and the mapper needs the path either way.
     let program = PathBuf::from(command.get_program());
-    command
-        .spawn()
-        .map(|child| child.id())
-        .map_err(|error| match override_env {
-            Some(override_env) => crate::binary::launch_error(&program, override_env, error),
-            None => crate::Error::Io(error),
-        })
+    command.spawn().map_err(|error| match override_env {
+        Some(override_env) => crate::binary::launch_error(&program, override_env, error),
+        None => crate::Error::Io(error),
+    })
 }
 
 #[cfg(test)]

@@ -3,6 +3,25 @@
 All notable changes to this project are documented here. Versions are the
 workspace `package.version` stamped on every decision-log row.
 
+## 0.23.1 - 2026-09-08
+
+- `adversarial-review` persists a review id and prints
+  `agent-router: adversarial review <id> started` to stderr before any
+  provider work begins, then runs the reviewer in a detached worker process
+  so the review survives the caller exiting or being killed. By default the
+  command still waits for a terminal result and prints the review body
+  exactly as before.
+- `--timeout <SECS>` bounds that wait: past the deadline the command exits
+  `4` and reports `status: "pending"` with `review_id` while the review
+  keeps running; `--timeout 0` returns pending immediately.
+- Add `agent-router review status <ID> [--json]` and
+  `agent-router review cancel <ID>` to report or stop a review by the id
+  `adversarial-review` printed.
+- The `reviews` table gains three nullable columns: `status`, the retained
+  terminal `outcome_json`, and `reason`. A row written before this version
+  has a NULL `status`; its state is derived from `exit_status` instead of
+  ever reading as pending.
+- `runtime::spawn_detached` now returns the spawned `Child`.
 ## 0.23.0 - 2026-09-08
 
 - Treat Codex model and reasoning effort as two gears: reset effort to low when the configured

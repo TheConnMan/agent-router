@@ -2,11 +2,12 @@
 //! decision, and one `reviews` row per adversarial review. `decisions` is the tuning data for the
 //! heuristic and the answer to "why did this route here".
 
+use crate::adversarial_review::ReviewStatus;
 use crate::decide::Decision;
 use crate::error::{Error, Result};
 use crate::runtime::now_ms;
 use rusqlite::Connection;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// One row to write: the decision plus what the caller asked for and what dispatch did.
@@ -44,6 +45,34 @@ pub struct ReviewEntry<'a> {
     pub dir: &'a Path,
 }
 
+/// The terminal state of a review that started as a pending row: everything `finish_review`
+/// settles in one write. Borrowed like `ReviewEntry`, since every field comes straight off an
+/// outcome the caller already holds.
+#[derive(Debug, Clone)]
+pub struct ReviewTerminal<'a> {
+    /// "completed", "skipped", "failed", or "cancelled".
+    pub status: &'a str,
+    pub exit_status: i64,
+    pub reviewer_provider: Option<&'a str>,
+    pub reviewer_model: Option<&'a str>,
+    pub usage_provenance: &'a str,
+    pub rationale: &'a str,
+    pub body_bytes: i64,
+    /// The serialized terminal outcome the caller and `review status` print. None where there is
+    /// no envelope to print, which is every cancelled row.
+    pub outcome_json: Option<&'a str>,
+    pub reason: Option<&'a str>,
+}
+
+/// What a cancel found. `AlreadyTerminal` carries the status token the row already holds, so the
+/// caller can say which terminal state won rather than only that the cancel did not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CancelResult {
+    Cancelled,
+    AlreadyTerminal(String),
+    Unknown,
+}
+
 /// One reviews row read back.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReviewRow {
@@ -57,6 +86,16 @@ pub struct ReviewRow {
     pub rationale: String,
     pub body_bytes: i64,
     pub dir: String,
+    /// "pending", "completed", "skipped", "failed", or "cancelled". None is a legacy row written
+    /// before the lifecycle columns, which is not the same as pending: a reader derives that
+    /// row's state from `exit_status` (0 completed, 3 skipped, anything else failed).
+    pub status: Option<String>,
+    /// The serialized terminal `ReviewOutcome`. None on a pending row, on a cancelled row, and on
+    /// every legacy row.
+    pub outcome_json: Option<String>,
+    /// The terminal explanation, and the only terminal detail a cancelled row carries. None means
+    /// nothing was explained, not that the review succeeded.
+    pub reason: Option<String>,
 }
 
 /// One row read back, flattened for display.
@@ -263,6 +302,10 @@ CREATE INDEX IF NOT EXISTS decisions_created_at ON decisions(created_at_ms);
 
 /// A new table, so an existing database picks it up the same way `decisions` did: `CREATE TABLE IF
 /// NOT EXISTS` on open. `"primary"` is quoted because it is a SQLite keyword.
+///
+/// The three lifecycle columns are nullable, because a database created before them gains them
+/// through `add_missing_columns` and its existing rows keep a NULL. A NULL `status` is a legacy
+/// row whose state is derived from `exit_status`, never a row in flight.
 const REVIEWS_SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS reviews (
     id                  INTEGER PRIMARY KEY,
@@ -274,9 +317,18 @@ CREATE TABLE IF NOT EXISTS reviews (
     usage_provenance    TEXT    NOT NULL,
     rationale           TEXT    NOT NULL,
     body_bytes          INTEGER NOT NULL,
-    dir                 TEXT    NOT NULL
+    dir                 TEXT    NOT NULL,
+    status              TEXT,
+    outcome_json        TEXT,
+    reason              TEXT
 );
 ";
+
+/// Every `reviews` column the readers project, in one place so `recent_reviews` and `review`
+/// cannot drift apart. `map_review_row` reads positionally against this list.
+const REVIEW_COLUMNS: &str = "\
+id, ts, exit_status, \"primary\", reviewer_provider, reviewer_model, usage_provenance, \
+rationale, body_bytes, dir, status, outcome_json, reason";
 
 const SELECT_COLUMNS: &str = "\
 id, created_at_ms, task, dir, requested, provider, model, effort, missing_connector, \
@@ -312,6 +364,10 @@ const RECONCILABLE: &str = "dry_run = 0 AND job_id IS NOT NULL";
 /// and restamping one with the version doing the reconciling would misattribute the decision to a
 /// build that never made it.
 const ROUTER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// What a cancel writes into `reason`. One string, because `review status` prints it and the
+/// cancel's own report must not word the same event differently.
+const CANCEL_REASON: &str = "cancelled by agent-router review cancel";
 
 pub struct DecisionLog {
     conn: Connection,
@@ -436,12 +492,14 @@ impl DecisionLog {
 
     /// IMPURE: append one adversarial-review outcome. Returns its row id.
     pub fn record_review(&self, entry: &ReviewEntry) -> Result<i64> {
-        self.conn.execute(
-            "INSERT INTO reviews (
+        self.conn
+            .prepare_cached(
+                "INSERT INTO reviews (
                 ts, exit_status, \"primary\", reviewer_provider, reviewer_model,
                 usage_provenance, rationale, body_bytes, dir
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            rusqlite::params![
+            )?
+            .execute(rusqlite::params![
                 now_ms(),
                 entry.exit_status,
                 entry.primary,
@@ -451,9 +509,123 @@ impl DecisionLog {
                 entry.rationale,
                 entry.body_bytes,
                 entry.dir.to_string_lossy(),
-            ],
-        )?;
+            ])?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// IMPURE: open one adversarial review as a pending row, before any provider work. Returns
+    /// its id, which is the review ID.
+    ///
+    /// `exit_status` is 4, the CLI's pending exit code, so the persisted status number and the
+    /// process exit code are the same fact and a reader never has to know two conventions. 4
+    /// never appears on a legacy row, so it is also unambiguous as a pending sentinel.
+    pub fn start_review(&self, primary: &str, dir: &Path) -> Result<i64> {
+        self.conn
+            .prepare_cached(
+                "INSERT INTO reviews (
+                ts, exit_status, \"primary\", reviewer_provider, reviewer_model,
+                usage_provenance, rationale, body_bytes, dir, status
+            ) VALUES (?1, 4, ?2, NULL, NULL, '[]', 'pending', 0, ?3, 'pending')",
+            )?
+            .execute(rusqlite::params![now_ms(), primary, dir.to_string_lossy()])?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// IMPURE: settle a pending review. Returns whether this write is the one that settled it.
+    ///
+    /// `AND status = 'pending'` is the compare-and-set, and it is the whole reason a cancel cannot
+    /// be overwritten: a reviewer finishing a moment after the operator's cancel landed changes no
+    /// row and gets `Ok(false)`. That is the normal outcome of a cancel, not an error.
+    pub fn finish_review(&self, id: i64, terminal: &ReviewTerminal<'_>) -> Result<bool> {
+        let changed = self
+            .conn
+            .prepare_cached(
+                "UPDATE reviews SET
+                status = :status,
+                exit_status = :exit_status,
+                reviewer_provider = :reviewer_provider,
+                reviewer_model = :reviewer_model,
+                usage_provenance = :usage_provenance,
+                rationale = :rationale,
+                body_bytes = :body_bytes,
+                outcome_json = :outcome_json,
+                reason = :reason
+             WHERE id = :id AND status = 'pending'",
+            )?
+            .execute(rusqlite::named_params! {
+                ":status": terminal.status,
+                ":exit_status": terminal.exit_status,
+                ":reviewer_provider": terminal.reviewer_provider,
+                ":reviewer_model": terminal.reviewer_model,
+                ":usage_provenance": terminal.usage_provenance,
+                ":rationale": terminal.rationale,
+                ":body_bytes": terminal.body_bytes,
+                ":outcome_json": terminal.outcome_json,
+                ":reason": terminal.reason,
+                ":id": id,
+            })?;
+        Ok(changed == 1)
+    }
+
+    /// IMPURE: settle a pending review as cancelled, through the same compare-and-set.
+    ///
+    /// Zero rows changed is not a failure, so the row is re-read to say which: no such id, or a
+    /// review that had already reached some other terminal state.
+    pub fn cancel_review(&self, id: i64) -> Result<CancelResult> {
+        let changed = self
+            .conn
+            .prepare_cached(
+                "UPDATE reviews SET status = 'cancelled', exit_status = 1, reason = ?2
+             WHERE id = ?1 AND status = 'pending'",
+            )?
+            .execute(rusqlite::params![id, CANCEL_REASON])?;
+        if changed == 1 {
+            return Ok(CancelResult::Cancelled);
+        }
+        match self.review(id)? {
+            None => Ok(CancelResult::Unknown),
+            // A row with a stored status token reports that token verbatim, so a diagnostic never
+            // rewrites what is actually persisted. Only a legacy row, written before the lifecycle
+            // columns and carrying no status token, reports the state its exit code implies instead.
+            // It is terminal either way: it was written by the pre-lifecycle path, which only ever
+            // wrote a finished review.
+            Some(row) => Ok(CancelResult::AlreadyTerminal(match row.status {
+                Some(status) => status,
+                None => ReviewStatus::from_row(None, row.exit_status)
+                    .as_str()
+                    .to_string(),
+            })),
+        }
+    }
+
+    /// IMPURE: append a cleanup detail to a cancelled review's reason. Returns whether a row
+    /// changed.
+    ///
+    /// A cancel settles the row before the worker has stopped provider work, so the cleanup
+    /// outcome can only arrive afterwards. `reason` is the one column a cancelled row may gain
+    /// later, and `AND status = 'cancelled'` keeps the append off every other row: a note against
+    /// a pending or already-settled review changes nothing and returns `Ok(false)`.
+    pub fn note_cancellation(&self, id: i64, detail: &str) -> Result<bool> {
+        let changed = self
+            .conn
+            .prepare_cached(
+                "UPDATE reviews SET reason = reason || '; ' || ?2
+             WHERE id = ?1 AND status = 'cancelled'",
+            )?
+            .execute(rusqlite::params![id, detail])?;
+        Ok(changed == 1)
+    }
+
+    /// IMPURE: one review by id, over the same projection `recent_reviews` reads.
+    pub fn review(&self, id: i64) -> Result<Option<ReviewRow>> {
+        let mut statement = self.conn.prepare_cached(&format!(
+            "SELECT {REVIEW_COLUMNS} FROM reviews WHERE id = ?1"
+        ))?;
+        match statement.query_row([id], map_review_row) {
+            Ok(row) => Ok(Some(row)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// IMPURE: the `limit` newest rows the stats reader needs, newest first. `since_ms` is an
@@ -629,29 +801,32 @@ impl DecisionLog {
 
     /// The `limit` newest adversarial reviews, newest first.
     pub fn recent_reviews(&self, limit: usize) -> Result<Vec<ReviewRow>> {
-        let mut statement = self.conn.prepare(
-            "SELECT id, ts, exit_status, \"primary\", reviewer_provider, reviewer_model, \
-             usage_provenance, rationale, body_bytes, dir \
-             FROM reviews ORDER BY id DESC LIMIT ?1",
-        )?;
+        let mut statement = self.conn.prepare(&format!(
+            "SELECT {REVIEW_COLUMNS} FROM reviews ORDER BY id DESC LIMIT ?1"
+        ))?;
         let rows = statement
-            .query_map([i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
-                Ok(ReviewRow {
-                    id: row.get(0)?,
-                    ts: row.get(1)?,
-                    exit_status: row.get(2)?,
-                    primary: row.get(3)?,
-                    reviewer_provider: row.get(4)?,
-                    reviewer_model: row.get(5)?,
-                    usage_provenance: row.get(6)?,
-                    rationale: row.get(7)?,
-                    body_bytes: row.get(8)?,
-                    dir: row.get(9)?,
-                })
-            })?
+            .query_map([i64::try_from(limit).unwrap_or(i64::MAX)], map_review_row)?
             .collect::<rusqlite::Result<Vec<ReviewRow>>>()?;
         Ok(rows)
     }
+}
+
+fn map_review_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReviewRow> {
+    Ok(ReviewRow {
+        id: row.get(0)?,
+        ts: row.get(1)?,
+        exit_status: row.get(2)?,
+        primary: row.get(3)?,
+        reviewer_provider: row.get(4)?,
+        reviewer_model: row.get(5)?,
+        usage_provenance: row.get(6)?,
+        rationale: row.get(7)?,
+        body_bytes: row.get(8)?,
+        dir: row.get(9)?,
+        status: row.get(10)?,
+        outcome_json: row.get(11)?,
+        reason: row.get(12)?,
+    })
 }
 
 fn map_decision_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
@@ -692,12 +867,18 @@ fn map_decision_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
     })
 }
 
-/// Columns added after schema v2. Empty after the v2 rewrite, which creates every current column
-/// in `SCHEMA`. Keep the mechanism: a later column goes here as `ALTER TABLE ADD COLUMN` so an
-/// existing v2 database picks it up on open without another table rewrite.
-const MISSING_COLUMNS: [(&str, &str); 2] = [
-    ("matched_capabilities", "TEXT"),
-    ("requested_model", "TEXT"),
+/// Columns added after the table they belong to was created, as `(table, name, declared_type)`.
+/// The `decisions` entries are the ones added after schema v2, which creates every other current
+/// column in `SCHEMA`. Keep the mechanism: a later column goes here as `ALTER TABLE ADD COLUMN` so
+/// an existing database picks it up on open without a table rewrite.
+///
+/// `reviews` has no versioned rewrite at all, so this list is its only migration.
+const MISSING_COLUMNS: [(&str, &str, &str); 5] = [
+    ("decisions", "matched_capabilities", "TEXT"),
+    ("decisions", "requested_model", "TEXT"),
+    ("reviews", "status", "TEXT"),
+    ("reviews", "outcome_json", "TEXT"),
+    ("reviews", "reason", "TEXT"),
 ];
 
 /// `PRAGMA user_version` stamped once the v2 rewrite has run. 0 is an unstamped pre-v2 database.
@@ -751,13 +932,20 @@ const V2_COLUMNS: [&str; 40] = [
 /// IMPURE: bring a database written before any of those columns up to the current schema. Guarded
 /// on each column being absent, because `ALTER TABLE ADD COLUMN` is an error when it is not.
 fn add_missing_columns(conn: &Connection) -> Result<()> {
-    for (name, declared_type) in MISSING_COLUMNS {
-        let present: bool = conn
-            .prepare("SELECT 1 FROM pragma_table_info('decisions') WHERE name = ?1")?
-            .exists([name])?;
+    // One `pragma_table_info` read per distinct table rather than one probe per column, then the
+    // same per-column guard against the set it returned. Every column is named once in
+    // `MISSING_COLUMNS`, so an `ALTER` this loop performs can never make a later reading stale.
+    let mut columns: HashMap<&str, HashSet<String>> = HashMap::new();
+    for (table, _, _) in MISSING_COLUMNS {
+        if !columns.contains_key(table) {
+            columns.insert(table, table_columns(conn, table)?);
+        }
+    }
+    for (table, name, declared_type) in MISSING_COLUMNS {
+        let present = columns.get(table).is_some_and(|names| names.contains(name));
         if !present {
             conn.execute(
-                &format!("ALTER TABLE decisions ADD COLUMN {name} {declared_type}"),
+                &format!("ALTER TABLE {table} ADD COLUMN {name} {declared_type}"),
                 [],
             )?;
         }
@@ -1792,5 +1980,315 @@ mod tests {
         assert!(reviews[0].ts > 0);
 
         DecisionLog::open_at(&path).expect("reopens");
+    }
+
+    /// The terminal fields a finished review carries. One fixture, so the `finish_review` calls
+    /// below differ only in the row they aim at and never in what they would have written.
+    fn completed_terminal() -> ReviewTerminal<'static> {
+        ReviewTerminal {
+            status: "completed",
+            exit_status: 0,
+            reviewer_provider: Some("claude"),
+            reviewer_model: Some("opus"),
+            usage_provenance: "[]",
+            rationale: "picked claude",
+            body_bytes: 21,
+            outcome_json: Some("{\"status\":\"completed\"}"),
+            reason: None,
+        }
+    }
+
+    /// A review row is settled exactly once. The terminal write is a compare-and-set on
+    /// `status = 'pending'`, so a cancel that lands first is never overwritten by a reviewer
+    /// finishing a moment later, and a second finish on a settled row changes nothing.
+    #[test]
+    fn a_pending_review_row_finishes_once_and_a_cancel_wins_the_race() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("router.db");
+        let log = DecisionLog::open_at(&path).expect("opens");
+
+        let cancelled = log
+            .start_review("codex", Path::new("/tmp"))
+            .expect("starts a review");
+        let row = log
+            .review(cancelled)
+            .expect("reads the pending row")
+            .expect("the pending row exists");
+        assert_eq!(row.status.as_deref(), Some("pending"));
+        // 4 is the CLI's pending exit code, so the persisted number and the process exit code are
+        // the same fact and no reader has to know two conventions.
+        assert_eq!(row.exit_status, 4);
+        assert_eq!(row.outcome_json, None);
+        assert_eq!(row.reason, None);
+        assert_eq!(row.primary, "codex");
+        assert_eq!(row.dir, "/tmp");
+        assert_eq!(row.body_bytes, 0);
+        assert!(row.ts > 0);
+
+        assert_eq!(
+            log.cancel_review(cancelled).expect("cancels"),
+            CancelResult::Cancelled
+        );
+        let row = log
+            .review(cancelled)
+            .expect("reads")
+            .expect("the cancelled row");
+        assert_eq!(row.status.as_deref(), Some("cancelled"));
+        assert_eq!(row.exit_status, 1);
+        assert!(
+            row.reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("cancelled")),
+            "{:?}",
+            row.reason
+        );
+
+        // Without the `AND status = 'pending'` predicate this is the assertion that fails: the
+        // reviewer's completion would overwrite a cancel the operator already saw succeed.
+        assert!(
+            !log.finish_review(cancelled, &completed_terminal())
+                .expect("a late finish is not an error")
+        );
+        let row = log
+            .review(cancelled)
+            .expect("reads")
+            .expect("still cancelled");
+        assert_eq!(row.status.as_deref(), Some("cancelled"));
+        assert_eq!(row.exit_status, 1);
+        assert_eq!(row.outcome_json, None);
+
+        assert_eq!(
+            log.cancel_review(cancelled).expect("second cancel"),
+            CancelResult::AlreadyTerminal("cancelled".to_string())
+        );
+        assert_eq!(
+            log.cancel_review(cancelled + 9999).expect("unknown cancel"),
+            CancelResult::Unknown
+        );
+
+        // A second row whose reviewer wins: the finish lands once and carries every terminal
+        // field, and a repeat of it is a no-op rather than a second write.
+        let finished = log
+            .start_review("claude", Path::new("/tmp"))
+            .expect("starts a second review");
+        assert!(
+            log.finish_review(finished, &completed_terminal())
+                .expect("finishes")
+        );
+        let row = log
+            .review(finished)
+            .expect("reads")
+            .expect("the finished row");
+        assert_eq!(row.status.as_deref(), Some("completed"));
+        assert_eq!(row.exit_status, 0);
+        assert_eq!(row.reviewer_provider.as_deref(), Some("claude"));
+        assert_eq!(row.reviewer_model.as_deref(), Some("opus"));
+        assert_eq!(row.usage_provenance, "[]");
+        assert_eq!(row.rationale, "picked claude");
+        assert_eq!(row.body_bytes, 21);
+        assert_eq!(
+            row.outcome_json.as_deref(),
+            Some("{\"status\":\"completed\"}")
+        );
+        assert_eq!(row.reason, None);
+        assert!(
+            !log.finish_review(finished, &completed_terminal())
+                .expect("a second finish is not an error")
+        );
+        assert_eq!(
+            log.cancel_review(finished).expect("cancel a settled row"),
+            CancelResult::AlreadyTerminal("completed".to_string())
+        );
+
+        // Two starts, two rows: settling a review is an update, never a second insert.
+        assert_eq!(log.recent_reviews(10).expect("reads reviews").len(), 2);
+    }
+
+    /// A cancel settles the row before the worker has stopped provider work, so the cleanup
+    /// outcome arrives afterwards as an append to `reason`. It is the one column a cancelled row
+    /// may gain later, and only a cancelled row may gain it.
+    #[test]
+    fn note_cancellation_appends_to_a_cancelled_reason_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("router.db");
+        let log = DecisionLog::open_at(&path).expect("opens");
+
+        let pending = log
+            .start_review("codex", Path::new("/tmp"))
+            .expect("starts a review");
+        assert!(
+            !log.note_cancellation(pending, "reviewer stopped")
+                .expect("a note on a pending row is a no-op, not an error")
+        );
+        assert_eq!(
+            log.review(pending).expect("reads").expect("row").reason,
+            None
+        );
+
+        let completed = log
+            .start_review("codex", Path::new("/tmp"))
+            .expect("starts a review");
+        assert!(
+            log.finish_review(completed, &completed_terminal())
+                .expect("finishes")
+        );
+        assert!(
+            !log.note_cancellation(completed, "reviewer stopped")
+                .expect("a note on a completed row is a no-op")
+        );
+        assert_eq!(
+            log.review(completed).expect("reads").expect("row").reason,
+            None
+        );
+
+        let cancelled = log
+            .start_review("codex", Path::new("/tmp"))
+            .expect("starts a review");
+        assert_eq!(
+            log.cancel_review(cancelled).expect("cancels"),
+            CancelResult::Cancelled
+        );
+        let before = log
+            .review(cancelled)
+            .expect("reads")
+            .expect("row")
+            .reason
+            .expect("a cancel writes a reason");
+        assert!(
+            log.note_cancellation(cancelled, "reviewer stopped")
+                .expect("appends")
+        );
+        let row = log.review(cancelled).expect("reads").expect("row");
+        assert_eq!(row.reason, Some(format!("{before}; reviewer stopped")));
+        // The append does not move the row off cancelled, so the CAS still holds afterwards.
+        assert_eq!(row.status.as_deref(), Some("cancelled"));
+        assert_eq!(row.exit_status, 1);
+    }
+
+    /// A database holding the pre-lifecycle `reviews` table gains the three columns on open,
+    /// keeps its row, and reads that row back with a NULL status. NULL is not pending: it means
+    /// nobody recorded a lifecycle state, and a reader derives the state from `exit_status`.
+    #[test]
+    fn an_existing_reviews_table_gains_the_lifecycle_columns_and_legacy_rows_read_back_null() {
+        // Written out by hand rather than derived from `REVIEWS_SCHEMA`: the const is what the
+        // migration moves away from, so a fixture built from it would follow every future change
+        // to it and stop being a migration test at all.
+        const LEGACY_REVIEWS_SCHEMA: &str = "\
+CREATE TABLE IF NOT EXISTS reviews (
+    id                  INTEGER PRIMARY KEY,
+    ts                  INTEGER NOT NULL,
+    exit_status         INTEGER NOT NULL,
+    \"primary\"         TEXT    NOT NULL,
+    reviewer_provider   TEXT,
+    reviewer_model      TEXT,
+    usage_provenance    TEXT    NOT NULL,
+    rationale           TEXT    NOT NULL,
+    body_bytes          INTEGER NOT NULL,
+    dir                 TEXT    NOT NULL
+);
+";
+        const LIFECYCLE_COLUMNS: [&str; 3] = ["status", "outcome_json", "reason"];
+
+        fn review_columns(path: &Path) -> Vec<String> {
+            let conn = rusqlite::Connection::open(path).expect("open the database");
+            conn.prepare("SELECT name FROM pragma_table_info('reviews')")
+                .expect("probe the reviews columns")
+                .query_map([], |row| row.get(0))
+                .expect("query")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("column names")
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("router.db");
+        {
+            let conn = rusqlite::Connection::open(&path).expect("create older database");
+            conn.execute_batch(SCHEMA).expect("decisions schema");
+            conn.execute_batch(LEGACY_REVIEWS_SCHEMA)
+                .expect("the pre-lifecycle reviews schema");
+            conn.execute(
+                "INSERT INTO reviews (
+                    ts, exit_status, \"primary\", reviewer_provider, reviewer_model,
+                    usage_provenance, rationale, body_bytes, dir
+                ) VALUES (1, 0, 'codex', 'claude', 'opus', '[]', 'picked claude', 4, '/tmp')",
+                [],
+            )
+            .expect("legacy review row");
+        }
+        let columns = review_columns(&path);
+        for column in LIFECYCLE_COLUMNS {
+            assert!(
+                !columns.iter().any(|name| name == column),
+                "the fixture is not a legacy database, it already has {column}: {columns:?}"
+            );
+        }
+
+        let log = DecisionLog::open_at(&path).expect("migrates on open");
+        let columns = review_columns(&path);
+        for column in LIFECYCLE_COLUMNS {
+            assert!(
+                columns.iter().any(|name| name == column),
+                "the migration did not add {column}: {columns:?}"
+            );
+        }
+
+        let reviews = log.recent_reviews(10).expect("reads the legacy row back");
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0].primary, "codex");
+        assert_eq!(reviews[0].exit_status, 0);
+        assert_eq!(reviews[0].reviewer_provider.as_deref(), Some("claude"));
+        assert_eq!(reviews[0].status, None);
+        assert_eq!(reviews[0].outcome_json, None);
+        assert_eq!(reviews[0].reason, None);
+
+        // A row started after the migration does know its lifecycle state, so the migrated
+        // database now holds one of each and `recent_reviews` tells them apart.
+        let started = log
+            .start_review("claude", Path::new("/tmp"))
+            .expect("starts a review on the migrated database");
+        assert_eq!(
+            log.review(started)
+                .expect("reads")
+                .expect("the new row")
+                .status
+                .as_deref(),
+            Some("pending")
+        );
+        let reviews = log.recent_reviews(10).expect("reads both rows");
+        assert_eq!(reviews.len(), 2);
+        assert_eq!(reviews.iter().filter(|row| row.status.is_none()).count(), 1);
+
+        // The migration is idempotent: opening again must not try to add the columns twice.
+        let reopened = DecisionLog::open_at(&path).expect("reopens");
+        assert_eq!(reopened.recent_reviews(10).expect("reads").len(), 2);
+    }
+
+    /// The preserved `record_review` path writes a row with no lifecycle status, so a pre-ID
+    /// failure and a legacy row are the same shape and both are read by deriving from
+    /// `exit_status` rather than being reported as in-flight.
+    #[test]
+    fn record_review_still_writes_a_row_with_no_lifecycle_status() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("router.db");
+        let log = DecisionLog::open_at(&path).expect("opens");
+
+        log.record_review(&ReviewEntry {
+            exit_status: 1,
+            primary: "claude",
+            reviewer_provider: None,
+            reviewer_model: None,
+            usage_provenance: "[]",
+            rationale: "claude requested explicitly with model fable",
+            body_bytes: 0,
+            dir: Path::new("/tmp"),
+        })
+        .expect("records a pre-id failure");
+
+        let reviews = log.recent_reviews(10).expect("reads reviews");
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0].exit_status, 1);
+        assert_eq!(reviews[0].status, None);
+        assert_eq!(reviews[0].outcome_json, None);
+        assert_eq!(reviews[0].reason, None);
     }
 }

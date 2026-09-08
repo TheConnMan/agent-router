@@ -221,8 +221,21 @@ request. The primary provider is always excluded, including Grok. Candidate prov
 registered as review capable, have an authoritative known and fresh weekly capacity reading, and
 be below 90 percent usage. Grok is a registered alternative when its public lifecycle reports an
 authoritative leader and capacity is available.
-The command does not classify the request or start a detached background job. It waits for the
-review to reach a terminal result, then prints the review body.
+The command still does not classify the request. Once a provider is selected it persists a review
+id and prints `agent-router: adversarial review <id> started` to stderr before any provider work
+begins, then hands the review to a detached worker process (`setsid`, logged to
+`~/.local/state/agent-router/logs/review-<ts>.log`) so the review survives the caller exiting or
+being killed. By default the command then waits for the worker to reach a terminal result and
+prints the review body exactly as it always has.
+
+`--timeout <SECS>` bounds that wait instead of blocking indefinitely. If the deadline passes before
+the review is terminal, the command exits `4` and reports `status: "pending"` (JSON also carries
+`review_id`); the review keeps running in its worker regardless. `--timeout 0` returns pending
+immediately, after the id has been printed and the worker started. Without `--timeout` the command
+waits exactly as it always has.
+
+Every review, whether it settled synchronously or is still pending, gets an id. JSON output always
+carries `review_id`.
 
 The eligible provider with the lowest effective weekly usage is selected. By default, Claude has a
 25-point reserve (`[adversarial_review] claude_usage_reserve_pct = 25.0`), protecting its premium
@@ -230,17 +243,42 @@ capacity: Claude is selected only when its raw weekly usage is at least 25 point
 other eligible reviewer. Set the reserve to `0.0` for raw-usage-only selection. The reserve never
 makes an ineligible provider eligible.
 
+`--provider` pins the reviewer instead of letting headroom choose it, and `--model` pins the model
+that reviewer runs. A pin chooses among the same registered reviewers; it bypasses nothing. It must
+name a provider other than `--primary`, and the pinned reviewer still passes every eligibility gate:
+authoritative availability, a fresh known weekly reading, and usage below the 90 percent ceiling.
+Because a pin removes the comparison the Claude reserve normally biases, the reserve becomes a floor
+on the pinned path: a pinned Claude reviewer is refused once its weekly usage plus
+`claude_usage_reserve_pct` reaches the ceiling, even at a reading the automatic policy would still
+have selected. An ineligible pin is reported as `skipped` with exit `3` and a reason that names the
+refusing gate; it is never rerouted to another provider. `--model` requires an explicit `--provider` other than `grok`, whose
+review lifecycle has no model selection, and is passed to the reviewer verbatim: a model the
+provider rejects fails the review with exit `1` rather than being replaced. Without `--model` a pin
+runs the provider's configured `high` review tier. A pinned reviewer is launched exactly like an
+automatic one: the same ephemeral read only invocation for Claude and Codex, with no persisted
+session, and for Grok the same disposable lifecycle session that is removed after the review. That
+invocation itself is still ephemeral; it is the router's own worker process around it, described
+below, that is detached and can outlive the caller.
+
 ```bash
 # Have a provider other than Codex review the request and wait for the result.
 agent-router adversarial-review --primary codex "Review the proposed authentication change"
 
 # Return the decision and review body as machine-readable JSON.
 agent-router adversarial-review --primary codex --json "Review the proposed authentication change"
+
+# Pin the reviewer to Claude Fable, or be told exactly why it cannot run. Same gates, no fallback.
+agent-router adversarial-review --primary codex --provider claude --model fable --json \
+    "Review the proposed authentication change"
 ```
 
 Text mode prints the completed review body. JSON reports `status`, `primary_provider`,
-`reviewer_provider`, `reviewer_model`, usage provenance, the selection rationale, and `result` when
-the review completes. When no eligible alternative exists, it reports the reason and exits `3`.
+`requested_provider` and `requested_model` (what a pin asked for, `null` under the automatic
+policy), `reviewer_provider` and `reviewer_model` (what actually ran), usage provenance, the
+selection rationale, and `result` when the review completes. The reviews table records the
+reviewer that ran; it has no requested columns, so its rationale names the pin instead, whether the
+pin was selected, refused by a gate, or rejected before selection. When no eligible alternative
+exists, or the pinned reviewer is ineligible, it reports the reason and exits `3`.
 A completed review exits `0`; an invocation or infrastructure failure exits `1`. Review execution
 uses the provider's review contract and is never routed through an ordinary task. Claude and Codex
 are launched with enforced read only restrictions. Grok's persistent lifecycle currently registers
@@ -250,6 +288,34 @@ tree or execute side effects. For Grok, the result also carries the exact offici
 session identity. Grok reviewer sessions are disposable: after Router reads the final review text,
 it uses the same public lifecycle to remove only the session it created. A failed cleanup is
 reported rather than silently leaving a reviewer session behind.
+
+### `review`
+
+Report or stop a review by the id `adversarial-review` printed.
+
+```bash
+agent-router review status <ID> [--json]
+agent-router review cancel <ID>
+```
+
+`review status` prints the retained result once the review is terminal, or reports it as still
+pending. Exit `0` completed, `3` skipped, `1` failed or cancelled, `4` pending. An unknown id prints
+`agent-router: unknown review <ID>` and exits `1`.
+
+`review cancel` stops an in-flight review and settles its row as cancelled, printing
+`review <ID> cancelled` and exiting `0`. A review that already reached a terminal state is reported
+with the state that won rather than cancelled a second time (`agent-router: review <ID> is already
+<state>`, exit `1`); an unknown id behaves the same as `review status`.
+
+```bash
+# Start a review without waiting, then check on it later.
+agent-router adversarial-review --primary codex --timeout 0 "Review the proposed authentication change"
+agent-router review status <ID>
+```
+
+There is no liveness detection: if a worker is killed outright rather than finishing or being
+cancelled, its row stays `pending` forever and `review status` keeps reporting pending. This is by
+design, not a bug to be fixed by polling harder.
 
 ### `usage`
 
@@ -575,8 +641,8 @@ See [docs/configuration.md](docs/configuration.md) for the full reference.
 | --- | --- |
 | `~/.config/agent-router/config.toml` | Routing policy, ceilings, model tiers, connector inventory, parity roots and exceptions. |
 | `/tmp/grok-usage-cache.json` | Normalized, non-secret Grok billing cache. Override with `$GROK_USAGE_CACHE`; Agent Router is its sole writer. |
-| `~/.local/state/agent-router/router.db` | SQLite log. `decisions` holds routing decisions including full task text; `reviews` holds one row per adversarial review. The directory is created mode `0700`. |
-| `~/.local/state/agent-router/logs/` | Per dispatch stdout and stderr from detached jobs. |
+| `~/.local/state/agent-router/router.db` | SQLite log. `decisions` holds routing decisions including full task text; `reviews` holds one row per adversarial review, carrying a lifecycle `status` (`pending`, `completed`, `skipped`, `failed`, `cancelled`), the retained terminal `outcome_json`, and a `reason`. A row written before this version has a NULL `status`; its state is derived from `exit_status` instead, and it is never treated as pending. The directory is created mode `0700`. |
+| `~/.local/state/agent-router/logs/` | Per dispatch stdout and stderr from detached jobs, including each detached `review-<ts>.log` worker. |
 
 ## Development
 
