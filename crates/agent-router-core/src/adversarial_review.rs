@@ -6,8 +6,9 @@ use crate::error::{Error, Result};
 use crate::provider::Provider;
 use crate::usage::{Headroom, claude_headroom, codex_headroom, grok_headroom};
 use agent_viewer_core::{Backend, GrokBackend, GrokLifecycle, Status as GrokStatus, TailEvent};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const WEEKLY_USAGE_CEILING: f64 = 90.0;
@@ -15,7 +16,16 @@ const CLAUDE_REVIEW_BIN_ENV: &str = "AGENT_ROUTER_CLAUDE_REVIEW_BIN";
 const CODEX_REVIEW_BIN_ENV: &str = "AGENT_ROUTER_CODEX_REVIEW_BIN";
 const GROK_REVIEW_MODEL: &str = "default";
 const GROK_REVIEW_TIMEOUT: Duration = Duration::from_secs(900);
-const GROK_REVIEW_POLL: Duration = Duration::from_millis(250);
+
+/// One poll interval for every review wait loop: the Grok lifecycle poll, the child-process
+/// runner, and the CLI's own wait. One number, so a cancel takes the same time to be observed
+/// whichever reviewer is running.
+pub const REVIEW_POLL: Duration = Duration::from_millis(250);
+
+/// The reason a reviewer that observed its own cancellation returns, and the one the CLI compares
+/// against. One constant, so the string the reviewer writes and the string the worker recognises
+/// cannot drift apart.
+pub const REVIEW_CANCELLED_REASON: &str = "review cancelled";
 const GROK_REVIEW_CONTRACT: &str = "You are an ephemeral read only adversarial reviewer. Inspect \
 the supplied working tree and report concrete correctness, security, and regression findings only. \
 You may read existing project content through read only capabilities. Do not write or edit files. \
@@ -31,15 +41,63 @@ pub struct ReviewRequest<'a> {
     pub dir: &'a Path,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReviewStatus {
     Completed,
     Skipped,
     Failed,
+    /// A review whose row exists and whose provider work has not settled. Only ever read back off
+    /// a persisted row; no in-process review path produces it.
+    Pending,
+    Cancelled,
 }
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+impl ReviewStatus {
+    /// PURE: the lifecycle token a row carries, which is the same token serde emits.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ReviewStatus::Completed => "completed",
+            ReviewStatus::Skipped => "skipped",
+            ReviewStatus::Failed => "failed",
+            ReviewStatus::Pending => "pending",
+            ReviewStatus::Cancelled => "cancelled",
+        }
+    }
+
+    /// PURE: the one status to exit-code map. The persisted `exit_status`, the terminal row write,
+    /// and the process's own exit code all read it, so a stored number and the code the caller sees
+    /// cannot diverge.
+    pub fn exit_status(self) -> i64 {
+        match self {
+            ReviewStatus::Completed => 0,
+            ReviewStatus::Skipped => 3,
+            ReviewStatus::Failed | ReviewStatus::Cancelled => 1,
+            ReviewStatus::Pending => 4,
+        }
+    }
+
+    /// PURE: the state a persisted row is in. A NULL token is a row written before the lifecycle
+    /// columns, and its state comes from `exit_status`. An unrecognised non-NULL token is not a
+    /// legacy row; it is treated as `Failed`.
+    pub fn from_row(status: Option<&str>, exit_status: i64) -> ReviewStatus {
+        match status {
+            Some("pending") => ReviewStatus::Pending,
+            Some("completed") => ReviewStatus::Completed,
+            Some("skipped") => ReviewStatus::Skipped,
+            Some("failed") => ReviewStatus::Failed,
+            Some("cancelled") => ReviewStatus::Cancelled,
+            None => match exit_status {
+                0 => ReviewStatus::Completed,
+                3 => ReviewStatus::Skipped,
+                _ => ReviewStatus::Failed,
+            },
+            Some(_) => ReviewStatus::Failed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ReviewOutcome {
     pub status: ReviewStatus,
     pub primary_provider: String,
@@ -57,9 +115,15 @@ pub struct ReviewOutcome {
     pub rationale: String,
     pub reason: Option<String>,
     pub result: Option<String>,
+    /// The `reviews` row this outcome is durable in. None means no durable row backs it, which is
+    /// not an unknown id: it is the read-only-database fallback and every failure raised before a
+    /// row could be started. Such an outcome omits the field entirely, leaving that output
+    /// byte-identical to the releases before reviews were persisted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_id: Option<i64>,
 }
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CandidateUsage {
     pub provider: String,
     pub weekly_pct: Option<f64>,
@@ -159,6 +223,18 @@ pub trait ReviewProvider {
         request: &ReviewRequest<'_>,
     ) -> Result<(String, Option<String>)> {
         self.review(request).map(|result| (result, None))
+    }
+
+    /// The same review, interruptible: `cancelled` is polled while the provider works, and a
+    /// provider that observes it returns `Err`. The default ignores it, so a provider that does
+    /// not override this simply cannot be interrupted — which is the honest answer, as against a
+    /// no-op that would report a cancel the reviewer never saw.
+    fn review_cancellable(
+        &self,
+        request: &ReviewRequest<'_>,
+        _cancelled: &dyn Fn() -> bool,
+    ) -> Result<(String, Option<String>)> {
+        self.review_with_identity(request)
     }
 }
 
@@ -261,7 +337,7 @@ fn select<'a>(
 }
 
 pub fn review_registered(request: &ReviewRequest<'_>, ctx: &Context) -> ReviewOutcome {
-    review_registered_selected(request, None, ctx)
+    review_registered_selected(request, None, ctx, &|| false)
 }
 
 /// The registered reviewers with the caller's pin applied. A pinned model replaces the configured
@@ -271,13 +347,27 @@ pub fn review_registered_pinned(
     pin: &ReviewerPin,
     ctx: &Context,
 ) -> ReviewOutcome {
-    review_registered_selected(request, Some(pin), ctx)
+    review_registered_selected(request, Some(pin), ctx, &|| false)
+}
+
+/// The registered reviewers with a cancellation hook. `cancelled` is polled while the selected
+/// reviewer works; a true reading stops it and settles as a failure carrying "review cancelled".
+/// A reading that cannot be taken must answer false, never true: a transient error that read as
+/// cancelled would kill a live paid review.
+pub fn review_registered_with_cancel(
+    request: &ReviewRequest<'_>,
+    pin: Option<&ReviewerPin>,
+    ctx: &Context,
+    cancelled: &dyn Fn() -> bool,
+) -> ReviewOutcome {
+    review_registered_selected(request, pin, ctx, cancelled)
 }
 
 fn review_registered_selected(
     request: &ReviewRequest<'_>,
     pin: Option<&ReviewerPin>,
     ctx: &Context,
+    cancelled: &dyn Fn() -> bool,
 ) -> ReviewOutcome {
     if !request.dir.is_dir() {
         return with_pin(
@@ -317,7 +407,7 @@ fn review_registered_selected(
             usage,
             rationale,
             usage_provenance,
-        } => match provider.review_with_identity(request) {
+        } => match provider.review_cancellable(request, cancelled) {
             Ok(result) => completed_outcome(
                 request,
                 pin,
@@ -341,6 +431,7 @@ fn review_registered_selected(
                     rationale,
                     reason: Some(error.to_string()),
                     result: None,
+                    review_id: None,
                 },
                 pin,
             ),
@@ -369,6 +460,7 @@ pub fn failed_outcome(primary_provider: &str, reason: impl Into<String>) -> Revi
         rationale: "review could not evaluate registered providers".to_string(),
         reason: Some(reason.into()),
         result: None,
+        review_id: None,
     }
 }
 
@@ -404,6 +496,7 @@ fn completed_outcome(
             rationale,
             reason: None,
             result: Some(result),
+            review_id: None,
         },
         pin,
     )
@@ -445,6 +538,7 @@ fn skipped_outcome(
             rationale,
             reason: Some(reason),
             result: None,
+            review_id: None,
         },
         pin,
     )
@@ -727,6 +821,25 @@ impl ReviewProvider for ClaudeReviewProvider<'_> {
     }
 
     fn review(&self, request: &ReviewRequest<'_>) -> Result<String> {
+        self.review_cancellable(request, &|| false)
+            .map(|(result, _)| result)
+    }
+
+    fn review_cancellable(
+        &self,
+        request: &ReviewRequest<'_>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(String, Option<String>)> {
+        let (command, binary) = self.review_command(request)?;
+        parse_claude_output(run_review(command, &binary, Provider::Claude, cancelled)?)
+            .map(|result| (result, None))
+    }
+}
+
+impl ClaudeReviewProvider<'_> {
+    /// IMPURE: the reviewer invocation both entry points run. One builder, so the interruptible
+    /// path and the plain one cannot drift on a single flag.
+    fn review_command(&self, request: &ReviewRequest<'_>) -> Result<(Command, PathBuf)> {
         if !request.dir.is_dir() {
             return Err(Error::Command(format!(
                 "target directory does not exist: {}",
@@ -753,7 +866,7 @@ impl ReviewProvider for ClaudeReviewProvider<'_> {
             .arg("plan")
             .arg("--strict-mcp-config")
             .arg(request.body);
-        parse_claude_output(run_review(command, &binary, Provider::Claude)?)
+        Ok((command, binary))
     }
 }
 
@@ -776,6 +889,25 @@ impl ReviewProvider for CodexReviewProvider<'_> {
     }
 
     fn review(&self, request: &ReviewRequest<'_>) -> Result<String> {
+        self.review_cancellable(request, &|| false)
+            .map(|(result, _)| result)
+    }
+
+    fn review_cancellable(
+        &self,
+        request: &ReviewRequest<'_>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(String, Option<String>)> {
+        let (command, binary) = self.review_command(request)?;
+        parse_codex_output(run_review(command, &binary, Provider::Codex, cancelled)?)
+            .map(|result| (result, None))
+    }
+}
+
+impl CodexReviewProvider<'_> {
+    /// IMPURE: the reviewer invocation both entry points run. One builder, so the interruptible
+    /// path and the plain one cannot drift on a single flag.
+    fn review_command(&self, request: &ReviewRequest<'_>) -> Result<(Command, PathBuf)> {
         if !request.dir.is_dir() {
             return Err(Error::Command(format!(
                 "target directory does not exist: {}",
@@ -796,7 +928,7 @@ impl ReviewProvider for CodexReviewProvider<'_> {
             .arg("--json")
             .arg("--ephemeral")
             .arg(request.body);
-        parse_codex_output(run_review(command, &binary, Provider::Codex)?)
+        Ok((command, binary))
     }
 }
 
@@ -833,14 +965,24 @@ impl ReviewProvider for GrokReviewProvider<'_> {
     }
 
     fn review(&self, request: &ReviewRequest<'_>) -> Result<String> {
-        run_grok_review(self.ctx, request).map(|(result, _)| result)
+        self.review_cancellable(request, &|| false)
+            .map(|(result, _)| result)
     }
 
     fn review_with_identity(
         &self,
         request: &ReviewRequest<'_>,
     ) -> Result<(String, Option<String>)> {
-        run_grok_review(self.ctx, request).map(|(result, session_id)| (result, Some(session_id)))
+        self.review_cancellable(request, &|| false)
+    }
+
+    fn review_cancellable(
+        &self,
+        request: &ReviewRequest<'_>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(String, Option<String>)> {
+        run_grok_review(self.ctx, request, cancelled)
+            .map(|(result, session_id)| (result, Some(session_id)))
     }
 }
 
@@ -862,7 +1004,11 @@ fn grok_review_poll(status: &GrokStatus) -> GrokReviewPoll {
     }
 }
 
-fn run_grok_review(ctx: &Context, request: &ReviewRequest<'_>) -> Result<(String, String)> {
+fn run_grok_review(
+    ctx: &Context,
+    request: &ReviewRequest<'_>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<(String, String)> {
     if !request.dir.is_dir() {
         return Err(Error::Command(format!(
             "target directory does not exist: {}",
@@ -881,6 +1027,12 @@ fn run_grok_review(ctx: &Context, request: &ReviewRequest<'_>) -> Result<(String
     let started = Instant::now();
 
     loop {
+        // There is no child process to kill here, so the cancel returns through `cleanup.failure`,
+        // which already cancels *and* deletes the session before building the error. A cancelled
+        // Grok review therefore leaves no live paid session behind.
+        if cancelled() {
+            return Err(cleanup.failure(REVIEW_CANCELLED_REASON.to_string()));
+        }
         let sessions = match lifecycle.list() {
             Ok(sessions) => sessions,
             Err(error) => {
@@ -898,7 +1050,7 @@ fn run_grok_review(ctx: &Context, request: &ReviewRequest<'_>) -> Result<(String
                 );
             }
             (None, _) if started.elapsed() < GROK_REVIEW_TIMEOUT => {
-                std::thread::sleep(GROK_REVIEW_POLL);
+                std::thread::sleep(REVIEW_POLL);
                 continue;
             }
             (None, _) => {
@@ -954,7 +1106,7 @@ fn run_grok_review(ctx: &Context, request: &ReviewRequest<'_>) -> Result<(String
                 "Grok review {session_id} did not finish before the timeout"
             )));
         }
-        std::thread::sleep(GROK_REVIEW_POLL);
+        std::thread::sleep(REVIEW_POLL);
     }
 }
 
@@ -1032,19 +1184,59 @@ fn review_binary(ctx: &Context, review_env: &'static str, provider: Provider) ->
     )
 }
 
-fn run_review(mut command: Command, binary: &Path, provider: Provider) -> Result<String> {
+/// IMPURE: run one reviewer child to completion, or kill it when `cancelled` goes true.
+///
+/// Both pipes are drained by their own threads for the whole life of the child. That is not an
+/// optimization: polling `try_wait` while reading neither pipe deadlocks as soon as a reviewer
+/// writes more than a pipe buffer, which every stub-sized test is too small to reach. The drains
+/// are detached threads owning their pipe ends rather than scoped ones, so the cancel path can
+/// return without joining them — a grandchild holding an inherited pipe would otherwise hang the
+/// cancel indefinitely. The child's own exit does not bound the drains for the same reason, so
+/// even the normal path waits for them on the poll interval and stays cancellable throughout.
+fn run_review(
+    mut command: Command,
+    binary: &Path,
+    provider: Provider,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<String> {
     let override_env = review_override(provider);
     let provider = provider.name();
-    let Output {
-        status,
-        stdout,
-        stderr,
-    } = command
-        .output()
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         // The binary resolved, so a NotFound here means it vanished or lost its exec bit before
         // the exec. Map through `launch_error` so it does not reach the log as `Error::Io`. See
         // docs/decisions/0005-launch-error-and-binary-resolver.md.
         .map_err(|error| binary::launch_error(binary, override_env, error))?;
+
+    let stdout_drain = drain_pipe(child.stdout.take());
+    let stderr_drain = drain_pipe(child.stderr.take());
+
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if cancelled() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(Error::Command(REVIEW_CANCELLED_REASON.to_string()));
+        }
+        std::thread::sleep(REVIEW_POLL);
+    };
+    // Join only once both drains have finished, so a descendant still holding an inherited pipe
+    // cannot block the cancel check.
+    while !(stdout_drain.is_finished() && stderr_drain.is_finished()) {
+        if cancelled() {
+            return Err(Error::Command(REVIEW_CANCELLED_REASON.to_string()));
+        }
+        std::thread::sleep(REVIEW_POLL);
+    }
+    // A panicked drain thread costs the output it held, not the review's exit status, so its
+    // buffer defaults to empty rather than turning a finished review into an error.
+    let stdout = stdout_drain.join().unwrap_or_default();
+    let stderr = stderr_drain.join().unwrap_or_default();
+
     if !status.success() {
         let detail = String::from_utf8_lossy(&stderr).trim().to_string();
         let suffix = if detail.is_empty() {
@@ -1058,6 +1250,21 @@ fn run_review(mut command: Command, binary: &Path, provider: Provider) -> Result
     }
     String::from_utf8(stdout)
         .map_err(|_| Error::Command(format!("{provider} review printed non UTF-8 output")))
+}
+
+/// IMPURE: read one of the child's pipes to EOF on its own thread.
+///
+/// The pipe end is moved into the thread, which is what lets `run_review` abandon the thread on
+/// the cancel path: nothing the caller still holds is borrowed by it. `None` is a pipe `spawn`
+/// did not hand back, which reads as empty output rather than as a failure.
+fn drain_pipe<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut buffer);
+        }
+        buffer
+    })
 }
 
 /// PURE: the override a review launch failure should name. The review-specific variable is the

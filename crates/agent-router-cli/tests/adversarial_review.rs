@@ -8,11 +8,26 @@ use serde_json::{Value, json};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(0);
+
+/// How long any lifecycle poll in this suite waits before it fails the test.
+///
+/// Every wait here is bounded on purpose: a review that never settles, a worker that never
+/// starts, or a cancel that never reaches the reviewer must fail its test with the last output it
+/// saw, never hang the suite.
+const POLL_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Pause between polls. Short enough that a settled lifecycle is observed promptly, long enough
+/// that the poll does not itself contend with the router's own 250ms row polling.
+const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How long a cancelled reviewer has to actually die. Separate from `POLL_DEADLINE` because this
+/// is the acceptance criterion's own bound, not a fixture convenience.
+const CANCEL_DEADLINE: Duration = Duration::from_secs(5);
 
 struct TempDir {
     path: PathBuf,
@@ -160,11 +175,33 @@ impl ReviewFixture {
             write_claude_usage(&usage_cache, weekly_pct);
         }
 
+        // The BLOCK mode below is what makes a review observable while it is still in flight: the
+        // stub publishes its own pid and then waits for a file this test writes, so a test can
+        // cancel it, kill the caller, or let a `--timeout` expire against a reviewer that is
+        // provably still running. It is keyed on its own variable and sits between the existing
+        // FAIL and DELAY modes, so every current test keeps its exact fixture behavior.
+        //
+        // The ORPHAN mode after it is the opposite shape: the reviewer exits immediately, having
+        // left a descendant holding the stdout and stderr it inherited. The reviewer process is
+        // gone, so anything reading those pipes to end-of-file is waiting on the descendant's
+        // whole lifetime rather than on the reviewer's.
         let claude_body = format!(
             "printf '%s\\n' \"$@\" >> {}\n\
              if [ \"${{AGENT_ROUTER_FIXTURE_REVIEW_FAIL:-0}}\" = \"1\" ]; then\n\
                printf 'review provider failed\\n' >&2\n\
                exit 17\n\
+             fi\n\
+             if [ -n \"${{AGENT_ROUTER_FIXTURE_REVIEW_BLOCK:-}}\" ]; then\n\
+               printf '%s' \"$$\" > \"$AGENT_ROUTER_FIXTURE_REVIEW_BLOCK/started\"\n\
+               while [ ! -f \"$AGENT_ROUTER_FIXTURE_REVIEW_BLOCK/release\" ]; do\n\
+                 sleep 0.05\n\
+               done\n\
+             fi\n\
+             if [ -n \"${{AGENT_ROUTER_FIXTURE_REVIEW_ORPHAN:-}}\" ]; then\n\
+               printf '%s' \"$$\" > \"$AGENT_ROUTER_FIXTURE_REVIEW_ORPHAN/started\"\n\
+               sleep 60 &\n\
+               printf '%s' \"$!\" > \"$AGENT_ROUTER_FIXTURE_REVIEW_ORPHAN/orphan\"\n\
+               exit 0\n\
              fi\n\
              if [ -n \"${{AGENT_ROUTER_FIXTURE_REVIEW_DELAY:-}}\" ]; then\n\
                sleep \"$AGENT_ROUTER_FIXTURE_REVIEW_DELAY\"\n\
@@ -213,18 +250,29 @@ impl ReviewFixture {
             .expect("read reviews")
     }
 
+    /// The directory the blocking reviewer publishes its pid into and watches for its release
+    /// file. Created here rather than by the stub: the stub redirects into it, and a redirect into
+    /// a missing directory would fail the reviewer instead of blocking it.
+    fn block_dir(&self) -> PathBuf {
+        let dir = self.root.path.join("blocking reviewer");
+        fs::create_dir_all(&dir).expect("create the blocking reviewer directory");
+        dir
+    }
+
+    /// The directory the orphaning reviewer publishes its own pid and its descendant's pid into.
+    /// Created here for the same reason as `block_dir`: the stub redirects into it, and a redirect
+    /// into a missing directory would fail the reviewer instead of orphaning a live descendant.
+    fn orphan_dir(&self) -> PathBuf {
+        let dir = self.root.path.join("orphaning reviewer");
+        fs::create_dir_all(&dir).expect("create the orphaning reviewer directory");
+        dir
+    }
+
     fn command(&self) -> Command {
         self.command_for("codex", &self.cwd)
     }
 
     fn command_for(&self, primary: &str, dir: &Path) -> Command {
-        let home = self.root.path.join("home");
-        let bin = self.root.path.join("bin");
-        let path = format!(
-            "{}:{}",
-            bin.display(),
-            std::env::var("PATH").unwrap_or_default()
-        );
         let mut command = Command::new(env!("CARGO_BIN_EXE_agent-router"));
         command
             .arg("adversarial-review")
@@ -232,7 +280,35 @@ impl ReviewFixture {
             .arg("--primary")
             .arg(primary)
             .arg("--dir")
-            .arg(dir)
+            .arg(dir);
+        self.apply_env(&mut command);
+        command
+    }
+
+    /// `agent-router review <args...>` under the same environment as the review that created the
+    /// row. Factored out with `command_for` rather than duplicated: a `review status` reading a
+    /// different HOME would read a different router.db and report every id as unknown, which is a
+    /// fixture bug that looks exactly like a product bug.
+    fn review_subcommand(&self, args: &[&str]) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agent-router"));
+        command.arg("review");
+        for arg in args {
+            command.arg(arg);
+        }
+        self.apply_env(&mut command);
+        command
+    }
+
+    /// The one environment both `adversarial-review` and its `review` subcommands run under.
+    fn apply_env(&self, command: &mut Command) {
+        let home = self.root.path.join("home");
+        let bin = self.root.path.join("bin");
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        command
             .env("HOME", home)
             .env("GROK_HOME", self.grok_state_dir())
             .env(
@@ -245,7 +321,6 @@ impl ReviewFixture {
             .env("AGENT_ROUTER_CLAUDE_REVIEW_BIN", bin.join("claude-review"))
             .env("AGENT_ROUTER_CODEX_REVIEW_BIN", bin.join("codex"))
             .env("PATH", path);
-        command
     }
 
     fn run_json(&self) -> Output {
@@ -295,6 +370,108 @@ fn candidate_provenance<'a>(value: &'a Value, provider: &str) -> &'a Value {
         .iter()
         .find(|candidate| candidate["provider"] == provider)
         .unwrap_or_else(|| panic!("missing usage provenance for {provider}: {}", value))
+}
+
+/// The single provenance line a review prints before any provider work exists, parsed back into
+/// the id it carries.
+///
+/// Asserted as an exact shape rather than a `contains`, and without a regex crate, because the
+/// line is the whole of the command's stderr on a successful review: an accidental second line of
+/// chatter has to fail here. `agent-router-cli` carries no dev-dependencies and this must not add
+/// one.
+fn started_review_id(stderr: &str) -> i64 {
+    const PREFIX: &str = "agent-router: adversarial review ";
+    const SUFFIX: &str = " started\n";
+    assert!(
+        stderr.starts_with(PREFIX)
+            && stderr.ends_with(SUFFIX)
+            && stderr.len() > PREFIX.len() + SUFFIX.len(),
+        "stderr is not exactly the started line: {stderr:?}"
+    );
+    let digits = &stderr[PREFIX.len()..stderr.len() - SUFFIX.len()];
+    assert!(
+        digits.bytes().all(|byte| byte.is_ascii_digit()),
+        "the review id is not all ASCII digits: {stderr:?}"
+    );
+    digits
+        .parse()
+        .unwrap_or_else(|error| panic!("the review id {digits:?} did not parse: {error}"))
+}
+
+/// Wait, bounded, for a path the blocking reviewer creates.
+fn wait_for_path(path: &Path, what: &str) {
+    let deadline = Instant::now() + POLL_DEADLINE;
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "{what}: {} never appeared within {POLL_DEADLINE:?}",
+            path.display()
+        );
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// The pid the blocking reviewer published, read back once the file actually carries one.
+///
+/// The stub creates `started` and writes into it as two steps, so the file can be observed to
+/// exist while still empty. Re-reading until it is non-empty is the difference between probing a
+/// real pid and parsing `""`.
+fn reviewer_pid(block: &Path) -> u32 {
+    let started = block.join("started");
+    let deadline = Instant::now() + POLL_DEADLINE;
+    loop {
+        if let Ok(contents) = fs::read_to_string(&started) {
+            let published = contents.trim();
+            if !published.is_empty() {
+                return published.parse().unwrap_or_else(|error| {
+                    panic!("the reviewer pid {published:?} did not parse: {error}")
+                });
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the blocking reviewer never published a pid at {}",
+            started.display()
+        );
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// Whether a pid is still signalable. `kill -0` through `sh` rather than a `libc` or `nix`
+/// dependency: this crate has no dev-dependencies and a process-liveness probe is not a reason to
+/// acquire the first one.
+fn process_is_alive(pid: u32) -> bool {
+    Command::new("sh")
+        .arg("-c")
+        .arg(format!("kill -0 {pid}"))
+        .status()
+        .expect("probe the reviewer process")
+        .success()
+}
+
+/// Poll `review status <id>` until it exits `expected`, bounded, panicking with the last output.
+fn poll_review_status(fixture: &ReviewFixture, id: i64, expected: i32, extra: &[&str]) -> Output {
+    let id = id.to_string();
+    let mut args = vec!["status", id.as_str()];
+    args.extend_from_slice(extra);
+    let deadline = Instant::now() + POLL_DEADLINE;
+    loop {
+        let output = fixture
+            .review_subcommand(&args)
+            .output()
+            .expect("run review status");
+        if output.status.code() == Some(expected) {
+            return output;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "review {id} never reached exit {expected} within {POLL_DEADLINE:?}\nlast exit: {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status.code(),
+            text(&output.stdout),
+            text(&output.stderr)
+        );
+        std::thread::sleep(POLL_INTERVAL);
+    }
 }
 
 #[test]
@@ -370,7 +547,9 @@ fn completed_human_output_is_the_review_body() {
 
     assert_exit(&output, 0);
     assert_eq!(text(&output.stdout), "completed review body\n");
-    assert!(text(&output.stderr).is_empty());
+    // The whole of stderr is the one provenance line and nothing else. `started_review_id` is an
+    // exact-shape check, so a second line of chatter fails here.
+    assert!(started_review_id(&text(&output.stderr)) > 0);
 }
 
 #[test]
@@ -616,6 +795,339 @@ fn a_read_only_reviews_db_does_not_change_the_review_exit_status() {
         .recent_reviews(10)
         .expect("read reviews");
     assert!(reviews.is_empty());
+}
+
+/// A bounded wait gives up with a review id and loses nothing: the id was on stderr before any
+/// provider work existed, the row is durable, and `review status` returns the eventual retained
+/// result byte for byte.
+#[test]
+fn timeout_returns_pending_with_an_id_and_status_attaches_to_the_retained_result() {
+    let fixture = ReviewFixture::new("timeout pending", Some(23.0));
+    let block = fixture.block_dir();
+    let output = fixture
+        .command()
+        .arg("--json")
+        .arg("--timeout")
+        .arg("1")
+        .env("AGENT_ROUTER_FIXTURE_REVIEW_BLOCK", &block)
+        .output()
+        .expect("run a bounded adversarial review");
+
+    assert_exit(&output, 4);
+    let value = parse_json(&output);
+    assert_eq!(value["status"], "pending");
+    let id = value["review_id"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("review_id is not an integer: {value}"));
+    assert!(id > 0, "{value}");
+    // The printed id and the persisted id are one thing, not two.
+    assert_eq!(started_review_id(&text(&output.stderr)), id);
+
+    // The stub only runs after the id exists and has been printed, so `started` appearing at all
+    // proves the id was persisted before any provider work began.
+    wait_for_path(
+        &block.join("started"),
+        "the detached reviewer never started, so the timeout returned without work in flight",
+    );
+
+    let pending = fixture
+        .review_subcommand(&["status", &id.to_string(), "--json"])
+        .output()
+        .expect("read the pending review");
+    assert_exit(&pending, 4);
+    assert_eq!(parse_json(&pending)["status"], "pending");
+    assert_eq!(parse_json(&pending)["review_id"].as_i64(), Some(id));
+
+    write_file(&block.join("release"), "");
+    let completed = poll_review_status(&fixture, id, 0, &[]);
+    // The retained result is byte-identical to what a synchronous run prints.
+    assert_eq!(text(&completed.stdout), "completed review body\n");
+
+    let completed = poll_review_status(&fixture, id, 0, &["--json"]);
+    let value = parse_json(&completed);
+    assert_eq!(value["status"], "completed");
+    assert_eq!(value["review_id"].as_i64(), Some(id));
+    assert_eq!(value["result"], "completed review body");
+    assert_eq!(value["primary_provider"], "codex");
+    assert_eq!(value["reviewer_provider"], "claude");
+    // These two would be gone if the terminal outcome envelope were reconstructed from the row's
+    // own columns instead of retained: the reviews table has no column for either.
+    assert_eq!(value["usage"]["weekly_pct"], 23.0);
+    assert!(
+        value["reviewer_model"]
+            .as_str()
+            .is_some_and(|model| !model.is_empty()),
+        "{value}"
+    );
+
+    // Start plus finish is an insert and an update, never two rows.
+    let rows = fixture.reviews();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status.as_deref(), Some("completed"));
+    assert_eq!(rows[0].exit_status, 0);
+    assert!(rows[0].body_bytes > 0, "{:?}", rows[0]);
+    assert!(rows[0].outcome_json.is_some(), "{:?}", rows[0]);
+}
+
+/// Cancel stops the reviewer that is actually running, and the cancel is what settles the row.
+#[test]
+fn cancel_stops_the_in_flight_reviewer() {
+    let fixture = ReviewFixture::new("cancel in flight", Some(23.0));
+    let block = fixture.block_dir();
+    let output = fixture
+        .command()
+        .arg("--json")
+        .arg("--timeout")
+        .arg("0")
+        .env("AGENT_ROUTER_FIXTURE_REVIEW_BLOCK", &block)
+        .output()
+        .expect("run an adversarial review that returns immediately");
+
+    assert_exit(&output, 4);
+    let id = parse_json(&output)["review_id"]
+        .as_i64()
+        .expect("review_id is an integer");
+    assert_eq!(started_review_id(&text(&output.stderr)), id);
+
+    let pid = reviewer_pid(&block);
+    assert!(
+        process_is_alive(pid),
+        "the reviewer {pid} was already gone before the cancel"
+    );
+
+    let cancel = fixture
+        .review_subcommand(&["cancel", &id.to_string()])
+        .output()
+        .expect("cancel the review");
+    assert_exit(&cancel, 0);
+    assert!(
+        text(&cancel.stdout).contains(&format!("review {id} cancelled")),
+        "{}",
+        text(&cancel.stdout)
+    );
+
+    let deadline = Instant::now() + CANCEL_DEADLINE;
+    while process_is_alive(pid) {
+        assert!(
+            Instant::now() < deadline,
+            "the cancelled reviewer {pid} was still running after {CANCEL_DEADLINE:?}"
+        );
+        std::thread::sleep(POLL_INTERVAL);
+    }
+
+    let status = fixture
+        .review_subcommand(&["status", &id.to_string()])
+        .output()
+        .expect("read the cancelled review");
+    assert_exit(&status, 1);
+    // The worker may append its cleanup outcome to this reason afterwards, so match the state
+    // rather than the whole sentence.
+    assert!(
+        text(&status.stderr).contains("cancelled"),
+        "{}",
+        text(&status.stderr)
+    );
+
+    let status = fixture
+        .review_subcommand(&["status", &id.to_string(), "--json"])
+        .output()
+        .expect("read the cancelled review as json");
+    assert_exit(&status, 1);
+    let value = parse_json(&status);
+    assert_eq!(value["status"], "cancelled");
+    assert_eq!(value["review_id"].as_i64(), Some(id));
+    assert_eq!(value["result"], Value::Null);
+
+    // The compare-and-set from the caller's side: a settled review cannot be settled twice.
+    let second = fixture
+        .review_subcommand(&["cancel", &id.to_string()])
+        .output()
+        .expect("cancel the review a second time");
+    assert_exit(&second, 1);
+    assert!(
+        text(&second.stderr).contains("cancelled"),
+        "the second cancel does not name the current state: {}",
+        text(&second.stderr)
+    );
+
+    // Never released: had the cancel not actually killed the reviewer, the stub would still be
+    // looping and the pid probe above could not have succeeded.
+    assert!(!block.join("release").exists());
+    let rows = fixture.reviews();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status.as_deref(), Some("cancelled"));
+    assert_eq!(rows[0].exit_status, 1);
+}
+
+/// Cancel has to be observed even when the reviewer's pipes outlive the reviewer.
+///
+/// The ORPHAN stub exits at once and leaves a descendant holding the stdout and stderr it
+/// inherited, so a worker that drains those pipes to end-of-file before it looks at the row is
+/// blocked for the descendant's whole 60s lifetime. During that window the cancel lands on the row
+/// but the worker never reaches its settle path, so `reviewer stopped` is never appended: without
+/// a cancellation-aware drain the poll below exhausts `CANCEL_DEADLINE` and fails. With one, the
+/// worker abandons the drain and the note appears within a second.
+#[test]
+fn cancel_is_observed_while_draining_an_orphaned_reviewer_pipe() {
+    let fixture = ReviewFixture::new("orphaned pipe cancel", Some(23.0));
+    let orphan = fixture.orphan_dir();
+    let output = fixture
+        .command()
+        .arg("--json")
+        .arg("--timeout")
+        .arg("0")
+        .env("AGENT_ROUTER_FIXTURE_REVIEW_ORPHAN", &orphan)
+        .output()
+        .expect("run an adversarial review that returns immediately");
+
+    assert_exit(&output, 4);
+    let id = parse_json(&output)["review_id"]
+        .as_i64()
+        .expect("review_id is an integer");
+    assert_eq!(started_review_id(&text(&output.stderr)), id);
+
+    wait_for_path(
+        &orphan.join("started"),
+        "the orphaning reviewer never ran, so nothing was holding the worker's pipes open",
+    );
+    wait_for_path(
+        &orphan.join("orphan"),
+        "the orphaning reviewer never published the descendant holding its pipes",
+    );
+
+    let cancel = fixture
+        .review_subcommand(&["cancel", &id.to_string()])
+        .output()
+        .expect("cancel the review");
+    assert_exit(&cancel, 0);
+
+    // The row is where the worker's own observation shows up. The cancel above only writes the
+    // cancelled state; `reviewer stopped` is appended by the worker's settle path, so it appearing
+    // at all is proof the worker got out of the drain and looked at the row.
+    let deadline = Instant::now() + CANCEL_DEADLINE;
+    loop {
+        let rows = fixture.reviews();
+        let row = rows
+            .iter()
+            .find(|row| row.id == id)
+            .unwrap_or_else(|| panic!("review {id} has no row at all: {rows:?}"));
+        if row
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("reviewer stopped"))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the worker never observed the cancel while its pipes were held open, within \
+             {CANCEL_DEADLINE:?}\nlast row: {row:?}"
+        );
+        std::thread::sleep(POLL_INTERVAL);
+    }
+
+    let status = fixture
+        .review_subcommand(&["status", &id.to_string(), "--json"])
+        .output()
+        .expect("read the cancelled review as json");
+    assert_exit(&status, 1);
+    let value = parse_json(&status);
+    assert_eq!(value["status"], "cancelled");
+    assert_eq!(value["review_id"].as_i64(), Some(id));
+    assert_eq!(value["result"], Value::Null);
+
+    // Best effort, and last: the descendant is orphaned by design and nothing else in this fixture
+    // reaps it, so leaving it behind would leak a `sleep 60` out of every run of this test.
+    let descendant = fs::read_to_string(orphan.join("orphan")).unwrap_or_default();
+    let descendant = descendant.trim();
+    if !descendant.is_empty() && descendant.bytes().all(|byte| byte.is_ascii_digit()) {
+        let _ = Command::new("sh")
+            .arg("-c")
+            .arg(format!("kill {descendant}"))
+            .status();
+    }
+}
+
+/// The literal reproduction in issue #10: SIGKILL the caller mid-review and the paid work is
+/// still there afterwards, addressable by the id the caller had already printed.
+#[test]
+fn a_killed_caller_does_not_lose_the_review() {
+    let fixture = ReviewFixture::new("killed caller", Some(23.0));
+    let block = fixture.block_dir();
+    let mut child = fixture
+        .command()
+        .env("AGENT_ROUTER_FIXTURE_REVIEW_BLOCK", &block)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn a waiting adversarial review");
+
+    wait_for_path(
+        &block.join("started"),
+        "the reviewer never started, so there was nothing in flight to orphan",
+    );
+    child.kill().expect("SIGKILL the waiting caller");
+    let output = child.wait_with_output().expect("reap the killed caller");
+    assert_eq!(output.status.code(), None, "the caller was not signalled");
+    let id = started_review_id(&text(&output.stderr));
+
+    write_file(&block.join("release"), "");
+    let completed = poll_review_status(&fixture, id, 0, &[]);
+    assert_eq!(text(&completed.stdout), "completed review body\n");
+
+    let rows = fixture.reviews();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status.as_deref(), Some("completed"));
+    assert!(rows[0].outcome_json.is_some(), "{:?}", rows[0]);
+}
+
+#[test]
+fn review_status_on_an_unknown_id_fails_and_names_it() {
+    let fixture = ReviewFixture::new("unknown review", Some(23.0));
+    let output = fixture
+        .review_subcommand(&["status", "4242"])
+        .output()
+        .expect("read an unknown review");
+
+    assert_exit(&output, 1);
+    assert!(
+        text(&output.stderr).contains("unknown review 4242"),
+        "{}",
+        text(&output.stderr)
+    );
+    assert!(text(&output.stdout).is_empty());
+}
+
+/// The request travels to the detached worker on a fresh argv, so a request whose text starts
+/// with a dash has to survive that hop rather than be read there as a flag.
+#[test]
+fn a_request_beginning_with_a_dash_survives_the_worker_re_exec() {
+    const REQUEST: &str = "--- not a flag: review this tree ---";
+    let fixture = ReviewFixture::new("dash request", Some(23.0));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agent-router"));
+    command
+        .arg("adversarial-review")
+        .arg("--primary")
+        .arg("codex")
+        .arg("--dir")
+        .arg(&fixture.cwd)
+        .arg("--json")
+        .arg("--")
+        .arg(REQUEST);
+    fixture.apply_env(&mut command);
+    let output = command
+        .output()
+        .expect("run a dash-prefixed review request");
+
+    assert_exit(&output, 0);
+    let value = parse_json(&output);
+    assert_eq!(value["status"], "completed");
+    assert_eq!(value["result"], "completed review body");
+    let invocation = argv(&fixture.claude_log);
+    assert!(
+        invocation.iter().any(|arg| arg.contains(REQUEST)),
+        "the request did not reach the reviewer intact: {invocation:?}"
+    );
 }
 
 /// The `--provider`/`--model` pin surface. Every case here runs through the same fixture as the

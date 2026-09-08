@@ -1,11 +1,17 @@
+use agent_router_core::adversarial_review::{
+    REVIEW_CANCELLED_REASON, REVIEW_POLL, ReviewOutcome, ReviewStatus, ReviewerPin,
+};
 use agent_router_core::doctor::Health;
-use agent_router_core::log::{DecisionLog, ReviewEntry, Row};
+use agent_router_core::log::{
+    CancelResult, DecisionLog, ReviewEntry, ReviewRow, ReviewTerminal, Row,
+};
 use agent_router_core::run::{Outcome, Request};
 use agent_router_core::stats::{Rate, Stats, Window};
 use agent_router_core::status::Report;
 use clap::{Parser, Subcommand};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 #[derive(Parser)]
 #[command(
@@ -77,6 +83,12 @@ enum Command {
         /// tier. A model the provider rejects fails the review rather than being substituted.
         #[arg(long)]
         model: Option<String>,
+        /// Give up waiting after this many seconds and report the review as pending with exit 4.
+        /// The review keeps running; `agent-router review status <ID>` returns its eventual
+        /// result. 0 returns pending immediately. Without this flag the command waits for a
+        /// terminal result exactly as it always has.
+        #[arg(long)]
+        timeout: Option<u64>,
         #[arg(long)]
         json: bool,
     },
@@ -127,6 +139,42 @@ enum Command {
     },
     /// Preflight the provider binaries, credentials, usage provenance, config, and decision log.
     Doctor,
+    /// Report or stop an adversarial review by the id `adversarial-review` printed.
+    Review {
+        #[command(subcommand)]
+        command: ReviewCommand,
+    },
+    /// Internal re-exec target for a detached adversarial reviewer, not a supported interface.
+    /// Its argv, its output, and its exit code are private to `adversarial-review` and may change
+    /// without notice.
+    #[command(hide = true)]
+    ReviewWorker {
+        #[arg(long = "review-id")]
+        review_id: i64,
+        #[arg(long)]
+        primary: String,
+        #[arg(long)]
+        dir: PathBuf,
+        #[arg(long)]
+        provider: String,
+        #[arg(long)]
+        model: Option<String>,
+        request: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ReviewCommand {
+    /// Whether the review is still running, and its retained result once it is terminal. Exits 0
+    /// completed, 3 skipped, 1 failed or cancelled, 4 still pending.
+    Status {
+        id: i64,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop an in-flight review and settle its row as cancelled. A review that already settled is
+    /// reported with the state that won, not cancelled a second time.
+    Cancel { id: i64 },
 }
 
 enum CliStatus {
@@ -134,6 +182,7 @@ enum CliStatus {
     Failure,
     Unrunnable,
     ReviewSkipped,
+    ReviewPending,
 }
 
 fn exit_code(status: CliStatus) -> std::process::ExitCode {
@@ -142,6 +191,7 @@ fn exit_code(status: CliStatus) -> std::process::ExitCode {
         CliStatus::Failure => std::process::ExitCode::FAILURE,
         CliStatus::Unrunnable => std::process::ExitCode::from(2),
         CliStatus::ReviewSkipped => std::process::ExitCode::from(3),
+        CliStatus::ReviewPending => std::process::ExitCode::from(4),
     }
 }
 
@@ -157,8 +207,20 @@ fn main() -> std::process::ExitCode {
             dir,
             provider,
             model,
+            timeout,
             json,
-        } => adversarial_review_status(&mut ctx, request, primary, dir, provider, model, json),
+        } => adversarial_review_status(
+            &mut ctx, request, primary, dir, provider, model, timeout, json,
+        ),
+        Command::Review { command } => review_command_status(&ctx, command),
+        Command::ReviewWorker {
+            review_id,
+            primary,
+            dir,
+            provider,
+            model,
+            request,
+        } => review_worker_status(&mut ctx, review_id, request, primary, dir, provider, model),
         command => match run(Cli { command }, &mut ctx) {
             Ok(()) => CliStatus::Success,
             Err(e) => {
@@ -170,6 +232,9 @@ fn main() -> std::process::ExitCode {
     exit_code(status)
 }
 
+// Parameters are the adversarial-review subcommand's clap flags passed straight through, so the
+// count tracks the CLI surface.
+#[allow(clippy::too_many_arguments)]
 fn adversarial_review_status(
     ctx: &mut agent_router_core::Context,
     body: String,
@@ -177,6 +242,7 @@ fn adversarial_review_status(
     dir: Option<PathBuf>,
     provider: String,
     model: Option<String>,
+    timeout: Option<u64>,
     json: bool,
 ) -> CliStatus {
     // Every early failure below still reports what the caller asked for, so a `--provider claude
@@ -197,44 +263,13 @@ fn adversarial_review_status(
         }
         outcome
     };
-    let primary_provider = match agent_router_core::run::parse_provider(&primary) {
-        Ok(Some(provider)) => provider.name(),
-        Ok(None) => {
-            return finish_adversarial_review(
-                &requested(agent_router_core::adversarial_review::failed_outcome(
-                    &primary,
-                    "primary provider must be codex, claude, or grok",
-                )),
-                None,
-                json,
-                ctx,
-            );
-        }
+    let (primary_provider, pin) = match review_selection(&primary, &provider, model.as_deref()) {
+        Ok(selection) => selection,
         Err(error) => {
             return finish_adversarial_review(
                 &requested(agent_router_core::adversarial_review::failed_outcome(
-                    &primary,
-                    error.to_string(),
-                )),
-                None,
-                json,
-                ctx,
-            );
-        }
-    };
-    let pin = match agent_router_core::run::parse_provider(&provider).and_then(|provider| {
-        agent_router_core::adversarial_review::reviewer_pin(
-            primary_provider,
-            provider,
-            model.as_deref(),
-        )
-    }) {
-        Ok(pin) => pin,
-        Err(error) => {
-            return finish_adversarial_review(
-                &requested(agent_router_core::adversarial_review::failed_outcome(
-                    primary_provider,
-                    error.to_string(),
+                    &error.primary,
+                    error.reason,
                 )),
                 None,
                 json,
@@ -270,18 +305,413 @@ fn adversarial_review_status(
             ctx,
         );
     }
-    let request = agent_router_core::adversarial_review::ReviewRequest {
-        primary_provider,
-        body: &body,
-        dir: &dir,
+    // The id has to exist before any provider work does, or an interrupted caller destroys both
+    // the record and the paid work. A router.db that cannot take the row has nothing for the
+    // lifecycle to stand on, so that case runs the review in this process exactly as it always
+    // has: no id, no worker, and --timeout inert.
+    let started = DecisionLog::open_in(&ctx.home).ok().and_then(|log| {
+        log.start_review(primary_provider, &dir)
+            .ok()
+            .map(|id| (log, id))
+    });
+    let Some((log, review_id)) = started else {
+        let request = agent_router_core::adversarial_review::ReviewRequest {
+            primary_provider,
+            body: &body,
+            dir: &dir,
+        };
+        let outcome = match &pin {
+            None => agent_router_core::adversarial_review::review_registered(&request, ctx),
+            Some(pin) => {
+                agent_router_core::adversarial_review::review_registered_pinned(&request, pin, ctx)
+            }
+        };
+        return finish_adversarial_review(&outcome, Some(&dir), json, ctx);
     };
-    let outcome = match &pin {
-        None => agent_router_core::adversarial_review::review_registered(&request, ctx),
-        Some(pin) => {
-            agent_router_core::adversarial_review::review_registered_pinned(&request, pin, ctx)
+    eprintln!("agent-router: adversarial review {review_id} started");
+
+    let worker = std::env::current_exe()
+        .map_err(agent_router_core::Error::Io)
+        .and_then(|exe| {
+            let mut command = std::process::Command::new(exe);
+            command
+                .arg("review-worker")
+                .arg("--review-id")
+                .arg(review_id.to_string())
+                .arg("--primary")
+                .arg(primary_provider)
+                .arg("--dir")
+                .arg(&dir)
+                .arg("--provider")
+                .arg(&provider);
+            if let Some(model) = &model {
+                command.arg("--model").arg(model);
+            }
+            // `--` keeps a request whose own text starts with a dash from being read as a flag on
+            // the worker's fresh argv.
+            command.arg("--").arg(&body);
+            agent_router_core::runtime::spawn_detached(
+                command,
+                &agent_router_core::runtime::router_log_path(&ctx.home, "review"),
+                None,
+            )
+        });
+    let mut worker = match worker {
+        Ok(worker) => worker,
+        Err(error) => {
+            let outcome = requested(agent_router_core::adversarial_review::failed_outcome(
+                primary_provider,
+                error.to_string(),
+            ));
+            let _ = settle_review(&log, review_id, &outcome);
+            return print_review_id_or(&log, review_id, json, &outcome);
         }
     };
-    finish_adversarial_review(&outcome, Some(&dir), json, ctx)
+
+    let deadline = timeout.map(|seconds| Instant::now() + Duration::from_secs(seconds));
+    loop {
+        if let Ok(Some(row)) = log.review(review_id)
+            && review_state(&row) != ReviewStatus::Pending
+        {
+            return print_review_row(&row, json);
+        }
+        // The worker writes the row and then exits, so a bare "the worker is gone" reading races
+        // the write it is trying to detect. Re-read once more and only settle a row that is still
+        // pending.
+        if matches!(worker.try_wait(), Ok(Some(_))) {
+            match log.review(review_id) {
+                Ok(Some(row)) if review_state(&row) != ReviewStatus::Pending => {
+                    return print_review_row(&row, json);
+                }
+                _ => {
+                    let outcome = requested(agent_router_core::adversarial_review::failed_outcome(
+                        primary_provider,
+                        "review worker exited before recording a result",
+                    ));
+                    let _ = settle_review(&log, review_id, &outcome);
+                    return print_review_id_or(&log, review_id, json, &outcome);
+                }
+            }
+        }
+        // Checked before the first sleep so `--timeout 0` returns pending immediately, with the
+        // id printed and the worker already running. This iteration already read the row as
+        // pending, so the report is the caller's own, carrying what it asked for.
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            let mut outcome = pending_review_outcome(review_id, primary_provider);
+            outcome.requested_provider = (provider != "auto").then_some(provider);
+            outcome.requested_model = model;
+            return print_adversarial_review(&outcome, json);
+        }
+        std::thread::sleep(REVIEW_POLL);
+    }
+}
+
+/// How many times a terminal write retries a busy database before giving up. Bounded on purpose:
+/// paid provider work must not be lost to a lock wait, and this is a retry loop, not a scheduler.
+const REVIEW_SETTLE_ATTEMPTS: usize = 20;
+
+/// The exit code map read as the process's own status. `ReviewStatus::exit_status` is the one map;
+/// this only names the codes the CLI already has variants for.
+fn review_cli_status(status: ReviewStatus) -> CliStatus {
+    match status.exit_status() {
+        0 => CliStatus::Success,
+        3 => CliStatus::ReviewSkipped,
+        4 => CliStatus::ReviewPending,
+        _ => CliStatus::Failure,
+    }
+}
+
+/// The state a row is in, over the one row-to-status map in core.
+fn review_state(row: &ReviewRow) -> ReviewStatus {
+    ReviewStatus::from_row(row.status.as_deref(), row.exit_status)
+}
+
+/// IMPURE: run one durable write against a database that may be busy, over a bounded number of
+/// attempts on the review poll interval. None is "it never went through", which every caller
+/// treats as a fact about the row rather than as an error.
+fn retry_write<T>(
+    attempts: usize,
+    mut op: impl FnMut() -> agent_router_core::Result<T>,
+) -> Option<T> {
+    for attempt in 1..=attempts {
+        match op() {
+            Ok(value) => return Some(value),
+            Err(_) if attempt == attempts => return None,
+            Err(_) => std::thread::sleep(REVIEW_POLL),
+        }
+    }
+    None
+}
+
+/// Settle a pending row with its terminal outcome, retrying a busy database a bounded number of
+/// times. A refused compare-and-set is not an error: it means a cancel already settled the review.
+fn settle_review(log: &DecisionLog, review_id: i64, outcome: &ReviewOutcome) -> bool {
+    let usage_provenance =
+        serde_json::to_string(&outcome.usage_provenance).unwrap_or_else(|_| "[]".to_string());
+    let outcome_json = serde_json::to_string(outcome).ok();
+    let body_bytes =
+        i64::try_from(outcome.result.as_deref().map_or(0, str::len)).unwrap_or(i64::MAX);
+    let terminal = ReviewTerminal {
+        status: outcome.status.as_str(),
+        exit_status: outcome.status.exit_status(),
+        reviewer_provider: outcome.reviewer_provider.as_deref(),
+        reviewer_model: outcome.reviewer_model.as_deref(),
+        usage_provenance: &usage_provenance,
+        rationale: &outcome.rationale,
+        body_bytes,
+        outcome_json: outcome_json.as_deref(),
+        reason: outcome.reason.as_deref(),
+    };
+    retry_write(REVIEW_SETTLE_ATTEMPTS, || {
+        log.finish_review(review_id, &terminal)
+    })
+    .unwrap_or(false)
+}
+
+/// A review still running in its worker, as the outcome the caller prints.
+fn pending_review_outcome(review_id: i64, primary_provider: &str) -> ReviewOutcome {
+    ReviewOutcome {
+        status: ReviewStatus::Pending,
+        primary_provider: primary_provider.to_string(),
+        requested_provider: None,
+        requested_model: None,
+        reviewer_provider: None,
+        reviewer_model: None,
+        reviewer_session_id: None,
+        usage: None,
+        usage_provenance: Vec::new(),
+        rationale: "review is still running in a detached worker".to_string(),
+        reason: None,
+        result: None,
+        review_id: Some(review_id),
+    }
+}
+
+/// A row that carries no retained envelope, as the outcome the caller prints. Every legacy row and
+/// every row a pre-selection failure wrote takes this path, so their columns are all there is.
+fn synthesized_review_outcome(row: &ReviewRow, state: ReviewStatus) -> ReviewOutcome {
+    let reason = match (row.reason.clone(), state) {
+        (Some(reason), _) => Some(reason),
+        (None, ReviewStatus::Cancelled) => Some(REVIEW_CANCELLED_REASON.to_string()),
+        (None, _) => None,
+    };
+    ReviewOutcome {
+        status: state,
+        primary_provider: row.primary.clone(),
+        requested_provider: None,
+        requested_model: None,
+        reviewer_provider: row.reviewer_provider.clone(),
+        reviewer_model: row.reviewer_model.clone(),
+        reviewer_session_id: None,
+        usage: None,
+        usage_provenance: Vec::new(),
+        rationale: row.rationale.clone(),
+        reason,
+        result: None,
+        review_id: Some(row.id),
+    }
+}
+
+/// Print one review from its row: the retained terminal envelope where the worker left one, a
+/// synthesis of the row's own columns otherwise. Shared by the waiting caller and `review status`
+/// so a review reads the same either way.
+fn print_review_row(row: &ReviewRow, json: bool) -> CliStatus {
+    let state = review_state(row);
+    let retained = match state {
+        ReviewStatus::Completed | ReviewStatus::Skipped | ReviewStatus::Failed => row
+            .outcome_json
+            .as_deref()
+            .and_then(|envelope| serde_json::from_str::<ReviewOutcome>(envelope).ok()),
+        ReviewStatus::Pending | ReviewStatus::Cancelled => None,
+    };
+    let outcome = retained.unwrap_or_else(|| synthesized_review_outcome(row, state));
+    print_adversarial_review(&outcome, json)
+}
+
+/// Print a review by id from its row, falling back to `outcome` when the row cannot be read back.
+fn print_review_id_or(
+    log: &DecisionLog,
+    review_id: i64,
+    json: bool,
+    outcome: &ReviewOutcome,
+) -> CliStatus {
+    match log.review(review_id) {
+        Ok(Some(row)) => print_review_row(&row, json),
+        _ => print_adversarial_review(outcome, json),
+    }
+}
+
+fn review_command_status(ctx: &agent_router_core::Context, command: ReviewCommand) -> CliStatus {
+    let log = match DecisionLog::open_in(&ctx.home) {
+        Ok(log) => log,
+        Err(error) => {
+            eprintln!("agent-router: {error}");
+            return CliStatus::Failure;
+        }
+    };
+    match command {
+        ReviewCommand::Status { id, json } => match log.review(id) {
+            Ok(Some(row)) => print_review_row(&row, json),
+            Ok(None) => {
+                eprintln!("agent-router: unknown review {id}");
+                CliStatus::Failure
+            }
+            Err(error) => {
+                eprintln!("agent-router: {error}");
+                CliStatus::Failure
+            }
+        },
+        ReviewCommand::Cancel { id } => match log.cancel_review(id) {
+            Ok(CancelResult::Cancelled) => {
+                println!("review {id} cancelled");
+                CliStatus::Success
+            }
+            Ok(CancelResult::AlreadyTerminal(state)) => {
+                eprintln!("agent-router: review {id} is already {state}");
+                CliStatus::Failure
+            }
+            Ok(CancelResult::Unknown) => {
+                eprintln!("agent-router: unknown review {id}");
+                CliStatus::Failure
+            }
+            Err(error) => {
+                eprintln!("agent-router: {error}");
+                CliStatus::Failure
+            }
+        },
+    }
+}
+
+/// The detached reviewer. Its own exit code is read by nobody: the review's result is the row it
+/// settles, and its output is the worker log.
+fn review_worker_status(
+    ctx: &mut agent_router_core::Context,
+    review_id: i64,
+    body: String,
+    primary: String,
+    dir: PathBuf,
+    provider: String,
+    model: Option<String>,
+) -> CliStatus {
+    let log = match DecisionLog::open_in(&ctx.home) {
+        Ok(log) => log,
+        Err(error) => {
+            eprintln!("agent-router: {error}");
+            return CliStatus::Failure;
+        }
+    };
+    // The worker re-derives the selection from the argv the caller already validated, so a pin
+    // chooses the same reviewer here as it did there rather than reselecting automatically.
+    let selection = review_selection(&primary, &provider, model.as_deref())
+        .map_err(|error| error.reason)
+        .and_then(|selection| match ctx.load_config() {
+            Ok(()) => Ok(selection),
+            Err(error) => Err(error.to_string()),
+        });
+    let mut outcome = match selection {
+        Ok((primary_provider, pin)) => {
+            let request = agent_router_core::adversarial_review::ReviewRequest {
+                primary_provider,
+                body: &body,
+                dir: &dir,
+            };
+            // A read error is not a cancel. A transient busy database must never stop a live paid
+            // review.
+            let cancelled = || {
+                matches!(
+                    log.review(review_id),
+                    Ok(Some(row)) if review_state(&row) == ReviewStatus::Cancelled
+                )
+            };
+            agent_router_core::adversarial_review::review_registered_with_cancel(
+                &request,
+                pin.as_ref(),
+                ctx,
+                &cancelled,
+            )
+        }
+        Err(reason) => agent_router_core::adversarial_review::failed_outcome(&primary, reason),
+    };
+    outcome.review_id = Some(review_id);
+
+    // A cancel can land at any point up to the terminal write itself, so the compare-and-set is
+    // the only reading of who settled the row; a snapshot taken before the write cannot be one.
+    // When the write is refused the row is re-read once: a cancelled row is owed the cleanup
+    // outcome as a note, and any other terminal state belongs to whoever wrote it.
+    if !settle_review(&log, review_id, &outcome) {
+        let cancelled_row = matches!(
+            log.review(review_id),
+            Ok(Some(row)) if review_state(&row) == ReviewStatus::Cancelled
+        );
+        if cancelled_row {
+            note_cancellation_detail(&log, review_id, cancellation_detail(&outcome));
+            return review_cli_status(ReviewStatus::Cancelled);
+        }
+    }
+    review_cli_status(outcome.status)
+}
+
+/// What the worker owes a row a cancel settled ahead of it. Every failure reason other than the
+/// observed cancel is provider or session-cleanup detail that exists nowhere else, so it is kept
+/// verbatim rather than recognised by shape.
+fn cancellation_detail(outcome: &ReviewOutcome) -> &str {
+    match (outcome.status, outcome.reason.as_deref()) {
+        (ReviewStatus::Failed, Some(reason)) if reason != REVIEW_CANCELLED_REASON => reason,
+        (ReviewStatus::Failed, _) => "reviewer stopped",
+        // A cancelled row keeps a NULL `outcome_json` by the compare-and-set, so a body that
+        // arrived after the cancel is not retained; the note records only that it did.
+        _ => "reviewer finished after the cancel",
+    }
+}
+
+/// IMPURE: append the cleanup detail to a cancelled row, over the terminal write's retry bound. A
+/// refused append is the normal outcome of a row that is no longer cancelled, not an error.
+fn note_cancellation_detail(log: &DecisionLog, review_id: i64, detail: &str) {
+    let _ = retry_write(REVIEW_SETTLE_ATTEMPTS, || {
+        log.note_cancellation(review_id, detail)
+    });
+}
+
+/// A selection the caller's argv could not produce, carrying the primary provider string the
+/// failure is reported against: the caller's raw `--primary` while that is all there is, the
+/// canonical name once it has parsed. That distinction is the whole reason this is a struct.
+struct SelectionError {
+    primary: String,
+    reason: String,
+}
+
+/// PURE: the primary provider and the reviewer pin the caller's argv asks for. The waiting caller
+/// and its detached worker both derive the selection here, so a pin chooses the same reviewer in
+/// the worker as it did in the caller rather than reselecting automatically.
+fn review_selection(
+    primary: &str,
+    provider: &str,
+    model: Option<&str>,
+) -> std::result::Result<(&'static str, Option<ReviewerPin>), SelectionError> {
+    let primary_provider = match agent_router_core::run::parse_provider(primary) {
+        Ok(Some(provider)) => provider.name(),
+        Ok(None) => {
+            return Err(SelectionError {
+                primary: primary.to_string(),
+                reason: "primary provider must be codex, claude, or grok".to_string(),
+            });
+        }
+        Err(error) => {
+            return Err(SelectionError {
+                primary: primary.to_string(),
+                reason: error.to_string(),
+            });
+        }
+    };
+    let pin = agent_router_core::run::parse_provider(provider)
+        .and_then(|provider| {
+            agent_router_core::adversarial_review::reviewer_pin(primary_provider, provider, model)
+        })
+        .map_err(|error| SelectionError {
+            primary: primary_provider.to_string(),
+            reason: error.to_string(),
+        })?;
+    Ok((primary_provider, pin))
 }
 
 /// Persist one reviews row, then print. A write failure is swallowed so it cannot change the
@@ -301,11 +731,7 @@ fn persist_adversarial_review(
     dir: Option<&Path>,
     ctx: &agent_router_core::Context,
 ) {
-    let exit_status = match outcome.status {
-        agent_router_core::adversarial_review::ReviewStatus::Completed => 0,
-        agent_router_core::adversarial_review::ReviewStatus::Skipped => 3,
-        agent_router_core::adversarial_review::ReviewStatus::Failed => 1,
-    };
+    let exit_status = outcome.status.exit_status();
     let usage_provenance =
         serde_json::to_string(&outcome.usage_provenance).unwrap_or_else(|_| "[]".to_string());
     let body_bytes =
@@ -344,8 +770,13 @@ fn print_adversarial_review(
                     println!();
                 }
             }
+            agent_router_core::adversarial_review::ReviewStatus::Pending => {
+                let review_id = outcome.review_id.unwrap_or_default();
+                println!("review {review_id} pending; poll agent-router review status {review_id}");
+            }
             agent_router_core::adversarial_review::ReviewStatus::Skipped
-            | agent_router_core::adversarial_review::ReviewStatus::Failed => {
+            | agent_router_core::adversarial_review::ReviewStatus::Failed
+            | agent_router_core::adversarial_review::ReviewStatus::Cancelled => {
                 eprintln!(
                     "{}",
                     escape_terminal_controls(outcome.reason.as_deref().unwrap_or("review failed"))
@@ -354,11 +785,7 @@ fn print_adversarial_review(
         }
     }
 
-    match outcome.status {
-        agent_router_core::adversarial_review::ReviewStatus::Completed => CliStatus::Success,
-        agent_router_core::adversarial_review::ReviewStatus::Skipped => CliStatus::ReviewSkipped,
-        agent_router_core::adversarial_review::ReviewStatus::Failed => CliStatus::Failure,
-    }
+    review_cli_status(outcome.status)
 }
 
 /// Doctor owns its exit code the same way status does: a failing check is reported by exiting
@@ -528,6 +955,12 @@ fn run(cli: Cli, ctx: &mut agent_router_core::Context) -> agent_router_core::Res
         Command::Stats { limit, since, json } => stats(ctx, limit, since, json),
         Command::AdversarialReview { .. } => {
             unreachable!("adversarial review has a command specific exit path")
+        }
+        Command::Review { .. } => {
+            unreachable!("review has a command specific exit path")
+        }
+        Command::ReviewWorker { .. } => {
+            unreachable!("the review worker has a command specific exit path")
         }
         Command::Doctor => unreachable!("doctor has a command specific exit path"),
         Command::Status { .. } => unreachable!("status has a command specific exit path"),
