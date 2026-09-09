@@ -736,6 +736,7 @@ fn persist_adversarial_review(
         serde_json::to_string(&outcome.usage_provenance).unwrap_or_else(|_| "[]".to_string());
     let body_bytes =
         i64::try_from(outcome.result.as_deref().map_or(0, str::len)).unwrap_or(i64::MAX);
+    let outcome_json = serde_json::to_string(outcome).ok();
     let dir = dir.unwrap_or(Path::new(""));
     let _ = DecisionLog::open_in(&ctx.home).and_then(|log| {
         log.record_review(&ReviewEntry {
@@ -747,6 +748,8 @@ fn persist_adversarial_review(
             rationale: &outcome.rationale,
             body_bytes,
             dir,
+            outcome_json: outcome_json.as_deref(),
+            reason: outcome.reason.as_deref(),
         })
     });
 }

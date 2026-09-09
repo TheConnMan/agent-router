@@ -43,6 +43,10 @@ pub struct ReviewEntry<'a> {
     pub rationale: &'a str,
     pub body_bytes: i64,
     pub dir: &'a Path,
+    /// The serialized outcome, so a pre-ID failure keeps the same envelope a settled row keeps.
+    pub outcome_json: Option<&'a str>,
+    /// Why the review failed or was skipped. None on a completed review.
+    pub reason: Option<&'a str>,
 }
 
 /// The terminal state of a review that started as a pending row: everything `finish_review`
@@ -498,8 +502,8 @@ impl DecisionLog {
             .prepare_cached(
                 "INSERT INTO reviews (
                 ts, exit_status, \"primary\", reviewer_provider, reviewer_model,
-                usage_provenance, rationale, body_bytes, dir
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                usage_provenance, rationale, body_bytes, dir, outcome_json, reason
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             )?
             .execute(rusqlite::params![
                 now_ms(),
@@ -511,6 +515,8 @@ impl DecisionLog {
                 entry.rationale,
                 entry.body_bytes,
                 entry.dir.to_string_lossy(),
+                entry.outcome_json,
+                entry.reason,
             ])?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -1968,6 +1974,8 @@ mod tests {
             rationale: "picked claude",
             body_bytes: 4,
             dir: Path::new("/tmp"),
+            outcome_json: None,
+            reason: None,
         })
         .expect("records a review");
 
@@ -2269,7 +2277,9 @@ CREATE TABLE IF NOT EXISTS reviews (
 
     /// The preserved `record_review` path writes a row with no lifecycle status, so a pre-ID
     /// failure and a legacy row are the same shape and both are read by deriving from
-    /// `exit_status` rather than being reported as in-flight.
+    /// `exit_status` rather than being reported as in-flight. It does keep the failure's reason
+    /// and outcome envelope: a week of reviews (2026-09-04 to 09-07) failed with every one of
+    /// those columns NULL, which left the cause unrecoverable from the ledger.
     #[test]
     fn record_review_still_writes_a_row_with_no_lifecycle_status() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2285,6 +2295,8 @@ CREATE TABLE IF NOT EXISTS reviews (
             rationale: "claude requested explicitly with model fable",
             body_bytes: 0,
             dir: Path::new("/tmp"),
+            outcome_json: Some("{\"status\":\"failed\"}"),
+            reason: Some("secure Grok storage requires openat2"),
         })
         .expect("records a pre-id failure");
 
@@ -2292,7 +2304,13 @@ CREATE TABLE IF NOT EXISTS reviews (
         assert_eq!(reviews.len(), 1);
         assert_eq!(reviews[0].exit_status, 1);
         assert_eq!(reviews[0].status, None);
-        assert_eq!(reviews[0].outcome_json, None);
-        assert_eq!(reviews[0].reason, None);
+        assert_eq!(
+            reviews[0].outcome_json.as_deref(),
+            Some("{\"status\":\"failed\"}")
+        );
+        assert_eq!(
+            reviews[0].reason.as_deref(),
+            Some("secure Grok storage requires openat2")
+        );
     }
 }
