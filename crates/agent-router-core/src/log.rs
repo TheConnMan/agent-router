@@ -338,12 +338,14 @@ orchestration, claude_projected_draw, codex_projected_draw, reconciled_at_ms, ma
 note, effective_effort, router_version, grok_weekly_pct, grok_projected_draw, \
 matched_capabilities, requested_model";
 
-/// Outcomes whose fate is known. Same set `stats` denominates a failure rate on: `completed`,
-/// `failed`, or a dispatch error. A dry run's outcome is `dry-run`, so it does not match; live
-/// jobs (`dispatched`, `running`) and `unknown` stay out because a review pass cannot judge a
-/// route whose job has not finished.
-const SETTLED_OUTCOME_SQL: &str =
-    "outcome = 'completed' OR outcome = 'failed' OR outcome LIKE 'error: %'";
+/// Outcomes whose route fate is known enough to judge. `completed`, `failed`, and a dispatch
+/// error are the job-fate set `stats` denominates a failure rate on. `capability-blocked` is
+/// extra: no job was dispatched, but the router already refused the route, so a review pass can
+/// judge that refuse the same way it judges a finished dispatch. A dry run's outcome is
+/// `dry-run`, so it does not match; live jobs (`dispatched`, `running`) and `unknown` stay out
+/// because a review pass cannot judge a route whose job has not finished.
+const SETTLED_OUTCOME_SQL: &str = "outcome = 'completed' OR outcome = 'failed' \
+     OR outcome = 'capability-blocked' OR outcome LIKE 'error: %'";
 
 /// The narrower list the stats reader needs, so a report never pays for columns it drops.
 const STATS_COLUMNS: &str = "created_at_ms, requested, provider, complexity, gates, dry_run, \
@@ -780,8 +782,9 @@ impl DecisionLog {
 
     /// IMPURE: the `limit` newest settled rows nobody has judged, newest first.
     ///
-    /// A review pass's worklist. Marked rows are already judged; unsettled rows have no fate to
-    /// judge against yet.
+    /// A review pass's worklist. Marked rows are already judged. Unsettled rows have no job fate
+    /// to judge against yet, except `capability-blocked`, which never dispatched and is itself
+    /// the fate.
     pub fn recent_unmarked(&self, limit: usize) -> Result<Vec<Row>> {
         let sql = format!(
             "SELECT {SELECT_COLUMNS} FROM decisions \
@@ -1338,6 +1341,7 @@ mod tests {
         let completed = record("completed-unmarked", false, "completed");
         let failed = record("failed-unmarked", false, "failed");
         let errored = record("error-unmarked", false, "error: dispatch refused");
+        let blocked = record("blocked-unmarked", false, "capability-blocked");
         let marked = record("completed-marked", false, "completed");
         log.mark(marked, Mark::Good, None).expect("marks");
         record("dispatched-unmarked", false, "dispatched");
@@ -1348,7 +1352,7 @@ mod tests {
         let rows = log.recent_unmarked(10).expect("reads");
         assert_eq!(
             rows.iter().map(|row| row.id).collect::<Vec<_>>(),
-            vec![errored, failed, completed]
+            vec![blocked, errored, failed, completed]
         );
         assert!(rows.iter().all(|row| row.mark.is_none()));
     }

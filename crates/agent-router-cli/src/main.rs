@@ -109,7 +109,7 @@ enum Command {
         /// What the judgement was, in free text. Requires --mark.
         #[arg(long)]
         note: Option<String>,
-        /// Settled rows nobody has judged yet, newest first. A review pass's worklist.
+        /// Settled rows nobody has judged yet, newest first. A review pass's worklist, including capability-blocked refuses.
         #[arg(long)]
         unmarked: bool,
         #[arg(long)]

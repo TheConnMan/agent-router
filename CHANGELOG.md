@@ -3,6 +3,11 @@
 All notable changes to this project are documented here. Versions are the
 workspace `package.version` stamped on every decision-log row.
 
+## 0.24.1 - 2026-09-09
+
+- Treat `capability-blocked` as settled for `log --unmarked`, so a review pass's worklist includes
+  fail-closed connector blocks. The stats failure rate still ignores them: nothing was dispatched.
+
 ## 0.24.0 - 2026-09-08
 
 - Route Codex complexity through Terra/high, Sol/medium, Astra/low, and Astra/high.

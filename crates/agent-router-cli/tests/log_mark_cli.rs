@@ -515,13 +515,16 @@ fn listed_ids(stdout: &str) -> Vec<i64> {
         .collect()
 }
 
-/// The review-pass worklist: settled rows (`completed`, `failed`, or `error: ...`) whose mark is
-/// still NULL. A marked settled row, a still-live unmarked row, and a dry run are the three
-/// neighbours that used to make `log --limit N` unusable as that worklist.
+/// The review-pass worklist: settled rows (`completed`, `failed`, `capability-blocked`, or
+/// `error: ...`) whose mark is still NULL. A marked settled row, a still-live unmarked row, and
+/// a dry run are the three neighbours that used to make `log --limit N` unusable as that
+/// worklist. `capability-blocked` is settled because the refuse is the fate: no job will ever
+/// finish.
 #[test]
 fn unmarked_lists_only_settled_unmarked_rows_and_refuses_a_combined_mark() {
     let fixture = MarkFixture::new("unmarked-worklist");
     let settled_unmarked = fixture.seed(Provider::Codex, false, "completed");
+    let blocked_unmarked = fixture.seed(Provider::Codex, false, "capability-blocked");
     let settled_marked = fixture.seed(Provider::Claude, false, "completed");
     let marked = fixture.log(&["--mark", &settled_marked.to_string(), "good"]);
     assert!(
@@ -541,8 +544,8 @@ fn unmarked_lists_only_settled_unmarked_rows_and_refuses_a_combined_mark() {
     let stdout = String::from_utf8_lossy(&listed.stdout);
     assert_eq!(
         listed_ids(&stdout),
-        vec![settled_unmarked],
-        "log --unmarked must list only the settled unmarked row, stdout: {stdout}"
+        vec![blocked_unmarked, settled_unmarked],
+        "log --unmarked must list only the settled unmarked rows, stdout: {stdout}"
     );
     for leaked in [settled_marked, unsettled_unmarked, dry_run] {
         assert!(
@@ -563,8 +566,8 @@ fn unmarked_lists_only_settled_unmarked_rows_and_refuses_a_combined_mark() {
         .expect("log --unmarked --json prints an array");
     assert_eq!(
         rows.iter().map(|row| &row["id"]).collect::<Vec<_>>(),
-        vec![&json!(settled_unmarked)],
-        "log --unmarked --json must list only the settled unmarked row: {rows:?}"
+        vec![&json!(blocked_unmarked), &json!(settled_unmarked)],
+        "log --unmarked --json must list only the settled unmarked rows: {rows:?}"
     );
     assert_eq!(
         field(&rows[0], "mark"),

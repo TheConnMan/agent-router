@@ -440,7 +440,7 @@ agent-router log --unmarked --limit 50
 | `--limit <N>` | `10` | Newest rows to print. |
 | `--mark <ROW_ID> <MARK>` | none | Record the human judgement on one row: `good`, `bad`, or `rerouted`. Any other value is rejected and exits nonzero naming the accepted three. An unknown `ROW_ID` also exits nonzero, without writing anything. Short circuits: it prints one confirmation line instead of the listing. |
 | `--note <TEXT>` | none | Free text alongside `--mark`. Requires `--mark`; a note with no mark is rejected. An empty or whitespace only note is rejected rather than stored. |
-| `--unmarked` | off | List only settled rows (`completed`, `failed`, or a dispatch error) whose mark is still NULL, newest first. A review pass's worklist. Rejected alongside `--mark`, which prints a confirmation line rather than a listing. |
+| `--unmarked` | off | List only settled rows (`completed`, `failed`, `capability-blocked`, or a dispatch error) whose mark is still NULL, newest first. A review pass's worklist. A capability-blocked row never dispatched, but the refuse is the fate a review pass judges. Rejected alongside `--mark`, which prints a confirmation line rather than a listing. |
 | `--json` | off | Emit the full decision, including gates, classification, and usage. Rejected alongside `--mark`, which prints a confirmation line rather than a listing. |
 
 `--json` emits every recorded column, including the full task text, the rationale, and the
@@ -508,10 +508,12 @@ on it.
 Both denominators are deliberately narrower than the row count, and that is what makes the numbers
 worth trusting. A bad rate counts only the rows a human actually judged, because an unmarked row is
 absence of evidence rather than evidence of a good route, and counting it as good would drive every
-bad rate toward zero as the log grows. A failure rate counts only the rows whose fate is settled
-(`completed`, `failed`, or a dispatch error), because a row still reading `dispatched`, `running`,
-or `unknown` has not been shown to have succeeded, and counting it as one reports a perfect record
-over jobs nobody has heard back about. A dry run never enters a failure denominator at all, since it
+bad rate toward zero as the log grows. A failure rate counts only the rows whose *job* fate is
+settled (`completed`, `failed`, or a dispatch error), because a row still reading `dispatched`,
+`running`, or `unknown` has not been shown to have succeeded, and counting it as one reports a
+perfect record over jobs nobody has heard back about. `capability-blocked` is not a job fate: nothing
+was dispatched, so it stays out of the failure rate, but it is settled for `log --unmarked` because
+the refuse is the route's fate. A dry run never enters a failure denominator at all, since it
 dispatched nothing that could succeed or fail, though it does enter a bad rate, because it still has
 a route a human can judge.
 
