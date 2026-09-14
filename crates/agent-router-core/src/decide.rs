@@ -187,10 +187,10 @@ pub fn decide(
     decide_with_task("", classification, usage, now_epoch_secs, config)
 }
 
-/// Automatic routing for a scored task. `task` is searched together with the classifier
-/// rationale when recovering a missing connector against `provider_capabilities`, so a
-/// one-sentence rationale that omits "Slack" still recovers Slack-capable providers when
-/// the task already named Slack. An unmatched miss still blocks rather than pinning Claude
+/// Automatic routing for a scored task. Inventory names in the task or classifier
+/// rationale recover against `provider_capabilities` even when the classifier left
+/// `missing_connector` false, so a paraphrased rationale cannot send an Airtable job
+/// to Grok. An unmatched classifier miss still blocks rather than pinning Claude
 /// (docs/decisions/0007-claude-capability-only.md).
 pub fn decide_with_task(
     task: &str,
@@ -200,16 +200,12 @@ pub fn decide_with_task(
     config: &Config,
 ) -> Decision {
     let mut gates = Vec::new();
-    let matched_capabilities = if classification.missing_connector {
-        config.matched_capabilities(task, &classification.rationale)
-    } else {
-        Vec::new()
-    };
+    let matched_capabilities = config.matched_capabilities(task, &classification.rationale);
     let capability_providers = config.capability_providers(&matched_capabilities);
-    let mut capability_blocked =
-        classification.missing_connector && capability_providers.is_empty();
+    let connector_required = classification.missing_connector || !matched_capabilities.is_empty();
+    let mut capability_blocked = connector_required && capability_providers.is_empty();
     let mut capability_pin = false;
-    if classification.missing_connector {
+    if connector_required {
         gates.push(Gate::MissingConnector);
         if capability_blocked {
             gates.push(Gate::CapabilityBlocked);
@@ -247,7 +243,7 @@ pub fn decide_with_task(
 
     if !capability_pin && !config.policy.weekly_routing {
         gates.push(Gate::WeeklyRoutingDisabled);
-        if classification.missing_connector && !capability_providers.contains(&Provider::Codex) {
+        if connector_required && !capability_providers.contains(&Provider::Codex) {
             capability_blocked = true;
             gates.push(Gate::CapabilityBlocked);
         }
@@ -257,9 +253,8 @@ pub fn decide_with_task(
         // unknown fall through to `over_ceiling`. A launch failure is ineligible the same way
         // and is not a pin to Claude. See docs/decisions/0004-fail-closed-weekly-unknown.md
         // and docs/decisions/0007-claude-capability-only.md.
-        let capability_eligible = |candidate| {
-            !classification.missing_connector || capability_providers.contains(&candidate)
-        };
+        let capability_eligible =
+            |candidate| !connector_required || capability_providers.contains(&candidate);
         let usage_eligible = |candidate| {
             headroom(&usage, candidate).weekly_known()
                 && weekly_used(&usage, candidate) < config.hard_ceiling_pct
@@ -288,7 +283,7 @@ pub fn decide_with_task(
             (false, false) => {
                 // The router routes; refusing work over a ceiling is bonus drain's job. The
                 // fallback stays Codex when neither authoritative weekly reading is usable.
-                if classification.missing_connector
+                if connector_required
                     && !capability_providers.contains(&Provider::Codex)
                     && !capability_blocked
                 {

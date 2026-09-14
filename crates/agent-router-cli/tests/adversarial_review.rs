@@ -669,6 +669,18 @@ fn invalid_directory_fails_before_an_empty_candidate_set_can_skip() {
         .is_some_and(|reason| reason.contains("does not exist") && reason.contains("directory")));
     assert!(!fixture.claude_log.exists());
     assert!(!fixture.codex_log.exists());
+
+    // A failure raised before a pending row existed still lands in the ledger with its reason and
+    // envelope, and reading it back by id names the row: a fresh fixture holds exactly one review.
+    let status = fixture
+        .review_subcommand(&["status", "1", "--json"])
+        .output()
+        .expect("run review status on the pre-id failure");
+    assert_exit(&status, 1);
+    let stored = parse_json(&status);
+    assert_eq!(stored["status"], "failed");
+    assert_eq!(stored["review_id"], 1);
+    assert_eq!(stored["reason"], value["reason"]);
 }
 
 #[test]

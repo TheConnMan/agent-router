@@ -3,6 +3,20 @@
 All notable changes to this project are documented here. Versions are the
 workspace `package.version` stamped on every decision-log row.
 
+## 0.24.3 - 2026-09-14
+
+- Recover Auto routes against `provider_capabilities` when the task or rationale names an
+  inventory connector, even if the classifier left `missing_connector` false. The 2026-09-13
+  routing-quality review found the same Airtable auto-management job leaking to Grok twice
+  in three runs because recovery waited on that flag.
+
+## 0.24.2 - 2026-09-09
+
+- Persist `reason` and `outcome_json` on the pre-ID `record_review` path, so a review that fails
+  before or instead of a pending row (selection error, config load, database busy fallback) keeps
+  its cause. 28 failed reviews between 2026-09-04 and 09-07 had every one of those columns NULL.
+  Lifecycle `status` stays NULL on that path, as before.
+
 ## 0.24.1 - 2026-09-09
 
 - Treat `capability-blocked` as settled for `log --unmarked`, so a review pass's worklist includes

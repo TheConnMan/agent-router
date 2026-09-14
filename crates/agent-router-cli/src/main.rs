@@ -524,7 +524,10 @@ fn print_review_row(row: &ReviewRow, json: bool) -> CliStatus {
             .and_then(|envelope| serde_json::from_str::<ReviewOutcome>(envelope).ok()),
         ReviewStatus::Pending | ReviewStatus::Cancelled => None,
     };
-    let outcome = retained.unwrap_or_else(|| synthesized_review_outcome(row, state));
+    let mut outcome = retained.unwrap_or_else(|| synthesized_review_outcome(row, state));
+    // A pre-ID envelope was serialized before its row existed, so it carries no id. The row is
+    // the authority for that either way.
+    outcome.review_id = Some(row.id);
     print_adversarial_review(&outcome, json)
 }
 
@@ -736,6 +739,7 @@ fn persist_adversarial_review(
         serde_json::to_string(&outcome.usage_provenance).unwrap_or_else(|_| "[]".to_string());
     let body_bytes =
         i64::try_from(outcome.result.as_deref().map_or(0, str::len)).unwrap_or(i64::MAX);
+    let outcome_json = serde_json::to_string(outcome).ok();
     let dir = dir.unwrap_or(Path::new(""));
     let _ = DecisionLog::open_in(&ctx.home).and_then(|log| {
         log.record_review(&ReviewEntry {
@@ -747,6 +751,8 @@ fn persist_adversarial_review(
             rationale: &outcome.rationale,
             body_bytes,
             dir,
+            outcome_json: outcome_json.as_deref(),
+            reason: outcome.reason.as_deref(),
         })
     });
 }

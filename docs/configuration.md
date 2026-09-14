@@ -212,14 +212,16 @@ claude = ["Granola"]
 codex = ["Granola"]
 ```
 
-For an Auto route whose classifier observes a missing connector, providers without a matching
-inventory entry are excluded before the existing capacity policy runs. Matching looks at the
-task text and the classifier rationale together: a one-sentence rationale that omits "Slack"
-still recovers Slack-capable providers when the task already named Slack. Names are whole
-words, and a Title-Case inventory name such as `Notion` does not match English `notion`.
-Grok stays out of that pool unless it is listed here. Explicit `--provider` requests remain
-exact and do not use this automatic eligibility filter. The decision log records which names
-hit and whether they came from the task, the rationale, or both.
+For an Auto route, providers without a matching inventory entry are excluded before the
+existing capacity policy runs whenever the classifier reports a missing connector *or* the
+task or rationale already names a configured inventory connector. Matching does not wait on
+the classifier flag: a paraphrased rationale that omits "Airtable" still recovers
+Airtable-capable providers when the task named Airtable. Names are whole words, and a
+Title-Case inventory name such as `Notion` does not match English `notion`. Grok stays out
+of that pool unless it is listed here. Explicit `--provider` requests remain exact and do
+not use this automatic eligibility filter. The decision log records which names hit and
+whether they came from the task, the rationale, or both. An unmatched classifier miss still
+blocks rather than pinning Claude.
 
 ## `[policy]`
 

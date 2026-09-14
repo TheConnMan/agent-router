@@ -48,8 +48,9 @@ log: row 87 in /home/you/.local/state/agent-router/router.db
    server names and enabled plugins are safely discovered from its local config, while Claude.ai
    connector registrations and other providers can be
    registered in `provider_capabilities`; unavailable providers are removed before ordinary policy
-   chooses the route. Only a capability absent from every provider inventory is
-   `capability_blocked`. The context-window gate is a capability pin: Codex's window is
+   chooses the route. A task that names a configured inventory connector is treated as a miss
+   even if the classifier left `missing_connector` false. Only a capability absent from every
+   provider inventory is `capability_blocked`. The context-window gate is a capability pin: Codex's window is
    258,400 tokens. It fires only when the task text actually dispatches `/implement` (read
    literally, never scored) **and** complexity is `high` or `ultra`; `low` and `medium`
    implement runs stay on ordinary routing. See
@@ -632,7 +633,8 @@ operator never wrote is worse than refusing to run.
 `connectors` remains the authoritative local-shell inventory used by the classifier. Provider
 capabilities are separate: Codex MCP server names and enabled plugins are discovered from
 `~/.codex/config.toml`, while Claude.ai registrations are read separately; operators may register
-other provider inventories in `provider_capabilities`. A miss is refused
+other provider inventories in `provider_capabilities`. Matching searches the task and
+rationale even when the classifier left `missing_connector` false. A miss is refused
 only when no provider establishes the named capability.
 
 See [docs/configuration.md](docs/configuration.md) for the full reference.
