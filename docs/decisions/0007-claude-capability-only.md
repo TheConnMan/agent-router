@@ -46,8 +46,10 @@ inferred from difficulty, scope, file count, or duration; unscoreable input
 scores false on both booleans; `missing_connector` is judged only against the
 configured inventory.
 
-A missing connector with no inventory-backed provider is `CapabilityBlocked`,
-never assumed to be a Claude capability.
+A matched inventory name with no provider is `CapabilityBlocked`, never
+assumed to be a Claude capability. An unmatched miss (no inventory name in
+the task or rationale) is ordinary workhorse routing, not a refuse and not a
+Claude pin; see 0010.
 
 ## Constraint
 

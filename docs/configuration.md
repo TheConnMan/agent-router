@@ -190,8 +190,9 @@ Default `["local shell"]`. The authoritative local-shell capability shown to the
 This is the one section that genuinely needs human maintenance. Rubric criterion 5 is scored
 against exactly this local-shell inventory. The shell covers its local executables, files, session
 JSONLs, and authenticated endpoints without advertising each one as a connector. A genuinely absent
-capability returns `capability_blocked` only after provider
-inventories have also been checked; absence is not evidence that Claude can reach it. The classifier is explicitly told
+capability returns `capability_blocked` only after an inventory name
+matches and no provider advertises it; an unmatched classifier miss is ordinary
+routing, not a refuse, and is not evidence that Claude can reach it. The classifier is explicitly told
 never to set `missing_connector` because it cannot see a connector itself, only because a named
 system is absent from this list.
 
@@ -213,7 +214,10 @@ codex = ["Granola"]
 ```
 
 For an Auto route whose classifier observes a missing connector, providers without a matching
-inventory entry are excluded before the existing capacity policy runs. Matching looks at the
+inventory entry are excluded before the existing capacity policy runs, but only after an
+inventory name matches in the task or the rationale. An unmatched miss records
+`missing_connector` and continues ordinary Codex or Grok routing; it is not
+`capability_blocked`. Matching looks at the
 task text and the classifier rationale together: a one-sentence rationale that omits "Slack"
 still recovers Slack-capable providers when the task already named Slack. Names are whole
 words, and a Title-Case inventory name such as `Notion` does not match English `notion`.

@@ -3,6 +3,14 @@
 All notable changes to this project are documented here. Versions are the
 workspace `package.version` stamped on every decision-log row.
 
+## 0.24.4 - 2026-09-15
+
+- An unmatched classifier `missing_connector` is ordinary auto routing, not
+  `capability_blocked`. Auto was refusing research questions that named a system nobody
+  inventories (Descript MCP, public web, Twitter) because recovery only matches configured
+  product names. A matched name with no dispatcher still refuses, and still does not pin
+  Claude. See `docs/decisions/0010-unmatched-connector-is-not-a-block.md`.
+
 ## 0.24.3 - 2026-09-15
 
 - Pin the `/implement` skill at Grok dispatch instead of trusting Grok's own resolution order. A

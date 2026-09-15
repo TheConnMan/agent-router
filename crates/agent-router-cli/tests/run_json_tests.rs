@@ -517,12 +517,11 @@ fn a_provider_only_dry_run_still_classifies_downstream_values() {
     assert_eq!(dry.classifier_calls(), 1);
 }
 
-/// A classifier-reported connector miss cannot silently become a Claude dispatch: the configured
-/// inventory establishes no provider capability for an absent connector.
+/// An unmatched classifier miss is ordinary auto routing, not a refuse and not a Claude pin.
 #[cfg(unix)]
 #[test]
-fn an_unavailable_capability_is_reported_without_dispatching_claude() {
-    let fixture = CliFixture::new("capability-blocked");
+fn an_unmatched_connector_miss_dry_runs_without_pinning_claude() {
+    let fixture = CliFixture::new("unmatched-connector-miss");
     fixture.answers_with(
         &json!({
             "orchestration": false,
@@ -534,6 +533,58 @@ fn an_unavailable_capability_is_reported_without_dispatching_claude() {
         })
         .to_string(),
     );
+    let output = fixture
+        .run_command()
+        .arg("--provider")
+        .arg("auto")
+        .arg("--dry-run")
+        .arg("--json")
+        .output()
+        .expect("run router");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("router json");
+
+    assert_eq!(value["provider"], "codex");
+    assert_eq!(value["capability_blocked"], Value::Null);
+    assert_eq!(value["dry_run"], true);
+    assert!(value["gates"].as_array().is_some_and(|gates| {
+        gates.contains(&Value::String("missing_connector".to_string()))
+            && !gates.contains(&Value::String("capability_blocked".to_string()))
+    }));
+    assert!(
+        !fixture.spawn_log.exists(),
+        "a dry run must never start a job"
+    );
+}
+
+/// A matched inventory name with no dispatcher still refuses, and still does not start Claude.
+#[cfg(unix)]
+#[test]
+fn a_matched_capability_with_no_provider_is_reported_without_dispatching() {
+    let fixture = CliFixture::new("capability-blocked")
+        .with_task("Use the client specific Slack MCP connection.");
+    fixture.answers_with(
+        &json!({
+            "orchestration": false,
+            "missing_connector": true,
+            "complexity": "medium",
+            "task_context_horizon": "ordinary",
+            "rationale": "requires a Slack thread",
+            "job_name": fixture.classifier_name,
+        })
+        .to_string(),
+    );
+    let config_path = fixture
+        .root
+        .path
+        .join("home/.config/agent-router/config.toml");
+    let mut config = fs::read_to_string(&config_path).expect("read fixture router config");
+    config.push_str("\n[provider_capabilities]\nnone = [\"Slack\"]\n");
+    fs::write(&config_path, config).expect("write unmatched Slack inventory");
     let output = fixture
         .run_command()
         .arg("--json")

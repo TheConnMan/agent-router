@@ -140,13 +140,40 @@ fn an_orchestration_task_pins_to_claude_past_every_usage_rule() {
     assert!(decision.gates.contains(&Gate::Orchestration));
 }
 
-/// Rule 2. A connector absent from the authoritative inventory is not evidence that Claude has
-/// it, so routing must retain the miss but block dispatch instead of assigning a provider halo.
+/// Rule 2. A classifier miss with no matching inventory name is not evidence that Claude has
+/// a connector, and it is not a refuse: ordinary workhorse routing proceeds.
 #[test]
-fn a_missing_connector_is_capability_blocked_instead_of_pinning_claude() {
+fn an_unmatched_connector_miss_does_not_pin_claude_or_refuse() {
     let config = Config::default();
     let decision = decide(
         scored(false, true, Complexity::High),
+        usage_with_grok(
+            window(99.0, HALF_WEEK, 100.0),
+            unknown_window(0.0, 0.0),
+            window(1.0, HALF_WEEK, 0.0),
+        ),
+        NOW,
+        &config,
+    );
+
+    assert!(decision.gates.contains(&Gate::MissingConnector));
+    assert!(!decision.gates.contains(&Gate::CapabilityBlocked));
+    assert!(!decision.capability_blocked);
+    assert_ne!(decision.provider, Provider::Claude);
+}
+
+/// A matched inventory name with no dispatcher still refuses, and still does not pin Claude.
+#[test]
+fn a_matched_capability_with_no_provider_still_blocks() {
+    let config = Config {
+        provider_capabilities: BTreeMap::from([("none".to_string(), vec!["Slack".to_string()])]),
+        ..Config::default()
+    };
+    let decision = decide(
+        Classification {
+            rationale: "requires a Slack thread".to_string(),
+            ..scored(false, true, Complexity::High)
+        },
         usage_with_grok(
             window(99.0, HALF_WEEK, 100.0),
             unknown_window(0.0, 0.0),
@@ -195,7 +222,8 @@ fn a_provider_scoped_capability_keeps_auto_routing_inside_the_eligible_pool() {
 }
 
 /// The same Slack inventory recovers when the product name is in the task and the one-sentence
-/// rationale omits it. Grok stays ineligible because it is not in the inventory.
+/// rationale omits it. Grok stays ineligible because it is not in the inventory. An unmatched
+/// miss (no product name in task or rationale) is ordinary routing, not a refuse.
 #[test]
 fn a_task_named_capability_recovers_when_the_rationale_omits_the_product() {
     let config = Config {
@@ -215,9 +243,11 @@ fn a_task_named_capability_recovers_when_the_rationale_omits_the_product() {
         window(76.0, HALF_WEEK, 0.0),
     );
 
-    let blocked = decide(classification.clone(), usage, NOW, &config);
-    assert!(blocked.capability_blocked);
-    assert!(blocked.gates.contains(&Gate::CapabilityBlocked));
+    let unmatched = decide(classification.clone(), usage, NOW, &config);
+    assert!(!unmatched.capability_blocked);
+    assert!(!unmatched.gates.contains(&Gate::CapabilityBlocked));
+    assert!(unmatched.matched_capabilities.is_empty());
+    assert_eq!(unmatched.provider, Provider::Codex);
 
     let recovered = decide_with_task(
         "Use the client specific Slack MCP connection for each linked Slack task.",
@@ -241,9 +271,10 @@ fn a_task_named_capability_recovers_when_the_rationale_omits_the_product() {
     assert_eq!(recovered.requested_model, None);
 }
 
-/// English "notion" in a task must not recover a Notion-capable provider.
+/// English "notion" in a task must not recover a Notion-capable provider. The miss stays
+/// unmatched, so ordinary routing proceeds rather than a refuse or a Notion pin.
 #[test]
-fn english_notion_does_not_unblock_a_missing_connector() {
+fn english_notion_does_not_recover_inventory_notion() {
     let config = Config {
         provider_capabilities: BTreeMap::from([
             ("claude".to_string(), vec!["Notion".to_string()]),
@@ -265,8 +296,63 @@ fn english_notion_does_not_unblock_a_missing_connector() {
         NOW,
         &config,
     );
-    assert!(decision.capability_blocked);
+    assert!(!decision.capability_blocked);
     assert!(decision.matched_capabilities.is_empty());
+    assert_eq!(decision.provider, Provider::Codex);
+}
+
+/// Investigating whether a Descript MCP exists is not a live connector requirement. See
+/// docs/decisions/0010-unmatched-connector-is-not-a-block.md.
+#[test]
+fn a_descript_mcp_research_question_is_ordinary_work() {
+    let config = Config {
+        provider_capabilities: BTreeMap::from([
+            (
+                "claude".to_string(),
+                vec![
+                    "Granola".to_string(),
+                    "Notion".to_string(),
+                    "Slack".to_string(),
+                    "Airtable".to_string(),
+                ],
+            ),
+            (
+                "codex".to_string(),
+                vec![
+                    "Granola".to_string(),
+                    "Notion".to_string(),
+                    "Slack".to_string(),
+                    "Airtable".to_string(),
+                ],
+            ),
+        ]),
+        ..Config::default()
+    };
+    let decision = decide_with_task(
+        "Are you or any of the other model providers able to connect to Descript through an MCP \
+         server? How much of the editing of Descript could I do with you? This includes \
+         investigating if Grokbot could do it. I'm also interested in whether you can see this \
+         YouTube video and take the best practices from it.",
+        Classification {
+            rationale: "The task requires investigating Descript MCP connectivity, comparing \
+                        model providers including Grokbot, and synthesizing best practices \
+                        from a YouTube video."
+                .to_string(),
+            ..scored(false, true, Complexity::High)
+        },
+        usage_with_grok(
+            window(26.0, HALF_WEEK, 8.0),
+            window(41.0, HALF_WEEK, 0.0),
+            window(60.0, HALF_WEEK, 0.0),
+        ),
+        NOW,
+        &config,
+    );
+    assert!(!decision.capability_blocked);
+    assert!(!decision.gates.contains(&Gate::CapabilityBlocked));
+    assert!(decision.gates.contains(&Gate::MissingConnector));
+    assert!(decision.matched_capabilities.is_empty());
+    assert_ne!(decision.provider, Provider::Claude);
 }
 
 /// Capability eligibility is an Auto-only preflight. An explicit caller continues to own the

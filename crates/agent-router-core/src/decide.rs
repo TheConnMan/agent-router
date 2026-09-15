@@ -28,8 +28,9 @@ pub enum Gate {
     ClassifierFailed,
     /// A required connector is absent from the configured inventory.
     MissingConnector,
-    /// The configured inventory proves no dispatcher has the required capability, so no job was
-    /// started. This follows `MissingConnector` to preserve the classifier observation in logs.
+    /// A matched inventory name has no dispatcher. Unmatched classifier misses are not this gate:
+    /// they stay on ordinary workhorse routing. This follows `MissingConnector` so the log keeps
+    /// the classifier observation. See docs/decisions/0010-unmatched-connector-is-not-a-block.md.
     CapabilityBlocked,
     /// The task needs several agents exchanging findings mid-run, which Codex cannot do: an
     /// automatic Claude decision regardless of usage.
@@ -42,10 +43,10 @@ pub enum Gate {
     /// `WeeklyUnknown`, which is recorded alongside this one to tell the two apart.
     FlippedOnExhaustion,
     /// Both workhorse providers are ineligible on CAPACITY, so Codex was used anyway. Recorded
-    /// only when at least one candidate cleared the capability filter: a field emptied purely by
-    /// a missing connector is `CapabilityBlocked` and nothing else, because naming it
-    /// `over_ceiling` alongside a weekly reading of 14 percent tells a reviewer the opposite of
-    /// what happened.
+    /// only when at least one candidate cleared the capability filter: a field emptied by a
+    /// matched inventory name with no dispatcher is `CapabilityBlocked` and nothing else, because
+    /// naming it `over_ceiling` alongside a weekly reading of 14 percent tells a reviewer the
+    /// opposite of what happened.
     OverCeiling,
     /// At least one provider's weekly window was never read, so its percentage is a default
     /// rather than a reading. Such a provider is ineligible. See
@@ -169,8 +170,9 @@ fn implement_exceeds_codex_window(classification: &Classification) -> bool {
 /// The rules, in the order they run, and each in the order it must run:
 ///
 /// 1. Capability pins select Claude, bypassing automatic capacity routing. A missing connector is
-///    different: without an inventory-backed provider capability it is blocked, never assumed to
-///    be a Claude capability.
+///    different: a matched inventory name with no provider is blocked, never assumed to be a
+///    Claude capability. An unmatched miss is not a constraint; ordinary workhorse routing
+///    proceeds. See docs/decisions/0010-unmatched-connector-is-not-a-block.md.
 /// 2. Ordinary work selects between eligible Codex and Grok. Eligibility is still current weekly
 ///    percent: unknown or at/over the hard ceiling is out. When both are eligible and both
 ///    projected draws exist, the lower projected draw wins — that is the provider further below
@@ -190,8 +192,10 @@ pub fn decide(
 /// Automatic routing for a scored task. `task` is searched together with the classifier
 /// rationale when recovering a missing connector against `provider_capabilities`, so a
 /// one-sentence rationale that omits "Slack" still recovers Slack-capable providers when
-/// the task already named Slack. An unmatched miss still blocks rather than pinning Claude
-/// (docs/decisions/0007-claude-capability-only.md).
+/// the task already named Slack. An unmatched miss is not a constraint: it does not pin
+/// Claude and it does not refuse dispatch. A matched name with no provider still blocks
+/// (docs/decisions/0007-claude-capability-only.md,
+/// docs/decisions/0010-unmatched-connector-is-not-a-block.md).
 pub fn decide_with_task(
     task: &str,
     classification: Classification,
@@ -206,8 +210,11 @@ pub fn decide_with_task(
         Vec::new()
     };
     let capability_providers = config.capability_providers(&matched_capabilities);
-    let mut capability_blocked =
-        classification.missing_connector && capability_providers.is_empty();
+    // A classifier miss constrains routing only once an inventory name matched. An unmatched
+    // miss is an unusable observation: do not pin Claude, and do not refuse the job.
+    let capability_constraint =
+        classification.missing_connector && !matched_capabilities.is_empty();
+    let mut capability_blocked = capability_constraint && capability_providers.is_empty();
     let mut capability_pin = false;
     if classification.missing_connector {
         gates.push(Gate::MissingConnector);
@@ -247,7 +254,10 @@ pub fn decide_with_task(
 
     if !capability_pin && !config.policy.weekly_routing {
         gates.push(Gate::WeeklyRoutingDisabled);
-        if classification.missing_connector && !capability_providers.contains(&Provider::Codex) {
+        if capability_constraint
+            && !capability_providers.contains(&Provider::Codex)
+            && !capability_blocked
+        {
             capability_blocked = true;
             gates.push(Gate::CapabilityBlocked);
         }
@@ -257,9 +267,8 @@ pub fn decide_with_task(
         // unknown fall through to `over_ceiling`. A launch failure is ineligible the same way
         // and is not a pin to Claude. See docs/decisions/0004-fail-closed-weekly-unknown.md
         // and docs/decisions/0007-claude-capability-only.md.
-        let capability_eligible = |candidate| {
-            !classification.missing_connector || capability_providers.contains(&candidate)
-        };
+        let capability_eligible =
+            |candidate| !capability_constraint || capability_providers.contains(&candidate);
         let usage_eligible = |candidate| {
             headroom(&usage, candidate).weekly_known()
                 && weekly_used(&usage, candidate) < config.hard_ceiling_pct
@@ -288,7 +297,7 @@ pub fn decide_with_task(
             (false, false) => {
                 // The router routes; refusing work over a ceiling is bonus drain's job. The
                 // fallback stays Codex when neither authoritative weekly reading is usable.
-                if classification.missing_connector
+                if capability_constraint
                     && !capability_providers.contains(&Provider::Codex)
                     && !capability_blocked
                 {
@@ -654,24 +663,54 @@ mod tests {
             decision.rationale
         );
         assert!(decision.rationale.contains("missing_connector"));
-        assert!(decision.rationale.contains("capability_blocked"));
+        assert!(
+            !decision.rationale.contains("capability_blocked"),
+            "an unmatched miss is not a refuse: {}",
+            decision.rationale
+        );
         assert!(decision.rationale.contains("codex weekly 71%"));
         assert!(decision.rationale.contains("claude weekly 50%"));
         assert!(decision.rationale.contains("grok weekly unknown"));
     }
 
-    /// `over_ceiling` is a capacity verdict; a field emptied by the capability filter alone must
-    /// not borrow it.
+    /// `over_ceiling` is a capacity verdict; a field emptied by a matched capability with no
+    /// dispatcher must not borrow it. An unmatched miss is ordinary routing, not this case.
     #[test]
     fn a_capability_emptied_field_is_not_labelled_over_ceiling() {
-        let config = Config::default();
+        let unmatched = Classification {
+            orchestration: false,
+            missing_connector: true,
+            complexity: Complexity::Medium,
+            task_context_horizon: TaskContextHorizon::Ordinary,
+            rationale: "requires a Slack thread nobody has an inventory for".to_string(),
+            classifier_failed: false,
+            invokes_implement: false,
+            unlaunchable: None,
+        };
+        let ordinary = decide(
+            unmatched,
+            usage(1.0, 14.0),
+            1_785_400_000,
+            &Config::default(),
+        );
+        assert!(!ordinary.capability_blocked);
+        assert!(!ordinary.gates.contains(&Gate::CapabilityBlocked));
+        assert!(!ordinary.gates.contains(&Gate::OverCeiling));
+        assert_eq!(ordinary.provider, Provider::Codex);
+
+        let config = Config {
+            provider_capabilities: std::collections::BTreeMap::from([(
+                "none".to_string(),
+                vec!["Slack".to_string()],
+            )]),
+            ..Config::default()
+        };
         let blocked = Classification {
             orchestration: false,
             missing_connector: true,
             complexity: Complexity::Medium,
             task_context_horizon: TaskContextHorizon::Ordinary,
-            // Names no capability in the default inventory, so no provider is credited.
-            rationale: "requires a Slack thread nobody has an inventory for".to_string(),
+            rationale: "requires a Slack thread".to_string(),
             classifier_failed: false,
             invokes_implement: false,
             unlaunchable: None,

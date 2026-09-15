@@ -178,8 +178,14 @@ fn historical_rows_without_known_grok_capacity_never_fabricate_a_grok_auto_route
             "row {} fabricated Grok capacity",
             row.id
         );
+        assert!(
+            !decision.capability_blocked,
+            "row {}: unmatched misses on the default inventory are ordinary routing",
+            row.id
+        );
         assert_eq!(
-            decision.capability_blocked, missing_connector,
+            decision.gates.contains(&Gate::MissingConnector),
+            missing_connector,
             "row {}",
             row.id
         );

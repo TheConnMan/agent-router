@@ -48,8 +48,9 @@ log: row 87 in /home/you/.local/state/agent-router/router.db
    server names and enabled plugins are safely discovered from its local config, while Claude.ai
    connector registrations and other providers can be
    registered in `provider_capabilities`; unavailable providers are removed before ordinary policy
-   chooses the route. Only a capability absent from every provider inventory is
-   `capability_blocked`. The context-window gate is a capability pin: Codex's window is
+   chooses the route. A matched inventory name absent from every provider inventory is
+   `capability_blocked`. An unmatched classifier miss (no inventory name in the task or
+   rationale) is ordinary Codex or Grok routing, not a refuse. The context-window gate is a capability pin: Codex's window is
    258,400 tokens. It fires only when the task text actually dispatches `/implement` (read
    literally, never scored) **and** complexity is `high` or `ultra`; `low` and `medium`
    implement runs stay on ordinary routing. See
