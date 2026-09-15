@@ -203,6 +203,40 @@ fn a_clean_launch_directory_pins_the_prompt_and_records_the_resolved_path() {
     );
 }
 
+/// A Grok binary that does not resolve must still produce a ROW. Returning the resolution error
+/// straight out of the preflight would kill the launch before the log is even opened, and a
+/// refusal with no row is the invisible failure this whole feature exists to end.
+#[test]
+fn an_unresolvable_grok_binary_is_a_logged_refusal_not_a_silent_error() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let home = user_scope_home(root.path());
+    let work = root.path().join("clean-repo");
+    fs::create_dir_all(&work).expect("the launch dir");
+    let environment = Environment::new(
+        None,
+        Some(home.clone()),
+        BTreeMap::from([(
+            GROK_BIN_ENV.to_string(),
+            OsString::from(root.path().join("no-such-grok")),
+        )]),
+    );
+    let ctx = Context::new(environment, home.clone(), Config::default())
+        .with_claude_usage_cache(root.path().join("claude-usage.json"))
+        .with_grok_usage_cache(root.path().join("grok-usage.json"))
+        .with_codex_sessions_dir(root.path().join("codex-sessions"));
+
+    let outcome = run(&request(TASK, &work, Provider::Grok), &ctx).expect("the run completes");
+
+    let reason = outcome
+        .skill_pin_blocked
+        .as_deref()
+        .expect("an unresolvable binary must refuse, not error out");
+    assert!(reason.contains("could not run grok"), "{reason}");
+    let row = newest_row(&ctx);
+    assert_eq!(row.outcome, "skill-pin-blocked");
+    assert_eq!(row.note.as_deref(), Some(reason));
+}
+
 /// The gate is Grok plus `/implement`, and both halves matter. A Claude launch of the same task
 /// must not run the preflight at all: proved by the stub's argv log, which only exists once the
 /// binary has been invoked.

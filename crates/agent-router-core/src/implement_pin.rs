@@ -15,7 +15,6 @@
 //! showed the missing-stage-row symptom.
 
 use crate::binary::Environment;
-use crate::error::Result;
 use crate::provider::Provider;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -100,18 +99,31 @@ pub fn resolved_skill(inspect_json: &str) -> std::result::Result<PathBuf, String
         .ok_or_else(|| "the resolved implement skill carried no source path".to_string())
 }
 
-/// PURE: accept a resolved path only when it is the user-scope skill.
+/// IMPURE (reads the filesystem): accept a resolved path only when it is a file that IS the
+/// user-scope skill.
 ///
-/// Both sides are canonicalized, so the `~/.grok/skills` and `~/.agents/skills` symlinks both
-/// pass and a project copy under `<repo>/.claude/skills/implement` does not. A path that cannot
-/// be canonicalized is compared literally: a resolution naming a file that is not there is a
-/// refusal either way, and reporting it as "not the user-scope skill" says what an operator needs.
+/// Both sides are canonicalized, so the `~/.grok/skills` and `~/.agents/skills` symlinks both pass
+/// and a project copy under `<repo>/.claude/skills/implement` does not.
+///
+/// A side that cannot be canonicalized is a refusal, deliberately NOT a fall back to comparing the
+/// two strings. String equality would accept a launch where neither file exists — the pin would
+/// then name a path the run cannot read, which is the same silent-wrong-pipeline failure this
+/// whole module exists to stop, dressed as a pass.
 pub fn accept(resolved: &Path, expected: &Path) -> std::result::Result<(), String> {
-    let same = match (resolved.canonicalize(), expected.canonicalize()) {
-        (Ok(resolved), Ok(expected)) => resolved == expected,
-        _ => resolved == expected,
-    };
-    if same {
+    let real_expected = expected.canonicalize().map_err(|error| {
+        format!(
+            "the user-scope implement skill at {} could not be read: {error}",
+            expected.display()
+        )
+    })?;
+    let real_resolved = resolved.canonicalize().map_err(|error| {
+        format!(
+            "the implement skill resolves to {} in this directory, which could not be read: \
+             {error}",
+            resolved.display()
+        )
+    })?;
+    if real_resolved == real_expected {
         return Ok(());
     }
     Err(format!(
@@ -142,19 +154,21 @@ pub fn pinned_task(task: &str, skill: &Path, telemetry: &Path) -> String {
 
 /// IMPURE: run the preflight for one Grok `/implement` launch.
 ///
-/// `Ok(Ok(pin))` is a launch that may proceed; `Ok(Err(reason))` is a refusal with the sentence to
-/// log. `Err` is reserved for the binary not resolving at all, which is the same failure an
-/// ordinary Grok dispatch would raise a moment later.
+/// `Ok(pin)` is a launch that may proceed; `Err(reason)` is a refusal with the sentence to log.
+///
+/// A Grok binary that does not resolve is one of those refusals, not a propagated error. Returning
+/// early here would skip the caller's logging entirely, and a launch the router killed with no row
+/// at all is exactly the invisible failure this module was written to end. The resolution error is
+/// carried into the reason verbatim, so the diagnosis is the same one dispatch would have given.
 pub fn preflight(
     environment: &Environment,
     home: &Path,
     dir: &Path,
     task: &str,
-) -> Result<std::result::Result<Pin, String>> {
-    let binary = crate::binary::resolve(Provider::Grok, environment)?;
-    Ok(preflight_with(&binary, home, dir, task, |command| {
-        command.output()
-    }))
+) -> std::result::Result<Pin, String> {
+    let binary = crate::binary::resolve(Provider::Grok, environment)
+        .map_err(|error| format!("the implement skill pin could not run grok: {error}"))?;
+    preflight_with(&binary, home, dir, task, |command| command.output())
 }
 
 /// IMPURE through `run`: the preflight body, with the subprocess injected so a test can drive
@@ -250,14 +264,22 @@ mod tests {
     /// file.
     #[test]
     fn a_project_shadow_copy_is_refused_and_named() {
-        let reason = accept(
-            Path::new("/repo/.claude/skills/implement/SKILL.md"),
-            Path::new("/home/me/.claude/skills/implement/SKILL.md"),
-        )
-        .expect_err("a project copy must not launch");
+        // Both files really exist, so this proves the REFUSAL comes from the paths differing and
+        // not from either one being unreadable.
+        let root = tempfile::tempdir().expect("a root");
+        let home = root.path().join("home");
+        let expected = expected_skill(&home);
+        let shadow = root.path().join("repo/.claude/skills/implement/SKILL.md");
+        for path in [&expected, &shadow] {
+            std::fs::create_dir_all(path.parent().expect("a parent")).expect("the skill dir");
+            std::fs::write(path, "pipeline").expect("the skill");
+        }
+
+        let reason = accept(&shadow, &expected).expect_err("a project copy must not launch");
+
         assert!(
-            reason.contains("/repo/.claude/skills/implement/SKILL.md")
-                && reason.contains("/home/me/.claude/skills/implement/SKILL.md"),
+            reason.contains(&shadow.display().to_string())
+                && reason.contains(&expected.display().to_string()),
             "the refusal must name the resolved and the expected path: {reason}"
         );
     }
@@ -335,6 +357,19 @@ mod tests {
 
         assert_eq!(pin.skill, skill);
         assert!(pin.task.ends_with("/implement RS-123"), "{}", pin.task);
+    }
+
+    /// String equality is not a substitute for reading the file. If both sides name the same
+    /// absent path, accepting would pin the run to a SKILL.md nothing can read, which fails
+    /// exactly like the project-shadow case it is supposed to prevent.
+    #[test]
+    fn two_identical_paths_that_do_not_exist_are_refused_rather_than_compared_as_strings() {
+        let missing = Path::new("/no-such-root/.claude/skills/implement/SKILL.md");
+        let reason = accept(missing, missing).expect_err("an unreadable skill must not launch");
+        assert!(
+            reason.contains("could not be read") && reason.contains(&missing.display().to_string()),
+            "the refusal must name the unreadable path and the filesystem cause: {reason}"
+        );
     }
 
     /// An inspect that exits non-zero is a refusal carrying its stderr, not a silent pass: a

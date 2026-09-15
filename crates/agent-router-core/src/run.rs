@@ -232,16 +232,9 @@ where
     // Claude and Codex are untouched: `is_grok_implement` is the whole gate.
     let is_grok_implement = decision.provider == Provider::Grok
         && crate::implement_pin::is_implement_task(request.task);
-    let pin = if is_grok_implement {
-        Some(crate::implement_pin::preflight(
-            &ctx.environment,
-            &ctx.home,
-            request.dir,
-            request.task,
-        )?)
-    } else {
-        None
-    };
+    let pin = is_grok_implement.then(|| {
+        crate::implement_pin::preflight(&ctx.environment, &ctx.home, request.dir, request.task)
+    });
     let log = open_log()?;
     // A refused launch is logged like a capability block: no job started, but the router's refusal
     // is exactly the row an operator needs, and the reason lands in `note` so `log` shows it
