@@ -61,6 +61,7 @@ fn record(log: &DecisionLog, decision: &Decision) {
         job_name: None,
         outcome: "dispatched",
         effective_effort: None,
+        note: None,
     })
     .expect("records the decision");
 }
@@ -201,6 +202,7 @@ fn fresh_auto_rows_persist_and_expose_each_context_horizon() {
             job_name: None,
             outcome: "dry-run",
             effective_effort: None,
+            note: None,
         })
         .expect("records");
     }
@@ -258,6 +260,7 @@ fn reconciliation_and_marking_leave_context_horizon_unchanged() {
             job_name: None,
             outcome: "dispatched",
             effective_effort: None,
+            note: None,
         })
         .expect("records");
 

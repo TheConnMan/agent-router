@@ -31,6 +31,7 @@ fn record(log: &DecisionLog, task: &str) -> i64 {
         job_name: None,
         outcome: "dispatched",
         effective_effort: None,
+        note: None,
     })
     .expect("records the decision")
 }
