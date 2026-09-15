@@ -103,6 +103,7 @@ impl MarkFixture {
             job_name: Some("a routed job"),
             outcome,
             effective_effort: None,
+            note: None,
         })
         .expect("seed a decision row")
     }

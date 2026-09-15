@@ -92,6 +92,7 @@ fn record(log: &DecisionLog, task: &str, decision: &Decision, outcome: &str) {
         job_name: None,
         outcome,
         effective_effort: None,
+        note: None,
     })
     .expect("records");
 }

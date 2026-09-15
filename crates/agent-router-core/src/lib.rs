@@ -11,6 +11,7 @@ pub mod dispatch;
 pub mod doctor;
 pub mod error;
 pub mod estimate;
+pub mod implement_pin;
 pub mod log;
 pub mod provider;
 pub mod run;

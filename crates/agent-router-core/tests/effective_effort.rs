@@ -41,6 +41,7 @@ fn entry<'a>(
         job_name: Some("Bonus: abc 123"),
         outcome: "dispatched",
         effective_effort,
+        note: None,
     }
 }
 

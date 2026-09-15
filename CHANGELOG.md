@@ -3,6 +3,22 @@
 All notable changes to this project are documented here. Versions are the
 workspace `package.version` stamped on every decision-log row.
 
+## 0.24.3 - 2026-09-15
+
+- Pin the `/implement` skill at Grok dispatch instead of trusting Grok's own resolution order. A
+  Grok launch whose task opens with `/implement` now runs `grok inspect --json` in the launch
+  directory first and refuses the launch, with `outcome = skill-pin-blocked` and the reason in
+  `note`, unless the `implement` skill resolves to the user-scope
+  `~/.claude/skills/implement/SKILL.md` (through either the `~/.grok/skills` or `~/.agents/skills`
+  symlink). A launch that passes gets two lines prepended to its task: the absolute SKILL.md path
+  to read, and the absolute `python3 .../factory-telemetry.py` command, with any project-level
+  `.claude/skills/implement` declared out of scope for the run. The resolved path is recorded in
+  `decisions.note`. Measured 2026-09-13: 13 of 23 launched Grok `/implement` runs wrote no factory
+  stage row, and the config-level fixes did not settle it because nothing in the dispatch path
+  checked which copy won. Claude and Codex launches are unchanged.
+- `record` now writes `decisions.note`, which until now only `mark --note` wrote. A human mark's
+  note still overwrites the router's.
+
 ## 0.24.2 - 2026-09-09
 
 - Persist `reason` and `outcome_json` on the pre-ID `record_review` path, so a review that fails
