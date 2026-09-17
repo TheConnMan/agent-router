@@ -3,6 +3,12 @@
 All notable changes to this project are documented here. Versions are the
 workspace `package.version` stamped on every decision-log row.
 
+## 0.25.0 - 2026-09-17
+
+- Add an opt-in `[classifier] engine = "jev"` that scores the four routing fields through one
+  TypeSafe System One call. Default engine stays Codex. Titles on the Jev path use `short_job_name`.
+  Failures fail open. The API key is an environment variable, never config.toml.
+
 ## 0.24.3 - 2026-09-14
 
 - Recover Auto routes against `provider_capabilities` when the task or rationale names an

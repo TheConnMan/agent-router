@@ -7,7 +7,7 @@
 //! moment it is used, so nothing silently routes on a wrong number because of it.
 
 use crate::binary::{self, Environment};
-use crate::config::{Config, default_config_path};
+use crate::config::{ClassifierEngine, Config, default_config_path};
 use crate::context::Context;
 use crate::error::Error;
 use crate::log::DecisionLog;
@@ -65,7 +65,7 @@ pub fn run(ctx: &Context) -> Report {
         grok_usage_source(grok_source, usage.grok, grok_installed),
     ];
     checks.extend(grok_checks(ctx));
-    checks.extend([config_parses(ctx), log_writable(ctx)]);
+    checks.extend([config_parses(ctx), jev_api_key(ctx), log_writable(ctx)]);
     Report { checks }
 }
 
@@ -433,6 +433,20 @@ fn one_line(error: &impl std::fmt::Display) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn jev_api_key(ctx: &Context) -> Check {
+    let name = "jev_api_key";
+    if ctx.config.classifier.engine != ClassifierEngine::Jev {
+        return pass(name, "jev is not the classifier engine".to_string());
+    }
+    match crate::classify::jev_key_present() {
+        true => pass(name, "TYPESAFE_API_KEY or TYPESAFE_AI_KEY is set".to_string()),
+        false => warn(
+            name,
+            "jev engine is configured but TYPESAFE_API_KEY and TYPESAFE_AI_KEY are absent; scoring will fail open".to_string(),
+        ),
+    }
 }
 
 fn pass(name: &'static str, detail: String) -> Check {

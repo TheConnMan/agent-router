@@ -45,6 +45,7 @@ impl Default for Policy {
 pub enum ClassifierEngine {
     Claude,
     Codex,
+    Jev,
 }
 
 impl ClassifierEngine {
@@ -52,6 +53,7 @@ impl ClassifierEngine {
         match self {
             ClassifierEngine::Claude => "claude",
             ClassifierEngine::Codex => "codex",
+            ClassifierEngine::Jev => "jev",
         }
     }
 }
@@ -67,6 +69,8 @@ pub struct Classifier {
     pub claude_model: String,
     /// The model used when `engine = "codex"`. Same intent, one tier down the codex catalogue.
     pub codex_model: String,
+    /// The TypeSafe model used when `engine = "jev"`. Version-pinned, not an alias.
+    pub jev_model: String,
 }
 
 impl Default for Classifier {
@@ -75,6 +79,7 @@ impl Default for Classifier {
             engine: ClassifierEngine::Codex,
             claude_model: "haiku".to_string(),
             codex_model: "gpt-5.6-luna".to_string(),
+            jev_model: "jev-1.13.0".to_string(),
         }
     }
 }
@@ -85,6 +90,7 @@ impl Classifier {
         match self.engine {
             ClassifierEngine::Claude => &self.claude_model,
             ClassifierEngine::Codex => &self.codex_model,
+            ClassifierEngine::Jev => &self.jev_model,
         }
     }
 }
@@ -895,6 +901,16 @@ mod tests {
         assert_eq!(claude_only.classifier.engine, ClassifierEngine::Codex);
         assert_eq!(claude_only.classifier.model(), "gpt-5.6-luna");
         assert_eq!(claude_only.classifier.claude_model, "sonnet");
+
+        std::fs::write(&path, "[classifier]\nengine = \"jev\"\n").expect("write");
+        let jev = Config::load_from(&path).expect("loads");
+        assert_eq!(jev.classifier.engine, ClassifierEngine::Jev);
+        assert_eq!(jev.classifier.model(), "jev-1.13.0");
+        let round = toml::to_string(&jev.classifier).expect("serializes");
+        assert!(
+            !round.to_ascii_lowercase().contains("api_key"),
+            "classifier config must not grow a key field: {round}"
+        );
     }
 
     /// An engine name that is not a supported CLI is an error, not a silent fall back to claude:

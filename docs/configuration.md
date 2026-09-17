@@ -239,11 +239,13 @@ Which engine scores a task, and the model each engine scores it with.
 
 ### `engine`
 
-Default `"claude"`. Either `"claude"` or `"codex"`. Any other value is a configuration error.
+Default `"codex"`. `"claude"`, `"codex"`, or `"jev"`. Any other value is a configuration error.
 
-Scoring and job naming are one small strict JSON answer, so either engine can do both. The choice is
-about which weekly budget the per task classifier call is drawn from. If Claude weekly budget is the
-scarce resource, set this to `"codex"`.
+Claude and Codex scoring remain one small strict JSON answer drawn from that provider's weekly
+budget. `jev` scores the four routing fields through TypeSafe (`jev_model`, default `jev-1.13.0`)
+and names the job with `short_job_name`. It does not spend Claude or Codex classifier quota. The
+TypeSafe key is `TYPESAFE_API_KEY` or `TYPESAFE_AI_KEY` in the environment, never this file. See
+[`docs/decisions/0011-jev-classifier.md`](decisions/0011-jev-classifier.md).
 
 Two consequences of `"codex"` worth knowing. Scoring runs with every tool disabled, so it cannot
 read a file even though the sandbox is read only. And it writes a session rollout per scored task

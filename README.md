@@ -31,8 +31,9 @@ log: row 87 in /home/you/.local/state/agent-router/router.db
    `CLAUDE.md`, `AGENTS.md`, skill, plugin, hook, or MCP server can shift the score. The Codex
    engine additionally runs with its shell, browser, computer use, image, app, and skill search
    tools disabled: scoring needs no tool, and a task carrying an injected instruction must have
-   nothing to reach for. If the call fails or times out, automatic capacity routing still selects
-   between Codex and Grok and the decision is tagged `classifier_failed`. The same classifier model also generates
+   nothing to reach for. The Jev engine is one TypeSafe HTTP call with no CLI; titles on that path
+   are `short_job_name`. If the call fails or times out, automatic capacity routing still selects
+   between Codex and Grok and the decision is tagged `classifier_failed`. The Claude and Codex engines also generate
    the job title. A ticket ID leads the title, followed by two to six concise Title Case words, such
    as `GH-123 Sprint 2 Bug Fixes` or `RS-123 Input Box Searching`. A title that forgot the ticket
    still keeps the model's words, with the ticket prepended. An unusable scored title (punctuation,

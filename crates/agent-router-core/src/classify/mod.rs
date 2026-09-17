@@ -6,10 +6,21 @@
 //! not about the task, and `Classification::unlaunchable` carries it to `decide` so a provider
 //! that cannot start is not handed more work.
 
+mod jev;
+
 use crate::config::{Classifier, ClassifierEngine};
 use crate::context::Context;
 use crate::provider::Provider;
-use crate::runtime::validate_job_name;
+use crate::runtime::{short_job_name, validate_job_name};
+
+pub use jev::{
+    SystemOneTransport, classify_with_transport as classify_jev_with_transport,
+    compose as compose_jev, questions as jev_questions, questions_carry_anti_halo,
+};
+
+pub fn jev_key_present() -> bool {
+    jev::api_key_from_env().is_some()
+}
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -152,6 +163,9 @@ pub fn classify(ctx: &Context, task: &str) -> Classification {
 /// IMPURE: score `task` and ask the same small classifier model for a session title. Never fails:
 /// an unusable score becomes the fallback and an unusable title becomes `None`.
 pub fn classify_with_name(ctx: &Context, task: &str) -> ClassifiedTask {
+    if ctx.config.classifier.engine == ClassifierEngine::Jev {
+        return jev::classify_with_name(ctx, task);
+    }
     let prompt = classifier_prompt(task, &ctx.config.connectors);
     let timeout = Duration::from_secs(ctx.config.classifier_timeout_secs);
     let engine = ctx.config.classifier.engine;
@@ -222,12 +236,12 @@ fn is_anthropic_usage_analysis(task: &str, connectors: &[String]) -> bool {
     asks_for_usage && has_local_shell
 }
 
-/// PURE: the provider whose CLI an engine setting spawns. `ClassifierEngine` has exactly two
-/// variants, so `unlaunchable` can only ever name Codex or Claude.
-const fn engine_provider(engine: ClassifierEngine) -> Provider {
+/// PURE: the provider whose CLI an engine setting spawns. Jev is HTTP, so it names none.
+const fn engine_provider(engine: ClassifierEngine) -> Option<Provider> {
     match engine {
-        ClassifierEngine::Claude => Provider::Claude,
-        ClassifierEngine::Codex => Provider::Codex,
+        ClassifierEngine::Claude => Some(Provider::Claude),
+        ClassifierEngine::Codex => Some(Provider::Codex),
+        ClassifierEngine::Jev => None,
     }
 }
 
@@ -245,7 +259,7 @@ fn classifier_command_in(
     prompt: &str,
     classifier: &Classifier,
 ) -> std::result::Result<Command, ClassifierFailure> {
-    let provider = engine_provider(classifier.engine);
+    let provider = engine_provider(classifier.engine).expect("CLI engines map to a provider");
     let binary = crate::binary::resolve(provider, &ctx.environment)
         .map_err(|error| ClassifierFailure::Launch(error.to_string()))?;
     let mut cmd = classifier_command_with_binary(&binary, prompt, classifier);
@@ -267,6 +281,9 @@ pub fn classifier_command_with_binary(
         }
         ClassifierEngine::Codex => {
             codex_classifier_command_with_binary(binary, prompt, &classifier.codex_model)
+        }
+        ClassifierEngine::Jev => {
+            panic!("jev scoring is HTTP and must not build a classifier CLI")
         }
     }
 }
@@ -421,6 +438,9 @@ Reply with exactly this JSON object, filled in:
 /// scoring path uses this only when its own title was unusable: asking twice for a title that
 /// already passed would pay for the same name twice.
 pub fn job_name(ctx: &Context, task: &str) -> Option<String> {
+    if ctx.config.classifier.engine == ClassifierEngine::Jev {
+        return validate_job_name(task, &short_job_name(task));
+    }
     let engine = ctx.config.classifier.engine;
     let cmd = classifier_command_in(ctx, &job_name_prompt(task), &ctx.config.classifier).ok()?;
     let timeout = Duration::from_secs(ctx.config.classifier_timeout_secs);
@@ -435,6 +455,7 @@ pub fn parse_job_name(stdout: &str, engine: ClassifierEngine) -> Option<String> 
     let text = match engine {
         ClassifierEngine::Claude => claude_answer(stdout)?,
         ClassifierEngine::Codex => codex_answer(stdout)?,
+        ClassifierEngine::Jev => return None,
     };
     parse_classifier_value(&text)?
         .get("job_name")
@@ -456,6 +477,7 @@ pub fn parse_classifier_output_with_name(
     let text = match engine {
         ClassifierEngine::Claude => claude_answer(stdout)?,
         ClassifierEngine::Codex => codex_answer(stdout)?,
+        ClassifierEngine::Jev => return None,
     };
     let value = parse_classifier_value(&text)?;
     let mut classification: Classification = serde_json::from_value(value.clone()).ok()?;
@@ -548,7 +570,7 @@ impl ClassifierFailure {
     /// PURE: the provider this failure proves could not be launched, if any.
     fn unlaunchable(&self, engine: ClassifierEngine) -> Option<Provider> {
         match self {
-            ClassifierFailure::Launch(_) => Some(engine_provider(engine)),
+            ClassifierFailure::Launch(_) => engine_provider(engine),
             ClassifierFailure::Ran(_) => None,
         }
     }
@@ -567,7 +589,9 @@ fn spawn_failure(
 ) -> ClassifierFailure {
     let diagnosis = crate::binary::launch_error(
         program,
-        crate::binary::override_env(engine_provider(engine)),
+        crate::binary::override_env(
+            engine_provider(engine).expect("CLI engines map to a provider"),
+        ),
         error,
     );
     // Composed once so both arms stay byte-identical; tests pin this sentence.
@@ -1206,6 +1230,7 @@ mod tests {
             engine: ClassifierEngine::Claude,
             claude_model: "haiku".to_string(),
             codex_model: "gpt-5.6-luna".to_string(),
+            jev_model: "jev-1.13.0".to_string(),
         };
 
         let on_claude =

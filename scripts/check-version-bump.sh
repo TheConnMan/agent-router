@@ -15,6 +15,8 @@ set -euo pipefail
 # silently evades it. Adding a path here is a deliberate edit.
 GATED_PATHS=(
     "crates/agent-router-core/src/classify.rs"
+    "crates/agent-router-core/src/classify/mod.rs"
+    "crates/agent-router-core/src/classify/jev.rs"
     "crates/agent-router-core/src/decide.rs"
     "crates/agent-router-core/src/config.rs"
     "crates/agent-router-core/src/usage/mod.rs"
