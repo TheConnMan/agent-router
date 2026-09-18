@@ -74,7 +74,10 @@ struct CliFixture {
     /// means every call reads the answer file, which is the default.
     classifier_queue: PathBuf,
     /// Present means every queued answer AFTER the first blocks until `naming_gate` appears. The
-    /// first call is the router's own scoring call and must never be held. This is what makes
+    /// first call is the router's own scoring call and must never be held. The wait gives up after
+    /// two minutes so a forgotten release cannot wedge the suite; that bound is far outside any
+    /// scheduling delay, and expiring early can only fail a correct implementation, never pass a
+    /// broken one. This is what makes
     /// "the job launched before the naming call finished" an assertion rather than a race: the
     /// router cannot have waited for a call the test has not released yet.
     naming_gate_armed: PathBuf,
@@ -192,7 +195,7 @@ impl CliFixture {
                if [ -s \"$queue\" ]; then\n\
                  if [ -e {} ] && [ \"$(wc -l < {})\" -gt 1 ]; then\n\
                    waited=0\n\
-                   while [ ! -e {} ] && [ \"$waited\" -lt 600 ]; do\n\
+                   while [ ! -e {} ] && [ \"$waited\" -lt 2400 ]; do\n\
                      sleep 0.05\n\
                      waited=$((waited+1))\n\
                    done\n\

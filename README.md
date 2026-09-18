@@ -668,7 +668,7 @@ relaunch it. Every outcome is written to `~/.local/state/agent-router/logs/namin
 
 | Provider | Rename mechanism | Identity | Detects a manual rename |
 | --- | --- | --- | --- |
-| Claude | Agent Viewer's `ClaudeBackend::rename`: an atomic read-modify-write of `~/.claude/jobs/<short-id>/state.json`, setting `name`, `nameSource: "user"`, and `updatedAt` | The short id the dispatch resolved by matching the launch name in `claude agents --json`. A job whose short id never resolved is not renamed: it could only be found by the field being changed. | Yes, from that same file |
+| Claude | A read-modify-write of `~/.claude/jobs/<short-id>/state.json`, setting `name`, `nameSource: "user"`, and `updatedAt` through Agent Viewer's `replace_atomic`, with the same fields and semantics as its own `ClaudeBackend::rename`. One read serves the guard and the write, so the name compared is the name overwritten. | The short id the dispatch resolved by matching the launch name in `claude agents --json`. A job whose short id never resolved is not renamed: it could only be found by the field being changed. | Yes, from that same file |
 | Codex | `thread/name/set` over the app-server daemon socket, the transport the dispatch itself used | Thread id | Yes, when `thread/read` reports a name |
 | Grok | Agent Viewer's `GrokLifecycle::rename`, an `x.ai/session/rename` call | Session id | No: the RPC reports success and nothing else, and Grok is Linux only |
 
