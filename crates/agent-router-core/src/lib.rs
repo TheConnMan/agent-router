@@ -13,6 +13,7 @@ pub mod error;
 pub mod estimate;
 pub mod implement_pin;
 pub mod log;
+pub mod naming;
 pub mod provider;
 pub mod run;
 pub mod runtime;

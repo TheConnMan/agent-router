@@ -763,6 +763,25 @@ impl DecisionLog {
         Ok(())
     }
 
+    /// IMPURE: replace a dispatched row's job name after the provider accepted the new one.
+    ///
+    /// Only ever called once the provider's own store took the name, so the row and the session
+    /// agree. `Ok(false)` means no row matched, which the naming worker reports rather than
+    /// failing: the job is running and named correctly either way, and the row is the record of
+    /// the decision, not of the job.
+    pub fn rename_job(&self, id: i64, job_name: &str) -> Result<bool> {
+        if job_name.trim().is_empty() {
+            return Err(Error::Command(
+                "a job name must not be empty or whitespace only".to_string(),
+            ));
+        }
+        let changed = self.conn.execute(
+            "UPDATE decisions SET job_name = ?1 WHERE id = ?2",
+            rusqlite::params![job_name, id],
+        )?;
+        Ok(changed > 0)
+    }
+
     /// IMPURE: this provider's own weekly percent at each dispatched decision on this exact model,
     /// oldest first. Dry runs are excluded: they drew nothing, so a step across one is not a draw.
     ///

@@ -441,8 +441,24 @@ pub fn job_name(ctx: &Context, task: &str) -> Option<String> {
     if ctx.config.classifier.engine == ClassifierEngine::Jev {
         return validate_job_name(task, &short_job_name(task));
     }
-    let engine = ctx.config.classifier.engine;
-    let cmd = classifier_command_in(ctx, &job_name_prompt(task), &ctx.config.classifier).ok()?;
+    job_name_with(ctx, task, &ctx.config.classifier)
+}
+
+/// IMPURE: the same title-only call, made through an explicitly chosen engine rather than the
+/// scoring engine.
+///
+/// This is what the asynchronous naming worker calls. It exists because the engine that SCORES a
+/// task need not be able to NAME one: Jev answers a fixed rubric and writes no prose, so a box
+/// scoring with Jev would otherwise be stuck with the derived title forever. `classifier` carries
+/// both the engine and the model, so nothing here can pair one engine with another's model.
+///
+/// Never fails, for the same reason as [`job_name`]: a title is cosmetic.
+pub fn job_name_with(ctx: &Context, task: &str, classifier: &Classifier) -> Option<String> {
+    let engine = classifier.engine;
+    if engine == ClassifierEngine::Jev {
+        return None;
+    }
+    let cmd = classifier_command_in(ctx, &job_name_prompt(task), classifier).ok()?;
     let timeout = Duration::from_secs(ctx.config.classifier_timeout_secs);
     let stdout = capture(cmd, engine, timeout).ok()?;
     validate_job_name(task, &parse_job_name(&stdout, engine)?)
@@ -1236,6 +1252,7 @@ mod tests {
             claude_model: "haiku".to_string(),
             codex_model: "gpt-5.6-luna".to_string(),
             jev_model: "jev-1.13.0".to_string(),
+            naming_engine: ClassifierEngine::Claude,
         };
 
         let on_claude =

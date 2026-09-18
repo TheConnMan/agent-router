@@ -243,7 +243,9 @@ Default `"codex"`. `"claude"`, `"codex"`, or `"jev"`. Any other value is a confi
 
 Claude and Codex scoring remain one small strict JSON answer drawn from that provider's weekly
 budget. `jev` scores the four routing fields through TypeSafe (`jev_model`, default `jev-1.13.0`)
-and names the job with `short_job_name`. It does not spend Claude or Codex classifier quota. The
+and names nothing: it answers a fixed rubric and writes no prose, so a box scoring with Jev takes
+its session titles from `naming_engine` after launch instead. It does not spend Claude or Codex
+classifier quota for scoring. The
 TypeSafe key is `TYPESAFE_API_KEY` or `TYPESAFE_AI_KEY` in the environment, never this file. See
 [`docs/decisions/0011-jev-classifier.md`](decisions/0011-jev-classifier.md).
 
@@ -262,10 +264,21 @@ re-pick of the model.
 
 Both want the cheapest model that reliably holds the output contract, since the classifier runs on
 every automatically routed task and emits the routing scores plus a concise job title. A run that
-names its provider still scores omitted model and effort on that same call; the title-only prompt
-is the follow-up when the scored title is unusable, and the only naming call for Grok. The
-engine choice sets which weekly budget every dispatch draws those small calls from,
-not only the automatic ones.
+names its provider still scores omitted model and effort on that same call. The engine choice sets
+which weekly budget every dispatch draws those small calls from, not only the automatic ones.
+
+### `naming_engine`
+
+Default `"claude"`. `"claude"` or `"codex"`: which engine writes a session title AFTER a job has
+launched, when the scoring call did not produce a usable one. It uses that engine's model above.
+
+It is separate from `engine` because the two calls answer different questions and one engine cannot
+do both. Jev scores a fixed rubric and writes no prose, so a box scoring with Jev still needs a
+small generative model to name its jobs. `"jev"` here is read as "no engine can name" and is
+normalized to the default rather than honoured: a config naming it would silently disable naming,
+and reading `naming_engine = "jev"` back would give no hint that it had.
+
+The call never blocks a dispatch. See [Asynchronous session naming](../README.md#asynchronous-session-naming).
 
 ## `[models.codex]` and `[models.claude]`
 

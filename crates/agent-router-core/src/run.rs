@@ -66,6 +66,12 @@ pub struct Outcome {
     /// The projected weekly draw, populated on the dry run path only. A real dispatch is not asking
     /// what a job would cost, it is spending it, so there is nothing to project.
     pub estimate: Option<Estimate>,
+    /// A detached worker is generating a descriptive title and will rename the launched session.
+    /// The job is already running under `dispatch.job_name` and never waits for this.
+    pub naming_started: bool,
+    /// Why no naming worker runs, when a dispatch would otherwise have had one. None on a dispatch
+    /// that started a worker, and on every path that dispatched nothing.
+    pub naming_skipped: Option<String>,
 }
 
 /// IMPURE: run one task through the router.
@@ -75,6 +81,7 @@ pub fn run(request: &Request, ctx: &Context) -> Result<Outcome> {
         ctx,
         || UsageSnapshot::read(ctx),
         || DecisionLog::open_in(&ctx.home),
+        true,
         true,
     )
 }
@@ -93,7 +100,7 @@ where
     R: FnOnce() -> UsageSnapshot + Send,
     L: FnOnce() -> Result<DecisionLog>,
 {
-    run_inner(request, ctx, read_usage, open_log, false)
+    run_inner(request, ctx, read_usage, open_log, false, false)
 }
 
 fn run_inner<R, L>(
@@ -102,6 +109,7 @@ fn run_inner<R, L>(
     read_usage: R,
     open_log: L,
     pin_codex_before_classify: bool,
+    spawn_naming_worker: bool,
 ) -> Result<Outcome>
 where
     R: FnOnce() -> UsageSnapshot + Send,
@@ -190,18 +198,21 @@ where
     } else {
         (read_usage(), None)
     };
-    // A scored title is used when it is usable. Otherwise one title-only call runs: the scoring
-    // model often spends the call on the rubric and drops a punctuated or ticket-less title, and
-    // Grok never scores at all. short_job_name remains only if that dedicated call is also
-    // unusable, so a job still dispatches.
+    // A scored title is used when it is usable: the scoring call already paid for it, so there is
+    // nothing to gain by asking again. When it is not usable — the scoring model spent the call on
+    // the rubric, or the engine writes no prose at all — the launch name stays the derived one and
+    // a descriptive title is generated AFTER the launch, by a detached worker. Nothing generative
+    // may run here: this is the line the dispatch is waiting on.
     let generated_name = if request.name.is_none() && !request.dry_run {
         classified
             .as_ref()
             .and_then(|classified| classified.job_name.clone())
-            .or_else(|| crate::classify::job_name(ctx, request.task))
     } else {
         None
     };
+    // Recorded before `classified` is consumed below. A job named by the caller or already named
+    // by the scoring call is finished being named.
+    let wants_async_name = request.name.is_none() && !request.dry_run && generated_name.is_none();
     let decision = match request.provider {
         Some(provider) => decide_explicit(
             provider,
@@ -261,6 +272,8 @@ where
                 log_id: Some(log_id),
                 log_error: None,
                 estimate: None,
+                naming_started: false,
+                naming_skipped: None,
             });
         }
         Some(Ok(pin)) => Some(pin),
@@ -296,6 +309,8 @@ where
             log_id: Some(log_id),
             log_error: None,
             estimate: None,
+            naming_started: false,
+            naming_skipped: None,
         });
     }
 
@@ -328,6 +343,8 @@ where
             log_id: Some(log_id),
             log_error: None,
             estimate: Some(estimate),
+            naming_started: false,
+            naming_skipped: None,
         });
     }
 
@@ -366,6 +383,31 @@ where
         Ok(id) => (Some(id), None),
         Err(e) => (None, Some(e.to_string())),
     };
+    // After the dispatch, after the row: the worker renames a session that provably launched and
+    // keeps a row that provably exists in step with it. It is detached, so this returns as soon as
+    // it is spawned and the naming outlives this process.
+    let (naming_started, naming_skipped) = if wants_async_name && spawn_naming_worker {
+        let job = crate::naming::NameJob {
+            provider: decision.provider,
+            job_id: dispatch.job_id.clone(),
+            launch_name: dispatch.job_name.clone(),
+            log_id,
+            task: task.to_string(),
+        };
+        match crate::naming::spawn_worker(ctx, &job) {
+            // Not waited on and not killed: the child is reaped by init once this process exits,
+            // which is the same contract the detached review worker runs under.
+            Ok(_) => (true, None),
+            Err(error) => (false, Some(error.to_string())),
+        }
+    } else if wants_async_name {
+        (
+            false,
+            Some("naming worker suppressed by the caller".to_string()),
+        )
+    } else {
+        (false, None)
+    };
     Ok(Outcome {
         decision,
         dispatch: Some(dispatch),
@@ -374,6 +416,8 @@ where
         log_id,
         log_error,
         estimate: None,
+        naming_started,
+        naming_skipped,
     })
 }
 

@@ -3,6 +3,21 @@
 All notable changes to this project are documented here. Versions are the
 workspace `package.version` stamped on every decision-log row.
 
+## 0.26.0 - 2026-09-18
+
+- Generate session titles asynchronously. No naming call sits on the dispatch path any more: a job
+  launches under the name already in hand, and when that is the name derived from the task text a
+  detached `setsid` worker generates a descriptive title, renames the launched session by its own
+  identity, and updates the decision row. It outlives the router process.
+- Rename through Agent Viewer's own mechanisms: claude's `state.json` writer, codex `thread/name/set`
+  over the app-server daemon, and Grok's `x.ai/session/rename`. Claude and Codex can report the
+  current name, so a rename somebody made by hand is kept rather than overwritten.
+- Add `[classifier] naming_engine`, default `"claude"`. Jev scores but writes no prose, so the
+  engine that names is chosen separately from the engine that scores; `"jev"` normalizes to the
+  default.
+- `run --json` gains `naming_started` and `naming_skipped`. Naming never fails, stops, or relaunches
+  a job; every outcome lands in `~/.local/state/agent-router/logs/naming-*.log`.
+
 ## 0.25.0 - 2026-09-18
 
 - Add an opt-in `[classifier] engine = "jev"` that scores the four routing fields through one
