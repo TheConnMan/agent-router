@@ -189,11 +189,11 @@ pub fn decide(
     decide_with_task("", classification, usage, now_epoch_secs, config)
 }
 
-/// Automatic routing for a scored task. `task` is searched together with the classifier
-/// rationale when recovering a missing connector against `provider_capabilities`, so a
-/// one-sentence rationale that omits "Slack" still recovers Slack-capable providers when
-/// the task already named Slack. An unmatched miss is not a constraint: it does not pin
-/// Claude and it does not refuse dispatch. A matched name with no provider still blocks
+/// Automatic routing for a scored task. Inventory names in the task or classifier
+/// rationale recover against `provider_capabilities` even when the classifier left
+/// `missing_connector` false, so a paraphrased rationale cannot send an Airtable job
+/// to Grok. An unmatched miss is not a constraint: it does not pin Claude and it does
+/// not refuse dispatch. A matched name with no provider still blocks
 /// (docs/decisions/0007-claude-capability-only.md,
 /// docs/decisions/0010-unmatched-connector-is-not-a-block.md).
 pub fn decide_with_task(
@@ -204,19 +204,14 @@ pub fn decide_with_task(
     config: &Config,
 ) -> Decision {
     let mut gates = Vec::new();
-    let matched_capabilities = if classification.missing_connector {
-        config.matched_capabilities(task, &classification.rationale)
-    } else {
-        Vec::new()
-    };
+    let matched_capabilities = config.matched_capabilities(task, &classification.rationale);
     let capability_providers = config.capability_providers(&matched_capabilities);
-    // A classifier miss constrains routing only once an inventory name matched. An unmatched
-    // miss is an unusable observation: do not pin Claude, and do not refuse the job.
-    let capability_constraint =
-        classification.missing_connector && !matched_capabilities.is_empty();
+    // A named inventory connector constrains even when the classifier omitted the flag.
+    // An unmatched classifier miss is not a constraint.
+    let capability_constraint = !matched_capabilities.is_empty();
     let mut capability_blocked = capability_constraint && capability_providers.is_empty();
     let mut capability_pin = false;
-    if classification.missing_connector {
+    if classification.missing_connector || capability_constraint {
         gates.push(Gate::MissingConnector);
         if capability_blocked {
             gates.push(Gate::CapabilityBlocked);

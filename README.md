@@ -31,8 +31,9 @@ log: row 87 in /home/you/.local/state/agent-router/router.db
    `CLAUDE.md`, `AGENTS.md`, skill, plugin, hook, or MCP server can shift the score. The Codex
    engine additionally runs with its shell, browser, computer use, image, app, and skill search
    tools disabled: scoring needs no tool, and a task carrying an injected instruction must have
-   nothing to reach for. If the call fails or times out, automatic capacity routing still selects
-   between Codex and Grok and the decision is tagged `classifier_failed`. The same classifier model also generates
+   nothing to reach for. The Jev engine is one TypeSafe HTTP call with no CLI; titles on that path
+   are `short_job_name`. If the call fails or times out, automatic capacity routing still selects
+   between Codex and Grok and the decision is tagged `classifier_failed`. The Claude and Codex engines also generate
    the job title. A ticket ID leads the title, followed by two to six concise Title Case words, such
    as `GH-123 Sprint 2 Bug Fixes` or `RS-123 Input Box Searching`. A title that forgot the ticket
    still keeps the model's words, with the ticket prepended. An unusable scored title (punctuation,
@@ -48,9 +49,11 @@ log: row 87 in /home/you/.local/state/agent-router/router.db
    server names and enabled plugins are safely discovered from its local config, while Claude.ai
    connector registrations and other providers can be
    registered in `provider_capabilities`; unavailable providers are removed before ordinary policy
-   chooses the route. A matched inventory name absent from every provider inventory is
-   `capability_blocked`. An unmatched classifier miss (no inventory name in the task or
-   rationale) is ordinary Codex or Grok routing, not a refuse. The context-window gate is a capability pin: Codex's window is
+   chooses the route. A task that names a configured inventory connector is treated as a miss
+   even if the classifier left `missing_connector` false. A matched inventory name absent from
+   every provider inventory is `capability_blocked`. An unmatched classifier miss (no inventory
+   name in the task or rationale) is ordinary Codex or Grok routing, not a refuse. The
+   context-window gate is a capability pin: Codex's window is
    258,400 tokens. It fires only when the task text actually dispatches `/implement` (read
    literally, never scored) **and** complexity is `high` or `ultra`; `low` and `medium`
    implement runs stay on ordinary routing. See
@@ -633,7 +636,8 @@ operator never wrote is worse than refusing to run.
 `connectors` remains the authoritative local-shell inventory used by the classifier. Provider
 capabilities are separate: Codex MCP server names and enabled plugins are discovered from
 `~/.codex/config.toml`, while Claude.ai registrations are read separately; operators may register
-other provider inventories in `provider_capabilities`. A miss is refused
+other provider inventories in `provider_capabilities`. Matching searches the task and
+rationale even when the classifier left `missing_connector` false. A miss is refused
 only when no provider establishes the named capability.
 
 See [docs/configuration.md](docs/configuration.md) for the full reference.

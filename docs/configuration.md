@@ -213,17 +213,15 @@ claude = ["Granola"]
 codex = ["Granola"]
 ```
 
-For an Auto route whose classifier observes a missing connector, providers without a matching
-inventory entry are excluded before the existing capacity policy runs, but only after an
-inventory name matches in the task or the rationale. An unmatched miss records
-`missing_connector` and continues ordinary Codex or Grok routing; it is not
-`capability_blocked`. Matching looks at the
-task text and the classifier rationale together: a one-sentence rationale that omits "Slack"
-still recovers Slack-capable providers when the task already named Slack. Names are whole
-words, and a Title-Case inventory name such as `Notion` does not match English `notion`.
-Grok stays out of that pool unless it is listed here. Explicit `--provider` requests remain
-exact and do not use this automatic eligibility filter. The decision log records which names
-hit and whether they came from the task, the rationale, or both.
+For an Auto route, providers without a matching inventory entry are excluded before the
+existing capacity policy runs whenever the task or rationale names a configured inventory
+connector, even if the classifier left `missing_connector` false. An unmatched classifier
+miss (no inventory name in the task or rationale) records `missing_connector` and continues
+ordinary Codex or Grok routing; it is not `capability_blocked`. Names are whole words, and a
+Title-Case inventory name such as `Notion` does not match English `notion`. Grok stays out
+of that pool unless it is listed here. Explicit `--provider` requests remain exact and do
+not use this automatic eligibility filter. The decision log records which names hit and
+whether they came from the task, the rationale, or both.
 
 ## `[policy]`
 
@@ -241,11 +239,13 @@ Which engine scores a task, and the model each engine scores it with.
 
 ### `engine`
 
-Default `"claude"`. Either `"claude"` or `"codex"`. Any other value is a configuration error.
+Default `"codex"`. `"claude"`, `"codex"`, or `"jev"`. Any other value is a configuration error.
 
-Scoring and job naming are one small strict JSON answer, so either engine can do both. The choice is
-about which weekly budget the per task classifier call is drawn from. If Claude weekly budget is the
-scarce resource, set this to `"codex"`.
+Claude and Codex scoring remain one small strict JSON answer drawn from that provider's weekly
+budget. `jev` scores the four routing fields through TypeSafe (`jev_model`, default `jev-1.13.0`)
+and names the job with `short_job_name`. It does not spend Claude or Codex classifier quota. The
+TypeSafe key is `TYPESAFE_API_KEY` or `TYPESAFE_AI_KEY` in the environment, never this file. See
+[`docs/decisions/0011-jev-classifier.md`](decisions/0011-jev-classifier.md).
 
 Two consequences of `"codex"` worth knowing. Scoring runs with every tool disabled, so it cannot
 read a file even though the sandbox is read only. And it writes a session rollout per scored task

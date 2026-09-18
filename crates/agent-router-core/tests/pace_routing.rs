@@ -271,6 +271,83 @@ fn a_task_named_capability_recovers_when_the_rationale_omits_the_product() {
     assert_eq!(recovered.requested_model, None);
 }
 
+/// Inventory names in the task recover even when the classifier left missing_connector
+/// false. Flag-gated matching sends this Airtable job to Grok, which has no Airtable.
+#[test]
+fn a_task_named_capability_recovers_when_the_classifier_omits_the_miss_flag() {
+    let config = Config {
+        provider_capabilities: BTreeMap::from([
+            ("claude".to_string(), vec!["Airtable".to_string()]),
+            ("codex".to_string(), vec!["Airtable".to_string()]),
+        ]),
+        ..Config::default()
+    };
+    let classification = Classification {
+        rationale: "scoped review-and-messaging with no multi-agent coordination".to_string(),
+        ..scored(false, false, Complexity::Medium)
+    };
+    let usage = usage_with_grok(
+        window(36.0, HALF_WEEK, 0.0),
+        window(18.0, HALF_WEEK, 0.0),
+        window(10.0, HALF_WEEK, 0.0),
+    );
+
+    let leaked = decide(classification.clone(), usage, NOW, &config);
+    assert_eq!(leaked.provider, Provider::Grok);
+    assert!(leaked.matched_capabilities.is_empty());
+    assert!(!leaked.gates.contains(&Gate::MissingConnector));
+
+    let recovered = decide_with_task(
+        "Use the auto-management-updates skill to review notifications from the Airtable bot.",
+        classification,
+        usage,
+        NOW,
+        &config,
+    );
+    assert_eq!(recovered.provider, Provider::Codex);
+    assert!(!recovered.capability_blocked);
+    assert!(recovered.gates.contains(&Gate::MissingConnector));
+    assert!(!recovered.gates.contains(&Gate::CapabilityBlocked));
+    assert_eq!(
+        recovered.matched_capabilities,
+        vec![agent_router_core::config::MatchedCapability {
+            name: "Airtable".to_string(),
+            in_task: true,
+            in_rationale: false,
+        }]
+    );
+}
+
+/// English "notion" in a task must not invent a connector requirement when the classifier
+/// did not report a miss.
+#[test]
+fn english_notion_does_not_invent_a_connector_miss() {
+    let config = Config {
+        provider_capabilities: BTreeMap::from([
+            ("claude".to_string(), vec!["Notion".to_string()]),
+            ("codex".to_string(), vec!["Notion".to_string()]),
+        ]),
+        ..Config::default()
+    };
+    let decision = decide_with_task(
+        "the notion that we should wait and report only",
+        Classification {
+            rationale: "bounded status recording".to_string(),
+            ..scored(false, false, Complexity::Medium)
+        },
+        usage_with_grok(
+            window(36.0, HALF_WEEK, 0.0),
+            window(18.0, HALF_WEEK, 0.0),
+            window(10.0, HALF_WEEK, 0.0),
+        ),
+        NOW,
+        &config,
+    );
+    assert_eq!(decision.provider, Provider::Grok);
+    assert!(decision.matched_capabilities.is_empty());
+    assert!(!decision.gates.contains(&Gate::MissingConnector));
+}
+
 /// English "notion" in a task must not recover a Notion-capable provider. The miss stays
 /// unmatched, so ordinary routing proceeds rather than a refuse or a Notion pin.
 #[test]

@@ -3,6 +3,12 @@
 All notable changes to this project are documented here. Versions are the
 workspace `package.version` stamped on every decision-log row.
 
+## 0.25.0 - 2026-09-18
+
+- Add an opt-in `[classifier] engine = "jev"` that scores the four routing fields through one
+  TypeSafe System One call. Default engine stays Codex. Titles on the Jev path use `short_job_name`.
+  Failures fail open. The API key is an environment variable, never config.toml.
+
 ## 0.24.4 - 2026-09-15
 
 - An unmatched classifier `missing_connector` is ordinary auto routing, not
@@ -26,7 +32,10 @@ workspace `package.version` stamped on every decision-log row.
   checked which copy won. Claude and Codex launches are unchanged.
 - `record` now writes `decisions.note`, which until now only `mark --note` wrote. A human mark's
   note still overwrites the router's.
-
+- Recover Auto routes against `provider_capabilities` when the task or rationale names an
+  inventory connector, even if the classifier left `missing_connector` false. The 2026-09-13
+  routing-quality review found the same Airtable auto-management job leaking to Grok twice
+  in three runs because recovery waited on that flag.
 ## 0.24.2 - 2026-09-09
 
 - Persist `reason` and `outcome_json` on the pre-ID `record_review` path, so a review that fails

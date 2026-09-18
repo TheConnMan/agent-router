@@ -714,6 +714,56 @@ fn a_task_named_slack_capability_unblocks_when_the_rationale_omits_it() {
     }));
 }
 
+/// A configured Airtable inventory must recover an auto route when the task names Airtable
+/// even if the classifier left missing_connector false. Flag-gated matching leaks this to Grok.
+#[cfg(unix)]
+#[test]
+fn a_task_named_airtable_capability_recovers_when_the_classifier_omits_the_miss_flag() {
+    let fixture = CliFixture::new("task-named-airtable-omitted-flag").with_task(
+        "Use the auto-management-updates skill to review notifications from the Airtable bot.",
+    );
+    fixture.answers_with(
+        &json!({
+            "orchestration": false,
+            "missing_connector": false,
+            "complexity": "medium",
+            "task_context_horizon": "ordinary",
+            "rationale": "scoped review-and-messaging with no multi-agent coordination",
+            "job_name": fixture.classifier_name,
+        })
+        .to_string(),
+    );
+    let config_path = fixture
+        .root
+        .path
+        .join("home/.config/agent-router/config.toml");
+    let mut config = fs::read_to_string(&config_path).expect("read fixture router config");
+    config.push_str("\n[provider_capabilities]\nclaude = [\"Airtable\"]\ncodex = [\"Airtable\"]\n");
+    fs::write(&config_path, config).expect("write Airtable provider capabilities");
+
+    let output = fixture
+        .run_command()
+        .arg("--provider")
+        .arg("auto")
+        .arg("--dry-run")
+        .arg("--json")
+        .output()
+        .expect("run router");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("router json");
+    assert_eq!(value["provider"], "codex");
+    assert_eq!(value["capability_blocked"], Value::Null);
+    assert_eq!(value["matched_capabilities"], "Airtable@task");
+    assert!(value["gates"].as_array().is_some_and(|gates| {
+        gates.contains(&Value::String("missing_connector".to_string()))
+            && !gates.contains(&Value::String("capability_blocked".to_string()))
+    }));
+}
+
 /// Claude account connectors are outside the router's static TOML. Their verified local record
 /// must remain positive capability evidence rather than being treated as unavailable by omission.
 #[cfg(unix)]
