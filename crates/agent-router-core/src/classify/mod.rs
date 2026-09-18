@@ -483,11 +483,18 @@ pub fn job_name_with(
             "jev scores a fixed rubric and writes no prose".to_string(),
         ));
     }
-    let cmd = classifier_command_in(ctx, &job_name_prompt(task), classifier)
-        .map_err(|failure| TitleFailure::NotLaunched(failure.why().to_string()))?;
+    // Both stages can fail to LAUNCH, so both are mapped by variant rather than by which call
+    // produced them. Resolution finding no path and an exec that failed anyway (a stub whose
+    // interpreter is missing, a lost exec bit) are the same event to an operator, and folding the
+    // second into "the call failed" would send them looking at the model instead of the box.
+    let from_classifier = |failure: ClassifierFailure| match failure {
+        ClassifierFailure::Launch(why) => TitleFailure::NotLaunched(why),
+        ClassifierFailure::Ran(why) => TitleFailure::CallFailed(why),
+    };
+    let cmd =
+        classifier_command_in(ctx, &job_name_prompt(task), classifier).map_err(from_classifier)?;
     let timeout = Duration::from_secs(ctx.config.classifier_timeout_secs);
-    let stdout = capture(cmd, engine, timeout)
-        .map_err(|failure| TitleFailure::CallFailed(failure.why().to_string()))?;
+    let stdout = capture(cmd, engine, timeout).map_err(from_classifier)?;
     let candidate = parse_job_name(&stdout, engine).ok_or(TitleFailure::Unparseable)?;
     validate_job_name(task, &candidate).ok_or(TitleFailure::Rejected(candidate))
 }

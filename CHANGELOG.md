@@ -3,6 +3,17 @@
 All notable changes to this project are documented here. Versions are the
 workspace `package.version` stamped on every decision-log row.
 
+## 0.26.1 - 2026-09-18
+
+- Keep a title whose words carry an interior dot or slash. The first real job through asynchronous
+  naming kept its derived name: the task was about `v0.10.0`, the model titled it accordingly, and
+  `validate_job_name` threw the whole title away over one dot. A title word is now judged by its
+  edges, so `v0.10.0` and `CI/CD` survive while prose punctuation is refused exactly as before.
+- Say which stage a naming call failed at. `no usable title` covered an unlaunchable CLI, a timed
+  out call, a missing field, and a refused title behind one sentence; the naming log now names the
+  stage and quotes a refused title verbatim. An exec that fails after the binary resolved is
+  reported as a launch failure, not a bad answer.
+
 ## 0.26.0 - 2026-09-18
 
 - Generate session titles asynchronously. No naming call sits on the dispatch path any more: a job
