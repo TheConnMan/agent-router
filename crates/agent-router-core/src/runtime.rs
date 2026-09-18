@@ -157,9 +157,35 @@ pub fn validate_job_name(task: &str, candidate: &str) -> Option<String> {
     Some(normalized.join(" "))
 }
 
+/// PURE: whether one word of a candidate title is a title word rather than prose.
+///
+/// The rule is about the EDGES, not the whole word. Prose gives itself away at a word boundary: a
+/// sentence's words end in `.`, `,`, `;`, `:`, `!` or `?`, and an explanation opens with a quote or
+/// a bracket. Inside a word, punctuation is almost always part of a real token instead.
+///
+/// So a word must start and end alphanumeric, and may carry `-`, `.`, `/` or `+` between. A title
+/// for a task about `v0.10.0` used to be thrown away whole, because one interior dot failed an
+/// all-characters test, and the job then kept the name derived from its prompt. That is what this
+/// shape fixes; `Renaming:`, `background,` and `sessions!` are still rejected exactly as before.
 fn valid_title_word(word: &str) -> bool {
+    let mut characters = word.chars();
+    let Some(first) = characters.next() else {
+        return false;
+    };
+    if !first.is_alphanumeric() {
+        return false;
+    }
+    let Some(last) = word.chars().next_back() else {
+        return false;
+    };
+    if !last.is_alphanumeric() {
+        return false;
+    }
+    // The interior: everything but the first and last character, which are already checked.
     word.chars()
-        .all(|character| character.is_alphanumeric() || character == '-')
+        .skip(1)
+        .take(word.chars().count().saturating_sub(2))
+        .all(|character| character.is_alphanumeric() || matches!(character, '-' | '.' | '/' | '+'))
 }
 
 fn is_ticket(value: &str) -> bool {
@@ -290,6 +316,56 @@ mod tests {
                 "RS-123 input box search"
             ),
             Some("RS-123 Input Box Search".to_string())
+        );
+    }
+
+    /// The regression that made asynchronous naming visibly do nothing: a task about a release
+    /// version gets a title carrying that version, and one interior dot used to throw the whole
+    /// title away, leaving the job on the name derived from its prompt.
+    #[test]
+    fn a_title_carrying_a_version_number_is_kept() {
+        let task = "As we get into work items for v0.10.0 and the dark software factory, we have \
+                    to have some way of marking dependencies";
+        // Title Case normalization still applies to every description word, so a lowercase
+        // leading `v` comes back uppercased. That is the existing rule doing its job, not a
+        // version string being mangled: the token survives, which is the whole point.
+        assert_eq!(
+            validate_job_name(task, "v0.10.0 Dependency Tracking Strategy"),
+            Some("V0.10.0 Dependency Tracking Strategy".to_string())
+        );
+        assert_eq!(
+            validate_job_name(task, "V0.10.0 Dark Factory Dependency Tracking"),
+            Some("V0.10.0 Dark Factory Dependency Tracking".to_string())
+        );
+    }
+
+    /// The bound on that widening. Punctuation at a word's edge is how prose gives itself away, and
+    /// an explanation that became a session name is the thing this validator exists to stop.
+    #[test]
+    fn punctuation_at_a_word_edge_still_rejects_the_whole_title() {
+        let task = "rename background sessions";
+        for prose in [
+            "Renaming: background, sessions!",
+            "I cannot name this task.",
+            "\"Rename Background Sessions\"",
+            "Rename Background Sessions.",
+            "Rename (Background Sessions)",
+        ] {
+            assert_eq!(
+                validate_job_name(task, prose),
+                None,
+                "{prose:?} is prose, not a title"
+            );
+        }
+    }
+
+    /// An interior separator is part of a real token, not prose.
+    #[test]
+    fn interior_separators_are_part_of_a_word() {
+        let task = "harden the pipeline";
+        assert_eq!(
+            validate_job_name(task, "CI/CD Pipeline Hardening"),
+            Some("CI/CD Pipeline Hardening".to_string())
         );
     }
 

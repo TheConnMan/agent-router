@@ -428,6 +428,40 @@ Reply with exactly this JSON object, filled in:
     )
 }
 
+/// Why a title call produced no title. One variant per stage, because "no usable title" covers
+/// four different faults with four different fixes, and a naming worker that logs only the
+/// conclusion cannot be diagnosed without rebuilding the binary. Learned the hard way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TitleFailure {
+    /// The naming CLI could not be turned into a runnable path, or could not be exec'd.
+    NotLaunched(String),
+    /// The CLI ran and then failed: a timeout, a nonzero exit, an unreadable answer.
+    CallFailed(String),
+    /// The CLI answered, but its envelope carried no `job_name` field.
+    Unparseable,
+    /// The model named the job and the name was refused. Carries the candidate verbatim, because
+    /// which title was refused is the entire diagnosis.
+    Rejected(String),
+}
+
+impl TitleFailure {
+    /// PURE: the sentence that lands in the naming log.
+    pub fn describe(&self) -> String {
+        match self {
+            TitleFailure::NotLaunched(why) => {
+                format!("the naming engine could not be launched: {why}")
+            }
+            TitleFailure::CallFailed(why) => format!("the naming call failed: {why}"),
+            TitleFailure::Unparseable => {
+                "the naming engine answered without a job_name field".to_string()
+            }
+            TitleFailure::Rejected(candidate) => {
+                format!("the naming engine answered {candidate:?}, which is not a usable title")
+            }
+        }
+    }
+}
+
 /// IMPURE: ask a small model for a session title alone, with nothing scored.
 ///
 /// The one naming call, and the only one. It takes its engine explicitly because the engine that
@@ -436,17 +470,33 @@ Reply with exactly this JSON object, filled in:
 /// both the engine and the model together, so nothing here can pair one engine with another's
 /// model.
 ///
-/// Never fails: None means the job keeps the name it launched with. That is the whole error path on
-/// purpose, because a title is cosmetic and the job it names is already running.
-pub fn job_name_with(ctx: &Context, task: &str, classifier: &Classifier) -> Option<String> {
+/// Never panics and never costs the job anything: every failure is an `Err` the caller reports and
+/// drops, because a title is cosmetic and the job it names is already running.
+pub fn job_name_with(
+    ctx: &Context,
+    task: &str,
+    classifier: &Classifier,
+) -> std::result::Result<String, TitleFailure> {
     let engine = classifier.engine;
     if engine == ClassifierEngine::Jev {
-        return None;
+        return Err(TitleFailure::NotLaunched(
+            "jev scores a fixed rubric and writes no prose".to_string(),
+        ));
     }
-    let cmd = classifier_command_in(ctx, &job_name_prompt(task), classifier).ok()?;
+    // Both stages can fail to LAUNCH, so both are mapped by variant rather than by which call
+    // produced them. Resolution finding no path and an exec that failed anyway (a stub whose
+    // interpreter is missing, a lost exec bit) are the same event to an operator, and folding the
+    // second into "the call failed" would send them looking at the model instead of the box.
+    let from_classifier = |failure: ClassifierFailure| match failure {
+        ClassifierFailure::Launch(why) => TitleFailure::NotLaunched(why),
+        ClassifierFailure::Ran(why) => TitleFailure::CallFailed(why),
+    };
+    let cmd =
+        classifier_command_in(ctx, &job_name_prompt(task), classifier).map_err(from_classifier)?;
     let timeout = Duration::from_secs(ctx.config.classifier_timeout_secs);
-    let stdout = capture(cmd, engine, timeout).ok()?;
-    validate_job_name(task, &parse_job_name(&stdout, engine)?)
+    let stdout = capture(cmd, engine, timeout).map_err(from_classifier)?;
+    let candidate = parse_job_name(&stdout, engine).ok_or(TitleFailure::Unparseable)?;
+    validate_job_name(task, &candidate).ok_or(TitleFailure::Rejected(candidate))
 }
 
 /// PURE: the title out of `engine`'s stdout. Reads the one field and ignores the rest, so it takes
