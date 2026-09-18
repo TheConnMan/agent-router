@@ -437,7 +437,18 @@ fn one_line(error: &impl std::fmt::Display) -> String {
 
 fn jev_api_key(ctx: &Context) -> Check {
     let name = "jev_api_key";
-    if ctx.config.classifier.engine != ClassifierEngine::Jev {
+    // Doctor does not load config into Context and must not create the file.
+    let path = default_config_path(&ctx.home);
+    let engine = match std::fs::read_to_string(&path) {
+        Ok(text) => match toml::from_str::<Config>(&text) {
+            Ok(config) => config.classifier.engine,
+            Err(_) => {
+                return pass(name, "classifier config already reported".to_string());
+            }
+        },
+        Err(_) => ClassifierEngine::Codex,
+    };
+    if engine != ClassifierEngine::Jev {
         return pass(name, "jev is not the classifier engine".to_string());
     }
     match crate::classify::jev_key_present() {
