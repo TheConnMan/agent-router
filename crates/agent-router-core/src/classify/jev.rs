@@ -2,7 +2,6 @@
 
 use super::{Classification, Complexity, TaskContextHorizon, invokes_implement};
 use crate::context::Context;
-use crate::runtime::{short_job_name, validate_job_name};
 use serde_json::{Value, json};
 use std::time::Duration;
 
@@ -273,9 +272,13 @@ pub fn classify_with_transport(
     key: Option<&str>,
     transport: &dyn SystemOneTransport,
 ) -> super::ClassifiedTask {
-    let title = validate_job_name(task, &short_job_name(task));
+    // No title, ever. Jev answers a fixed rubric and writes no prose, and the derived name it used
+    // to return here is exactly the name the asynchronous namer exists to replace: returning it
+    // would read as "this job has been named" and suppress the naming worker on every Jev-scored
+    // job. The launch name is unchanged either way — `dispatch` derives the same name from the
+    // task when none is supplied.
     let Some(key) = key else {
-        return failed("missing typesafe api key", title, task);
+        return failed("missing typesafe api key", task);
     };
     let body = json!({
         "state": {
@@ -297,21 +300,21 @@ pub fn classify_with_transport(
                 classification.invokes_implement = invokes_implement(task);
                 super::ClassifiedTask {
                     classification,
-                    job_name: title,
+                    job_name: None,
                 }
             }
-            None => failed("unparseable json", title, task),
+            None => failed("unparseable json", task),
         },
-        Err(why) => failed(&why, title, task),
+        Err(why) => failed(&why, task),
     }
 }
 
-fn failed(why: &str, job_name: Option<String>, task: &str) -> super::ClassifiedTask {
+fn failed(why: &str, task: &str) -> super::ClassifiedTask {
     let mut classification = Classification::fallback(why);
     classification.invokes_implement = invokes_implement(task);
     super::ClassifiedTask {
         classification,
-        job_name,
+        job_name: None,
     }
 }
 

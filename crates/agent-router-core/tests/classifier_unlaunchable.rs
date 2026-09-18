@@ -2,7 +2,7 @@
 //! and answered badly. A fallback names no destination; only a launch failure sets
 //! `unlaunchable`. See docs/decisions/0005-launch-error-and-binary-resolver.md.
 //!
-//! Every case drives `classify` / `job_name` with an explicit `Context`. No
+//! Every case drives `classify` / `job_name_with` with an explicit `Context`. No
 //! process-environment mutation and no user-namespace isolation: see `binary_resolution.rs`.
 
 #![cfg(unix)]
@@ -11,7 +11,7 @@ use agent_router_core::Context;
 use agent_router_core::Provider;
 use agent_router_core::binary::{CLAUDE_BIN_ENV, CODEX_BIN_ENV, Environment};
 use agent_router_core::classify::{
-    Classification, Complexity, TaskContextHorizon, classify, classify_with_name, job_name,
+    Classification, Complexity, TaskContextHorizon, classify, classify_with_name, job_name_with,
     parse_classification, parse_classifier_output_with_name,
 };
 use agent_router_core::config::{ClassifierEngine, Config};
@@ -207,21 +207,24 @@ fn a_model_claiming_a_provider_is_unlaunchable_does_not_get_to_set_it() {
 
 // ------------------------------------------------------------------ #14: job naming
 
-/// Plan test #14, and the C19 guard. `job_name` is a THIRD classifier-command caller, and naming
-/// is optional by design: an unlaunchable CLI must return None rather than panicking or
-/// propagating an error into a path documented as never failing.
+/// Plan test #14, and the C19 guard. `job_name_with` is a SECOND classifier-command caller, and
+/// naming is optional by design: an unlaunchable CLI must return None rather than panicking or
+/// propagating an error into a path documented as never failing. It runs in the detached naming
+/// worker now, where an error would be even further from anyone who could act on it.
 #[test]
-fn job_name_returns_none_when_the_classifier_cannot_be_launched() {
+fn job_name_returns_none_when_the_naming_engine_cannot_be_launched() {
     let root = tempfile::tempdir().expect("tempdir");
+    let context = ctx(
+        root.path(),
+        stripped(root.path()),
+        config_on(ClassifierEngine::Codex),
+    );
 
     assert_eq!(
-        job_name(
-            &ctx(
-                root.path(),
-                stripped(root.path()),
-                config_on(ClassifierEngine::Codex),
-            ),
+        job_name_with(
+            &context,
             "GH-123 audit the airtable records",
+            &context.config.classifier,
         ),
         None,
         "a job that cannot be named still dispatches"

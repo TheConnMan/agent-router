@@ -21,7 +21,9 @@ Jev scores via one `POST https://api.typesafe.ai/v1/systemone` call. Code compos
 - complexity as the argmax of a four-level Score, with torn ultra reading as high
 - horizon as a Choice
 
-Titles on this path are `short_job_name`. Failures fail open (`classifier_failed`,
+This path returns no title: Jev answers a fixed rubric and writes no prose, so a Jev-scored job
+launches under the name derived from its task and is retitled afterwards by the asynchronous namer
+(`[classifier] naming_engine`). Failures fail open (`classifier_failed`,
 `unlaunchable` unset). The API key is `TYPESAFE_API_KEY` or `TYPESAFE_AI_KEY` in the
 environment, never config.toml.
 

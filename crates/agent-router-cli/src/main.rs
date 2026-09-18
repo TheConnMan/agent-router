@@ -161,6 +161,20 @@ enum Command {
         model: Option<String>,
         request: String,
     },
+    /// Internal re-exec target for the detached session namer, not a supported interface. Its
+    /// argv, its output, and its exit code are private to `run` and may change without notice.
+    #[command(hide = true)]
+    NameWorker {
+        #[arg(long)]
+        provider: String,
+        #[arg(long = "job-id")]
+        job_id: Option<String>,
+        #[arg(long = "launch-name")]
+        launch_name: String,
+        #[arg(long = "log-id")]
+        log_id: Option<i64>,
+        task: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -181,7 +195,9 @@ enum CliStatus {
     Success,
     Failure,
     Unrunnable,
-    ReviewSkipped,
+    /// Exit 3: the command ran and deliberately did nothing. A review with no eligible
+    /// alternative, or a session naming that kept the name it found.
+    Skipped,
     ReviewPending,
 }
 
@@ -190,7 +206,7 @@ fn exit_code(status: CliStatus) -> std::process::ExitCode {
         CliStatus::Success => std::process::ExitCode::SUCCESS,
         CliStatus::Failure => std::process::ExitCode::FAILURE,
         CliStatus::Unrunnable => std::process::ExitCode::from(2),
-        CliStatus::ReviewSkipped => std::process::ExitCode::from(3),
+        CliStatus::Skipped => std::process::ExitCode::from(3),
         CliStatus::ReviewPending => std::process::ExitCode::from(4),
     }
 }
@@ -221,6 +237,13 @@ fn main() -> std::process::ExitCode {
             model,
             request,
         } => review_worker_status(&mut ctx, review_id, request, primary, dir, provider, model),
+        Command::NameWorker {
+            provider,
+            job_id,
+            launch_name,
+            log_id,
+            task,
+        } => name_worker_status(&mut ctx, provider, job_id, launch_name, log_id, task),
         command => match run(Cli { command }, &mut ctx) {
             Ok(()) => CliStatus::Success,
             Err(e) => {
@@ -415,7 +438,7 @@ const REVIEW_SETTLE_ATTEMPTS: usize = 20;
 fn review_cli_status(status: ReviewStatus) -> CliStatus {
     match status.exit_status() {
         0 => CliStatus::Success,
-        3 => CliStatus::ReviewSkipped,
+        3 => CliStatus::Skipped,
         4 => CliStatus::ReviewPending,
         _ => CliStatus::Failure,
     }
@@ -968,6 +991,9 @@ fn run(cli: Cli, ctx: &mut agent_router_core::Context) -> agent_router_core::Res
         Command::ReviewWorker { .. } => {
             unreachable!("the review worker has a command specific exit path")
         }
+        Command::NameWorker { .. } => {
+            unreachable!("the name worker has a command specific exit path")
+        }
         Command::Doctor => unreachable!("doctor has a command specific exit path"),
         Command::Status { .. } => unreachable!("status has a command specific exit path"),
     }
@@ -1025,6 +1051,50 @@ fn route(
     Ok(())
 }
 
+/// The detached session namer. Exits 0 when the session was renamed, 3 when naming was skipped for
+/// an ordinary reason, and 1 when the rename was attempted and failed.
+///
+/// Every one of those is a normal end. The job it names is already running and nothing here can
+/// stop, fail, or relaunch it, so the exit code exists for an operator reading
+/// `~/.local/state/agent-router/logs/naming-*.log`, not for a caller to act on.
+fn name_worker_status(
+    ctx: &mut agent_router_core::Context,
+    provider: String,
+    job_id: Option<String>,
+    launch_name: String,
+    log_id: Option<i64>,
+    task: String,
+) -> CliStatus {
+    let Ok(Some(provider)) = agent_router_core::run::parse_provider(&provider) else {
+        eprintln!("agent-router: name-worker needs an explicit provider, not {provider:?}");
+        return CliStatus::Failure;
+    };
+    if let Err(error) = ctx.load_config() {
+        // Naming is cosmetic, but its engine and timeout come from config, so an unreadable config
+        // is reported rather than silently replaced with the defaults.
+        eprintln!("agent-router: name-worker could not load config: {error}");
+        return CliStatus::Failure;
+    }
+    let job = agent_router_core::naming::NameJob {
+        provider,
+        job_id,
+        launch_name,
+        log_id,
+        task,
+    };
+    let naming = agent_router_core::naming::name_job(ctx, &job);
+    println!(
+        "agent-router: naming {} {}",
+        provider.name(),
+        naming.describe()
+    );
+    match naming {
+        agent_router_core::naming::Naming::Renamed { .. } => CliStatus::Success,
+        agent_router_core::naming::Naming::Skipped(_) => CliStatus::Skipped,
+        agent_router_core::naming::Naming::Failed(_) => CliStatus::Failure,
+    }
+}
+
 fn outcome_json(outcome: &Outcome) -> serde_json::Value {
     let decision = &outcome.decision;
     serde_json::json!({
@@ -1050,6 +1120,11 @@ fn outcome_json(outcome: &Outcome) -> serde_json::Value {
         // Emitted on both paths, as null off the dry run one, so the JSON shape does not depend on
         // which path produced it.
         "estimate": outcome.estimate,
+        // The launched name, not the final one: the worker renames the session after this process
+        // has printed and exited, so a caller reading `dispatch.job_name` must be able to tell
+        // that it is about to change.
+        "naming_started": outcome.naming_started,
+        "naming_skipped": outcome.naming_skipped,
     })
 }
 
@@ -1086,6 +1161,14 @@ fn print_outcome(outcome: &Outcome, ctx: &agent_router_core::Context) {
     }
     println!("{line}");
     println!("why: {}", decision.rationale);
+    if outcome.naming_started {
+        println!(
+            "naming: a detached worker is generating a descriptive title and will rename this session"
+        );
+    }
+    if let Some(reason) = &outcome.naming_skipped {
+        eprintln!("naming: NOT STARTED, the job keeps its launch name: {reason}");
+    }
     if let Some(estimate) = &outcome.estimate {
         print_estimate(estimate);
     }

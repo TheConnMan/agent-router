@@ -60,14 +60,31 @@ struct CliFixture {
     classifier_name: String,
     cwd: PathBuf,
     spawn_log: PathBuf,
-    /// One line per `claude -p` invocation, so a test can assert the naming call happened, or that
-    /// it was skipped, rather than inferring either from the name that came out.
+    /// One line per `claude -p` invocation, written on ENTRY, before any gate. Used to wait for a
+    /// call to start; never to assert that one has not happened, because a detached worker may
+    /// legitimately have entered the call already.
     classifier_log: PathBuf,
+    /// One line per `claude -p` ANSWER, written after the gate releases. This is the marker the
+    /// launch-before-naming assertion reads: an answer that has not been written is an answer the
+    /// router provably did not wait for.
+    classifier_answers: PathBuf,
     /// What the fake `claude -p` answers, replaceable per test.
     classifier_answer_file: PathBuf,
     /// Optional one-JSON-object-per-line queue consumed before `classifier_answer_file`. Empty
     /// means every call reads the answer file, which is the default.
     classifier_queue: PathBuf,
+    /// Present means every queued answer AFTER the first blocks until `naming_gate` appears. The
+    /// first call is the router's own scoring call and must never be held. The wait gives up after
+    /// two minutes so a forgotten release cannot wedge the suite; that bound is far outside any
+    /// scheduling delay, and expiring early can only fail a correct implementation, never pass a
+    /// broken one. This is what makes
+    /// "the job launched before the naming call finished" an assertion rather than a race: the
+    /// router cannot have waited for a call the test has not released yet.
+    naming_gate_armed: PathBuf,
+    naming_gate: PathBuf,
+    /// The claude job state file the rename writes, which is claude's own store of record for a
+    /// background job's name.
+    job_state: PathBuf,
 }
 
 /// The envelope `claude -p --output-format json` wraps the model's text in.
@@ -131,6 +148,13 @@ impl CliFixture {
         let spawn_log = root.path.join("claude.argv");
         let classifier_log = root.path.join("claude.-p.calls");
         let classifier_queue = root.path.join("classifier.queue");
+        let classifier_answers = root.path.join("claude.-p.answers");
+        let naming_gate_armed = root.path.join("naming.armed");
+        let naming_gate = root.path.join("naming.released");
+        // The job claude itself would have written for the short id the listing advertises. The
+        // rename is a read-modify-write of exactly this file, so it has to exist for the same
+        // reason a real job's does.
+        let job_state = home.join(".claude/jobs/claude exact id/state.json");
         // The model titles a job on both routes now, so that is the name the listing advertises
         // and the name the router matches its own spawn against to resolve a short id.
         let listed = listed.unwrap_or(classifier_name);
@@ -169,12 +193,21 @@ impl CliFixture {
                printf 'called\\n' >> {}\n\
                queue={}\n\
                if [ -s \"$queue\" ]; then\n\
+                 if [ -e {} ] && [ \"$(wc -l < {})\" -gt 1 ]; then\n\
+                   waited=0\n\
+                   while [ ! -e {} ] && [ \"$waited\" -lt 2400 ]; do\n\
+                     sleep 0.05\n\
+                     waited=$((waited+1))\n\
+                   done\n\
+                 fi\n\
                  IFS= read -r line < \"$queue\" || true\n\
                  tail -n +2 \"$queue\" > \"$queue.tmp\"\n\
                  mv \"$queue.tmp\" \"$queue\"\n\
+                 printf 'answered\\n' >> {}\n\
                  printf '%s\\n' \"$line\"\n\
                  exit 0\n\
                fi\n\
+               printf 'answered\\n' >> {}\n\
                cat {}\n\
                exit 0\n\
              fi\n\
@@ -182,6 +215,11 @@ impl CliFixture {
             shell_quote(&agents),
             shell_quote(&classifier_log.to_string_lossy()),
             shell_quote(&classifier_queue.to_string_lossy()),
+            shell_quote(&naming_gate_armed.to_string_lossy()),
+            shell_quote(&classifier_log.to_string_lossy()),
+            shell_quote(&naming_gate.to_string_lossy()),
+            shell_quote(&classifier_answers.to_string_lossy()),
+            shell_quote(&classifier_answers.to_string_lossy()),
             shell_quote(&classifier_answer_file.to_string_lossy()),
             shell_quote(&spawn_log.to_string_lossy())
         );
@@ -196,7 +234,100 @@ impl CliFixture {
             spawn_log,
             classifier_log,
             classifier_answer_file,
+            classifier_answers,
             classifier_queue,
+            naming_gate_armed,
+            naming_gate,
+            job_state,
+        }
+    }
+
+    /// Write the claude job state file for the short id the fake listing advertises, under the
+    /// name the job launched with, so a rename has claude's real store to act on.
+    fn launch_job_state(&self, name: &str) {
+        fs::create_dir_all(self.job_state.parent().expect("job dir")).expect("create job dir");
+        fs::write(
+            &self.job_state,
+            json!({
+                "name": name,
+                "nameSource": "auto",
+                "respawn": {"prompt": "the job's own respawn contract"}
+            })
+            .to_string(),
+        )
+        .expect("write job state");
+    }
+
+    /// The name claude's own store currently holds for the launched job.
+    fn provider_name(&self) -> String {
+        let state: Value = serde_json::from_str(
+            &fs::read_to_string(&self.job_state).expect("read the claude job state"),
+        )
+        .expect("job state is json");
+        state["name"].as_str().expect("a name field").to_string()
+    }
+
+    /// Hold every queued classifier answer until [`Self::release_naming`].
+    fn arm_naming_gate(&self) {
+        fs::write(&self.naming_gate_armed, "armed").expect("arm the naming gate");
+    }
+
+    fn release_naming(&self) {
+        fs::write(&self.naming_gate, "released").expect("release the naming gate");
+    }
+
+    /// The job name the decision row carries, which the worker updates only once the provider
+    /// took the new name.
+    fn logged_job_name(&self, log_id: i64) -> Option<String> {
+        let output = self
+            .router()
+            .arg("log")
+            .arg("--limit")
+            .arg("50")
+            .arg("--json")
+            .output()
+            .expect("read the decision log");
+        let rows: Value = serde_json::from_slice(&output.stdout).expect("log json");
+        rows.as_array()?
+            .iter()
+            .find(|row| row["id"].as_i64() == Some(log_id))?
+            .get("job_name")?
+            .as_str()
+            .map(str::to_string)
+    }
+
+    /// Everything the detached naming workers wrote, which is where a worker that skipped or
+    /// failed says so. Included in every naming assertion's failure message: without it a
+    /// disagreement about a name is invisible from outside the worker process.
+    fn naming_log(&self) -> String {
+        let dir = self.root.path.join("home/.local/state/agent-router/logs");
+        let Ok(entries) = fs::read_dir(&dir) else {
+            return format!("(no {} directory)", dir.display());
+        };
+        let mut text = String::new();
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with("naming-") {
+                text.push_str(&fs::read_to_string(entry.path()).unwrap_or_default());
+            }
+        }
+        text
+    }
+
+    /// Poll until `read` answers `expected`, so a test observes the detached worker's effect
+    /// rather than sleeping for a guessed interval.
+    fn wait_until<F: Fn() -> Option<String>>(&self, what: &str, expected: &str, read: F) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let seen = read();
+            if seen.as_deref() == Some(expected) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{what} never became {expected:?} (last saw {seen:?}); naming log: {}",
+                self.naming_log()
+            );
+            std::thread::sleep(Duration::from_millis(25));
         }
     }
 
@@ -242,6 +373,34 @@ impl CliFixture {
         fs::read_to_string(&self.classifier_log)
             .map(|log| log.lines().count())
             .unwrap_or(0)
+    }
+
+    /// How many prompts the fake claude has ANSWERED. A gated call is entered but unanswered, so
+    /// this is what distinguishes "the router did not wait for the title" from "the worker had not
+    /// got around to starting the call yet", which the entry count cannot.
+    fn classifier_answers(&self) -> usize {
+        fs::read_to_string(&self.classifier_answers)
+            .map(|log| log.lines().count())
+            .unwrap_or(0)
+    }
+
+    /// Block until a naming worker has written its terminal outcome, and return it.
+    ///
+    /// The worker's own last act, so anything asserted after this is asserted about a worker that
+    /// has finished, not one that has merely been observed starting a call.
+    fn wait_for_naming_outcome(&self) -> String {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let log = self.naming_log();
+            if log.contains("agent-router: naming ") {
+                return log;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no naming worker outcome was ever written (saw {log:?})"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
     }
 
     /// The router binary against this fixture's fake PATH, home, and decision log.
@@ -423,13 +582,26 @@ fn a_scored_title_that_omits_the_ticket_is_recovered_without_a_second_call() {
     );
 }
 
-/// A punctuated or unparseable scored title is not the last word: one title-only call still
-/// names the job when that call answers in contract.
+/// The whole asynchronous naming contract, observed from outside the router binary.
+///
+/// The scored title is unusable, so this job must launch under the derived name with NOTHING
+/// generative between classification and dispatch, and be renamed afterwards by a worker that
+/// outlives the router. The gate is what makes that an assertion rather than a race: the second
+/// classifier call cannot answer until this test releases it, which it does only after the router
+/// process has already exited.
 #[cfg(unix)]
 #[test]
-fn an_unusable_scored_title_retries_the_title_only_call() {
-    let recovered = "RS-123 Input Box Searching";
-    let fixture = CliFixture::listing_agent_named("retry-title", Some(recovered));
+fn a_job_launches_under_its_derived_name_and_is_renamed_after_the_router_exits() {
+    let generated = "RS-123 Input Box Searching";
+    // The listing must advertise the LAUNCH name: claude resolves the short id of the job
+    // it just spawned by matching that name, and it does so before any rename exists.
+    let fixture = CliFixture::listing_agent_named(
+        "async-naming",
+        Some(&short_job_name(
+            "/implement RS-123 rename background sessions",
+        )),
+    );
+    fixture.launch_job_state(&fixture.name);
     fixture.answers_sequence(&[
         &json!({
             "orchestration": false,
@@ -440,8 +612,10 @@ fn an_unusable_scored_title_retries_the_title_only_call() {
             "job_name": "Renaming: background, sessions!",
         })
         .to_string(),
-        &json!({ "job_name": recovered }).to_string(),
+        &json!({ "job_name": generated }).to_string(),
     ]);
+    fixture.arm_naming_gate();
+
     let output = fixture
         .run_command()
         .arg("--provider")
@@ -449,28 +623,160 @@ fn an_unusable_scored_title_retries_the_title_only_call() {
         .arg("--json")
         .output()
         .expect("run router");
+
     assert!(
         output.status.success(),
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let value: Value = serde_json::from_slice(&output.stdout).expect("router json");
-    assert_eq!(value["dispatch"]["job_name"], recovered);
-    assert_eq!(fixture.classifier_calls(), 2);
+    // The router has exited. The naming call is still blocked on the gate, so everything below is
+    // the state of the world with the job running and nothing named yet.
+    assert_eq!(
+        value["dispatch"]["job_name"], fixture.name,
+        "the launch must use the derived name, never wait for a generated one"
+    );
+    assert_eq!(
+        value["dispatch"]["job_id"], "claude exact id",
+        "the fixture listing must resolve the short id, or nothing below is under test"
+    );
+    assert_eq!(
+        value["naming_started"], true,
+        "an unnamed job must hand its title to a worker"
+    );
+    assert_eq!(
+        fixture.classifier_answers(),
+        1,
+        "the router returned while the naming answer was still gated, so it cannot have waited \
+         for it"
+    );
+    assert_eq!(
+        fixture.provider_name(),
+        fixture.name,
+        "claude's own store still holds the launch name at this point"
+    );
+
+    fixture.release_naming();
+
+    let log_id = value["log_id"].as_i64().expect("a decision row");
+    fixture.wait_until("the claude job state name", generated, || {
+        Some(fixture.provider_name())
+    });
+    fixture.wait_until("the decision row job name", generated, || {
+        fixture.logged_job_name(log_id)
+    });
+    assert_eq!(
+        fixture.classifier_answers(),
+        2,
+        "the title call is the worker's, and there is exactly one of it"
+    );
+    let state: Value =
+        serde_json::from_str(&fs::read_to_string(&fixture.job_state).expect("job state"))
+            .expect("job state json");
+    assert_eq!(
+        state["respawn"]["prompt"], "the job's own respawn contract",
+        "a rename must leave the rest of claude's job state intact"
+    );
+    assert_eq!(
+        state["nameSource"], "user",
+        "the generated title must outrank claude's own auto-titler"
+    );
 }
 
-/// The title is cosmetic, so a naming call that answers nothing usable even after the title-only
-/// retry must cost the job nothing: it dispatches under the derived name instead of failing or
-/// going unnamed.
+/// An explicitly named job is finished being named. No worker, no call, and claude's own store is
+/// never touched.
 #[cfg(unix)]
 #[test]
-fn an_unusable_title_leaves_an_explicit_job_on_its_derived_name() {
+fn an_explicit_name_is_preserved_and_starts_no_naming_worker() {
+    let fixture = CliFixture::listing_agent_named("explicit-name", Some("My Own Title"));
+    fixture.launch_job_state("My Own Title");
+    let output = fixture
+        .run_command()
+        .arg("--provider")
+        .arg("claude")
+        .arg("--name")
+        .arg("My Own Title")
+        .arg("--json")
+        .output()
+        .expect("run router");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("router json");
+    assert_eq!(value["dispatch"]["job_name"], "My Own Title");
+    assert_eq!(value["naming_started"], false);
+    assert_eq!(value["naming_skipped"], Value::Null);
+    assert_eq!(
+        fixture.classifier_calls(),
+        1,
+        "only the scoring call runs: an explicit name needs no title at all"
+    );
+    assert_eq!(fixture.provider_name(), "My Own Title");
+}
+
+/// A title the scoring call already produced is used as it stands. Asking a second model for a
+/// title it already paid for would be the one thing this whole path exists to avoid.
+#[cfg(unix)]
+#[test]
+fn a_usable_scored_title_names_the_job_at_launch_and_starts_no_worker() {
+    let fixture = CliFixture::listing_agent_named("scored-title", None);
+    fixture.launch_job_state(&fixture.classifier_name);
+    let output = fixture
+        .run_command()
+        .arg("--provider")
+        .arg("claude")
+        .arg("--json")
+        .output()
+        .expect("run router");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("router json");
+    assert_eq!(value["dispatch"]["job_name"], fixture.classifier_name);
+    assert_eq!(value["naming_started"], false);
+    assert_eq!(
+        fixture.classifier_calls(),
+        1,
+        "the scoring call already carried the title"
+    );
+}
+
+/// A naming call that answers nothing usable costs the job nothing: it keeps running under the
+/// name it launched with, the worker reports a skip, and nothing is renamed.
+#[cfg(unix)]
+#[test]
+fn an_unusable_generated_title_leaves_the_job_running_on_its_launch_name() {
     for answer in [
         "I cannot name this task.",
         r#"{"job_name":"Renaming: background, sessions!"}"#,
     ] {
-        let fixture = CliFixture::listing_agent_named("unusable-title", None);
-        fixture.answers_with(answer);
+        // The listing must advertise the LAUNCH name: claude resolves the short id of the job
+        // it just spawned by matching that name, and it does so before any rename exists.
+        let fixture = CliFixture::listing_agent_named(
+            "unusable-title",
+            Some(&short_job_name(
+                "/implement RS-123 rename background sessions",
+            )),
+        );
+        fixture.launch_job_state(&fixture.name);
+        fixture.answers_sequence(&[
+            &json!({
+                "orchestration": false,
+                "missing_connector": false,
+                "complexity": "medium",
+                "task_context_horizon": "ordinary",
+                "rationale": "fixture scored",
+                "job_name": "Renaming: background, sessions!",
+            })
+            .to_string(),
+            answer,
+        ]);
         let output = fixture
             .run_command()
             .arg("--provider")
@@ -478,9 +784,10 @@ fn an_unusable_title_leaves_an_explicit_job_on_its_derived_name() {
             .arg("--json")
             .output()
             .expect("run router");
+
         assert!(
             output.status.success(),
-            "answer {answer:?} stderr: {}",
+            "answer {answer:?} must not fail the dispatch, stderr: {}",
             String::from_utf8_lossy(&output.stderr)
         );
         let value: Value = serde_json::from_slice(&output.stdout).expect("router json");
@@ -488,12 +795,88 @@ fn an_unusable_title_leaves_an_explicit_job_on_its_derived_name() {
             value["dispatch"]["job_name"], fixture.name,
             "answer {answer:?} must leave the derived name in place"
         );
+        assert_eq!(value["naming_started"], true);
+        let outcome = fixture.wait_for_naming_outcome();
+        assert!(
+            outcome.contains("skipped: the naming model returned no usable title"),
+            "answer {answer:?} must be reported as a skip, not a failure: {outcome}"
+        );
+        // The worker has finished, so the name it left behind is final.
         assert_eq!(
-            fixture.classifier_calls(),
+            fixture.provider_name(),
+            fixture.name,
+            "answer {answer:?} must leave claude's own store untouched"
+        );
+        assert_eq!(
+            fixture.classifier_answers(),
             2,
-            "answer {answer:?} must retry the title-only call before the derived name"
+            "answer {answer:?} must be one naming call, not a retry loop"
         );
     }
+}
+
+/// A name a person set between launch and naming outranks a generated one. The guard reads
+/// claude's own store, which is the same file the rename would write.
+#[cfg(unix)]
+#[test]
+fn a_manual_rename_made_before_the_worker_runs_is_kept() {
+    // The listing must advertise the LAUNCH name: claude resolves the short id of the job
+    // it just spawned by matching that name, and it does so before any rename exists.
+    let fixture = CliFixture::listing_agent_named(
+        "manual-rename",
+        Some(&short_job_name(
+            "/implement RS-123 rename background sessions",
+        )),
+    );
+    fixture.launch_job_state(&fixture.name);
+    fixture.answers_sequence(&[
+        &json!({
+            "orchestration": false,
+            "missing_connector": false,
+            "complexity": "medium",
+            "task_context_horizon": "ordinary",
+            "rationale": "fixture scored",
+            "job_name": "Renaming: background, sessions!",
+        })
+        .to_string(),
+        &json!({ "job_name": "RS-123 Input Box Searching" }).to_string(),
+    ]);
+    fixture.arm_naming_gate();
+
+    let output = fixture
+        .run_command()
+        .arg("--provider")
+        .arg("claude")
+        .arg("--json")
+        .output()
+        .expect("run router");
+    assert!(output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).expect("router json");
+    assert_eq!(value["naming_started"], true);
+
+    // The human rename, made while the worker is still waiting on its title.
+    fixture.launch_job_state("A Name Brian Chose");
+    fixture.release_naming();
+
+    // The worker's own terminal outcome, not a call count: the assertions below are about what a
+    // FINISHED worker did, and a worker merely observed entering its call could still write.
+    let outcome = fixture.wait_for_naming_outcome();
+    assert!(
+        outcome.contains("a manual rename was kept"),
+        "the worker must report the kept name: {outcome}"
+    );
+    let log_id = value["log_id"].as_i64().expect("a decision row");
+    assert_eq!(
+        fixture.provider_name(),
+        "A Name Brian Chose",
+        "a name a person set outranks a generated one"
+    );
+    assert_eq!(
+        fixture.logged_job_name(log_id).as_deref(),
+        Some(fixture.name.as_str()),
+        "a kept manual rename leaves the decision row on the launch name: the row records the \
+         name the router chose, and the router chose nothing here"
+    );
 }
 
 /// A dry run dispatches nothing, but a provider only pin still needs classification for its model

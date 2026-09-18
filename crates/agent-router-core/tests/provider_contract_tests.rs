@@ -1399,3 +1399,102 @@ fn mcp_scoping_on_a_non_claude_decision_fails_before_any_provider_work() {
         );
     }
 }
+
+/// The asynchronous namer's Codex path: read the thread's current name, then set the new one.
+///
+/// The read is not decoration. It is the only thing standing between a generated title and a name
+/// somebody typed, and Codex is one of the two providers that can answer the question at all.
+#[test]
+fn codex_rename_reads_the_current_thread_name_before_setting_a_new_one() {
+    let mut rpc = ScriptedRpc::with_replies(vec![
+        Ok(
+            r#"{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread named","name":"Rename Background Sessions"}}}"#
+                .to_string(),
+        ),
+        Ok(r#"{"jsonrpc":"2.0","id":3,"result":{}}"#.to_string()),
+    ]);
+
+    let renamed = agent_router_core::dispatch::codex::rename_thread_on_rpc(
+        &mut rpc,
+        "thread named",
+        "Rename Background Sessions",
+        "RS-123 Input Box Searching",
+    )
+    .expect("a thread still carrying its launch name is renameable");
+
+    assert!(renamed);
+    assert_eq!(rpc.requests[0]["method"], "thread/read");
+    assert_eq!(rpc.requests[1]["method"], "thread/name/set");
+    assert_eq!(rpc.requests[1]["params"]["threadId"], "thread named");
+    assert_eq!(
+        rpc.requests[1]["params"]["name"],
+        "RS-123 Input Box Searching"
+    );
+}
+
+#[test]
+fn codex_rename_keeps_a_name_that_is_neither_the_launch_name_nor_the_new_one() {
+    let mut rpc = ScriptedRpc::with_replies(vec![Ok(
+        r#"{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread named","name":"A Name Brian Chose"}}}"#
+            .to_string(),
+    )]);
+
+    let renamed = agent_router_core::dispatch::codex::rename_thread_on_rpc(
+        &mut rpc,
+        "thread named",
+        "Rename Background Sessions",
+        "RS-123 Input Box Searching",
+    )
+    .expect("keeping a name is not an error");
+
+    assert!(!renamed, "a manual rename outranks a generated title");
+    assert_eq!(
+        rpc.requests.len(),
+        1,
+        "nothing may be written once the read says a person named it"
+    );
+}
+
+/// A daemon that reports no name has not told us the name is unchanged, and it has not told us a
+/// person changed it either. Refusing to name the job on that silence would leave a Jev-scored
+/// codex job stuck on its derived name forever, so the rename proceeds.
+#[test]
+fn codex_rename_proceeds_when_the_daemon_reports_no_name_at_all() {
+    let mut rpc = ScriptedRpc::with_replies(vec![
+        Ok(r#"{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread named"}}}"#.to_string()),
+        Ok(r#"{"jsonrpc":"2.0","id":3,"result":{}}"#.to_string()),
+    ]);
+
+    let renamed = agent_router_core::dispatch::codex::rename_thread_on_rpc(
+        &mut rpc,
+        "thread named",
+        "Rename Background Sessions",
+        "RS-123 Input Box Searching",
+    )
+    .expect("an unreadable name is not a refusal");
+
+    assert!(renamed);
+}
+
+/// A rejected `thread/name/set` must not be reported as a rename: the decision row would then
+/// carry a name the thread never took, which is exactly the disagreement this path exists to stop.
+#[test]
+fn codex_rename_reports_a_rejected_set_as_a_failure() {
+    let mut rpc = ScriptedRpc::with_replies(vec![
+        Ok(r#"{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread named"}}}"#.to_string()),
+        Ok(
+            r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"unknown thread"}}"#
+                .to_string(),
+        ),
+    ]);
+
+    let error = agent_router_core::dispatch::codex::rename_thread_on_rpc(
+        &mut rpc,
+        "thread named",
+        "Rename Background Sessions",
+        "RS-123 Input Box Searching",
+    )
+    .expect_err("a refused set is a failed rename");
+
+    assert!(error.to_string().contains("thread/name/set"), "{error}");
+}

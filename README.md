@@ -31,18 +31,18 @@ log: row 87 in /home/you/.local/state/agent-router/router.db
    `CLAUDE.md`, `AGENTS.md`, skill, plugin, hook, or MCP server can shift the score. The Codex
    engine additionally runs with its shell, browser, computer use, image, app, and skill search
    tools disabled: scoring needs no tool, and a task carrying an injected instruction must have
-   nothing to reach for. The Jev engine is one TypeSafe HTTP call with no CLI; titles on that path
-   are `short_job_name`. If the call fails or times out, automatic capacity routing still selects
-   between Codex and Grok and the decision is tagged `classifier_failed`. The Claude and Codex engines also generate
-   the job title. A ticket ID leads the title, followed by two to six concise Title Case words, such
-   as `GH-123 Sprint 2 Bug Fixes` or `RS-123 Input Box Searching`. A title that forgot the ticket
-   still keeps the model's words, with the ticket prepended. An unusable scored title (punctuation,
-   wrong length, unparseable) gets one dedicated title-only call before the last-ditch prompt
-   prefix. The routing classifier runs whenever provider, model, or effort is omitted for Claude or
-   Codex. An explicit Claude or Codex provider therefore pins only the provider: omitted model and
-   effort values still come from classification. Grok skips cross-provider classification;
-   job naming remains a separate title call when a name was not supplied and dispatch is not a dry
-   run.
+   nothing to reach for. The Jev engine is one TypeSafe HTTP call with no CLI and writes no
+   prose, so it names nothing. If the call fails or times out, automatic capacity routing still
+   selects between Codex and Grok and the decision is tagged `classifier_failed`. The Claude and
+   Codex engines also generate the job title on that same call. A ticket ID leads the title,
+   followed by two to six concise Title Case words, such as `GH-123 Sprint 2 Bug Fixes` or
+   `RS-123 Input Box Searching`. A title that forgot the ticket still keeps the model's words, with
+   the ticket prepended. When the scored title is unusable, or the engine writes none, the job
+   launches under the name derived from the task and is renamed afterwards; see
+   [Asynchronous session naming](#asynchronous-session-naming). The routing classifier runs
+   whenever provider, model, or effort is omitted for Claude or Codex. An explicit Claude or Codex
+   provider therefore pins only the provider: omitted model and effort values still come from
+   classification. Grok skips cross-provider classification.
 2. **Apply capability gates.** A task needing several agents to exchange findings mid-run or a
    build-tier `/implement` run (`implement_context_window`) pins to Claude regardless of usage.
    A missing connector is different: provider-specific inventories are checked first. Codex MCP
@@ -188,7 +188,7 @@ agent-router run "Fix the failing test" --dir ~/git/other-project
 | `--provider <NAME>` | `auto` | `auto` classifies the task, balances ordinary work between Codex and Grok, and pins Claude for capability needs. An explicit provider pins it. |
 | `--model <NAME>` | tier table | Model pin. Requires an explicit `--provider`. With explicit Claude or Codex and no effort, classification fills effort. Pairing it with `--provider auto` is rejected. An explicit Grok model reaches the public lifecycle unchanged. |
 | `--effort <NAME>` | complexity ladder | Effort pin. Requires an explicit provider and model. Derived Codex and Claude effort is high, medium, low, or high for low, medium, high, or ultra complexity respectively. Grok rejects this flag. |
-| `--name <NAME>` | the model's title, recovered if it omitted a ticket, or one title-only retry; three to five words derived from the task only if both fail | Name for the dispatched job. Supplying it skips the naming call. It reaches the `claude --bg --name` argv verbatim, names the Codex thread, and is recorded as `job_name` in the decision log for every provider, so callers that reconcile inflight jobs by exact name depend on it. An empty or whitespace only name is rejected. |
+| `--name <NAME>` | the model's title, recovered if it omitted a ticket; otherwise three to five words derived from the task, replaced after launch by [asynchronous naming](#asynchronous-session-naming) | Name for the dispatched job. Supplying it skips naming entirely, before and after launch. It reaches the `claude --bg --name` argv verbatim, names the Codex thread, and is recorded as `job_name` in the decision log for every provider, so callers that reconcile inflight jobs by exact name depend on it. An empty or whitespace only name is rejected. |
 | `--dry-run` | off | Decide and log, dispatch nothing, and project the weekly draw the job is likely to cost on the provider it landed on. |
 | `--mcp-config <PATH>` | none | MCP config file for the dispatched Claude job. Repeatable. Rejected for every other provider, including Grok, and the check runs after routing, so pairing it with `--provider auto` fails whenever classification lands on a provider other than Claude. |
 | `--strict-mcp-config` | off | Use only the `--mcp-config` files and drop every inherited MCP server. See the warning below before using it. |
@@ -641,6 +641,44 @@ rationale even when the classifier left `missing_connector` false. A miss is ref
 only when no provider establishes the named capability.
 
 See [docs/configuration.md](docs/configuration.md) for the full reference.
+
+## Asynchronous session naming
+
+A good session title needs a generative model, and that call is far slower than the launch it would
+otherwise sit in front of. No naming call is ever on the dispatch path.
+
+A job launches under the best name already in hand: the one supplied with `--name`, else the title
+the scoring call returned alongside its four routing scores, else the name derived from the task
+text. When that last case is what happened, the router spawns a detached `setsid` worker after the
+dispatch and returns immediately. `run --json` reports this as `naming_started`.
+
+The worker makes ONE title-only call through `classifier.naming_engine`, renames the exact launched
+session by the identity the dispatch resolved, and then updates `job_name` on that decision row. It
+outlives the router process, which has usually printed its result and exited before the title
+arrives.
+
+The row is only written once the provider has taken the name, so a job never carries a title the
+session does not have. The two can still differ in two ways, and both are written to the naming
+log rather than hidden: a row update that fails after a successful rename leaves the row on the
+launch name, and a kept manual rename leaves it there too. The row records the name the router
+chose, and where a person renamed the session the router chose nothing.
+
+Naming is cosmetic and the job is already running, so nothing the worker does can fail, stop, or
+relaunch it. Every outcome is written to `~/.local/state/agent-router/logs/naming-*.log`.
+
+| Provider | Rename mechanism | Identity | Detects a manual rename |
+| --- | --- | --- | --- |
+| Claude | A read-modify-write of `~/.claude/jobs/<short-id>/state.json`, setting `name`, `nameSource: "user"`, and `updatedAt` through Agent Viewer's `replace_atomic`, with the same fields and semantics as its own `ClaudeBackend::rename`. One read serves the guard and the write, so the name compared is the name overwritten. | The short id the dispatch resolved by matching the launch name in `claude agents --json`. A job whose short id never resolved is not renamed: it could only be found by the field being changed. | Yes, from that same file |
+| Codex | `thread/name/set` over the app-server daemon socket, the transport the dispatch itself used | Thread id | Yes, when `thread/read` reports a name |
+| Grok | Agent Viewer's `GrokLifecycle::rename`, an `x.ai/session/rename` call | Session id | No: the RPC reports success and nothing else, and Grok is Linux only |
+
+Where a manual rename is detectable, a name that is neither the launch name nor the generated one
+is somebody's own and is kept.
+
+For Claude the guard and the write share one read of `state.json`, so the name compared is the name
+overwritten. That narrows the window rather than closing it: claude's own worker writes that file
+while the job runs and its format offers no compare-and-swap, so a write landing in between is
+lost. Agent Viewer's own rename accepts the same race against the same writer.
 
 ## State on disk
 

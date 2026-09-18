@@ -71,6 +71,13 @@ pub struct Classifier {
     pub codex_model: String,
     /// The TypeSafe model used when `engine = "jev"`. Version-pinned, not an alias.
     pub jev_model: String,
+    /// Which engine writes the asynchronous session title after a job has launched.
+    ///
+    /// Separate from `engine` because the two calls answer different questions and one engine
+    /// cannot do both: Jev scores a fixed rubric and writes no prose, so a box scoring with Jev
+    /// still needs a small generative model to name its jobs. `Jev` here is read as "no engine
+    /// can name" and is normalized to the default by [`Classifier::naming`].
+    pub naming_engine: ClassifierEngine,
 }
 
 impl Default for Classifier {
@@ -80,6 +87,7 @@ impl Default for Classifier {
             claude_model: "haiku".to_string(),
             codex_model: "gpt-5.6-luna".to_string(),
             jev_model: "jev-1.13.0".to_string(),
+            naming_engine: ClassifierEngine::Claude,
         }
     }
 }
@@ -91,6 +99,26 @@ impl Classifier {
             ClassifierEngine::Claude => &self.claude_model,
             ClassifierEngine::Codex => &self.codex_model,
             ClassifierEngine::Jev => &self.jev_model,
+        }
+    }
+
+    /// PURE: this classifier, rewritten to the engine that writes session titles.
+    ///
+    /// Returned as a whole `Classifier` so the naming call reuses `classifier_command_in`
+    /// unchanged: the command builder reads `engine` and `model()` off one value, and a second
+    /// builder taking a loose engine/model pair is how the two drift.
+    ///
+    /// Jev is normalized away rather than honoured. It has no title prompt at all, so a config
+    /// naming it would silently disable naming instead of failing, and an operator reading
+    /// `naming_engine = "jev"` back would have no way to tell.
+    pub fn naming(&self) -> Classifier {
+        let engine = match self.naming_engine {
+            ClassifierEngine::Jev => Classifier::default().naming_engine,
+            engine => engine,
+        };
+        Classifier {
+            engine,
+            ..self.clone()
         }
     }
 }
@@ -987,5 +1015,33 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "hard_ceiling_pct = \"ninety\"\n").expect("write");
         assert!(Config::load_from(&path).is_err());
+    }
+
+    /// Naming must never fall back to Jev. Jev has no title prompt at all, so honouring it would
+    /// silently disable naming on exactly the boxes that need it most: a Jev-scored job never gets
+    /// a title from its scoring call.
+    #[test]
+    fn a_jev_naming_engine_is_normalized_to_a_generative_one() {
+        let classifier = Classifier {
+            engine: ClassifierEngine::Jev,
+            naming_engine: ClassifierEngine::Jev,
+            ..Classifier::default()
+        };
+        let naming = classifier.naming();
+        assert_eq!(naming.engine, ClassifierEngine::Claude);
+        assert_eq!(naming.model(), "haiku");
+    }
+
+    /// The naming engine takes its OWN engine's model. Pairing one engine with another's model is
+    /// how a naming call starts failing for a reason nobody can read off the config.
+    #[test]
+    fn the_naming_engine_scores_with_its_own_configured_model() {
+        let classifier = Classifier {
+            engine: ClassifierEngine::Claude,
+            naming_engine: ClassifierEngine::Codex,
+            ..Classifier::default()
+        };
+        assert_eq!(classifier.model(), "haiku");
+        assert_eq!(classifier.naming().model(), "gpt-5.6-luna");
     }
 }

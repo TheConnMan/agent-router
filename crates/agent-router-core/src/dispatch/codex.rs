@@ -163,6 +163,74 @@ fn read_field(line: &str, expected_id: i64, pointer: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// PURE: the name the app-server reports for a thread, when `thread/read` carries one.
+///
+/// None covers both "the daemon answered without a name" and "the reply was an error or another
+/// shape". The caller treats that as "cannot tell", never as "the name is empty", because the
+/// difference decides whether a later manual rename is silently overwritten.
+pub fn parse_thread_name(line: &str, expected_id: i64) -> Option<String> {
+    read_field(line, expected_id, "/result/thread/name")
+}
+
+/// IMPURE only in the RPC it is handed: read the current name, then set the new one.
+///
+/// `expected` is the name the router launched the thread with. When the daemon reports a name that
+/// is neither that nor already the new one, somebody renamed the thread in between and this
+/// returns `Ok(false)` without writing: a person's own title outranks a generated one. A daemon
+/// that reports no name at all is unreadable rather than changed, so the rename proceeds; Codex is
+/// the only provider that can answer this question at all.
+pub fn rename_thread_on_rpc(
+    rpc: &mut impl CodexRpc,
+    thread_id: &str,
+    expected: &str,
+    name: &str,
+) -> Result<bool> {
+    let current = rpc
+        .request(2, &thread_read_request(2, thread_id))
+        .ok()
+        .and_then(|line| parse_thread_name(&line, 2));
+    if let Some(current) = current
+        && current != expected
+        && current != name
+    {
+        return Ok(false);
+    }
+    let response = rpc.request(3, &thread_set_name_request(3, thread_id, name))?;
+    // The app-server answers a rejected set with a JSON-RPC error on the same id. Reporting that
+    // as a rename would put a name in the decision row that the thread never took.
+    let value: serde_json::Value = serde_json::from_str(&response)?;
+    if value.get("error").is_some_and(|error| !error.is_null()) {
+        return Err(Error::Command(format!(
+            "app-server thread/name/set failed: {response}"
+        )));
+    }
+    Ok(true)
+}
+
+/// IMPURE: rename an already running thread through the daemon the dispatch used.
+///
+/// Probes for a daemon and never starts one: the thread being renamed was started by a daemon that
+/// is still up, and starting one here would be the naming path creating provider state.
+pub fn rename_thread(ctx: &Context, thread_id: &str, expected: &str, name: &str) -> Result<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        let Some(daemon) = probe_daemon(ctx) else {
+            return Err(Error::Command(
+                "no codex app-server daemon answered, so the thread cannot be renamed".to_string(),
+            ));
+        };
+        let mut client = Client::connect(&daemon)?;
+        rename_thread_on_rpc(&mut client, thread_id, expected, name)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (ctx, thread_id, expected, name);
+        Err(Error::Command(
+            "codex app-server daemon transport is unavailable on this platform".to_string(),
+        ))
+    }
+}
+
 /// IMPURE: what the app-server knows about each thread, one `thread/read` apiece.
 ///
 /// This probes for a daemon and never starts one: a command reporting on jobs that already exist
