@@ -3,7 +3,7 @@
 use agent_router_core::binary::Environment;
 use agent_router_core::classify::{
     Classification, Complexity, SystemOneTransport, TaskContextHorizon,
-    classify_jev_with_transport, compose_jev, jev_questions, job_name, questions_carry_anti_halo,
+    classify_jev_with_transport, compose_jev, jev_questions, questions_carry_anti_halo,
 };
 use agent_router_core::config::{ClassifierEngine, Config};
 use agent_router_core::context::Context;
@@ -363,13 +363,27 @@ fn canned_success_goes_through_the_entry_point() {
     assert!(!scored.classification.orchestration);
     assert!(!scored.classification.missing_connector);
     assert_eq!(scored.classification.complexity, Complexity::Low);
-    assert!(scored.job_name.is_some());
+    assert_eq!(
+        scored.job_name, None,
+        "Jev writes no prose, so a scored task is left for the asynchronous namer to title"
+    );
 }
 
+/// Jev names nothing, on every path, including its failure paths. A derived title returned here
+/// would read as "this job has been named" and suppress the naming worker on every Jev-scored job,
+/// which is the whole population this box's asynchronous naming exists for.
 #[test]
-fn jev_job_name_is_heuristic_without_a_cli() {
+fn jev_never_returns_a_title_of_its_own() {
     let root = tempfile::tempdir().expect("tempdir");
     let ctx = jev_ctx(root.path());
-    let name = job_name(&ctx, "audit the scheduler").expect("named");
-    assert_eq!(name, "Audit The Scheduler");
+    let unkeyed = classify_jev_with_transport(
+        &ctx,
+        "audit the scheduler",
+        None,
+        &FakeTransport {
+            result: Err("no transport".to_string()),
+        },
+    );
+    assert_eq!(unkeyed.job_name, None);
+    assert!(unkeyed.classification.classifier_failed);
 }

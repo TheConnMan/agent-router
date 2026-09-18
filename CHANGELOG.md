@@ -15,6 +15,9 @@ workspace `package.version` stamped on every decision-log row.
 - Add `[classifier] naming_engine`, default `"claude"`. Jev scores but writes no prose, so the
   engine that names is chosen separately from the engine that scores; `"jev"` normalizes to the
   default.
+- The Jev engine no longer returns a derived title of its own. It writes no prose, and returning the
+  derived name read as "this job has been named", which would have suppressed the naming worker on
+  every Jev-scored job. The launch name is unchanged; the title now arrives after launch.
 - `run --json` gains `naming_started` and `naming_skipped`. Naming never fails, stops, or relaunches
   a job; every outcome lands in `~/.local/state/agent-router/logs/naming-*.log`.
 
