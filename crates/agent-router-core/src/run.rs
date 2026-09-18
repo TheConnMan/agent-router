@@ -386,7 +386,17 @@ where
     // After the dispatch, after the row: the worker renames a session that provably launched and
     // keeps a row that provably exists in step with it. It is detached, so this returns as soon as
     // it is spawned and the naming outlives this process.
-    let (naming_started, naming_skipped) = if wants_async_name && spawn_naming_worker {
+    let (naming_started, naming_skipped) = if wants_async_name && dispatch.job_id.is_none() {
+        // A model call would be paid for and then thrown away: with no resolved identity the
+        // worker could only find the session by the very field it is trying to change.
+        (
+            false,
+            Some(format!(
+                "{} dispatch resolved no job id, so there is no session to rename",
+                decision.provider.name()
+            )),
+        )
+    } else if wants_async_name && spawn_naming_worker {
         let job = crate::naming::NameJob {
             provider: decision.provider,
             job_id: dispatch.job_id.clone(),

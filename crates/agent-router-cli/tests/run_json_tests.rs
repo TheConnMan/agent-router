@@ -595,6 +595,10 @@ fn a_job_launches_under_its_derived_name_and_is_renamed_after_the_router_exits()
         "the launch must use the derived name, never wait for a generated one"
     );
     assert_eq!(
+        value["dispatch"]["job_id"], "claude exact id",
+        "the fixture listing must resolve the short id, or nothing below is under test"
+    );
+    assert_eq!(
         value["naming_started"], true,
         "an unnamed job must hand its title to a worker"
     );
