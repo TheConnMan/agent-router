@@ -752,9 +752,18 @@ fn a_usable_scored_title_names_the_job_at_launch_and_starts_no_worker() {
 #[cfg(unix)]
 #[test]
 fn an_unusable_generated_title_leaves_the_job_running_on_its_launch_name() {
-    for answer in [
-        "I cannot name this task.",
-        r#"{"job_name":"Renaming: background, sessions!"}"#,
+    // Each answer fails at a DIFFERENT stage, and the naming log must say which. One sentence
+    // covering every fault is what made the first real job to hit this impossible to diagnose
+    // without rebuilding the binary.
+    for (answer, expected) in [
+        (
+            "I cannot name this task.",
+            "answered without a job_name field",
+        ),
+        (
+            r#"{"job_name":"Renaming: background, sessions!"}"#,
+            "answered \"Renaming: background, sessions!\", which is not a usable title",
+        ),
     ] {
         // The listing must advertise the LAUNCH name: claude resolves the short id of the job
         // it just spawned by matching that name, and it does so before any rename exists.
@@ -798,8 +807,9 @@ fn an_unusable_generated_title_leaves_the_job_running_on_its_launch_name() {
         assert_eq!(value["naming_started"], true);
         let outcome = fixture.wait_for_naming_outcome();
         assert!(
-            outcome.contains("skipped: the naming model returned no usable title"),
-            "answer {answer:?} must be reported as a skip, not a failure: {outcome}"
+            outcome.contains(expected),
+            "answer {answer:?} must be reported as a skip naming its own stage \
+             ({expected:?}), not a failure: {outcome}"
         );
         // The worker has finished, so the name it left behind is final.
         assert_eq!(

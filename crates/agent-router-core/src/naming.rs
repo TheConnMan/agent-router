@@ -84,10 +84,14 @@ pub fn name_job(ctx: &Context, job: &NameJob) -> Naming {
     // scoring call already had its chance to return a title; a worker only exists because it did
     // not, and a second failure is a title this box cannot generate today, not a flake worth
     // paying for twice.
-    let Some(name) =
-        crate::classify::job_name_with(ctx, &job.task, &ctx.config.classifier.naming())
-    else {
-        return Naming::Skipped("the naming model returned no usable title".to_string());
+    //
+    // The failure is carried through whole. A worker that logged only "no usable title" hid a
+    // refused title, a timeout, and an unlaunchable CLI behind one sentence, and the first real job
+    // to hit it could not be diagnosed without rebuilding the binary.
+    let name = match crate::classify::job_name_with(ctx, &job.task, &ctx.config.classifier.naming())
+    {
+        Ok(name) => name,
+        Err(failure) => return Naming::Skipped(failure.describe()),
     };
     if name == job.launch_name {
         return Naming::Skipped("the generated title matches the launch name".to_string());

@@ -11,8 +11,8 @@ use agent_router_core::Context;
 use agent_router_core::Provider;
 use agent_router_core::binary::{CLAUDE_BIN_ENV, CODEX_BIN_ENV, Environment};
 use agent_router_core::classify::{
-    Classification, Complexity, TaskContextHorizon, classify, classify_with_name, job_name_with,
-    parse_classification, parse_classifier_output_with_name,
+    Classification, Complexity, TaskContextHorizon, TitleFailure, classify, classify_with_name,
+    job_name_with, parse_classification, parse_classifier_output_with_name,
 };
 use agent_router_core::config::{ClassifierEngine, Config};
 use std::collections::BTreeMap;
@@ -220,14 +220,18 @@ fn job_name_returns_none_when_the_naming_engine_cannot_be_launched() {
         config_on(ClassifierEngine::Codex),
     );
 
-    assert_eq!(
-        job_name_with(
-            &context,
-            "GH-123 audit the airtable records",
-            &context.config.classifier,
-        ),
-        None,
-        "a job that cannot be named still dispatches"
+    let failure = job_name_with(
+        &context,
+        "GH-123 audit the airtable records",
+        &context.config.classifier,
+    )
+    .expect_err("a job that cannot be named still dispatches");
+
+    // The stage matters, not just the absence of a title: an unlaunchable CLI and a refused title
+    // are different faults, and the naming log is the only place either is ever read.
+    assert!(
+        matches!(&failure, TitleFailure::NotLaunched(_)),
+        "{failure:?}"
     );
 }
 
