@@ -31,8 +31,10 @@ pub struct NameJob {
 /// What one naming attempt did. Every variant is a normal outcome; none of them is a job failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Naming {
-    /// The provider took the name, and the decision row was updated when there was one.
-    Renamed { name: String, row_updated: bool },
+    /// The provider took the name. `row` says what became of the decision row, which is a
+    /// separate question: the job is correctly named either way, but a row left on the launch name
+    /// is a disagreement somebody may have to repair by hand, so it is never silently dropped.
+    Renamed { name: String, row: Row },
     /// Nothing was renamed, for a reason that is not an error: no usable title, no job id, or a
     /// name a person changed in the meantime.
     Skipped(String),
@@ -40,14 +42,27 @@ pub enum Naming {
     Failed(String),
 }
 
+/// What became of the decision row after the provider took the new name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Row {
+    Updated,
+    /// There was no row to update: the dispatch could not write one, or it has since gone.
+    Absent,
+    /// The row could not be written. Carried verbatim, because this is the one outcome where the
+    /// decision log and the provider disagree and the reason is the whole diagnosis.
+    Failed(String),
+}
+
 impl Naming {
     pub fn describe(&self) -> String {
         match self {
-            Naming::Renamed { name, row_updated } => {
-                let row = if *row_updated {
-                    "decision row updated"
-                } else {
-                    "no decision row updated"
+            Naming::Renamed { name, row } => {
+                let row = match row {
+                    Row::Updated => "decision row updated".to_string(),
+                    Row::Absent => "no decision row to update".to_string(),
+                    Row::Failed(error) => format!(
+                        "DECISION ROW NOT UPDATED, it still carries the launch name: {error}"
+                    ),
                 };
                 format!("renamed to {name:?} ({row})")
             }
@@ -83,14 +98,37 @@ pub fn name_job(ctx: &Context, job: &NameJob) -> Naming {
             job.provider.name()
         )),
         Ok(true) => {
-            let row_updated = job.log_id.is_some_and(|id| {
-                crate::log::DecisionLog::open_in(&ctx.home)
-                    .and_then(|log| log.rename_job(id, &name))
-                    .unwrap_or(false)
-            });
-            Naming::Renamed { name, row_updated }
+            let row = match job.log_id {
+                None => Row::Absent,
+                Some(id) => record_rename(ctx, id, &name),
+            };
+            Naming::Renamed { name, row }
         }
         Err(error) => Naming::Failed(error.to_string()),
+    }
+}
+
+/// IMPURE: put the new name on the decision row, retried once.
+///
+/// The provider has already taken the name by the time this runs, so a failure here cannot be
+/// undone by failing: it leaves the row and the session disagreeing, and the only useful thing to
+/// do with it is say so. `rusqlite` already waits out a busy database, so the single retry is for
+/// the writer that was still holding the lock when that wait expired, and there is no second one:
+/// naming is bounded work on a job that is already running.
+fn record_rename(ctx: &Context, log_id: i64, name: &str) -> Row {
+    let attempt =
+        || crate::log::DecisionLog::open_in(&ctx.home).and_then(|log| log.rename_job(log_id, name));
+    let result = match attempt() {
+        Err(_) => {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            attempt()
+        }
+        settled => settled,
+    };
+    match result {
+        Ok(true) => Row::Updated,
+        Ok(false) => Row::Absent,
+        Err(error) => Row::Failed(error.to_string()),
     }
 }
 
@@ -134,63 +172,51 @@ pub fn claude_jobs_root(home: &Path) -> PathBuf {
 
 /// IMPURE: Claude's rename, which is a read-modify-write of the job's `state.json`.
 ///
-/// The guard reads that same file first. Claude stamps `nameSource` on every write, and Agent
-/// Viewer's writer sets it to `user` exactly so Claude's own auto-titler leaves the name alone, so
-/// a name that is neither the launch name nor the new one is somebody's deliberate rename.
+/// ONE read serves both the guard and the mutation, deliberately. Reading the file to decide
+/// whether to rename and then handing the job to a writer that reads it again would let a rename
+/// made in that window be read as ours and overwritten: the guard would be checking bytes the
+/// write never saw. Here the name that is compared and the object that is written are the same
+/// parse.
 ///
-/// The write itself is `ClaudeBackend::rename`, not a local copy of it: that writer preserves the
-/// job's respawn contract, stamps `nameSource` and `updatedAt`, and writes atomically, and a second
-/// implementation of it here is how this file and Claude's format drift apart.
+/// That narrows the window; it does not close it. Claude's own worker writes this file while the
+/// job runs, and nothing in claude's format offers a compare-and-swap, so a write landing between
+/// this read and `replace_atomic` is lost. Agent Viewer's own rename accepts exactly this race, for
+/// the same reason and against the same writer.
+///
+/// The three fields are the ones Agent Viewer's writer sets, for the reasons it gives:
+/// `nameSource: "user"` is what stops claude's auto-titler overwriting the name later, and claude
+/// stamps `updatedAt` on every state write, so leaving it stale would make the rename invisible to
+/// anything sorting or invalidating on it. The write itself is Agent Viewer's `replace_atomic`,
+/// which preserves the file's mode and never exposes a half-written state.json.
 fn rename_claude(jobs_root: &Path, short_id: &str, launch_name: &str, name: &str) -> Result<bool> {
     let path = agent_viewer_core::claude::job_state_path_in(jobs_root, short_id);
-    let state: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
-    let current = state.get("name").and_then(serde_json::Value::as_str);
+    // A missing file means the job is gone. That is an Err the worker reports and drops, never a
+    // reason to create one: a blind write would fabricate a job state with no respawn contract.
+    let mut state: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+    let Some(object) = state.as_object_mut() else {
+        return Err(Error::Command(format!(
+            "{} is not a JSON object",
+            path.display()
+        )));
+    };
+    let current = object.get("name").and_then(serde_json::Value::as_str);
     if let Some(current) = current
         && current != launch_name
         && current != name
     {
         return Ok(false);
     }
-    let session = claude_session(short_id, current.unwrap_or(launch_name));
-    agent_viewer_core::backend::Backend::rename(
-        &agent_viewer_core::claude::ClaudeBackend::with_binary_and_jobs_root(
-            "claude",
-            jobs_root.to_path_buf(),
-        ),
-        &session,
-        name,
-    )
-    .map_err(|error| Error::Command(format!("Claude job rename failed: {error}")))?;
+    object.insert("name".to_string(), serde_json::Value::from(name));
+    object.insert("nameSource".to_string(), serde_json::Value::from("user"));
+    object.insert(
+        "updatedAt".to_string(),
+        serde_json::Value::from(agent_viewer_core::claude::iso8601_utc_millis(
+            std::time::SystemTime::now(),
+        )),
+    );
+    agent_viewer_core::claude::replace_atomic(&path, &serde_json::to_string_pretty(&state)?)
+        .map_err(|error| Error::Command(format!("Claude job rename failed: {error}")))?;
     Ok(true)
-}
-
-/// PURE: the minimal session `ClaudeBackend::rename` addresses.
-///
-/// It reads `short_id` and nothing else, but `Session` is Agent Viewer's whole row type and has no
-/// `Default`, so the remaining fields are filled with empties. They are never read, and building
-/// this here rather than fabricating a row from a listing keeps the rename addressed by the exact
-/// identity the dispatch resolved.
-fn claude_session(short_id: &str, title: &str) -> agent_viewer_core::Session {
-    agent_viewer_core::Session {
-        backend: agent_viewer_core::BackendKind::Claude,
-        id: short_id.to_string(),
-        short_id: Some(short_id.to_string()),
-        origin: agent_viewer_core::SessionOrigin::Background,
-        title: title.to_string(),
-        cwd: PathBuf::new(),
-        git_branch: None,
-        status: agent_viewer_core::Status::Unknown,
-        created_at_ms: 0,
-        updated_at_ms: 0,
-        hidden: false,
-        companion: false,
-        subagent: false,
-        summary: String::new(),
-        pid: None,
-        rollout_path: None,
-        pr_refs: Vec::new(),
-        daemon_hosted: false,
-    }
 }
 
 /// IMPURE: start the detached worker that will name `job`.
@@ -306,6 +332,27 @@ mod tests {
         let error = rename_claude(root.path(), "ab12cd", "Launch Name Here", "New Name Here")
             .expect_err("a job with no state file cannot be renamed");
         assert!(matches!(error, Error::Io(_)), "{error:?}");
+    }
+
+    /// A row that could not be written after a successful rename is the one case where the log and
+    /// the session disagree, and the reason is the whole diagnosis. It must reach the naming log
+    /// verbatim rather than reading as an ordinary success.
+    #[test]
+    fn a_failed_row_update_is_reported_in_full_beside_the_successful_rename() {
+        let naming = Naming::Renamed {
+            name: "RS-123 Nightly Scheduler Audit".to_string(),
+            row: Row::Failed("database is locked".to_string()),
+        };
+        let described = naming.describe();
+        assert!(
+            described.contains("RS-123 Nightly Scheduler Audit"),
+            "{described}"
+        );
+        assert!(
+            described.contains("DECISION ROW NOT UPDATED"),
+            "{described}"
+        );
+        assert!(described.contains("database is locked"), "{described}");
     }
 
     #[test]

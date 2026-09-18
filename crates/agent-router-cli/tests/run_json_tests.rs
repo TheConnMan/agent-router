@@ -60,9 +60,14 @@ struct CliFixture {
     classifier_name: String,
     cwd: PathBuf,
     spawn_log: PathBuf,
-    /// One line per `claude -p` invocation, so a test can assert the naming call happened, or that
-    /// it was skipped, rather than inferring either from the name that came out.
+    /// One line per `claude -p` invocation, written on ENTRY, before any gate. Used to wait for a
+    /// call to start; never to assert that one has not happened, because a detached worker may
+    /// legitimately have entered the call already.
     classifier_log: PathBuf,
+    /// One line per `claude -p` ANSWER, written after the gate releases. This is the marker the
+    /// launch-before-naming assertion reads: an answer that has not been written is an answer the
+    /// router provably did not wait for.
+    classifier_answers: PathBuf,
     /// What the fake `claude -p` answers, replaceable per test.
     classifier_answer_file: PathBuf,
     /// Optional one-JSON-object-per-line queue consumed before `classifier_answer_file`. Empty
@@ -140,6 +145,7 @@ impl CliFixture {
         let spawn_log = root.path.join("claude.argv");
         let classifier_log = root.path.join("claude.-p.calls");
         let classifier_queue = root.path.join("classifier.queue");
+        let classifier_answers = root.path.join("claude.-p.answers");
         let naming_gate_armed = root.path.join("naming.armed");
         let naming_gate = root.path.join("naming.released");
         // The job claude itself would have written for the short id the listing advertises. The
@@ -194,9 +200,11 @@ impl CliFixture {
                  IFS= read -r line < \"$queue\" || true\n\
                  tail -n +2 \"$queue\" > \"$queue.tmp\"\n\
                  mv \"$queue.tmp\" \"$queue\"\n\
+                 printf 'answered\\n' >> {}\n\
                  printf '%s\\n' \"$line\"\n\
                  exit 0\n\
                fi\n\
+               printf 'answered\\n' >> {}\n\
                cat {}\n\
                exit 0\n\
              fi\n\
@@ -207,6 +215,8 @@ impl CliFixture {
             shell_quote(&naming_gate_armed.to_string_lossy()),
             shell_quote(&classifier_log.to_string_lossy()),
             shell_quote(&naming_gate.to_string_lossy()),
+            shell_quote(&classifier_answers.to_string_lossy()),
+            shell_quote(&classifier_answers.to_string_lossy()),
             shell_quote(&classifier_answer_file.to_string_lossy()),
             shell_quote(&spawn_log.to_string_lossy())
         );
@@ -221,6 +231,7 @@ impl CliFixture {
             spawn_log,
             classifier_log,
             classifier_answer_file,
+            classifier_answers,
             classifier_queue,
             naming_gate_armed,
             naming_gate,
@@ -359,6 +370,34 @@ impl CliFixture {
         fs::read_to_string(&self.classifier_log)
             .map(|log| log.lines().count())
             .unwrap_or(0)
+    }
+
+    /// How many prompts the fake claude has ANSWERED. A gated call is entered but unanswered, so
+    /// this is what distinguishes "the router did not wait for the title" from "the worker had not
+    /// got around to starting the call yet", which the entry count cannot.
+    fn classifier_answers(&self) -> usize {
+        fs::read_to_string(&self.classifier_answers)
+            .map(|log| log.lines().count())
+            .unwrap_or(0)
+    }
+
+    /// Block until a naming worker has written its terminal outcome, and return it.
+    ///
+    /// The worker's own last act, so anything asserted after this is asserted about a worker that
+    /// has finished, not one that has merely been observed starting a call.
+    fn wait_for_naming_outcome(&self) -> String {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let log = self.naming_log();
+            if log.contains("agent-router: naming ") {
+                return log;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no naming worker outcome was ever written (saw {log:?})"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
     }
 
     /// The router binary against this fixture's fake PATH, home, and decision log.
@@ -603,9 +642,10 @@ fn a_job_launches_under_its_derived_name_and_is_renamed_after_the_router_exits()
         "an unnamed job must hand its title to a worker"
     );
     assert_eq!(
-        fixture.classifier_calls(),
+        fixture.classifier_answers(),
         1,
-        "only the scoring call may run before the router returns"
+        "the router returned while the naming answer was still gated, so it cannot have waited \
+         for it"
     );
     assert_eq!(
         fixture.provider_name(),
@@ -623,7 +663,7 @@ fn a_job_launches_under_its_derived_name_and_is_renamed_after_the_router_exits()
         fixture.logged_job_name(log_id)
     });
     assert_eq!(
-        fixture.classifier_calls(),
+        fixture.classifier_answers(),
         2,
         "the title call is the worker's, and there is exactly one of it"
     );
@@ -753,15 +793,19 @@ fn an_unusable_generated_title_leaves_the_job_running_on_its_launch_name() {
             "answer {answer:?} must leave the derived name in place"
         );
         assert_eq!(value["naming_started"], true);
-        wait_for_calls(&fixture, 2);
-        // The worker has made its one call and cannot make another, so the name it found is final.
+        let outcome = fixture.wait_for_naming_outcome();
+        assert!(
+            outcome.contains("skipped: the naming model returned no usable title"),
+            "answer {answer:?} must be reported as a skip, not a failure: {outcome}"
+        );
+        // The worker has finished, so the name it left behind is final.
         assert_eq!(
             fixture.provider_name(),
             fixture.name,
             "answer {answer:?} must leave claude's own store untouched"
         );
         assert_eq!(
-            fixture.classifier_calls(),
+            fixture.classifier_answers(),
             2,
             "answer {answer:?} must be one naming call, not a retry loop"
         );
@@ -810,39 +854,26 @@ fn a_manual_rename_made_before_the_worker_runs_is_kept() {
     // The human rename, made while the worker is still waiting on its title.
     fixture.launch_job_state("A Name Brian Chose");
     fixture.release_naming();
-    wait_for_calls(&fixture, 2);
 
+    // The worker's own terminal outcome, not a call count: the assertions below are about what a
+    // FINISHED worker did, and a worker merely observed entering its call could still write.
+    let outcome = fixture.wait_for_naming_outcome();
+    assert!(
+        outcome.contains("a manual rename was kept"),
+        "the worker must report the kept name: {outcome}"
+    );
     let log_id = value["log_id"].as_i64().expect("a decision row");
-    fixture.wait_until("the claude job state name", "A Name Brian Chose", || {
-        Some(fixture.provider_name())
-    });
+    assert_eq!(
+        fixture.provider_name(),
+        "A Name Brian Chose",
+        "a name a person set outranks a generated one"
+    );
     assert_eq!(
         fixture.logged_job_name(log_id).as_deref(),
         Some(fixture.name.as_str()),
-        "a kept manual rename must not be written into the decision row either"
+        "a kept manual rename leaves the decision row on the launch name: the row records the \
+         name the router chose, and the router chose nothing here"
     );
-}
-
-/// Poll until the fake classifier has been called `expected` times, so a test observes the
-/// detached worker finishing its call rather than sleeping for a guessed interval.
-#[cfg(unix)]
-fn wait_for_calls(fixture: &CliFixture, expected: usize) {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        if fixture.classifier_calls() >= expected {
-            // The call is logged before the answer is printed, so give the worker the moment it
-            // needs to act on the answer before anything is asserted about what it did.
-            std::thread::sleep(Duration::from_millis(250));
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the classifier was called {} times, expected {expected}; naming log: {}",
-            fixture.classifier_calls(),
-            fixture.naming_log()
-        );
-        std::thread::sleep(Duration::from_millis(25));
-    }
 }
 
 /// A dry run dispatches nothing, but a provider only pin still needs classification for its model

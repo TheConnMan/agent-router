@@ -653,9 +653,15 @@ text. When that last case is what happened, the router spawns a detached `setsid
 dispatch and returns immediately. `run --json` reports this as `naming_started`.
 
 The worker makes ONE title-only call through `classifier.naming_engine`, renames the exact launched
-session by the identity the dispatch resolved, and then updates `job_name` on that decision row, so
-the log and the provider never disagree. It outlives the router process, which has usually printed
-its result and exited before the title arrives.
+session by the identity the dispatch resolved, and then updates `job_name` on that decision row. It
+outlives the router process, which has usually printed its result and exited before the title
+arrives.
+
+The row is only written once the provider has taken the name, so a job never carries a title the
+session does not have. The two can still differ in two ways, and both are written to the naming
+log rather than hidden: a row update that fails after a successful rename leaves the row on the
+launch name, and a kept manual rename leaves it there too. The row records the name the router
+chose, and where a person renamed the session the router chose nothing.
 
 Naming is cosmetic and the job is already running, so nothing the worker does can fail, stop, or
 relaunch it. Every outcome is written to `~/.local/state/agent-router/logs/naming-*.log`.
@@ -667,7 +673,12 @@ relaunch it. Every outcome is written to `~/.local/state/agent-router/logs/namin
 | Grok | Agent Viewer's `GrokLifecycle::rename`, an `x.ai/session/rename` call | Session id | No: the RPC reports success and nothing else, and Grok is Linux only |
 
 Where a manual rename is detectable, a name that is neither the launch name nor the generated one
-is somebody's own and is kept, in the provider's store and in the decision row alike.
+is somebody's own and is kept.
+
+For Claude the guard and the write share one read of `state.json`, so the name compared is the name
+overwritten. That narrows the window rather than closing it: claude's own worker writes that file
+while the job runs and its format offers no compare-and-swap, so a write landing in between is
+lost. Agent Viewer's own rename accepts the same race against the same writer.
 
 ## State on disk
 
