@@ -102,6 +102,11 @@ selection until a usable capacity source is available.
 
 Default `98.0`. Weekly percent used at or above which a provider counts as exhausted.
 
+### `grok_hard_ceiling_pct`
+
+Optional, absent by default. Grok's own weekly ceiling, replacing `hard_ceiling_pct` for Grok
+alone. When absent, Grok uses `hard_ceiling_pct`.
+
 A provider at or over this ceiling is ineligible, and so is a provider whose weekly window nobody
 read. When both workhorse providers are eligible, the lower projected weekly draw wins; ties go to
 Codex. Current weekly percent is the fallback only when a projection cannot be computed. Exactly

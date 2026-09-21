@@ -266,7 +266,7 @@ pub fn decide_with_task(
             |candidate| !capability_constraint || capability_providers.contains(&candidate);
         let usage_eligible = |candidate| {
             headroom(&usage, candidate).weekly_known()
-                && weekly_used(&usage, candidate) < config.hard_ceiling_pct
+                && weekly_used(&usage, candidate) < config.hard_ceiling_for(candidate)
                 && classification.unlaunchable != Some(candidate)
         };
         let eligible = |candidate| capability_eligible(candidate) && usage_eligible(candidate);

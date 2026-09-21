@@ -289,6 +289,10 @@ pub struct Config {
     /// consulting this ceiling, so a router that spends down to the limit leaves nothing for the
     /// work a person is doing by hand.
     pub hard_ceiling_pct: f64,
+    /// Grok's own weekly ceiling, replacing `hard_ceiling_pct` for Grok alone. Absent means Grok
+    /// uses `hard_ceiling_pct` like every other provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grok_hard_ceiling_pct: Option<f64>,
     /// How long the classifier call may take before it counts as failed.
     ///
     /// Declared here rather than below `policy`, because a scalar after a table typed field makes
@@ -353,6 +357,7 @@ impl Default for Config {
         Config {
             config_version: CURRENT_CONFIG_VERSION,
             hard_ceiling_pct: DEFAULT_HARD_CEILING_PCT,
+            grok_hard_ceiling_pct: None,
             classifier_timeout_secs: DEFAULT_CLASSIFIER_TIMEOUT_SECS,
             // Local shell is one capability, not a duplicated inventory of every executable,
             // file, or authenticated endpoint that the shell can reach.
@@ -368,6 +373,16 @@ impl Default for Config {
 }
 
 impl Config {
+    /// The weekly percent at or above which `provider` counts as exhausted.
+    pub fn hard_ceiling_for(&self, provider: crate::provider::Provider) -> f64 {
+        match provider {
+            crate::provider::Provider::Grok => {
+                self.grok_hard_ceiling_pct.unwrap_or(self.hard_ceiling_pct)
+            }
+            _ => self.hard_ceiling_pct,
+        }
+    }
+
     /// IMPURE: the config at the default path under `home`, created with defaults when absent.
     pub fn load_in(home: &Path) -> Result<Config> {
         let mut config = Config::load_from(&default_config_path(home))?;
