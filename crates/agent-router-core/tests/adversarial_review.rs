@@ -2,6 +2,7 @@ use agent_router_core::adversarial_review::{
     ReviewProvider, ReviewRequest, ReviewStatus, ReviewerPin, review_pinned_with_providers,
     review_with_claude_usage_reserve, review_with_providers, reviewer_pin,
 };
+use agent_router_core::log::{DecisionLog, ReviewEntry};
 use agent_router_core::{Error, Headroom, Provider, Result};
 use std::cell::Cell;
 use std::path::Path;
@@ -31,11 +32,20 @@ impl<'a> StubReviewer<'a> {
     }
 
     fn failing(provider: &'a str, model: &'a str, usage: Option<Headroom>) -> Self {
+        Self::failing_with(provider, model, usage, "review invocation failed")
+    }
+
+    fn failing_with(
+        provider: &'a str,
+        model: &'a str,
+        usage: Option<Headroom>,
+        message: &'a str,
+    ) -> Self {
         Self {
             provider,
             model,
             usage,
-            result: Err(Error::Command("review invocation failed".to_string())),
+            result: Err(Error::Command(message.to_string())),
             calls: Cell::new(0),
         }
     }
@@ -356,7 +366,6 @@ fn explicit_pin_without_a_model_records_the_registered_model_as_the_actual_one()
 #[test]
 fn an_ineligible_pin_is_a_skip_and_never_falls_back_to_an_eligible_alternative() {
     for (label, usage, expected) in [
-        ("ceiling", Some(fresh(90.0)), "90"),
         (
             "stale",
             Some(Headroom {
@@ -393,6 +402,7 @@ fn an_ineligible_pin_is_a_skip_and_never_falls_back_to_an_eligible_alternative()
         assert_eq!(outcome.reviewer_provider, None, "{label}");
         assert_eq!(outcome.reviewer_model, None, "{label}");
         assert_eq!(outcome.result, None, "{label}");
+        assert_eq!(outcome.fallback_from, None, "{label}");
         let reason = outcome.reason.as_deref().unwrap_or_default();
         assert!(
             reason.starts_with("requested reviewer claude is not eligible: "),
@@ -419,6 +429,36 @@ fn an_ineligible_pin_is_a_skip_and_never_falls_back_to_an_eligible_alternative()
         assert!(!claude.eligible);
         assert!(claude.rejection_reason.is_some());
     }
+}
+
+#[test]
+fn a_usage_gate_pin_refusal_runs_the_next_eligible_reviewer_once() {
+    let primary = StubReviewer::successful("codex", "primary", Some(fresh(1.0)), "wrong");
+    let fallback = StubReviewer::successful("grok", "default", Some(fresh(5.0)), "grok review");
+    let pinned = StubReviewer::successful("claude", "fable", Some(fresh(90.0)), "must not run");
+
+    let outcome = review_pinned_with_providers(
+        &request("codex"),
+        &[&primary, &fallback, &pinned],
+        &pin(Provider::Claude, Some("fable")),
+        25.0,
+    )
+    .expect("usage-gate refusal fails over");
+
+    assert_eq!(outcome.status, ReviewStatus::Completed);
+    assert_eq!(outcome.requested_provider.as_deref(), Some("claude"));
+    assert_eq!(outcome.reviewer_provider.as_deref(), Some("grok"));
+    assert_eq!(outcome.fallback_from.as_deref(), Some("claude"));
+    assert_eq!(outcome.result.as_deref(), Some("grok review"));
+    let reason = outcome.reason.as_deref().unwrap_or_default();
+    assert!(
+        reason.starts_with("requested reviewer claude is not eligible: "),
+        "{reason}"
+    );
+    assert!(reason.contains("90"), "{reason}");
+    assert_eq!(pinned.calls.get(), 0);
+    assert_eq!(fallback.calls.get(), 1);
+    assert_eq!(primary.calls.get(), 0);
 }
 
 #[test]
@@ -592,4 +632,250 @@ fn reviewer_pin_validation_rejects_the_primary_orphan_models_and_malformed_model
             Ok(accepted) => panic!("model {malformed:?} was accepted as {accepted:?}"),
         }
     }
+}
+
+#[test]
+fn a_forced_grok_timeout_with_codex_primary_selects_claude_and_keeps_both_fields() {
+    let grok = StubReviewer::failing_with(
+        "grok",
+        "default",
+        Some(fresh(1.0)),
+        "Grok review sess-1 did not finish before the timeout",
+    );
+    let claude = StubReviewer::successful("claude", "opus", Some(fresh(20.0)), "claude review");
+
+    let outcome = review_with_providers(&request("codex"), &[&grok, &claude])
+        .expect("Grok timeout fails over to Claude");
+
+    assert_eq!(outcome.status, ReviewStatus::Completed);
+    assert_eq!(outcome.reviewer_provider.as_deref(), Some("claude"));
+    assert_eq!(outcome.fallback_from.as_deref(), Some("grok"));
+    assert_eq!(
+        outcome.reason.as_deref(),
+        Some("Grok review sess-1 did not finish before the timeout")
+    );
+    assert_eq!(outcome.result.as_deref(), Some("claude review"));
+    assert_eq!(grok.calls.get(), 1);
+    assert_eq!(claude.calls.get(), 1);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let log = DecisionLog::open_at(&dir.path().join("router.db")).expect("opens");
+    let outcome_json = serde_json::to_string(&outcome).ok();
+    log.record_review(&ReviewEntry {
+        exit_status: outcome.status.exit_status(),
+        primary: &outcome.primary_provider,
+        reviewer_provider: outcome.reviewer_provider.as_deref(),
+        reviewer_model: outcome.reviewer_model.as_deref(),
+        usage_provenance: "[]",
+        rationale: &outcome.rationale,
+        body_bytes: i64::try_from(outcome.result.as_deref().map_or(0, str::len)).unwrap(),
+        dir: Path::new("/tmp"),
+        outcome_json: outcome_json.as_deref(),
+        reason: outcome.reason.as_deref(),
+        fallback_from: outcome.fallback_from.as_deref(),
+    })
+    .expect("records the failover review");
+    let row = &log.recent_reviews(1).expect("reads")[0];
+    assert_eq!(row.exit_status, 0);
+    assert_eq!(row.fallback_from.as_deref(), Some("grok"));
+    assert!(
+        row.reason
+            .as_deref()
+            .is_some_and(|reason| !reason.is_empty()),
+        "{:?}",
+        row.reason
+    );
+}
+
+#[test]
+fn a_grok_openat2_storage_error_fails_over_once() {
+    let grok = StubReviewer::failing_with(
+        "grok",
+        "default",
+        Some(fresh(1.0)),
+        "secure Grok storage requires openat2",
+    );
+    let claude = StubReviewer::successful("claude", "opus", Some(fresh(20.0)), "claude review");
+
+    let outcome = review_with_providers(&request("codex"), &[&grok, &claude])
+        .expect("Grok storage error fails over to Claude");
+
+    assert_eq!(outcome.status, ReviewStatus::Completed);
+    assert_eq!(outcome.reviewer_provider.as_deref(), Some("claude"));
+    assert_eq!(outcome.fallback_from.as_deref(), Some("grok"));
+    assert_eq!(
+        outcome.reason.as_deref(),
+        Some("secure Grok storage requires openat2")
+    );
+    assert_eq!(grok.calls.get(), 1);
+    assert_eq!(claude.calls.get(), 1);
+}
+
+#[test]
+fn a_cancelled_grok_review_does_not_fail_over() {
+    let grok = StubReviewer::failing_with("grok", "default", Some(fresh(1.0)), "review cancelled");
+    let claude = StubReviewer::successful("claude", "opus", Some(fresh(20.0)), "must not run");
+
+    let error = review_with_providers(&request("codex"), &[&grok, &claude])
+        .expect_err("a cancel must not be rewritten as a fallback review");
+
+    assert_eq!(error.to_string(), "review cancelled");
+    assert_eq!(grok.calls.get(), 1);
+    assert_eq!(claude.calls.get(), 0);
+}
+
+#[test]
+fn a_generic_grok_failure_does_not_fail_over() {
+    let grok = StubReviewer::failing_with(
+        "grok",
+        "default",
+        Some(fresh(1.0)),
+        "Grok review sess-1 ended with an error",
+    );
+    let claude = StubReviewer::successful("claude", "opus", Some(fresh(20.0)), "must not run");
+
+    let error = review_with_providers(&request("codex"), &[&grok, &claude])
+        .expect_err("only timeout and openat2 fail over");
+
+    assert!(error.to_string().contains("ended with an error"));
+    assert_eq!(grok.calls.get(), 1);
+    assert_eq!(claude.calls.get(), 0);
+}
+
+#[test]
+fn a_failed_fallback_reviewer_is_reported_as_failed_with_both_fields() {
+    let grok = StubReviewer::failing_with(
+        "grok",
+        "default",
+        Some(fresh(1.0)),
+        "Grok review sess-1 did not finish before the timeout",
+    );
+    let claude = StubReviewer::failing("claude", "opus", Some(fresh(20.0)));
+
+    let outcome = review_with_providers(&request("codex"), &[&grok, &claude])
+        .expect("a failed fallback is a reported failure, not a dropped one");
+
+    assert_eq!(outcome.status, ReviewStatus::Failed);
+    assert_eq!(outcome.reviewer_provider.as_deref(), Some("claude"));
+    assert_eq!(outcome.fallback_from.as_deref(), Some("grok"));
+    assert_eq!(
+        outcome.reason.as_deref(),
+        Some("Grok review sess-1 did not finish before the timeout")
+    );
+    assert!(
+        outcome
+            .rationale
+            .contains("fallback reviewer failed: review invocation failed"),
+        "{}",
+        outcome.rationale
+    );
+    assert_eq!(grok.calls.get(), 1);
+    assert_eq!(claude.calls.get(), 1);
+}
+
+#[test]
+fn a_failed_usage_gate_fallback_is_reported_as_failed_not_skipped() {
+    let pinned = StubReviewer::successful("claude", "fable", Some(fresh(90.0)), "must not run");
+    let fallback = StubReviewer::failing("grok", "default", Some(fresh(5.0)));
+
+    let outcome = review_pinned_with_providers(
+        &request("codex"),
+        &[&pinned, &fallback],
+        &pin(Provider::Claude, Some("fable")),
+        25.0,
+    )
+    .expect("a failed fallback after a usage-gate pin is a failure");
+
+    assert_eq!(outcome.status, ReviewStatus::Failed);
+    assert_eq!(outcome.requested_provider.as_deref(), Some("claude"));
+    assert_eq!(outcome.reviewer_provider.as_deref(), Some("grok"));
+    assert_eq!(outcome.fallback_from.as_deref(), Some("claude"));
+    assert!(
+        outcome
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("not eligible") && reason.contains("90")),
+        "{:?}",
+        outcome.reason
+    );
+    assert_eq!(pinned.calls.get(), 0);
+    assert_eq!(fallback.calls.get(), 1);
+}
+
+#[test]
+fn grok_timeout_with_no_other_eligible_reviewer_still_fails() {
+    let grok = StubReviewer::failing_with(
+        "grok",
+        "default",
+        Some(fresh(1.0)),
+        "Grok review sess-1 did not finish before the timeout",
+    );
+    let claude = StubReviewer::successful("claude", "full", Some(fresh(90.0)), "must not run");
+
+    let error = review_with_providers(&request("codex"), &[&grok, &claude])
+        .expect_err("no eligible fallback keeps the original failure");
+
+    assert!(
+        error
+            .to_string()
+            .contains("did not finish before the timeout")
+    );
+    assert_eq!(grok.calls.get(), 1);
+    assert_eq!(claude.calls.get(), 0);
+}
+
+#[test]
+fn a_usage_gate_pin_with_no_eligible_fallback_still_skips() {
+    let pinned = StubReviewer::successful("claude", "fable", Some(fresh(90.0)), "must not run");
+    let other = StubReviewer::successful("grok", "default", Some(fresh(90.0)), "must not run");
+
+    let outcome = review_pinned_with_providers(
+        &request("codex"),
+        &[&pinned, &other],
+        &pin(Provider::Claude, Some("fable")),
+        25.0,
+    )
+    .expect("all ineligible stays a skip");
+
+    assert_eq!(outcome.status, ReviewStatus::Skipped);
+    assert_eq!(outcome.reviewer_provider, None);
+    assert_eq!(outcome.fallback_from, None);
+    assert!(
+        outcome
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("not eligible") && reason.contains("90")),
+        "{:?}",
+        outcome.reason
+    );
+    assert_eq!(pinned.calls.get(), 0);
+    assert_eq!(other.calls.get(), 0);
+}
+
+#[test]
+fn a_reserve_floor_pin_refusal_fails_over_when_another_reviewer_is_eligible() {
+    let pinned = StubReviewer::successful("claude", "fable", Some(fresh(70.0)), "must not run");
+    let fallback = StubReviewer::successful("grok", "default", Some(fresh(5.0)), "grok review");
+
+    let outcome = review_pinned_with_providers(
+        &request("codex"),
+        &[&pinned, &fallback],
+        &pin(Provider::Claude, Some("fable")),
+        25.0,
+    )
+    .expect("reserve refusal fails over");
+
+    assert_eq!(outcome.status, ReviewStatus::Completed);
+    assert_eq!(outcome.reviewer_provider.as_deref(), Some("grok"));
+    assert_eq!(outcome.fallback_from.as_deref(), Some("claude"));
+    assert!(
+        outcome
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("reserve") && reason.contains("70.0")),
+        "{:?}",
+        outcome.reason
+    );
+    assert_eq!(pinned.calls.get(), 0);
+    assert_eq!(fallback.calls.get(), 1);
 }

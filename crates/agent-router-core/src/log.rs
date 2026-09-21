@@ -50,8 +50,12 @@ pub struct ReviewEntry<'a> {
     pub dir: &'a Path,
     /// The serialized outcome, so a pre-ID failure keeps the same envelope a settled row keeps.
     pub outcome_json: Option<&'a str>,
-    /// Why the review failed or was skipped. None on a completed review.
+    /// Why the review failed or was skipped, and the original refusal or Grok failure after a
+    /// successful failover. None on a completed review that did not fall back.
     pub reason: Option<&'a str>,
+    /// The reviewer that was refused or that failed before the reviewer that actually ran. None
+    /// when no failover happened, and on every row written before this column.
+    pub fallback_from: Option<&'a str>,
 }
 
 /// The terminal state of a review that started as a pending row: everything `finish_review`
@@ -71,6 +75,7 @@ pub struct ReviewTerminal<'a> {
     /// no envelope to print, which is every cancelled row.
     pub outcome_json: Option<&'a str>,
     pub reason: Option<&'a str>,
+    pub fallback_from: Option<&'a str>,
 }
 
 /// What a cancel found. `AlreadyTerminal` carries the status token the row already holds, so the
@@ -105,6 +110,9 @@ pub struct ReviewRow {
     /// The terminal explanation, and the only terminal detail a cancelled row carries. None means
     /// nothing was explained, not that the review succeeded.
     pub reason: Option<String>,
+    /// The reviewer that was refused or that failed before the reviewer that actually ran. None
+    /// when no failover happened, and on every row written before this column.
+    pub fallback_from: Option<String>,
 }
 
 /// One row read back, flattened for display.
@@ -331,7 +339,8 @@ CREATE TABLE IF NOT EXISTS reviews (
     dir                 TEXT    NOT NULL,
     status              TEXT,
     outcome_json        TEXT,
-    reason              TEXT
+    reason              TEXT,
+    fallback_from       TEXT
 );
 ";
 
@@ -339,7 +348,7 @@ CREATE TABLE IF NOT EXISTS reviews (
 /// cannot drift apart. `map_review_row` reads positionally against this list.
 const REVIEW_COLUMNS: &str = "\
 id, ts, exit_status, \"primary\", reviewer_provider, reviewer_model, usage_provenance, \
-rationale, body_bytes, dir, status, outcome_json, reason";
+rationale, body_bytes, dir, status, outcome_json, reason, fallback_from";
 
 const SELECT_COLUMNS: &str = "\
 id, created_at_ms, task, dir, requested, provider, model, effort, missing_connector, \
@@ -512,8 +521,9 @@ impl DecisionLog {
             .prepare_cached(
                 "INSERT INTO reviews (
                 ts, exit_status, \"primary\", reviewer_provider, reviewer_model,
-                usage_provenance, rationale, body_bytes, dir, outcome_json, reason
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                usage_provenance, rationale, body_bytes, dir, outcome_json, reason,
+                fallback_from
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             )?
             .execute(rusqlite::params![
                 now_ms(),
@@ -527,6 +537,7 @@ impl DecisionLog {
                 entry.dir.to_string_lossy(),
                 entry.outcome_json,
                 entry.reason,
+                entry.fallback_from,
             ])?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -567,7 +578,8 @@ impl DecisionLog {
                 rationale = :rationale,
                 body_bytes = :body_bytes,
                 outcome_json = :outcome_json,
-                reason = :reason
+                reason = :reason,
+                fallback_from = :fallback_from
              WHERE id = :id AND status = 'pending'",
             )?
             .execute(rusqlite::named_params! {
@@ -580,6 +592,7 @@ impl DecisionLog {
                 ":body_bytes": terminal.body_bytes,
                 ":outcome_json": terminal.outcome_json,
                 ":reason": terminal.reason,
+                ":fallback_from": terminal.fallback_from,
                 ":id": id,
             })?;
         Ok(changed == 1)
@@ -864,6 +877,7 @@ fn map_review_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReviewRow> {
         status: row.get(10)?,
         outcome_json: row.get(11)?,
         reason: row.get(12)?,
+        fallback_from: row.get(13)?,
     })
 }
 
@@ -911,12 +925,13 @@ fn map_decision_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
 /// an existing database picks it up on open without a table rewrite.
 ///
 /// `reviews` has no versioned rewrite at all, so this list is its only migration.
-const MISSING_COLUMNS: [(&str, &str, &str); 5] = [
+const MISSING_COLUMNS: [(&str, &str, &str); 6] = [
     ("decisions", "matched_capabilities", "TEXT"),
     ("decisions", "requested_model", "TEXT"),
     ("reviews", "status", "TEXT"),
     ("reviews", "outcome_json", "TEXT"),
     ("reviews", "reason", "TEXT"),
+    ("reviews", "fallback_from", "TEXT"),
 ];
 
 /// `PRAGMA user_version` stamped once the v2 rewrite has run. 0 is an unstamped pre-v2 database.
@@ -2018,6 +2033,7 @@ mod tests {
             dir: Path::new("/tmp"),
             outcome_json: None,
             reason: None,
+            fallback_from: None,
         })
         .expect("records a review");
 
@@ -2049,6 +2065,7 @@ mod tests {
             body_bytes: 21,
             outcome_json: Some("{\"status\":\"completed\"}"),
             reason: None,
+            fallback_from: None,
         }
     }
 
@@ -2219,7 +2236,7 @@ mod tests {
         assert_eq!(row.exit_status, 1);
     }
 
-    /// A database holding the pre-lifecycle `reviews` table gains the three columns on open,
+    /// A database holding the pre-lifecycle `reviews` table gains the later columns on open,
     /// keeps its row, and reads that row back with a NULL status. NULL is not pending: it means
     /// nobody recorded a lifecycle state, and a reader derives the state from `exit_status`.
     #[test]
@@ -2241,7 +2258,7 @@ CREATE TABLE IF NOT EXISTS reviews (
     dir                 TEXT    NOT NULL
 );
 ";
-        const LIFECYCLE_COLUMNS: [&str; 3] = ["status", "outcome_json", "reason"];
+        const LIFECYCLE_COLUMNS: [&str; 4] = ["status", "outcome_json", "reason", "fallback_from"];
 
         fn review_columns(path: &Path) -> Vec<String> {
             let conn = rusqlite::Connection::open(path).expect("open the database");
@@ -2339,6 +2356,7 @@ CREATE TABLE IF NOT EXISTS reviews (
             dir: Path::new("/tmp"),
             outcome_json: Some("{\"status\":\"failed\"}"),
             reason: Some("secure Grok storage requires openat2"),
+            fallback_from: None,
         })
         .expect("records a pre-id failure");
 
@@ -2352,6 +2370,73 @@ CREATE TABLE IF NOT EXISTS reviews (
         );
         assert_eq!(
             reviews[0].reason.as_deref(),
+            Some("secure Grok storage requires openat2")
+        );
+        assert_eq!(reviews[0].fallback_from, None);
+    }
+
+    /// A completed failover keeps both the original reason and the reviewer that failed, so a
+    /// later reader can tell a substituted review from a first-choice one.
+    #[test]
+    fn a_completed_review_row_keeps_fallback_from_and_the_original_reason() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("router.db");
+        let log = DecisionLog::open_at(&path).expect("opens");
+
+        log.record_review(&ReviewEntry {
+            exit_status: 0,
+            primary: "codex",
+            reviewer_provider: Some("claude"),
+            reviewer_model: Some("opus"),
+            usage_provenance: "[]",
+            rationale: "fell back from grok",
+            body_bytes: 4,
+            dir: Path::new("/tmp"),
+            outcome_json: Some("{\"status\":\"completed\"}"),
+            reason: Some("Grok review abc did not finish before the timeout"),
+            fallback_from: Some("grok"),
+        })
+        .expect("records a failover review");
+
+        let reviews = log.recent_reviews(10).expect("reads reviews");
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0].exit_status, 0);
+        assert_eq!(reviews[0].reviewer_provider.as_deref(), Some("claude"));
+        assert_eq!(reviews[0].fallback_from.as_deref(), Some("grok"));
+        assert_eq!(
+            reviews[0].reason.as_deref(),
+            Some("Grok review abc did not finish before the timeout")
+        );
+
+        let started = log
+            .start_review("codex", Path::new("/tmp"))
+            .expect("starts a pending review");
+        assert!(
+            log.finish_review(
+                started,
+                &ReviewTerminal {
+                    status: "completed",
+                    exit_status: 0,
+                    reviewer_provider: Some("claude"),
+                    reviewer_model: Some("opus"),
+                    usage_provenance: "[]",
+                    rationale: "fell back from grok",
+                    body_bytes: 4,
+                    outcome_json: Some("{\"status\":\"completed\"}"),
+                    reason: Some("secure Grok storage requires openat2"),
+                    fallback_from: Some("grok"),
+                }
+            )
+            .expect("finishes")
+        );
+        let row = log
+            .review(started)
+            .expect("reads")
+            .expect("the settled row");
+        assert_eq!(row.exit_status, 0);
+        assert_eq!(row.fallback_from.as_deref(), Some("grok"));
+        assert_eq!(
+            row.reason.as_deref(),
             Some("secure Grok storage requires openat2")
         );
     }
