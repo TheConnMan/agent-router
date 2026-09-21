@@ -784,6 +784,7 @@ fn a_review_exit_writes_one_reviews_row() {
         i64::try_from(value["result"].as_str().unwrap().len()).unwrap()
     );
     assert_eq!(row.dir, fixture.cwd.to_string_lossy());
+    assert_eq!(row.fallback_from, None);
     assert!(row.ts > 0);
     let provenance: Value = serde_json::from_str(&row.usage_provenance).expect("provenance json");
     assert_eq!(provenance, value["usage_provenance"]);
@@ -949,6 +950,7 @@ fn cancel_stops_the_in_flight_reviewer() {
     assert_eq!(value["status"], "cancelled");
     assert_eq!(value["review_id"].as_i64(), Some(id));
     assert_eq!(value["result"], Value::Null);
+    assert_eq!(value["fallback_from"], Value::Null);
 
     // The compare-and-set from the caller's side: a settled review cannot be settled twice.
     let second = fixture
@@ -969,6 +971,7 @@ fn cancel_stops_the_in_flight_reviewer() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].status.as_deref(), Some("cancelled"));
     assert_eq!(rows[0].exit_status, 1);
+    assert_eq!(rows[0].fallback_from, None);
 }
 
 /// Cancel has to be observed even when the reviewer's pipes outlive the reviewer.
@@ -1423,52 +1426,97 @@ fn a_model_pin_on_grok_and_a_malformed_model_are_rejected() {
 
 #[test]
 fn an_ineligible_pin_skips_with_exit_three_and_never_falls_back() {
-    // Grok is the primary, so codex is the eligible automatic alternative the pin must not use.
-    for (label, weekly_pct, expected) in [("ceiling", Some(90.0), "90"), ("stale", None, "stale")] {
-        let fixture = ReviewFixture::new(label, weekly_pct);
-        write_codex_usage(&fixture.sessions, 17);
-        let output = pinned(
-            &fixture,
-            "grok",
-            &["--provider", "claude", "--model", "fable"],
-        );
+    // Grok is the primary, so codex is the eligible automatic alternative a stale pin must not use.
+    let fixture = ReviewFixture::new("stale", None);
+    write_codex_usage(&fixture.sessions, 17);
+    let output = pinned(
+        &fixture,
+        "grok",
+        &["--provider", "claude", "--model", "fable"],
+    );
 
-        assert_exit(&output, 3);
-        let value = parse_json(&output);
-        assert_eq!(value["status"], "skipped", "{label}");
-        assert_eq!(value["primary_provider"], "grok");
-        assert_eq!(value["requested_provider"], "claude");
-        assert_eq!(value["requested_model"], "fable");
-        assert_eq!(value["reviewer_provider"], Value::Null, "{label}");
-        assert_eq!(value["reviewer_model"], Value::Null, "{label}");
-        assert_eq!(value["result"], Value::Null, "{label}");
-        assert!(
-            value["reason"].as_str().is_some_and(|reason| {
-                reason.starts_with("requested reviewer claude is not eligible: ")
-                    && reason.contains(expected)
-            }),
-            "{label}: {}",
-            value["reason"]
-        );
-        assert!(
-            value["rationale"]
-                .as_str()
-                .is_some_and(|why| why.contains(expected)),
-            "{label}: {}",
-            value["rationale"]
-        );
-        let claude = candidate_provenance(&value, "claude");
-        assert_eq!(claude["eligible"], false);
-        assert!(
-            !fixture.codex_log.exists(),
-            "{label}: the pin fell back to codex"
-        );
-        assert!(!fixture.claude_log.exists(), "{label}");
-        let rows = fixture.reviews();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].exit_status, 3);
-        assert_eq!(rows[0].reviewer_provider, None);
-    }
+    assert_exit(&output, 3);
+    let value = parse_json(&output);
+    assert_eq!(value["status"], "skipped");
+    assert_eq!(value["primary_provider"], "grok");
+    assert_eq!(value["requested_provider"], "claude");
+    assert_eq!(value["requested_model"], "fable");
+    assert_eq!(value["reviewer_provider"], Value::Null);
+    assert_eq!(value["reviewer_model"], Value::Null);
+    assert_eq!(value["result"], Value::Null);
+    assert_eq!(value["fallback_from"], Value::Null);
+    assert!(
+        value["reason"].as_str().is_some_and(|reason| {
+            reason.starts_with("requested reviewer claude is not eligible: ")
+                && reason.contains("stale")
+        }),
+        "{}",
+        value["reason"]
+    );
+    assert!(
+        value["rationale"]
+            .as_str()
+            .is_some_and(|why| why.contains("stale")),
+        "{}",
+        value["rationale"]
+    );
+    let claude = candidate_provenance(&value, "claude");
+    assert_eq!(claude["eligible"], false);
+    assert!(!fixture.codex_log.exists(), "the pin fell back to codex");
+    assert!(!fixture.claude_log.exists());
+    let rows = fixture.reviews();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].exit_status, 3);
+    assert_eq!(rows[0].reviewer_provider, None);
+    assert_eq!(rows[0].fallback_from, None);
+}
+
+#[test]
+fn a_usage_gate_pin_refusal_fails_over_to_the_next_eligible_reviewer() {
+    // Grok is the primary, Claude is pinned at the ceiling, Codex is the remaining eligible reviewer.
+    let fixture = ReviewFixture::new("ceiling failover", Some(90.0));
+    write_codex_usage(&fixture.sessions, 17);
+    let output = pinned(
+        &fixture,
+        "grok",
+        &["--provider", "claude", "--model", "fable"],
+    );
+
+    assert_exit(&output, 0);
+    let value = parse_json(&output);
+    assert_eq!(value["status"], "completed");
+    assert_eq!(value["primary_provider"], "grok");
+    assert_eq!(value["requested_provider"], "claude");
+    assert_eq!(value["requested_model"], "fable");
+    assert_eq!(value["reviewer_provider"], "codex");
+    assert_eq!(value["fallback_from"], "claude");
+    assert_eq!(value["result"], "codex completed review");
+    assert!(
+        value["reason"].as_str().is_some_and(|reason| {
+            reason.starts_with("requested reviewer claude is not eligible: ")
+                && reason.contains("90")
+        }),
+        "{}",
+        value["reason"]
+    );
+    assert!(
+        fixture.codex_log.exists(),
+        "the usage-gate pin did not fail over to codex"
+    );
+    assert!(!fixture.claude_log.exists());
+    let rows = fixture.reviews();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].exit_status, 0);
+    assert_eq!(rows[0].reviewer_provider.as_deref(), Some("codex"));
+    assert_eq!(rows[0].fallback_from.as_deref(), Some("claude"));
+    assert!(
+        rows[0]
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("90")),
+        "{:?}",
+        rows[0].reason
+    );
 }
 
 #[test]

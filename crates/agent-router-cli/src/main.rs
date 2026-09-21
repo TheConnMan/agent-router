@@ -74,8 +74,9 @@ enum Command {
         /// auto selects the eligible alternative with the most headroom. codex, claude, or grok
         /// pins the reviewer instead. A pin must differ from --primary and still passes every
         /// eligibility gate (authoritative fresh capacity below the ceiling, and for claude the
-        /// configured reserve as a floor). An ineligible pin is reported as skipped, never
-        /// rerouted.
+        /// configured reserve as a floor). A pin refused on the usage or reserve gate is retried
+        /// once on the next eligible reviewer that is not the primary. Any other ineligible pin
+        /// is reported as skipped, never rerouted.
         #[arg(long, default_value = "auto")]
         provider: String,
         /// Reviewer model, passed to the pinned provider verbatim. Requires an explicit
@@ -484,6 +485,7 @@ fn settle_review(log: &DecisionLog, review_id: i64, outcome: &ReviewOutcome) -> 
         body_bytes,
         outcome_json: outcome_json.as_deref(),
         reason: outcome.reason.as_deref(),
+        fallback_from: outcome.fallback_from.as_deref(),
     };
     retry_write(REVIEW_SETTLE_ATTEMPTS, || {
         log.finish_review(review_id, &terminal)
@@ -505,6 +507,7 @@ fn pending_review_outcome(review_id: i64, primary_provider: &str) -> ReviewOutco
         usage_provenance: Vec::new(),
         rationale: "review is still running in a detached worker".to_string(),
         reason: None,
+        fallback_from: None,
         result: None,
         review_id: Some(review_id),
     }
@@ -530,6 +533,7 @@ fn synthesized_review_outcome(row: &ReviewRow, state: ReviewStatus) -> ReviewOut
         usage_provenance: Vec::new(),
         rationale: row.rationale.clone(),
         reason,
+        fallback_from: row.fallback_from.clone(),
         result: None,
         review_id: Some(row.id),
     }
@@ -776,6 +780,7 @@ fn persist_adversarial_review(
             dir,
             outcome_json: outcome_json.as_deref(),
             reason: outcome.reason.as_deref(),
+            fallback_from: outcome.fallback_from.as_deref(),
         })
     });
 }

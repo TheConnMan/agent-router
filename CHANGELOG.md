@@ -3,6 +3,17 @@
 All notable changes to this project are documented here. Versions are the
 workspace `package.version` stamped on every decision-log row.
 
+## 0.28.0 - 2026-09-21
+
+- Compare shared capability providers by projected weekly draw. Claude is selected only when both
+  capable providers are eligible and Claude projects lower.
+- Fail over a Grok adversarial review once when it times out or hits a Grok storage `openat2`
+  error, and fail over a pinned reviewer once when the usage or reserve gate refuses it. The next
+  eligible reviewer that is not the primary runs the same sealed request. The reviews row keeps the
+  original `reason` and records `fallback_from`. A user-issued `review cancel` never fails over. If
+  no other reviewer is eligible, the review still fails as before. The timeout, the gate, and the
+  reserve are unchanged.
+
 ## 0.26.1 - 2026-09-18
 
 - Keep a title whose words carry an interior dot or slash. The first real job through asynchronous
