@@ -49,7 +49,10 @@ log: row 87 in /home/you/.local/state/agent-router/router.db
    server names and enabled plugins are safely discovered from its local config, while Claude.ai
    connector registrations and other providers can be
    registered in `provider_capabilities`; unavailable providers are removed before ordinary policy
-   chooses the route. A task that names a configured inventory connector is treated as a miss
+   chooses the route. When a matched capability is available on both Claude and Codex and both
+   pass weekly capacity eligibility, Claude is selected only when both projections exist and its
+   projected draw is strictly lower. A tie or a missing projection stays on Codex. A task that
+   names a configured inventory connector is treated as a miss
    even if the classifier left `missing_connector` false. A matched inventory name absent from
    every provider inventory is `capability_blocked`. An unmatched classifier miss (no inventory
    name in the task or rationale) is ordinary Codex or Grok routing, not a refuse. The
@@ -68,8 +71,9 @@ log: row 87 in /home/you/.local/state/agent-router/router.db
    a twentieth elapsed), the comparison falls back to lower current weekly percent and records
    `projection_unavailable`. If neither has usable capacity, the configured default (Codex by
    default) is used and the decision visibly records the all-unavailable fallback. Claude's
-   5-hour window does not pace automatic routing; Claude is reserved for the capability pins
-   above. Grok remains available for explicit dispatch with `--provider grok`.
+   five hour window does not pace automatic routing. Claude remains reserved for the capability
+   pins and the bounded shared capability comparison above. Grok remains available for explicit
+   dispatch with `--provider grok`.
 4. **Complete the provider, model, and effort pins.** With no pins, classification chooses the
    provider through usage routing, then complexity walks that provider's model tier table and
    shared effort ladder: low uses the workhorse at high effort, medium uses the stronger model at

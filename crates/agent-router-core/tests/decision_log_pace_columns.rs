@@ -9,7 +9,7 @@
 
 use agent_router_core::classify::{Classification, Complexity, TaskContextHorizon};
 use agent_router_core::config::Config;
-use agent_router_core::decide::{Decision, decide};
+use agent_router_core::decide::{Decision, Gate, decide};
 use agent_router_core::log::{DecisionLog, Entry, Mark};
 use agent_router_core::stats::{Window, collect};
 use agent_router_core::{Headroom, Provider, UsageSnapshot};
@@ -129,6 +129,68 @@ fn a_recorded_decision_writes_the_orchestration_score_and_both_projections() {
         .expect("grok columns exist");
     assert_eq!(grok_draw, Some(20.0));
     assert_eq!(grok_weekly, Some(10.0));
+}
+
+/// The bounded capability move must survive the SQLite boundary with its rationale tag, and stats
+/// must count the row as one provider move.
+#[test]
+fn a_capability_projected_draw_gate_persists_and_counts_as_a_flip() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("router.db");
+    let log = DecisionLog::open_at(&path).expect("opens");
+    let config = Config {
+        provider_capabilities: BTreeMap::from([
+            ("claude".to_string(), vec!["Granola".to_string()]),
+            ("codex".to_string(), vec!["Granola".to_string()]),
+        ]),
+        ..Config::default()
+    };
+    let decision = decide(
+        Classification {
+            missing_connector: true,
+            rationale: "requires Granola meeting notes".to_string(),
+            ..scored(false, TaskContextHorizon::Ordinary)
+        },
+        UsageSnapshot {
+            claude: window(5.0, HALF_WEEK),
+            codex: window(80.0, HALF_WEEK),
+            grok: window(1.0, HALF_WEEK),
+        },
+        NOW,
+        &config,
+    );
+    assert_eq!(decision.provider, Provider::Claude);
+    assert!(decision.gates.contains(&Gate::CapabilityProjectedDraw));
+    record(&log, &decision);
+
+    let (provider, gates, rationale): (String, String, String) = rusqlite::Connection::open(&path)
+        .expect("reopen")
+        .query_row(
+            "SELECT provider, gates, rationale FROM decisions",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("query");
+    assert_eq!(provider, "claude");
+    assert_eq!(gates, "missing_connector,capability_projected_draw");
+    assert!(rationale.contains("capability_projected_draw"));
+
+    let stats = collect(
+        &log,
+        Window {
+            limit: 10,
+            since_ms: None,
+        },
+    )
+    .expect("stats");
+    assert_eq!(
+        (stats.flip_rate.numerator, stats.flip_rate.denominator),
+        (1, 1)
+    );
+    assert_eq!(
+        stats.gates.get("capability_projected_draw").copied(),
+        Some(1)
+    );
 }
 
 /// A reset that was never read has no projection, and the column says so rather than carrying a

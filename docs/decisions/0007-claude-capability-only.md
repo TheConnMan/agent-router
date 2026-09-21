@@ -1,4 +1,4 @@
-# 0007. Claude is a capability-only destination
+# 0007. Claude is a capability constrained destination
 
 ## Context
 
@@ -36,10 +36,20 @@ or public web, and git/gh release work; the prompt now names those as local-shel
 
 ## Decision
 
-Claude is selected only by capability pins: `orchestration`,
-`implement_exceeds_codex_window`, or an explicit `--provider claude`. A
-classifier failure is not a pin. A launch failure is not a pin. Exhaustion of
-both workhorses falls through to Codex (`over_ceiling`), never to Claude.
+Claude is selected automatically only through capability routing. The hard
+pins remain `orchestration` and `implement_exceeds_codex_window`. An explicit
+`--provider claude` remains exact. A classifier failure is not a pin. A launch
+failure is not a pin. Exhaustion of both workhorses falls through to Codex
+(`over_ceiling`), never to Claude.
+
+There is one bounded capacity choice. When a matched `provider_capabilities`
+constraint allows both Claude and Codex, weekly routing is enabled, both have
+authoritative weekly capacity below the hard ceiling, and neither is marked
+unlaunchable, compare their projected weekly draws. Claude is selected only
+when both projections exist and its projection is strictly lower. The move is
+recorded as `capability_projected_draw`. A tie or either missing projection
+stays on Codex. If either provider is ineligible, the existing capable
+workhorse behavior applies.
 
 The classifier prompt attacks halo scoring directly: orchestration is never
 inferred from difficulty, scope, file count, or duration; unscoreable input
@@ -53,5 +63,7 @@ Claude pin; see 0010.
 
 ## Constraint
 
-Do not add Claude to the workhorse eligibility set. Do not restore a
-`claude_signals` pin. A fallback classification names no destination.
+Do not add Claude to ordinary workhorse eligibility. The shared capability
+comparison must remain limited to a matched constraint that includes both
+Claude and Codex, and it must never fall back from missing projections. Do not
+restore a `claude_signals` pin. A fallback classification names no destination.

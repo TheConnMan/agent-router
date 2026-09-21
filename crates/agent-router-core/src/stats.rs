@@ -17,7 +17,11 @@ use std::collections::BTreeMap;
 /// `legacy_flip` is the folded form of the four retired provider-moving tags (`headroom_tiebreak`,
 /// `pace_flip`, `projected_overdraw`, `five_hour_pacing`). Schema v2 rewrites those tags on open
 /// so a report over an old window still counts the routes that really did move.
-const FLIP_GATES: [&str; 2] = ["flipped_on_exhaustion", "legacy_flip"];
+const FLIP_GATES: [&str; 3] = [
+    "capability_projected_draw",
+    "flipped_on_exhaustion",
+    "legacy_flip",
+];
 
 /// The gate a row carries when the classifier could not answer and the default provider was used.
 const CLASSIFIER_FAILED: &str = "classifier_failed";

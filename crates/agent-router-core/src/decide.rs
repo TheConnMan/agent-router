@@ -1,5 +1,5 @@
-//! The decision engine: capability pins select Claude; ordinary work selects the eligible Codex or
-//! Grok provider with the lower projected weekly draw. Pure given its inputs.
+//! The decision engine: capability routing selects among capable providers; ordinary work selects
+//! the eligible Codex or Grok provider with the lower projected weekly draw. Pure given its inputs.
 //! See docs/decisions/0006-projected-draw-replaces-pace-flip-gap.md and
 //! docs/decisions/0007-claude-capability-only.md.
 
@@ -38,9 +38,13 @@ pub enum Gate {
     /// A build-tier `/implement` run, which does not fit Codex's context window: an automatic
     /// Claude decision regardless of usage. See `implement_exceeds_codex_window`.
     ImplementContextWindow,
-    /// The provider the task was on is ineligible and the other is not, so it moved. Ineligible is
-    /// either at or over the hard ceiling, or carrying a weekly number nobody read: see
-    /// `WeeklyUnknown`, which is recorded alongside this one to tell the two apart.
+    /// A matched capability is available on Claude and Codex, both pass capacity eligibility, and
+    /// Claude has the strictly lower projected weekly draw. This records only an actual move from
+    /// the Codex default. Missing projections and ties stay on Codex.
+    CapabilityProjectedDraw,
+    /// A workhorse provider is ineligible and the other is not, so the route moved. Ineligible is
+    /// either at or over the hard ceiling, carrying a weekly number nobody read, or unable to
+    /// launch. See `WeeklyUnknown` and `ClassifierUnlaunchable` for the diagnostic cause.
     FlippedOnExhaustion,
     /// Both workhorse providers are ineligible on CAPACITY, so Codex was used anyway. Recorded
     /// only when at least one candidate cleared the capability filter: a field emptied by a
@@ -48,8 +52,8 @@ pub enum Gate {
     /// naming it `over_ceiling` alongside a weekly reading of 14 percent tells a reviewer the
     /// opposite of what happened.
     OverCeiling,
-    /// At least one provider's weekly window was never read, so its percentage is a default
-    /// rather than a reading. Such a provider is ineligible. See
+    /// At least one provider consulted by the active comparison has no authoritative weekly
+    /// reading, so its percentage is a default. Such a provider is ineligible. See
     /// docs/decisions/0004-fail-closed-weekly-unknown.md.
     WeeklyUnknown,
     /// Grok is excluded from automatic routing because its official weekly telemetry is unknown.
@@ -61,16 +65,12 @@ pub enum Gate {
     /// excluded from the eligibility test, in the same sense as one over its hard ceiling.
     ///
     /// This is a DIAGNOSTIC gate, not a provider-moving one. It records only that unlaunchability
-    /// was applied; whether the destination actually changed is recorded separately, by
-    /// `FlippedOnExhaustion` when it moved and by `OverCeiling` when nothing eligible was left.
-    /// It is pushed either way, because the row where an unlaunchable provider kept the work and
-    /// is about to fail loudly is the one an operator most needs to see.
+    /// was applied. `FlippedOnExhaustion` records a workhorse move. A shared capability can exclude
+    /// Claude and stay on Codex without any move gate.
     ///
-    /// It deliberately does NOT belong in `stats.rs`'s `FLIP_GATES`, whose doc says any new
-    /// provider-moving gate does: on a row that moved, `flipped_on_exhaustion` already counts it
-    /// and `any()` counts a row once, so adding this is a no-op; on a row that did not move — the
-    /// common case, since `GrokUnavailable` makes Grok ineligible whenever its weekly window is
-    /// unread — it would count a flip that never happened.
+    /// It deliberately does not belong in `stats.rs`'s `FLIP_GATES`. A moved workhorse row already
+    /// has `flipped_on_exhaustion`, and `any()` counts that row once. A row that did not move must
+    /// not count as a flip.
     ClassifierUnlaunchable,
     /// Both workhorses are eligible but at least one projected weekly draw could not be computed,
     /// so the comparison fell back to raw weekly percent used. Typically this is a window with
@@ -88,6 +88,7 @@ impl Gate {
             Gate::CapabilityBlocked => "capability_blocked",
             Gate::Orchestration => "orchestration",
             Gate::ImplementContextWindow => "implement_context_window",
+            Gate::CapabilityProjectedDraw => "capability_projected_draw",
             Gate::FlippedOnExhaustion => "flipped_on_exhaustion",
             Gate::OverCeiling => "over_ceiling",
             Gate::WeeklyUnknown => "weekly_unknown",
@@ -169,10 +170,11 @@ fn implement_exceeds_codex_window(classification: &Classification) -> bool {
 ///
 /// The rules, in the order they run, and each in the order it must run:
 ///
-/// 1. Capability pins select Claude, bypassing automatic capacity routing. A missing connector is
-///    different: a matched inventory name with no provider is blocked, never assumed to be a
-///    Claude capability. An unmatched miss is not a constraint; ordinary workhorse routing
-///    proceeds. See docs/decisions/0010-unmatched-connector-is-not-a-block.md.
+/// 1. Capability pins select Claude, bypassing automatic capacity routing. A matched capability
+///    available on Claude and Codex uses their projected draw only when both pass the existing
+///    eligibility rules. A matched inventory name with no capable provider is blocked. An
+///    unmatched miss is not a constraint, so ordinary workhorse routing proceeds. See
+///    docs/decisions/0010-unmatched-connector-is-not-a-block.md.
 /// 2. Ordinary work selects between eligible Codex and Grok. Eligibility is still current weekly
 ///    percent: unknown or at/over the hard ceiling is out. When both are eligible and both
 ///    projected draws exist, the lower projected draw wins — that is the provider further below
@@ -226,8 +228,8 @@ pub fn decide_with_task(
         capability_pin = true;
     }
 
-    // Ordinary work starts on Codex. Claude is a capability destination only; automatic capacity
-    // routing chooses between Codex and Grok below.
+    // Ordinary work starts on Codex. Claude remains limited to hard pins and the bounded shared
+    // capability comparison. Automatic workhorse routing still chooses between Codex and Grok.
     let mut provider = Provider::Codex;
     if capability_providers == [Provider::Claude] {
         // Claude remains a capability pin when it is the only established provider.
@@ -270,72 +272,88 @@ pub fn decide_with_task(
                 && classification.unlaunchable != Some(candidate)
         };
         let eligible = |candidate| capability_eligible(candidate) && usage_eligible(candidate);
-        // Only Codex and Grok are ever asked about, so only those two can have been excluded.
-        // Claude is unrepresentable as an exclusion here; it is a no-op rather than an unreachable
-        // arm, because the field is deserialized from a log row and a future engine could widen
-        // what it names.
+        let shared_claude_codex_capability = capability_constraint
+            && capability_providers.contains(&Provider::Claude)
+            && capability_providers.contains(&Provider::Codex);
         if matches!(
             classification.unlaunchable,
             Some(Provider::Codex | Provider::Grok)
-        ) {
+        ) || (shared_claude_codex_capability
+            && classification.unlaunchable == Some(Provider::Claude))
+        {
             gates.push(Gate::ClassifierUnlaunchable);
         }
         if !headroom(&usage, Provider::Codex).weekly_known()
             || !headroom(&usage, Provider::Grok).weekly_known()
+            || (shared_claude_codex_capability
+                && !headroom(&usage, Provider::Claude).weekly_known())
         {
             gates.push(Gate::WeeklyUnknown);
         }
         if !headroom(&usage, Provider::Grok).weekly_known() {
             gates.push(Gate::GrokUnavailable);
         }
-        match (eligible(Provider::Codex), eligible(Provider::Grok)) {
-            (false, false) => {
-                // The router routes; refusing work over a ceiling is bonus drain's job. The
-                // fallback stays Codex when neither authoritative weekly reading is usable.
-                if capability_constraint
-                    && !capability_providers.contains(&Provider::Codex)
-                    && !capability_blocked
-                {
-                    capability_blocked = true;
-                    gates.push(Gate::CapabilityBlocked);
-                } else if capability_eligible(Provider::Codex)
-                    || capability_eligible(Provider::Grok)
-                {
-                    // Some candidate had the capability and still had nowhere to go, so this
-                    // really is a capacity verdict. When neither did, `CapabilityBlocked` is
-                    // already recorded and adding `over_ceiling` would misattribute the block.
-                    gates.push(Gate::OverCeiling);
+        if shared_claude_codex_capability
+            && usage_eligible(Provider::Claude)
+            && usage_eligible(Provider::Codex)
+        {
+            if let (Some(claude_draw), Some(codex_draw)) =
+                (claude_projected_draw, codex_projected_draw)
+                && claude_draw < codex_draw
+            {
+                provider = Provider::Claude;
+                gates.push(Gate::CapabilityProjectedDraw);
+            }
+        } else {
+            match (eligible(Provider::Codex), eligible(Provider::Grok)) {
+                (false, false) => {
+                    // The router routes; refusing work over a ceiling is bonus drain's job. The
+                    // fallback stays Codex when neither authoritative weekly reading is usable.
+                    if capability_constraint
+                        && !capability_providers.contains(&Provider::Codex)
+                        && !capability_blocked
+                    {
+                        capability_blocked = true;
+                        gates.push(Gate::CapabilityBlocked);
+                    } else if capability_eligible(Provider::Codex)
+                        || capability_eligible(Provider::Grok)
+                    {
+                        // Some candidate had the capability and still had nowhere to go, so this
+                        // really is a capacity verdict. When neither did, `CapabilityBlocked` is
+                        // already recorded and adding `over_ceiling` would misattribute the block.
+                        gates.push(Gate::OverCeiling);
+                    }
                 }
-            }
-            (false, true) => {
-                provider = Provider::Grok;
-                gates.push(Gate::FlippedOnExhaustion);
-            }
-            // Exactly Codex eligible: the task stays on Codex.
-            (true, false) => {}
-            (true, true) => {
-                // Pace, not current percent. A tie or a missing projection stays on weekly
-                // percent, which itself ties to Codex. See
-                // docs/decisions/0006-projected-draw-replaces-pace-flip-gap.md.
-                provider = match (codex_projected_draw, grok_projected_draw) {
-                    (Some(codex_draw), Some(grok_draw)) => {
-                        if grok_draw < codex_draw {
-                            Provider::Grok
-                        } else {
-                            Provider::Codex
+                (false, true) => {
+                    provider = Provider::Grok;
+                    gates.push(Gate::FlippedOnExhaustion);
+                }
+                // Exactly Codex eligible: the task stays on Codex.
+                (true, false) => {}
+                (true, true) => {
+                    // Pace, not current percent. A tie or a missing projection stays on weekly
+                    // percent, which itself ties to Codex. See
+                    // docs/decisions/0006-projected-draw-replaces-pace-flip-gap.md.
+                    provider = match (codex_projected_draw, grok_projected_draw) {
+                        (Some(codex_draw), Some(grok_draw)) => {
+                            if grok_draw < codex_draw {
+                                Provider::Grok
+                            } else {
+                                Provider::Codex
+                            }
                         }
-                    }
-                    _ => {
-                        gates.push(Gate::ProjectionUnavailable);
-                        if weekly_used(&usage, Provider::Grok)
-                            < weekly_used(&usage, Provider::Codex)
-                        {
-                            Provider::Grok
-                        } else {
-                            Provider::Codex
+                        _ => {
+                            gates.push(Gate::ProjectionUnavailable);
+                            if weekly_used(&usage, Provider::Grok)
+                                < weekly_used(&usage, Provider::Codex)
+                            {
+                                Provider::Grok
+                            } else {
+                                Provider::Codex
+                            }
                         }
-                    }
-                };
+                    };
+                }
             }
         }
     }

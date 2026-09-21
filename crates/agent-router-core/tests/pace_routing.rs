@@ -48,6 +48,18 @@ fn unknown_window(weekly_pct: f64, five_hour_pct: f64) -> Headroom {
     }
 }
 
+/// A provider with authoritative weekly capacity but no reset timestamp. It passes capacity
+/// eligibility while leaving projected draw unavailable.
+fn projectionless_window(weekly_pct: f64, five_hour_pct: f64) -> Headroom {
+    Headroom {
+        weekly_pct,
+        weekly_reset_epoch: 0,
+        weekly_capacity_known: true,
+        five_hour_pct,
+        ..Headroom::full()
+    }
+}
+
 /// Supply all three provider windows when a rule must distinguish the two workhorse providers.
 fn usage_with_grok(claude: Headroom, codex: Headroom, grok: Headroom) -> UsageSnapshot {
     UsageSnapshot {
@@ -83,6 +95,28 @@ fn implement(complexity: Complexity) -> Classification {
     Classification {
         invokes_implement: true,
         ..scored(false, false, complexity)
+    }
+}
+
+fn shared_capability_config(include_grok: bool) -> Config {
+    let mut provider_capabilities = BTreeMap::from([
+        ("claude".to_string(), vec!["Granola".to_string()]),
+        ("codex".to_string(), vec!["Granola".to_string()]),
+    ]);
+    if include_grok {
+        provider_capabilities.insert("grok".to_string(), vec!["Granola".to_string()]);
+    }
+    Config {
+        provider_capabilities,
+        ..Config::default()
+    }
+}
+
+fn shared_capability_classification(unlaunchable: Option<Provider>) -> Classification {
+    Classification {
+        rationale: "requires Granola meeting notes".to_string(),
+        unlaunchable,
+        ..scored(false, true, Complexity::Medium)
     }
 }
 
@@ -221,6 +255,208 @@ fn a_provider_scoped_capability_keeps_auto_routing_inside_the_eligible_pool() {
     assert!(!decision.capability_blocked);
 }
 
+/// A capability available only on Codex remains on Codex even when Claude has the lower projected
+/// draw. The shared capability exception requires both providers in the matched inventory.
+#[test]
+fn a_codex_only_capability_does_not_compare_claude_projection() {
+    let config = Config {
+        provider_capabilities: BTreeMap::from([("codex".to_string(), vec!["Granola".to_string()])]),
+        ..Config::default()
+    };
+    let decision = decide(
+        shared_capability_classification(None),
+        usage_with_grok(
+            window(1.0, HALF_WEEK, 0.0),
+            window(80.0, HALF_WEEK, 0.0),
+            window(1.0, HALF_WEEK, 0.0),
+        ),
+        NOW,
+        &config,
+    );
+
+    assert_eq!(decision.provider, Provider::Codex);
+    assert!(!decision.capability_blocked);
+    assert!(!decision.gates.contains(&Gate::CapabilityProjectedDraw));
+}
+
+/// A capability shared by Claude and Codex may use Claude only when both providers pass the
+/// existing capacity checks and Claude has a strictly lower projected draw.
+#[test]
+fn a_shared_capability_selects_claude_on_strictly_lower_projected_draw() {
+    let decision = decide(
+        shared_capability_classification(None),
+        usage_with_grok(
+            window(20.0, HALF_WEEK, 0.0),
+            window(40.0, HALF_WEEK, 0.0),
+            window(1.0, HALF_WEEK, 0.0),
+        ),
+        NOW,
+        &shared_capability_config(false),
+    );
+
+    assert_eq!(decision.provider, Provider::Claude);
+    assert!(decision.gates.contains(&Gate::CapabilityProjectedDraw));
+    assert!(decision.rationale.contains("capability_projected_draw"));
+    assert!(!decision.capability_blocked);
+}
+
+/// Disabling weekly routing keeps the configured Codex default even when Claude has the lower
+/// shared capability projection.
+#[test]
+fn disabled_weekly_routing_prevents_the_shared_capability_comparison() {
+    let mut config = shared_capability_config(false);
+    config.policy.weekly_routing = false;
+    let decision = decide(
+        shared_capability_classification(None),
+        usage_with_grok(
+            window(1.0, HALF_WEEK, 0.0),
+            window(40.0, HALF_WEEK, 0.0),
+            window(1.0, HALF_WEEK, 0.0),
+        ),
+        NOW,
+        &config,
+    );
+
+    assert_eq!(decision.provider, Provider::Codex);
+    assert!(decision.gates.contains(&Gate::WeeklyRoutingDisabled));
+    assert!(!decision.gates.contains(&Gate::CapabilityProjectedDraw));
+}
+
+/// Missing projections, equal projections, and a lower Codex projection all preserve Codex.
+/// The capability comparison has no raw percentage fallback.
+#[test]
+fn a_shared_capability_requires_two_projections_and_a_strict_claude_win() {
+    let cases = [
+        (
+            window(40.0, HALF_WEEK, 0.0),
+            window(20.0, HALF_WEEK, 0.0),
+            "Codex has the lower projection",
+        ),
+        (
+            window(20.0, HALF_WEEK, 0.0),
+            window(20.0, HALF_WEEK, 0.0),
+            "equal projections preserve Codex",
+        ),
+        (
+            projectionless_window(1.0, 0.0),
+            window(20.0, HALF_WEEK, 0.0),
+            "Claude has no projection",
+        ),
+        (
+            window(1.0, HALF_WEEK, 0.0),
+            projectionless_window(20.0, 0.0),
+            "Codex has no projection",
+        ),
+    ];
+
+    for (claude, codex, reason) in cases {
+        let decision = decide(
+            shared_capability_classification(None),
+            usage_with_grok(claude, codex, window(0.5, HALF_WEEK, 0.0)),
+            NOW,
+            &shared_capability_config(false),
+        );
+
+        assert_eq!(decision.provider, Provider::Codex, "{reason}");
+        assert!(
+            !decision.gates.contains(&Gate::CapabilityProjectedDraw),
+            "{reason}"
+        );
+        assert!(!decision.gates.contains(&Gate::ProjectionUnavailable));
+    }
+}
+
+/// When either member of the Claude and Codex pair is ineligible, routing returns to the existing
+/// capable workhorse rules. Grok is capable in this fixture and has the lowest projected draw.
+#[test]
+fn an_ineligible_shared_capability_provider_preserves_existing_routing() {
+    let unread = Headroom {
+        weekly_pct: 1.0,
+        weekly_reset_epoch: NOW + HALF_WEEK,
+        weekly_capacity_known: false,
+        ..Headroom::full()
+    };
+    let cases = [
+        (
+            unread,
+            window(30.0, HALF_WEEK, 0.0),
+            None,
+            Gate::WeeklyUnknown,
+            "Claude weekly capacity is unknown",
+        ),
+        (
+            window(30.0, HALF_WEEK, 0.0),
+            unread,
+            None,
+            Gate::WeeklyUnknown,
+            "Codex weekly capacity is unknown",
+        ),
+        (
+            window(98.0, HALF_WEEK, 0.0),
+            window(30.0, HALF_WEEK, 0.0),
+            None,
+            Gate::MissingConnector,
+            "Claude is at the hard ceiling",
+        ),
+        (
+            window(30.0, HALF_WEEK, 0.0),
+            window(98.0, HALF_WEEK, 0.0),
+            None,
+            Gate::MissingConnector,
+            "Codex is at the hard ceiling",
+        ),
+        (
+            window(30.0, HALF_WEEK, 0.0),
+            window(30.0, HALF_WEEK, 0.0),
+            Some(Provider::Claude),
+            Gate::ClassifierUnlaunchable,
+            "Claude cannot launch",
+        ),
+        (
+            window(30.0, HALF_WEEK, 0.0),
+            window(30.0, HALF_WEEK, 0.0),
+            Some(Provider::Codex),
+            Gate::ClassifierUnlaunchable,
+            "Codex cannot launch",
+        ),
+    ];
+
+    for (claude, codex, unlaunchable, expected_gate, reason) in cases {
+        let decision = decide(
+            shared_capability_classification(unlaunchable),
+            usage_with_grok(claude, codex, window(5.0, HALF_WEEK, 0.0)),
+            NOW,
+            &shared_capability_config(true),
+        );
+
+        assert_eq!(decision.provider, Provider::Grok, "{reason}");
+        assert!(decision.gates.contains(&expected_gate), "{reason}");
+        assert!(
+            !decision.gates.contains(&Gate::CapabilityProjectedDraw),
+            "{reason}"
+        );
+    }
+}
+
+/// Even when Grok also advertises the capability and has the lowest draw, two eligible pair
+/// members use the bounded Claude and Codex comparison. A lower Codex projection stays on Codex.
+#[test]
+fn a_lower_codex_projection_wins_the_capability_pair_when_grok_is_also_capable() {
+    let decision = decide(
+        shared_capability_classification(None),
+        usage_with_grok(
+            window(40.0, HALF_WEEK, 0.0),
+            window(20.0, HALF_WEEK, 0.0),
+            window(1.0, HALF_WEEK, 0.0),
+        ),
+        NOW,
+        &shared_capability_config(true),
+    );
+
+    assert_eq!(decision.provider, Provider::Codex);
+    assert!(!decision.gates.contains(&Gate::CapabilityProjectedDraw));
+}
+
 /// The same Slack inventory recovers when the product name is in the task and the one-sentence
 /// rationale omits it. Grok stays ineligible because it is not in the inventory. An unmatched
 /// miss (no product name in task or rationale) is ordinary routing, not a refuse.
@@ -257,8 +493,9 @@ fn a_task_named_capability_recovers_when_the_rationale_omits_the_product() {
         &config,
     );
     assert!(!recovered.capability_blocked);
-    assert_eq!(recovered.provider, Provider::Codex);
+    assert_eq!(recovered.provider, Provider::Claude);
     assert!(recovered.gates.contains(&Gate::MissingConnector));
+    assert!(recovered.gates.contains(&Gate::CapabilityProjectedDraw));
     assert!(!recovered.gates.contains(&Gate::CapabilityBlocked));
     assert_eq!(
         recovered.matched_capabilities,
@@ -436,12 +673,9 @@ fn a_descript_mcp_research_question_is_ordinary_work() {
 /// provider choice even when another provider is the only one that advertises the capability.
 #[test]
 fn explicit_provider_bypasses_automatic_capability_eligibility() {
-    let config = Config {
-        provider_capabilities: BTreeMap::from([("codex".to_string(), vec!["Granola".to_string()])]),
-        ..Config::default()
-    };
+    let config = shared_capability_config(false);
     let decision = decide_explicit(
-        Provider::Grok,
+        Provider::Codex,
         None,
         None,
         Some(Classification {
@@ -450,13 +684,13 @@ fn explicit_provider_bypasses_automatic_capability_eligibility() {
         }),
         usage_with_grok(
             window(1.0, HALF_WEEK, 0.0),
-            window(1.0, HALF_WEEK, 0.0),
-            window(1.0, HALF_WEEK, 0.0),
+            window(40.0, HALF_WEEK, 0.0),
+            window(5.0, HALF_WEEK, 0.0),
         ),
         &config,
     );
 
-    assert_eq!(decision.provider, Provider::Grok);
+    assert_eq!(decision.provider, Provider::Codex);
     assert_eq!(decision.gates, vec![Gate::ExplicitProvider]);
     assert!(!decision.capability_blocked);
 }
@@ -500,6 +734,7 @@ fn workhorse_routing_uses_known_weekly_headroom_and_breaks_ties_to_codex() {
         );
 
         assert_eq!(decision.provider, expected, "{reason}");
+        assert!(!decision.gates.contains(&Gate::CapabilityProjectedDraw));
     }
 }
 

@@ -34,4 +34,6 @@ so no plan sizes appear in the comparison.
 
 Do not bring back `pace_flip_gap` or any jobs-per-hour comparison. Do not
 project from a zero reset epoch or from a window with less than
-`MIN_PROJECTION_ELAPSED`. Claude is not in this comparison (see 0007).
+`MIN_PROJECTION_ELAPSED`. Claude is not in the ordinary workhorse comparison.
+The bounded shared capability comparison in 0007 reuses projected draw only
+when Claude and Codex are both eligible, and it has no raw percentage fallback.

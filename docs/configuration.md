@@ -164,7 +164,8 @@ window, so that decision carries `weekly_unknown` instead, which names the reaso
 consequence.
 
 Setting `weekly_routing = false` disables weekly balancing along with every other usage-driven rule.
-Claude's 5-hour usage does not pace automatic routing; Claude is selected only by capability pins.
+Claude's five hour usage does not pace automatic routing. Claude is selected by capability pins or
+the bounded shared capability comparison described under `provider_capabilities`.
 
 ### `classifier_timeout_secs`
 
@@ -227,6 +228,13 @@ Title-Case inventory name such as `Notion` does not match English `notion`. Grok
 of that pool unless it is listed here. Explicit `--provider` requests remain exact and do
 not use this automatic eligibility filter. The decision log records which names hit and
 whether they came from the task, the rationale, or both.
+
+When a matched capability is registered for both Claude and Codex, weekly routing may choose
+between those two providers. Both must have authoritative weekly capacity below the hard ceiling,
+neither may be marked unlaunchable, and both projected draws must exist. Claude is selected only
+when its projection is strictly lower, and the decision records `capability_projected_draw`. A tie
+or either missing projection stays on Codex. If either provider is ineligible, the existing capable
+workhorse routing applies. This rule does not apply to ordinary unmatched work.
 
 ## `[policy]`
 
