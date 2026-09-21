@@ -235,6 +235,35 @@ fn automatic_routing_balances_known_workhorse_weekly_headroom() {
 }
 
 #[test]
+fn grok_ceiling_excludes_grok_without_moving_the_codex_ceiling() {
+    let config = Config {
+        grok_hard_ceiling_pct: Some(95.0),
+        ..Config::default()
+    };
+    let route = |codex, grok| {
+        decide(
+            plain_task(),
+            UsageSnapshot {
+                claude: known(10.0),
+                codex,
+                grok,
+            },
+            NOW,
+            &config,
+        )
+        .provider
+    };
+
+    // Grok at 96 is past its own 95 ceiling, so an exhausted Codex cannot flip to it.
+    assert_eq!(route(known(99.0), known(96.0)), Provider::Codex);
+    // Grok under 95 stays a flip target.
+    assert_eq!(route(known(99.0), known(94.0)), Provider::Grok);
+    // Codex at 96 is still under the shared 98 ceiling, so it keeps the task over a full Grok.
+    assert_eq!(route(known(96.0), known(96.0)), Provider::Codex);
+    assert_eq!(config.hard_ceiling_for(Provider::Codex), 98.0);
+}
+
+#[test]
 fn grok_can_be_an_eligible_adversarial_reviewer() {
     let grok = EligibleGrokReviewer;
     let request = ReviewRequest {
