@@ -411,6 +411,14 @@ impl DecisionLog {
         }
         let conn = Connection::open(path)?;
         conn.busy_timeout(std::time::Duration::from_millis(500))?;
+        // The review worker commits while `review status` opens this same file. The rollback
+        // journal holds an exclusive lock for that whole commit, and this timeout is 500ms, so a
+        // status call in that window fails with "database is locked". That is what the main check
+        // hit on cancel. WAL lets the read proceed against the last committed snapshot. A database
+        // this process cannot write refuses the change and stays on the rollback journal; that
+        // refusal must not fail open, because the read-only fixtures exist to prove a later write
+        // fails.
+        enable_wal(&conn)?;
         migrate_schema(&conn)?;
         conn.execute_batch(SCHEMA)?;
         conn.execute_batch(REVIEWS_SCHEMA)?;
@@ -981,6 +989,26 @@ const V2_COLUMNS: [&str; 40] = [
     "requested_model",
     "outcome",
 ];
+
+/// IMPURE: put `conn` into WAL mode.
+///
+/// `PRAGMA journal_mode` persists in the database header, so later connections inherit it. A
+/// read-only database returns `SQLITE_READONLY` instead of changing mode. That is success here:
+/// open has to keep working so the caller can discover the write failure itself.
+fn enable_wal(conn: &Connection) -> Result<()> {
+    match conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get::<_, String>(0)) {
+        Ok(mode) if mode.eq_ignore_ascii_case("wal") => Ok(()),
+        Ok(mode) => Err(Error::Command(format!(
+            "router.db journal mode is {mode}, not wal"
+        ))),
+        Err(rusqlite::Error::SqliteFailure(code, _))
+            if code.code == rusqlite::ErrorCode::ReadOnly =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
 
 /// IMPURE: bring a database written before any of those columns up to the current schema. Guarded
 /// on each column being absent, because `ALTER TABLE ADD COLUMN` is an error when it is not.
@@ -2234,6 +2262,32 @@ mod tests {
         // The append does not move the row off cancelled, so the CAS still holds afterwards.
         assert_eq!(row.status.as_deref(), Some("cancelled"));
         assert_eq!(row.exit_status, 1);
+    }
+
+    /// `review status` runs while the worker may still be committing the cancel. A reader that
+    /// blocks on that writer fails the status command with "database is locked" once the 500ms
+    /// busy timeout expires, which is the main-check failure this guards.
+    #[test]
+    fn a_reader_is_not_blocked_by_a_writer_holding_the_reserved_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("router.db");
+        let log = DecisionLog::open_at(&path).expect("opens");
+        let id = log
+            .start_review("codex", Path::new("/tmp"))
+            .expect("starts a review");
+
+        let holder = rusqlite::Connection::open(&path).expect("second connection");
+        holder
+            .execute_batch("BEGIN IMMEDIATE;")
+            .expect("take the write lock");
+
+        let row = log
+            .review(id)
+            .expect("a reader must not wait out the writer's lock")
+            .expect("the pending row");
+        assert_eq!(row.status.as_deref(), Some("pending"));
+
+        holder.execute_batch("ROLLBACK;").expect("release the lock");
     }
 
     /// A database holding the pre-lifecycle `reviews` table gains the later columns on open,
