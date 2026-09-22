@@ -1259,20 +1259,20 @@ fn a_pinned_codex_reviewer_keeps_the_read_only_ephemeral_sandbox_with_the_exact_
     let output = pinned(
         &fixture,
         "claude",
-        &["--provider", "codex", "--model", "gpt-5.6-terra"],
+        &["--provider", "codex", "--model", "gpt-6-terra"],
     );
 
     assert_exit(&output, 0);
     let value = parse_json(&output);
     assert_eq!(value["status"], "completed");
     assert_eq!(value["reviewer_provider"], "codex");
-    assert_eq!(value["reviewer_model"], "gpt-5.6-terra");
-    assert_eq!(value["requested_model"], "gpt-5.6-terra");
+    assert_eq!(value["reviewer_model"], "gpt-6-terra");
+    assert_eq!(value["requested_model"], "gpt-6-terra");
     assert!(!fixture.claude_log.exists());
     let invocation = argv(&fixture.codex_log);
     assert_eq!(
         flag_value(&invocation, "--model").as_deref(),
-        Some("gpt-5.6-terra")
+        Some("gpt-6-terra")
     );
     assert_eq!(
         flag_value(&invocation, "--sandbox").as_deref(),

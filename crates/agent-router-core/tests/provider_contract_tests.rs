@@ -483,7 +483,7 @@ fn a_codex_response_without_a_reasoning_effort_records_the_accepted_turn_overrid
         Path::new("/tmp"),
         "perform one task",
         "Bonus: abc 123",
-        Some("gpt-5.6-sol"),
+        Some("gpt-6-sol"),
         Some("xhigh"),
     );
 
@@ -502,7 +502,7 @@ fn a_codex_response_without_a_reasoning_effort_records_the_accepted_turn_overrid
         "the decided effort did reach the turn, so it was available to be wrongly recorded"
     );
     assert_eq!(
-        rpc.requests[0]["params"]["model"], "gpt-5.6-sol",
+        rpc.requests[0]["params"]["model"], "gpt-6-sol",
         "the model was available to be wrongly recorded too"
     );
 }
@@ -1166,7 +1166,7 @@ fn codex_decision_effort_reaches_turn_start_at_the_dispatch_boundary() {
 
     let decision = decide_explicit(
         Provider::Codex,
-        Some("gpt-5.6-sol".to_string()),
+        Some("gpt-6-sol".to_string()),
         Some("high".to_string()),
         None,
         UsageSnapshot::full(),
@@ -1174,13 +1174,13 @@ fn codex_decision_effort_reaches_turn_start_at_the_dispatch_boundary() {
     );
     // A fully pinned route must reach the provider unchanged, without classification supplying
     // another model or effort.
-    assert_eq!(decision.model.as_deref(), Some("gpt-5.6-sol"));
+    assert_eq!(decision.model.as_deref(), Some("gpt-6-sol"));
     assert_eq!(decision.effort.as_deref(), Some("high"));
     let request = Request {
         task: "exercise the real dispatch seam",
         dir: &root.path,
         provider: Some(Provider::Codex),
-        model: Some("gpt-5.6-sol".to_string()),
+        model: Some("gpt-6-sol".to_string()),
         effort: Some("high".to_string()),
         name: None,
         dry_run: false,
@@ -1217,7 +1217,7 @@ fn codex_decision_effort_reaches_turn_start_at_the_dispatch_boundary() {
     );
     assert_eq!(requests[3]["method"], "turn/start");
     assert_eq!(requests[3]["params"]["effort"], "high");
-    assert_eq!(requests[1]["params"]["model"], "gpt-5.6-sol");
+    assert_eq!(requests[1]["params"]["model"], "gpt-6-sol");
     // The task reaches Codex verbatim. The router prepends nothing: an execution-mode preamble
     // here fought the repo's own AGENTS.md and showed up as boilerplate on every routed session.
     assert_eq!(

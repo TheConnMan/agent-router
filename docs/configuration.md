@@ -49,11 +49,11 @@ weekly_routing = true
 [classifier]
 engine = "codex"
 claude_model = "haiku"
-codex_model = "gpt-5.6-luna"
+codex_model = "gpt-6-luna"
 
 [models.codex]
-low = "gpt-5.6-terra"
-medium = "gpt-5.6-sol"
+low = "gpt-6-terra"
+medium = "gpt-6-sol"
 high = "gpt-6-astra"
 ultra = "gpt-6-astra"
 
@@ -271,7 +271,7 @@ task.
 
 ### `claude_model` and `codex_model`
 
-Defaults `"haiku"` and `"gpt-5.6-luna"`; the default engine is Codex. The model each engine scores with. Both are kept
+Defaults `"haiku"` and `"gpt-6-luna"`; the default engine is Codex. The model each engine scores with. Both are kept
 regardless of which engine is in force, so flipping `engine` is a one word edit rather than a
 re-pick of the model.
 

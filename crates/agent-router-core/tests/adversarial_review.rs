@@ -511,11 +511,11 @@ fn a_pinned_claude_reviewer_is_refused_once_usage_plus_the_reserve_reaches_the_c
     assert_eq!(at_seventy.calls.get(), 1);
 
     // The reserve is Claude's alone: a pinned codex reviewer at the same reading is unaffected.
-    let codex = StubReviewer::successful("codex", "gpt-5.6-sol", Some(fresh(70.0)), "review");
+    let codex = StubReviewer::successful("codex", "gpt-6-sol", Some(fresh(70.0)), "review");
     let outcome = review_pinned_with_providers(
         &request("claude"),
         &[&codex],
-        &pin(Provider::Codex, Some("gpt-5.6-sol")),
+        &pin(Provider::Codex, Some("gpt-6-sol")),
         25.0,
     )
     .expect("completes");

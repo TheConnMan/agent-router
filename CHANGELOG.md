@@ -3,6 +3,11 @@
 All notable changes to this project are documented here. Versions are the
 workspace `package.version` stamped on every decision-log row.
 
+## 0.29.0 - 2026-09-22
+
+- Use the GPT-6 Codex model names. `gpt-5.6-luna`, `gpt-5.6-terra`, and `gpt-5.6-sol` are now
+  `gpt-6-luna`, `gpt-6-terra`, and `gpt-6-sol`. The tier table is otherwise unchanged.
+
 ## 0.28.0 - 2026-09-21
 
 - Compare shared capability providers by projected weekly draw. Claude is selected only when both

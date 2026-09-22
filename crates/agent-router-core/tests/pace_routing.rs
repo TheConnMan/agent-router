@@ -952,8 +952,8 @@ fn both_workhorse_weekly_windows_unknown_still_route_to_codex() {
 fn complexity_picks_codex_tiers_without_overruling_workhorse_headroom() {
     let config = Config::default();
     let cases = [
-        (Complexity::Low, "gpt-5.6-terra", "high"),
-        (Complexity::Medium, "gpt-5.6-sol", "medium"),
+        (Complexity::Low, "gpt-6-terra", "high"),
+        (Complexity::Medium, "gpt-6-sol", "medium"),
         (Complexity::High, "gpt-6-astra", "low"),
         (Complexity::Ultra, "gpt-6-astra", "high"),
     ];
@@ -979,14 +979,14 @@ fn complexity_picks_codex_tiers_without_overruling_workhorse_headroom() {
 #[test]
 fn codex_effort_follows_the_complexity_ladder_with_custom_models() {
     let mut config = Config::default();
-    config.models.codex.low = "gpt-5.6-terra".to_string();
-    config.models.codex.medium = "gpt-5.6-terra".to_string();
+    config.models.codex.low = "gpt-6-terra".to_string();
+    config.models.codex.medium = "gpt-6-terra".to_string();
     config.models.codex.high = "gpt-6-astra".to_string();
     config.models.codex.ultra = "gpt-6-astra".to_string();
 
     let cases = [
-        (Complexity::Low, "gpt-5.6-terra", "high"),
-        (Complexity::Medium, "gpt-5.6-terra", "medium"),
+        (Complexity::Low, "gpt-6-terra", "high"),
+        (Complexity::Medium, "gpt-6-terra", "medium"),
         (Complexity::High, "gpt-6-astra", "low"),
         (Complexity::Ultra, "gpt-6-astra", "high"),
     ];
