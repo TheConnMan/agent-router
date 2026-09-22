@@ -872,10 +872,7 @@ mod tests {
 
         let defaults = Config::default();
         assert_eq!(defaults.models.codex.pick(Complexity::Low), "gpt-6-terra");
-        assert_eq!(
-            defaults.models.codex.pick(Complexity::Medium),
-            "gpt-6-sol"
-        );
+        assert_eq!(defaults.models.codex.pick(Complexity::Medium), "gpt-6-sol");
         assert_eq!(defaults.models.codex.pick(Complexity::High), "gpt-6-astra");
         assert_eq!(defaults.models.codex.pick(Complexity::Ultra), "gpt-6-astra");
         assert_eq!(defaults.models.claude.pick(Complexity::Low), "sonnet");
