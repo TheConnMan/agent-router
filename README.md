@@ -10,7 +10,7 @@ data instead of memory.
 
 ```
 $ agent-router run "Port usage.sh to Rust with the same fail-open semantics"
-codex complexity medium model gpt-5.6-terra job 019c3f2a name "Port usage.sh to Rust with the same fail"
+codex complexity medium model gpt-6-terra job 019c3f2a name "Port usage.sh to Rust with the same fail"
 why: codex: bounded rust port, fail-open usage (orchestration no, claude weekly 12%, codex weekly 41%, grok weekly 8%, claude 5h 3%)
 log: row 87 in /home/you/.local/state/agent-router/router.db
 ```
@@ -177,7 +177,7 @@ agent-router run "Add a --json flag to the log command"
 agent-router run "Refactor the parity scanner" --dry-run
 
 # Pin the provider while classification fills omitted values.
-agent-router run "Bump the lockfile" --provider codex --model gpt-5.6-luna
+agent-router run "Bump the lockfile" --provider codex --model gpt-6-luna
 
 # Dispatch a Grok task explicitly (auto routing may also select it for ordinary work).
 agent-router run "Review this migration plan" --provider grok --model grok-4

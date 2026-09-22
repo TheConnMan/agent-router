@@ -1539,7 +1539,7 @@ fn a_claude_dispatch_records_no_effective_effort() {
 #[test]
 fn pinned_codex_provider_uses_the_complexity_model_and_effort_mapping() {
     for (label, task, complexity, model, effort) in [
-        ("codex-low", "say hi", "low", "gpt-5.6-terra", "high"),
+        ("codex-low", "say hi", "low", "gpt-6-terra", "high"),
         (
             "codex-high",
             "/implement redesign the router architecture",

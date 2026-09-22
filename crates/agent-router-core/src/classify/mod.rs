@@ -1203,7 +1203,7 @@ mod tests {
     #[test]
     fn the_codex_invocation_pins_its_hermetic_flags_and_a_read_only_sandbox() {
         let cmd =
-            codex_classifier_command_with_binary(Path::new("codex"), "score this", "gpt-5.6-luna");
+            codex_classifier_command_with_binary(Path::new("codex"), "score this", "gpt-6-luna");
         assert_eq!(cmd.get_program(), std::ffi::OsStr::new("codex"));
         let args = args_of(&cmd);
         assert_eq!(args.first().map(String::as_str), Some("exec"));
@@ -1220,7 +1220,7 @@ mod tests {
         let config = args.iter().position(|a| a == "-c").expect("-c");
         assert_eq!(args[config + 1], "project_doc_max_bytes=0");
         let model = args.iter().position(|a| a == "--model").expect("--model");
-        assert_eq!(args[model + 1], "gpt-5.6-luna");
+        assert_eq!(args[model + 1], "gpt-6-luna");
         assert_eq!(args.last().map(String::as_str), Some("score this"));
 
         // Scoring must reach the model with no tool it could be talked into using.
@@ -1285,7 +1285,7 @@ mod tests {
         let mut classifier = Classifier {
             engine: ClassifierEngine::Claude,
             claude_model: "haiku".to_string(),
-            codex_model: "gpt-5.6-luna".to_string(),
+            codex_model: "gpt-6-luna".to_string(),
             jev_model: "jev-1.13.0".to_string(),
             naming_engine: ClassifierEngine::Claude,
         };
@@ -1294,19 +1294,19 @@ mod tests {
             classifier_command_with_binary(Path::new("claude"), "score this", &classifier);
         assert_eq!(on_claude.get_program(), std::ffi::OsStr::new("claude"));
         assert!(args_of(&on_claude).contains(&"haiku".to_string()));
-        assert!(!args_of(&on_claude).contains(&"gpt-5.6-luna".to_string()));
+        assert!(!args_of(&on_claude).contains(&"gpt-6-luna".to_string()));
 
         classifier.engine = ClassifierEngine::Codex;
         let on_codex =
             classifier_command_with_binary(Path::new("codex"), "score this", &classifier);
         assert_eq!(on_codex.get_program(), std::ffi::OsStr::new("codex"));
-        assert!(args_of(&on_codex).contains(&"gpt-5.6-luna".to_string()));
+        assert!(args_of(&on_codex).contains(&"gpt-6-luna".to_string()));
         assert!(!args_of(&on_codex).contains(&"haiku".to_string()));
 
         // A retuned model reaches the invocation; nothing pins the catalogue names in code.
-        classifier.codex_model = "gpt-5.6-terra".to_string();
+        classifier.codex_model = "gpt-6-terra".to_string();
         let retuned = classifier_command_with_binary(Path::new("codex"), "score this", &classifier);
-        assert!(args_of(&retuned).contains(&"gpt-5.6-terra".to_string()));
+        assert!(args_of(&retuned).contains(&"gpt-6-terra".to_string()));
     }
 
     /// The codex envelope is JSONL rather than one object, so the answer is dug out of the event

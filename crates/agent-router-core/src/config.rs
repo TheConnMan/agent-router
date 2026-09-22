@@ -85,7 +85,7 @@ impl Default for Classifier {
         Classifier {
             engine: ClassifierEngine::Codex,
             claude_model: "haiku".to_string(),
-            codex_model: "gpt-5.6-luna".to_string(),
+            codex_model: "gpt-6-luna".to_string(),
             jev_model: "jev-1.13.0".to_string(),
             naming_engine: ClassifierEngine::Claude,
         }
@@ -146,8 +146,8 @@ pub struct CodexModels {
 impl Default for CodexModels {
     fn default() -> CodexModels {
         CodexModels {
-            low: "gpt-5.6-terra".to_string(),
-            medium: "gpt-5.6-sol".to_string(),
+            low: "gpt-6-terra".to_string(),
+            medium: "gpt-6-sol".to_string(),
             high: "gpt-6-astra".to_string(),
             ultra: "gpt-6-astra".to_string(),
         }
@@ -871,11 +871,8 @@ mod tests {
         let path = dir.path().join("config.toml");
 
         let defaults = Config::default();
-        assert_eq!(defaults.models.codex.pick(Complexity::Low), "gpt-5.6-terra");
-        assert_eq!(
-            defaults.models.codex.pick(Complexity::Medium),
-            "gpt-5.6-sol"
-        );
+        assert_eq!(defaults.models.codex.pick(Complexity::Low), "gpt-6-terra");
+        assert_eq!(defaults.models.codex.pick(Complexity::Medium), "gpt-6-sol");
         assert_eq!(defaults.models.codex.pick(Complexity::High), "gpt-6-astra");
         assert_eq!(defaults.models.codex.pick(Complexity::Ultra), "gpt-6-astra");
         assert_eq!(defaults.models.claude.pick(Complexity::Low), "sonnet");
@@ -890,12 +887,12 @@ mod tests {
 
         std::fs::write(
             &path,
-            "[models.codex]\nlow = \"gpt-5.6-tiny\"\n\n[models.claude]\nultra = \"opus[1m]\"\n",
+            "[models.codex]\nlow = \"gpt-6-tiny\"\n\n[models.claude]\nultra = \"opus[1m]\"\n",
         )
         .expect("write");
         let partial = Config::load_from(&path).expect("loads");
-        assert_eq!(partial.models.codex.low, "gpt-5.6-tiny");
-        assert_eq!(partial.models.codex.medium, "gpt-5.6-sol");
+        assert_eq!(partial.models.codex.low, "gpt-6-tiny");
+        assert_eq!(partial.models.codex.medium, "gpt-6-sol");
         assert_eq!(partial.models.codex.high, "gpt-6-astra");
         assert_eq!(partial.models.codex.ultra, "gpt-6-astra");
         assert_eq!(partial.models.claude.ultra, "opus[1m]");
@@ -914,8 +911,8 @@ mod tests {
         let defaults = Config::default();
         assert_eq!(defaults.classifier.engine, ClassifierEngine::Codex);
         assert_eq!(defaults.classifier.claude_model, "haiku");
-        assert_eq!(defaults.classifier.codex_model, "gpt-5.6-luna");
-        assert_eq!(defaults.classifier.model(), "gpt-5.6-luna");
+        assert_eq!(defaults.classifier.codex_model, "gpt-6-luna");
+        assert_eq!(defaults.classifier.model(), "gpt-6-luna");
         assert_eq!(defaults.connectors, vec!["local shell"]);
         assert!(defaults.provider_capabilities.is_empty());
 
@@ -928,21 +925,21 @@ mod tests {
         std::fs::write(&path, "[classifier]\nengine = \"codex\"\n").expect("write");
         let flipped = Config::load_from(&path).expect("loads");
         assert_eq!(flipped.classifier.engine, ClassifierEngine::Codex);
-        assert_eq!(flipped.classifier.model(), "gpt-5.6-luna");
+        assert_eq!(flipped.classifier.model(), "gpt-6-luna");
         assert_eq!(flipped.classifier.claude_model, "haiku");
 
         std::fs::write(
             &path,
-            "[classifier]\nengine = \"codex\"\ncodex_model = \"gpt-5.6-terra\"\n",
+            "[classifier]\nengine = \"codex\"\ncodex_model = \"gpt-6-terra\"\n",
         )
         .expect("write");
         let retuned = Config::load_from(&path).expect("loads");
-        assert_eq!(retuned.classifier.model(), "gpt-5.6-terra");
+        assert_eq!(retuned.classifier.model(), "gpt-6-terra");
 
         std::fs::write(&path, "[classifier]\nclaude_model = \"sonnet\"\n").expect("write");
         let claude_only = Config::load_from(&path).expect("loads");
         assert_eq!(claude_only.classifier.engine, ClassifierEngine::Codex);
-        assert_eq!(claude_only.classifier.model(), "gpt-5.6-luna");
+        assert_eq!(claude_only.classifier.model(), "gpt-6-luna");
         assert_eq!(claude_only.classifier.claude_model, "sonnet");
 
         std::fs::write(&path, "[classifier]\nengine = \"jev\"\n").expect("write");
@@ -1057,6 +1054,6 @@ mod tests {
             ..Classifier::default()
         };
         assert_eq!(classifier.model(), "haiku");
-        assert_eq!(classifier.naming().model(), "gpt-5.6-luna");
+        assert_eq!(classifier.naming().model(), "gpt-6-luna");
     }
 }

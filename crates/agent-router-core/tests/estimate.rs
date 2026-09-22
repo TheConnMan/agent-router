@@ -14,9 +14,9 @@ use std::path::Path;
 
 /// The model every comparable row in these fixtures ran on. Named here rather than read from the
 /// config defaults, so a retiered catalogue cannot quietly change what "comparable" means.
-const MODEL: &str = "gpt-5.6-sol";
+const MODEL: &str = "gpt-6-sol";
 /// A second tier on the same provider, which is a different sample key.
-const OTHER_MODEL: &str = "gpt-5.6-tiny";
+const OTHER_MODEL: &str = "gpt-6-tiny";
 
 /// One row to write straight into the table: provider, model, claude weekly percent, codex weekly
 /// percent, dry run, in the order the INSERT below binds them. `record` reads its percentages from
