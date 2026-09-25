@@ -46,15 +46,13 @@ pub enum Gate {
     /// `PriorityOverriddenByUsage`. See docs/decisions/0012-configurable-provider-priority.md.
     CapabilityProjectedDraw,
     /// The highest-priority capable candidate is ineligible and another eligible candidate took
-    /// the task. Ineligible is
-    /// either at or over the hard ceiling, carrying a weekly number nobody read, or unable to
-    /// launch. See `WeeklyUnknown` and `ClassifierUnlaunchable` for the diagnostic cause.
+    /// the task. Ineligible is either at or over the hard ceiling, carrying a weekly number nobody
+    /// read, or unable to launch. See `WeeklyUnknown` and `ClassifierUnlaunchable` for the diagnostic cause.
     FlippedOnExhaustion,
     /// Every capable priority candidate is ineligible on CAPACITY, so the first capable candidate
-    /// was used anyway. Recorded
-    /// only when at least one candidate cleared the capability filter: a field emptied by a
-    /// matched inventory name with no dispatcher is `CapabilityBlocked` and nothing else, because
-    /// naming it `over_ceiling` alongside a weekly reading of 14 percent tells a reviewer the
+    /// was used anyway. Recorded only when at least one candidate cleared the capability filter: a
+    /// field emptied by a matched inventory name with no dispatcher is `CapabilityBlocked` and
+    /// nothing else, because naming it `over_ceiling` alongside a weekly reading of 14 percent tells a reviewer the
     /// opposite of what happened.
     OverCeiling,
     /// At least one provider consulted by the active comparison has no authoritative weekly
@@ -75,15 +73,14 @@ pub enum Gate {
     /// `FlippedOnExhaustion` records a move off the first candidate. An unlaunchable
     /// lower-priority candidate can be excluded without any move gate.
     ///
-    /// It deliberately does not belong in `stats.rs`'s `FLIP_GATES`. A moved workhorse row already
+    /// It deliberately does not belong in `stats.rs`'s `FLIP_GATES`. A row moved off its first candidate already
     /// has `flipped_on_exhaustion`, and `any()` counts that row once. A row that did not move must
     /// not count as a flip.
     ClassifierUnlaunchable,
     /// Two or more priority candidates are eligible but at least one projected weekly draw could
     /// not be computed, so every eligible candidate was compared on raw weekly percent used.
-    /// Typically this is a window with
-    /// less than a twentieth elapsed, where dividing by that fraction would turn a couple of jobs
-    /// into a four-figure projection.
+    /// Typically this is a window with less than a twentieth elapsed, where dividing by that
+    /// fraction would turn a couple of jobs into a four-figure projection.
     ProjectionUnavailable,
     /// The highest-priority capable candidate was eligible, but usage selected a lower-priority one
     /// whose score beat it by more than `priority_margin_pct`. A provider-moving gate: it is in
@@ -269,7 +266,7 @@ pub fn decide_with_task(
     } else if capability_pin {
         provider = Provider::Claude;
     } else if classification.classifier_failed {
-        // Not a pin: a task nobody could score still selects by known workhorse capacity.
+        // Not a pin: a task nobody could score still selects by known candidate capacity.
         gates.push(Gate::ClassifierFailed);
     }
 
@@ -303,14 +300,15 @@ pub fn decide_with_task(
         {
             gates.push(Gate::ClassifierUnlaunchable);
         }
-        if candidates
+        let weekly_unknown: Vec<Provider> = candidates
             .iter()
-            .any(|candidate| !headroom(&usage, *candidate).weekly_known())
-        {
+            .copied()
+            .filter(|candidate| !headroom(&usage, *candidate).weekly_known())
+            .collect();
+        if !weekly_unknown.is_empty() {
             gates.push(Gate::WeeklyUnknown);
         }
-        if candidates.contains(&Provider::Grok) && !headroom(&usage, Provider::Grok).weekly_known()
-        {
+        if weekly_unknown.contains(&Provider::Grok) {
             gates.push(Gate::GrokUnavailable);
         }
         let eligible: Vec<Provider> = candidates
@@ -338,9 +336,16 @@ pub fn decide_with_task(
             let winner = if eligible.len() == 1 {
                 eligible[0]
             } else {
+                // Score on the same projections the decision records, so the logged pace always
+                // explains the route.
+                let draw_for = |candidate: Provider| match candidate {
+                    Provider::Claude => claude_projected_draw,
+                    Provider::Codex => codex_projected_draw,
+                    Provider::Grok => grok_projected_draw,
+                };
                 let draws: Option<Vec<f64>> = eligible
                     .iter()
-                    .map(|candidate| projected_draw(headroom(&usage, *candidate), now_epoch_secs))
+                    .map(|candidate| draw_for(*candidate))
                     .collect();
                 let scores = draws.unwrap_or_else(|| {
                     gates.push(Gate::ProjectionUnavailable);
