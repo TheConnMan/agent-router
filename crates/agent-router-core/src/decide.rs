@@ -609,7 +609,7 @@ mod tests {
             usage(0.0, 0.0),
             &config,
         );
-        assert_eq!(claude.model.as_deref(), Some("fable"));
+        assert_eq!(claude.model.as_deref(), Some("claude-opus-5-5[1m]"));
         assert_eq!(claude.effort.as_deref(), Some("low"));
     }
 

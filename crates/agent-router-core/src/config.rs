@@ -875,10 +875,22 @@ mod tests {
         assert_eq!(defaults.models.codex.pick(Complexity::Medium), "gpt-6-sol");
         assert_eq!(defaults.models.codex.pick(Complexity::High), "gpt-6-astra");
         assert_eq!(defaults.models.codex.pick(Complexity::Ultra), "gpt-6-astra");
-        assert_eq!(defaults.models.claude.pick(Complexity::Low), "sonnet");
-        assert_eq!(defaults.models.claude.pick(Complexity::Medium), "opus[1m]");
-        assert_eq!(defaults.models.claude.pick(Complexity::High), "fable");
-        assert_eq!(defaults.models.claude.pick(Complexity::Ultra), "fable");
+        assert_eq!(
+            defaults.models.claude.pick(Complexity::Low),
+            "claude-opus-5-5[1m]"
+        );
+        assert_eq!(
+            defaults.models.claude.pick(Complexity::Medium),
+            "claude-opus-5-5[1m]"
+        );
+        assert_eq!(
+            defaults.models.claude.pick(Complexity::High),
+            "claude-opus-5-5[1m]"
+        );
+        assert_eq!(
+            defaults.models.claude.pick(Complexity::Ultra),
+            "claude-opus-5-5[1m]"
+        );
 
         // No models section at all.
         std::fs::write(&path, "hard_ceiling_pct = 90.0\n").expect("write");
@@ -896,8 +908,8 @@ mod tests {
         assert_eq!(partial.models.codex.high, "gpt-6-astra");
         assert_eq!(partial.models.codex.ultra, "gpt-6-astra");
         assert_eq!(partial.models.claude.ultra, "opus[1m]");
-        assert_eq!(partial.models.claude.low, "sonnet");
-        assert_eq!(partial.models.claude.high, "fable");
+        assert_eq!(partial.models.claude.low, "claude-opus-5-5[1m]");
+        assert_eq!(partial.models.claude.high, "claude-opus-5-5[1m]");
     }
 
     /// The classifier engine is the setting that decides which weekly budget the per-task scoring

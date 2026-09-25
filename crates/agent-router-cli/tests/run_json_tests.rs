@@ -476,7 +476,7 @@ fn run_json_preserves_provider_decision_and_dispatched_job_identity() {
     let value: Value = serde_json::from_slice(&output.stdout).expect("router json");
 
     assert_eq!(value["provider"], "claude");
-    assert_eq!(value["model"], "opus[1m]");
+    assert_eq!(value["model"], "claude-opus-5-5[1m]");
     assert_eq!(value["effort"], "medium");
     assert_eq!(value["gates"], json!(["explicit_provider"]));
     assert_eq!(value["classification"]["complexity"], "medium");
@@ -504,7 +504,7 @@ fn run_json_preserves_provider_decision_and_dispatched_job_identity() {
         vec![
             "--bg",
             "--model",
-            "opus[1m]",
+            "claude-opus-5-5[1m]",
             "--effort",
             "medium",
             "--name",
@@ -1371,7 +1371,7 @@ fn auto_route_uses_the_classifier_generated_job_name() {
         vec![
             "--bg",
             "--model",
-            "opus[1m]",
+            "claude-opus-5-5[1m]",
             "--effort",
             "medium",
             "--name",
@@ -1430,7 +1430,7 @@ fn a_supplied_name_reaches_the_spawned_job_and_the_decision_log_verbatim() {
     let expected = [
         "--bg",
         "--model",
-        "opus[1m]",
+        "claude-opus-5-5[1m]",
         "--effort",
         "medium",
         "--name",
@@ -1491,7 +1491,7 @@ fn a_claude_dispatch_records_no_effective_effort() {
         Value::Null,
         "claude reported no effort, so the router must record none"
     );
-    assert_eq!(value["model"], "opus[1m]");
+    assert_eq!(value["model"], "claude-opus-5-5[1m]");
     assert_eq!(value["effort"], "medium");
 
     let logged = fixture
@@ -1600,7 +1600,7 @@ fn pinned_claude_classifies_but_stays_on_claude() {
     let value: Value = serde_json::from_slice(&output.stdout).expect("router json");
 
     assert_eq!(value["provider"], "claude");
-    assert_eq!(value["model"], "sonnet");
+    assert_eq!(value["model"], "claude-opus-5-5[1m]");
     assert_eq!(value["effort"], "high");
     assert_eq!(value["classification"]["complexity"], "low");
     assert_eq!(fixture.classifier_calls(), 1);

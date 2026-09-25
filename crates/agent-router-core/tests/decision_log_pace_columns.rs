@@ -8,7 +8,7 @@
 //! under test is the shape of the table, which is what a later backtest reads.
 
 use agent_router_core::classify::{Classification, Complexity, TaskContextHorizon};
-use agent_router_core::config::Config;
+use agent_router_core::config::{Config, Routing};
 use agent_router_core::decide::{Decision, Gate, decide};
 use agent_router_core::log::{DecisionLog, Entry, Mark};
 use agent_router_core::stats::{Window, collect};
@@ -131,10 +131,10 @@ fn a_recorded_decision_writes_the_orchestration_score_and_both_projections() {
     assert_eq!(grok_weekly, Some(10.0));
 }
 
-/// The bounded capability move must survive the SQLite boundary with its rationale tag, and stats
-/// must count the row as one provider move.
+/// A usage-chosen move off the first listed provider must survive the SQLite boundary with its
+/// rationale tag, and stats must count the row as one provider move.
 #[test]
-fn a_capability_projected_draw_gate_persists_and_counts_as_a_flip() {
+fn a_priority_override_gate_persists_and_counts_as_a_flip() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("router.db");
     let log = DecisionLog::open_at(&path).expect("opens");
@@ -143,6 +143,10 @@ fn a_capability_projected_draw_gate_persists_and_counts_as_a_flip() {
             ("claude".to_string(), vec!["Granola".to_string()]),
             ("codex".to_string(), vec!["Granola".to_string()]),
         ]),
+        routing: Routing {
+            priority: vec![Provider::Codex, Provider::Claude],
+            priority_margin_pct: 0.0,
+        },
         ..Config::default()
     };
     let decision = decide(
@@ -160,7 +164,8 @@ fn a_capability_projected_draw_gate_persists_and_counts_as_a_flip() {
         &config,
     );
     assert_eq!(decision.provider, Provider::Claude);
-    assert!(decision.gates.contains(&Gate::CapabilityProjectedDraw));
+    assert!(decision.gates.contains(&Gate::PriorityOverriddenByUsage));
+    assert!(!decision.gates.contains(&Gate::CapabilityProjectedDraw));
     record(&log, &decision);
 
     let (provider, gates, rationale): (String, String, String) = rusqlite::Connection::open(&path)
@@ -172,8 +177,8 @@ fn a_capability_projected_draw_gate_persists_and_counts_as_a_flip() {
         )
         .expect("query");
     assert_eq!(provider, "claude");
-    assert_eq!(gates, "missing_connector,capability_projected_draw");
-    assert!(rationale.contains("capability_projected_draw"));
+    assert_eq!(gates, "missing_connector,priority_overridden_by_usage");
+    assert!(rationale.contains("priority_overridden_by_usage"));
 
     let stats = collect(
         &log,
@@ -188,7 +193,7 @@ fn a_capability_projected_draw_gate_persists_and_counts_as_a_flip() {
         (1, 1)
     );
     assert_eq!(
-        stats.gates.get("capability_projected_draw").copied(),
+        stats.gates.get("priority_overridden_by_usage").copied(),
         Some(1)
     );
 }

@@ -387,8 +387,10 @@ fn rates_are_denominated_on_auto_routes_only() {
 
 /// The flip rate counts routes that moved, not tags that fired. A row carrying two provider moving
 /// gates is one flipped route: the task moved once. `legacy_flip` is the folded form of the retired
-/// provider-moving tags, so a migrated corpus still counts in the numerator. Four flip tags fire
-/// across these five rows and four routes moved, so dropping either remaining flip gate from the
+/// provider-moving tags, so a migrated corpus still counts in the numerator.
+/// `priority_overridden_by_usage` is a usage-chosen move off the first listed provider, and
+/// `capability_projected_draw` is its retired predecessor that old rows still carry. Eight flip tags
+/// fire across these seven rows and six routes moved, so dropping any flip gate from the
 /// numerator's list fails this, and so does counting tags instead of rows.
 #[test]
 fn every_provider_moving_gate_counts_toward_the_flip_rate() {
@@ -420,20 +422,39 @@ fn every_provider_moving_gate_counts_toward_the_flip_rate() {
             "legacy_flip,flipped_on_exhaustion",
             false,
         ),
+        row(
+            800,
+            "auto",
+            "grok",
+            Some("high"),
+            "priority_overridden_by_usage",
+            false,
+        ),
+        row(
+            600,
+            "auto",
+            "claude",
+            Some("high"),
+            "missing_connector,capability_projected_draw",
+            false,
+        ),
     ];
 
     let stats = summarize(&rows);
 
     assert_eq!(
         (stats.flip_rate.numerator, stats.flip_rate.denominator),
-        (4, 5)
+        (6, 7)
     );
     assert_eq!(
         stats.gates,
         counts(&[
+            ("capability_projected_draw", 1),
             ("flipped_on_exhaustion", 3),
             ("legacy_flip", 3),
+            ("missing_connector", 1),
             ("over_ceiling", 1),
+            ("priority_overridden_by_usage", 1),
         ])
     );
 }

@@ -1172,10 +1172,10 @@ fn automatic_selection_records_no_pin_and_keeps_the_configured_high_tier() {
     assert_eq!(value["requested_provider"], Value::Null);
     assert_eq!(value["requested_model"], Value::Null);
     assert_eq!(value["reviewer_provider"], "claude");
-    assert_eq!(value["reviewer_model"], "fable");
+    assert_eq!(value["reviewer_model"], "claude-opus-5-5[1m]");
     assert_eq!(
         flag_value(&argv(&fixture.claude_log), "--model").as_deref(),
-        Some("fable")
+        Some("claude-opus-5-5[1m]")
     );
 }
 
@@ -1249,7 +1249,7 @@ fn a_provider_pin_without_a_model_runs_the_configured_high_tier() {
     let value = parse_json(&output);
     assert_eq!(value["requested_provider"], "claude");
     assert_eq!(value["requested_model"], Value::Null);
-    assert_eq!(value["reviewer_model"], "fable");
+    assert_eq!(value["reviewer_model"], "claude-opus-5-5[1m]");
 }
 
 #[test]
