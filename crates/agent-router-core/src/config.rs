@@ -12,6 +12,8 @@ const DEFAULT_HARD_CEILING_PCT: f64 = 98.0;
 /// Ceiling on the classifier call. Headroom over the fast-path worst case rather than a target;
 /// 30s lost the slow tail. See docs/decisions/0001-classifier-hermeticity.md.
 const DEFAULT_CLASSIFIER_TIMEOUT_SECS: u64 = 60;
+/// Every Claude tier's default model.
+const DEFAULT_CLAUDE_MODEL: &str = "claude-opus-5-5[1m]";
 
 /// The migration level a config file written by this build carries. A file stamped below this is
 /// rewritten once so dead keys drop off disk; serde already ignores them on parse.
@@ -35,6 +37,62 @@ impl Default for Policy {
         Policy {
             weekly_routing: true,
         }
+    }
+}
+
+/// The order ordinary automatic routing prefers providers in, and how much usage must beat that
+/// order by to override it. See docs/decisions/0012-configurable-provider-priority.md.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Routing {
+    /// The ordered ordinary automatic candidates; the first is preferred. Claude is a candidate
+    /// only when listed here: the hard pins (orchestration, the implement context window, a
+    /// Claude-only capability) reach it regardless.
+    pub priority: Vec<crate::provider::Provider>,
+    /// How many points of projected weekly draw (or of weekly percent, when a projection is
+    /// missing) a higher-priority eligible candidate may sit above the lowest and still win.
+    pub priority_margin_pct: f64,
+}
+
+impl Default for Routing {
+    fn default() -> Routing {
+        Routing {
+            priority: vec![
+                crate::provider::Provider::Codex,
+                crate::provider::Provider::Grok,
+            ],
+            priority_margin_pct: 0.0,
+        }
+    }
+}
+
+impl Routing {
+    /// PURE: reject a table the engine cannot order unambiguously. Unknown provider names never
+    /// reach this: serde rejects them at parse. A NaN margin would make every comparison false and
+    /// silently fall back, so it is an error rather than a default.
+    fn validate(&self) -> Result<()> {
+        let invalid = |reason: String| {
+            crate::error::Error::Command(format!("invalid [routing] in config: {reason}"))
+        };
+        if self.priority.is_empty() {
+            return Err(invalid(
+                "priority must name at least one provider".to_string(),
+            ));
+        }
+        for (index, provider) in self.priority.iter().enumerate() {
+            if self.priority[..index].contains(provider) {
+                return Err(invalid(format!(
+                    "priority lists {} more than once",
+                    provider.name()
+                )));
+            }
+        }
+        if !self.priority_margin_pct.is_finite() || self.priority_margin_pct < 0.0 {
+            return Err(invalid(
+                "priority_margin_pct must be a finite number of points, 0 or more".to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -165,7 +223,8 @@ impl CodexModels {
     }
 }
 
-/// High and ultra share Fable; ultra increases effort within that top model.
+/// Every tier defaults to Opus 5.5 with the 1M context window; only the effort ladder scales
+/// with complexity. Each tier stays separately configurable.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct ClaudeModels {
@@ -178,10 +237,10 @@ pub struct ClaudeModels {
 impl Default for ClaudeModels {
     fn default() -> ClaudeModels {
         ClaudeModels {
-            low: "sonnet".to_string(),
-            medium: "opus[1m]".to_string(),
-            high: "fable".to_string(),
-            ultra: "fable".to_string(),
+            low: DEFAULT_CLAUDE_MODEL.to_string(),
+            medium: DEFAULT_CLAUDE_MODEL.to_string(),
+            high: DEFAULT_CLAUDE_MODEL.to_string(),
+            ultra: DEFAULT_CLAUDE_MODEL.to_string(),
         }
     }
 }
@@ -308,6 +367,9 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub provider_capabilities: BTreeMap<String, Vec<String>>,
     pub policy: Policy,
+    /// The ordinary routing order and the margin usage must beat to override it. A table, so it
+    /// stays below every scalar field (see classifier_timeout_secs).
+    pub routing: Routing,
     /// Which engine and model score a task.
     pub classifier: Classifier,
     /// Which model each provider runs per task complexity.
@@ -364,6 +426,7 @@ impl Default for Config {
             connectors: vec!["local shell".to_string()],
             provider_capabilities: BTreeMap::new(),
             policy: Policy::default(),
+            routing: Routing::default(),
             classifier: Classifier::default(),
             models: Models::default(),
             adversarial_review: AdversarialReviewConfig::default(),
@@ -486,11 +549,13 @@ impl Config {
     /// IMPURE: the config at `path`, created with defaults when absent, and migrated in place when
     /// it predates the current version. A file that exists but does not parse is an Err: silently
     /// substituting defaults would route jobs against ceilings and a connector list the operator
-    /// never wrote.
+    /// never wrote. An invalid `[routing]` table is an Err for the same reason, and is checked
+    /// before migration so a rejected file is never rewritten.
     pub fn load_from(path: &Path) -> Result<Config> {
         match std::fs::read_to_string(path) {
             Ok(text) => {
                 let mut config: Config = toml::from_str(&text)?;
+                config.routing.validate()?;
                 if config.migrate() {
                     config.write_to(path)?;
                 }

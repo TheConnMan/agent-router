@@ -17,10 +17,15 @@ use std::collections::BTreeMap;
 /// `legacy_flip` is the folded form of the four retired provider-moving tags (`headroom_tiebreak`,
 /// `pace_flip`, `projected_overdraw`, `five_hour_pacing`). Schema v2 rewrites those tags on open
 /// so a report over an old window still counts the routes that really did move.
-const FLIP_GATES: [&str; 3] = [
+///
+/// `capability_projected_draw` is retired and no longer emitted, but it stays so rows written
+/// before 0.30.0 still count. `priority_overridden_by_usage` is its successor: a usage move off an
+/// eligible first priority candidate. See docs/decisions/0012-configurable-provider-priority.md.
+const FLIP_GATES: [&str; 4] = [
     "capability_projected_draw",
     "flipped_on_exhaustion",
     "legacy_flip",
+    "priority_overridden_by_usage",
 ];
 
 /// The gate a row carries when the classifier could not answer and the default provider was used.
