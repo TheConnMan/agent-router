@@ -1,7 +1,9 @@
-//! The decision engine: capability routing selects among capable providers; ordinary work selects
-//! the eligible Codex or Grok provider with the lower projected weekly draw. Pure given its inputs.
-//! See docs/decisions/0006-projected-draw-replaces-pace-flip-gap.md and
-//! docs/decisions/0007-claude-capability-only.md.
+//! The decision engine: hard pins select Claude; ordinary work walks `[routing] priority`, narrowed
+//! to capable providers, and takes the first eligible candidate whose projected weekly draw is
+//! within `priority_margin_pct` of the lowest. Pure given its inputs. See
+//! docs/decisions/0006-projected-draw-replaces-pace-flip-gap.md,
+//! docs/decisions/0007-claude-capability-only.md, and
+//! docs/decisions/0012-configurable-provider-priority.md.
 
 use crate::classify::{Classification, Complexity};
 use crate::config::{Config, MatchedCapability};
@@ -38,25 +40,27 @@ pub enum Gate {
     /// A build-tier `/implement` run, which does not fit Codex's context window: an automatic
     /// Claude decision regardless of usage. See `implement_exceeds_codex_window`.
     ImplementContextWindow,
-    /// A matched capability is available on Claude and Codex, both pass capacity eligibility, and
-    /// Claude has the strictly lower projected weekly draw. This records only an actual move from
-    /// the Codex default. Missing projections and ties stay on Codex.
+    /// Retired: no longer emitted since 0.30.0. It recorded the removed Claude and Codex shared
+    /// capability comparison. Kept so rows and JSON written before 0.30.0 still decode and still
+    /// count toward the flip rate. The general priority engine records the same move as
+    /// `PriorityOverriddenByUsage`. See docs/decisions/0012-configurable-provider-priority.md.
     CapabilityProjectedDraw,
-    /// A workhorse provider is ineligible and the other is not, so the route moved. Ineligible is
-    /// either at or over the hard ceiling, carrying a weekly number nobody read, or unable to
-    /// launch. See `WeeklyUnknown` and `ClassifierUnlaunchable` for the diagnostic cause.
+    /// The highest-priority capable candidate is ineligible and another eligible candidate took
+    /// the task. Ineligible is either at or over the hard ceiling, carrying a weekly number nobody
+    /// read, or unable to launch. See `WeeklyUnknown` and `ClassifierUnlaunchable` for the diagnostic cause.
     FlippedOnExhaustion,
-    /// Both workhorse providers are ineligible on CAPACITY, so Codex was used anyway. Recorded
-    /// only when at least one candidate cleared the capability filter: a field emptied by a
-    /// matched inventory name with no dispatcher is `CapabilityBlocked` and nothing else, because
-    /// naming it `over_ceiling` alongside a weekly reading of 14 percent tells a reviewer the
+    /// Every capable priority candidate is ineligible on CAPACITY, so the first capable candidate
+    /// was used anyway. Recorded only when at least one candidate cleared the capability filter: a
+    /// field emptied by a matched inventory name with no dispatcher is `CapabilityBlocked` and
+    /// nothing else, because naming it `over_ceiling` alongside a weekly reading of 14 percent tells a reviewer the
     /// opposite of what happened.
     OverCeiling,
     /// At least one provider consulted by the active comparison has no authoritative weekly
     /// reading, so its percentage is a default. Such a provider is ineligible. See
     /// docs/decisions/0004-fail-closed-weekly-unknown.md.
     WeeklyUnknown,
-    /// Grok is excluded from automatic routing because its official weekly telemetry is unknown.
+    /// Grok is a priority candidate but is excluded because its official weekly telemetry is
+    /// unknown. Not recorded when Grok is not a candidate.
     GrokUnavailable,
     /// Weekly usage routing is disabled by policy.
     WeeklyRoutingDisabled,
@@ -65,18 +69,23 @@ pub enum Gate {
     /// excluded from the eligibility test, in the same sense as one over its hard ceiling.
     ///
     /// This is a DIAGNOSTIC gate, not a provider-moving one. It records only that unlaunchability
-    /// was applied. `FlippedOnExhaustion` records a workhorse move. A shared capability can exclude
-    /// Claude and stay on Codex without any move gate.
+    /// was applied, and only when the unlaunchable provider is a priority candidate.
+    /// `FlippedOnExhaustion` records a move off the first candidate. An unlaunchable
+    /// lower-priority candidate can be excluded without any move gate.
     ///
-    /// It deliberately does not belong in `stats.rs`'s `FLIP_GATES`. A moved workhorse row already
+    /// It deliberately does not belong in `stats.rs`'s `FLIP_GATES`. A row moved off its first candidate already
     /// has `flipped_on_exhaustion`, and `any()` counts that row once. A row that did not move must
     /// not count as a flip.
     ClassifierUnlaunchable,
-    /// Both workhorses are eligible but at least one projected weekly draw could not be computed,
-    /// so the comparison fell back to raw weekly percent used. Typically this is a window with
-    /// less than a twentieth elapsed, where dividing by that fraction would turn a couple of jobs
-    /// into a four-figure projection.
+    /// Two or more priority candidates are eligible but at least one projected weekly draw could
+    /// not be computed, so every eligible candidate was compared on raw weekly percent used.
+    /// Typically this is a window with less than a twentieth elapsed, where dividing by that
+    /// fraction would turn a couple of jobs into a four-figure projection.
     ProjectionUnavailable,
+    /// The highest-priority capable candidate was eligible, but usage selected a lower-priority one
+    /// whose score beat it by more than `priority_margin_pct`. A provider-moving gate: it is in
+    /// `stats.rs` `FLIP_GATES`.
+    PriorityOverriddenByUsage,
 }
 
 impl Gate {
@@ -96,6 +105,7 @@ impl Gate {
             Gate::WeeklyRoutingDisabled => "weekly_routing_disabled",
             Gate::ClassifierUnlaunchable => "classifier_unlaunchable",
             Gate::ProjectionUnavailable => "projection_unavailable",
+            Gate::PriorityOverriddenByUsage => "priority_overridden_by_usage",
         }
     }
 }
@@ -170,18 +180,17 @@ fn implement_exceeds_codex_window(classification: &Classification) -> bool {
 ///
 /// The rules, in the order they run, and each in the order it must run:
 ///
-/// 1. Capability pins select Claude, bypassing automatic capacity routing. A matched capability
-///    available on Claude and Codex uses their projected draw only when both pass the existing
-///    eligibility rules. A matched inventory name with no capable provider is blocked. An
-///    unmatched miss is not a constraint, so ordinary workhorse routing proceeds. See
+/// 1. Capability pins (orchestration, the implement context window, a Claude-only capability)
+///    select Claude, bypassing automatic capacity routing. A matched inventory name with no
+///    capable listed provider is blocked. An unmatched miss is not a constraint. See
 ///    docs/decisions/0010-unmatched-connector-is-not-a-block.md.
-/// 2. Ordinary work selects between eligible Codex and Grok. Eligibility is still current weekly
-///    percent: unknown or at/over the hard ceiling is out. When both are eligible and both
-///    projected draws exist, the lower projected draw wins — that is the provider further below
-///    its own week's pace, which is not the same as the lower current percent when the windows
-///    started at different times. An exact projected-draw tie stays on Codex. When either
-///    projection is missing, the comparison falls back to lower current weekly percent and
-///    records `projection_unavailable`.
+/// 2. Ordinary work walks `[routing] priority`, narrowed to capable providers. Eligibility is
+///    current weekly percent: unknown, at/over the hard ceiling, or unlaunchable is out. Among
+///    eligible candidates the score is projected draw (or current weekly percent for all when any
+///    projection is missing, recorded as `projection_unavailable`), and the first candidate in
+///    priority order within `priority_margin_pct` of the lowest score wins, so an exact tie stays
+///    with the higher priority. See docs/decisions/0006-projected-draw-replaces-pace-flip-gap.md
+///    and docs/decisions/0012-configurable-provider-priority.md.
 pub fn decide(
     classification: Classification,
     usage: UsageSnapshot,
@@ -194,10 +203,12 @@ pub fn decide(
 /// Automatic routing for a scored task. Inventory names in the task or classifier
 /// rationale recover against `provider_capabilities` even when the classifier left
 /// `missing_connector` false, so a paraphrased rationale cannot send an Airtable job
-/// to Grok. An unmatched miss is not a constraint: it does not pin Claude and it does
-/// not refuse dispatch. A matched name with no provider still blocks
+/// to a provider without Airtable. An unmatched miss is not a constraint: it does not pin
+/// Claude and it does not refuse dispatch. A matched capability narrows the priority
+/// candidates, and a matched name with no listed capable provider blocks
 /// (docs/decisions/0007-claude-capability-only.md,
-/// docs/decisions/0010-unmatched-connector-is-not-a-block.md).
+/// docs/decisions/0010-unmatched-connector-is-not-a-block.md,
+/// docs/decisions/0012-configurable-provider-priority.md).
 pub fn decide_with_task(
     task: &str,
     classification: Classification,
@@ -228,9 +239,26 @@ pub fn decide_with_task(
         capability_pin = true;
     }
 
-    // Ordinary work starts on Codex. Claude remains limited to hard pins and the bounded shared
-    // capability comparison. Automatic workhorse routing still chooses between Codex and Grok.
-    let mut provider = Provider::Codex;
+    // Ordinary work starts on the first capable priority candidate. Claude is a candidate only
+    // when listed; the hard pins below reach it regardless. See
+    // docs/decisions/0012-configurable-provider-priority.md.
+    let capability_eligible =
+        |candidate: Provider| !capability_constraint || capability_providers.contains(&candidate);
+    let candidates: Vec<Provider> = config
+        .routing
+        .priority
+        .iter()
+        .copied()
+        .filter(|candidate| capability_eligible(*candidate))
+        .collect();
+    // With no capable candidate the ordinary route is kept for log compatibility and never
+    // dispatched. Load rejects an empty priority, so the Codex literal only keeps `decide` total
+    // for a `Config` built in code.
+    let mut provider = candidates
+        .first()
+        .or(config.routing.priority.first())
+        .copied()
+        .unwrap_or(Provider::Codex);
     if capability_providers == [Provider::Claude] {
         // Claude remains a capability pin when it is the only established provider.
         capability_pin = true;
@@ -238,7 +266,7 @@ pub fn decide_with_task(
     } else if capability_pin {
         provider = Provider::Claude;
     } else if classification.classifier_failed {
-        // Not a pin: a task nobody could score still selects by known workhorse capacity.
+        // Not a pin: a task nobody could score still selects by known candidate capacity.
         gates.push(Gate::ClassifierFailed);
     }
 
@@ -251,110 +279,91 @@ pub fn decide_with_task(
 
     if !capability_pin && !config.policy.weekly_routing {
         gates.push(Gate::WeeklyRoutingDisabled);
-        if capability_constraint
-            && !capability_providers.contains(&Provider::Codex)
-            && !capability_blocked
-        {
+        if capability_constraint && candidates.is_empty() && !capability_blocked {
             capability_blocked = true;
             gates.push(Gate::CapabilityBlocked);
         }
     } else if !capability_pin {
         // Fail closed on a weekly number nobody read: an unread window reports 0 percent, the
-        // same as idle. Closing here keeps the reader's fail-open contract intact; both
-        // unknown fall through to `over_ceiling`. A launch failure is ineligible the same way
-        // and is not a pin to Claude. See docs/decisions/0004-fail-closed-weekly-unknown.md
+        // same as idle. Closing here keeps the reader's fail-open contract intact; every
+        // candidate unknown falls through to `over_ceiling`. A launch failure is ineligible the
+        // same way and is not a pin to Claude. See docs/decisions/0004-fail-closed-weekly-unknown.md
         // and docs/decisions/0007-claude-capability-only.md.
-        let capability_eligible =
-            |candidate| !capability_constraint || capability_providers.contains(&candidate);
-        let usage_eligible = |candidate| {
+        let usage_eligible = |candidate: Provider| {
             headroom(&usage, candidate).weekly_known()
                 && weekly_used(&usage, candidate) < config.hard_ceiling_for(candidate)
                 && classification.unlaunchable != Some(candidate)
         };
-        let eligible = |candidate| capability_eligible(candidate) && usage_eligible(candidate);
-        let shared_claude_codex_capability = capability_constraint
-            && capability_providers.contains(&Provider::Claude)
-            && capability_providers.contains(&Provider::Codex);
-        if matches!(
-            classification.unlaunchable,
-            Some(Provider::Codex | Provider::Grok)
-        ) || (shared_claude_codex_capability
-            && classification.unlaunchable == Some(Provider::Claude))
+        if classification
+            .unlaunchable
+            .is_some_and(|unlaunchable| candidates.contains(&unlaunchable))
         {
             gates.push(Gate::ClassifierUnlaunchable);
         }
-        if !headroom(&usage, Provider::Codex).weekly_known()
-            || !headroom(&usage, Provider::Grok).weekly_known()
-            || (shared_claude_codex_capability
-                && !headroom(&usage, Provider::Claude).weekly_known())
-        {
+        let weekly_unknown: Vec<Provider> = candidates
+            .iter()
+            .copied()
+            .filter(|candidate| !headroom(&usage, *candidate).weekly_known())
+            .collect();
+        if !weekly_unknown.is_empty() {
             gates.push(Gate::WeeklyUnknown);
         }
-        if !headroom(&usage, Provider::Grok).weekly_known() {
+        if weekly_unknown.contains(&Provider::Grok) {
             gates.push(Gate::GrokUnavailable);
         }
-        if shared_claude_codex_capability
-            && usage_eligible(Provider::Claude)
-            && usage_eligible(Provider::Codex)
-        {
-            if let (Some(claude_draw), Some(codex_draw)) =
-                (claude_projected_draw, codex_projected_draw)
-                && claude_draw < codex_draw
-            {
-                provider = Provider::Claude;
-                gates.push(Gate::CapabilityProjectedDraw);
+        let eligible: Vec<Provider> = candidates
+            .iter()
+            .copied()
+            .filter(|candidate| usage_eligible(*candidate))
+            .collect();
+        if eligible.is_empty() {
+            // The router routes; refusing work over a ceiling is bonus drain's job. The fallback
+            // stays on the first capable candidate when no authoritative weekly reading is usable.
+            if capability_constraint && candidates.is_empty() && !capability_blocked {
+                capability_blocked = true;
+                gates.push(Gate::CapabilityBlocked);
+            } else if !candidates.is_empty() {
+                // Some candidate had the capability and still had nowhere to go, so this really
+                // is a capacity verdict. When none did, `CapabilityBlocked` is already recorded
+                // and adding `over_ceiling` would misattribute the block.
+                gates.push(Gate::OverCeiling);
             }
         } else {
-            match (eligible(Provider::Codex), eligible(Provider::Grok)) {
-                (false, false) => {
-                    // The router routes; refusing work over a ceiling is bonus drain's job. The
-                    // fallback stays Codex when neither authoritative weekly reading is usable.
-                    if capability_constraint
-                        && !capability_providers.contains(&Provider::Codex)
-                        && !capability_blocked
-                    {
-                        capability_blocked = true;
-                        gates.push(Gate::CapabilityBlocked);
-                    } else if capability_eligible(Provider::Codex)
-                        || capability_eligible(Provider::Grok)
-                    {
-                        // Some candidate had the capability and still had nowhere to go, so this
-                        // really is a capacity verdict. When neither did, `CapabilityBlocked` is
-                        // already recorded and adding `over_ceiling` would misattribute the block.
-                        gates.push(Gate::OverCeiling);
-                    }
-                }
-                (false, true) => {
-                    provider = Provider::Grok;
-                    gates.push(Gate::FlippedOnExhaustion);
-                }
-                // Exactly Codex eligible: the task stays on Codex.
-                (true, false) => {}
-                (true, true) => {
-                    // Pace, not current percent. A tie or a missing projection stays on weekly
-                    // percent, which itself ties to Codex. See
-                    // docs/decisions/0006-projected-draw-replaces-pace-flip-gap.md.
-                    provider = match (codex_projected_draw, grok_projected_draw) {
-                        (Some(codex_draw), Some(grok_draw)) => {
-                            if grok_draw < codex_draw {
-                                Provider::Grok
-                            } else {
-                                Provider::Codex
-                            }
-                        }
-                        _ => {
-                            gates.push(Gate::ProjectionUnavailable);
-                            if weekly_used(&usage, Provider::Grok)
-                                < weekly_used(&usage, Provider::Codex)
-                            {
-                                Provider::Grok
-                            } else {
-                                Provider::Codex
-                            }
-                        }
-                    };
-                }
+            // Pace, not current percent, and never a mix of the two: when any eligible candidate
+            // lacks a projection, every eligible candidate is scored on weekly percent. See
+            // docs/decisions/0006-projected-draw-replaces-pace-flip-gap.md and
+            // docs/decisions/0012-configurable-provider-priority.md.
+            let winner = if eligible.len() == 1 {
+                eligible[0]
+            } else {
+                // Score on the same projections the decision records, so the logged pace always
+                // explains the route.
+                let draw_for = |candidate: Provider| match candidate {
+                    Provider::Claude => claude_projected_draw,
+                    Provider::Codex => codex_projected_draw,
+                    Provider::Grok => grok_projected_draw,
+                };
+                let draws: Option<Vec<f64>> = eligible
+                    .iter()
+                    .map(|candidate| draw_for(*candidate))
+                    .collect();
+                let scores = draws.unwrap_or_else(|| {
+                    gates.push(Gate::ProjectionUnavailable);
+                    eligible
+                        .iter()
+                        .map(|candidate| weekly_used(&usage, *candidate))
+                        .collect()
+                });
+                first_within_margin(&eligible, &scores, config.routing.priority_margin_pct)
+            };
+            if winner != candidates[0] {
+                gates.push(if eligible.contains(&candidates[0]) {
+                    Gate::PriorityOverriddenByUsage
+                } else {
+                    Gate::FlippedOnExhaustion
+                });
             }
+            provider = winner;
         }
     }
 
@@ -400,6 +409,19 @@ fn projected_draw(headroom: &Headroom, now_epoch_secs: i64) -> Option<f64> {
         return None;
     }
     Some(headroom.weekly_pct / elapsed)
+}
+
+/// PURE: the first candidate, in priority order, whose score is within `margin` points of the
+/// lowest score. `candidates` and `scores` are parallel and non-empty; the lowest-scoring candidate
+/// always qualifies, so the fallback to the first candidate is never reached with finite scores.
+fn first_within_margin(candidates: &[Provider], scores: &[f64], margin: f64) -> Provider {
+    let best = scores.iter().copied().fold(f64::INFINITY, f64::min);
+    candidates
+        .iter()
+        .zip(scores)
+        .find(|(_, score)| **score <= best + margin)
+        .map(|(candidate, _)| *candidate)
+        .unwrap_or(candidates[0])
 }
 
 /// PURE: the decision for a caller pinned provider. The provider stays exact while classification
@@ -609,7 +631,7 @@ mod tests {
             usage(0.0, 0.0),
             &config,
         );
-        assert_eq!(claude.model.as_deref(), Some("fable"));
+        assert_eq!(claude.model.as_deref(), Some("claude-opus-5-5[1m]"));
         assert_eq!(claude.effort.as_deref(), Some("low"));
     }
 

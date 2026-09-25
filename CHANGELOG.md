@@ -3,6 +3,24 @@
 All notable changes to this project are documented here. Versions are the
 workspace `package.version` stamped on every decision-log row.
 
+## 0.30.0 - 2026-09-25
+
+- Add configurable `[routing]` priority and margin with the selection rule. `priority` is the
+  ordered list of ordinary automatic candidates (default `["codex", "grok"]`), narrowed by
+  capability; `priority_margin_pct` (default 0) is the band of projected draw, or weekly percent
+  when a projection is missing, within which an earlier candidate still wins over the lowest.
+- Add the `priority_overridden_by_usage` gate for a usage move off an eligible first candidate,
+  and count it toward the stats flip rate, so the flip rate rises for ordinary Codex to Grok pace
+  picks.
+- Claude is an ordinary candidate only when `[routing] priority` lists it; hard pins
+  (orchestration, the implement context window, a Claude-only capability) are unchanged.
+- Retire the shared Claude and Codex capability comparison. `capability_projected_draw` is no
+  longer emitted (old rows still decode and still count as a flip); a shared capability now stays
+  on Codex under defaults.
+- Default all Claude model tiers to `claude-opus-5-5[1m]`.
+- Fail config load on an invalid `[routing]`: an empty or duplicated priority, an unknown
+  provider name, or a negative or non-finite margin.
+
 ## 0.29.0 - 2026-09-22
 
 - Use the GPT-6 Codex model names. `gpt-5.6-luna`, `gpt-5.6-terra`, and `gpt-5.6-sol` are now

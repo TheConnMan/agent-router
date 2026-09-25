@@ -24,10 +24,11 @@ mod common;
 /// Restated here rather than imported so the reconciliation below is an independent count rather
 /// than the implementation agreeing with itself. `legacy_flip` is the folded form of the retired
 /// provider-moving tags, so a migrated corpus still counts.
-const FLIP_GATES: [&str; 3] = [
+const FLIP_GATES: [&str; 4] = [
     "capability_projected_draw",
     "flipped_on_exhaustion",
     "legacy_flip",
+    "priority_overridden_by_usage",
 ];
 
 /// Every metric `stats --json` is contracted to publish. The CLI writes that object field by

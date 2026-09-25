@@ -46,6 +46,10 @@ connectors = ["local shell"]
 [policy]
 weekly_routing = true
 
+[routing]
+priority = ["codex", "grok"]
+priority_margin_pct = 0.0
+
 [classifier]
 engine = "codex"
 claude_model = "haiku"
@@ -58,10 +62,10 @@ high = "gpt-6-astra"
 ultra = "gpt-6-astra"
 
 [models.claude]
-low = "sonnet"
-medium = "opus[1m]"
-high = "fable"
-ultra = "fable"
+low = "claude-opus-5-5[1m]"
+medium = "claude-opus-5-5[1m]"
+high = "claude-opus-5-5[1m]"
+ultra = "claude-opus-5-5[1m]"
 
 [parity]
 roots = []
@@ -108,16 +112,16 @@ Optional, absent by default. Grok's own weekly ceiling, replacing `hard_ceiling_
 alone. When absent, Grok uses `hard_ceiling_pct`.
 
 A provider at or over this ceiling is ineligible, and so is a provider whose weekly window nobody
-read. When both workhorse providers are eligible, the lower projected weekly draw wins; ties go to
-Codex. Current weekly percent is the fallback only when a projection cannot be computed. Exactly
-one ineligible sends the task to the other. Both ineligible keeps the default provider and
-records the all-unavailable fallback visibly.
+read. Among eligible candidates the selection rule in `[routing]` applies. When the first
+candidate is ineligible the task moves to the next eligible one (`flipped_on_exhaustion`). When
+every candidate is ineligible the first capable candidate keeps the task and the decision records
+`over_ceiling`.
 
 An unread weekly window is ineligible because it reports no capacity verdict, so trusting it would
 hand every job to whichever provider failed to report. A Codex Premium credits event is different:
 its `rate_limits` payload has `limit_id = "premium"`, both window slots null, and
 `credits.has_credits = false`. It parses as a live, known 100 percent weekly reading, so Codex is
-ineligible and a decision flips to Claude when Claude has confirmed room.
+ineligible and a decision moves to the next eligible provider in `[routing] priority`.
 
 A window that has genuinely reset is a different input and stays eligible: it reports 0 percent
 against a real past reset epoch, which is a provider that does have a full week.
@@ -149,23 +153,25 @@ spent with half the window gone projects to 160, meaning it runs out with days t
 providers reset at different instants, so each is measured against its own reset and its own
 allowance, which is what makes two providers on different sized plans comparable at all.
 
-When both workhorses are eligible and both projections exist, the lower projected draw wins, with
-an exact tie staying on Codex. That is the whole selector: a provider finishing its week inside
+When two or more candidates are eligible and every projection exists, the scores are
+projected draws and the `[routing]` rule picks the winner; with the default margin of 0 the lower
+projected draw wins and an exact tie stays with the higher priority. That is the whole selector:
+a provider finishing its week inside
 its allowance still yields to one that is further under-pacing, because the goal is to equalize
 end-of-week utilization rather than to wait until someone overdraws. Current weekly percent is
-the fallback when either projection cannot be computed, and that fallback is tagged
+the fallback when any eligible candidate's projection cannot be computed, and that fallback is tagged
 `projection_unavailable`.
 
 In practice `projection_unavailable` means one thing only: less than a twentieth of a provider's
 window has elapsed, so dividing by that elapsed fraction would turn a couple of jobs into a four
 figure projection. A projection is also uncomputable when a reset was never read, but the
-comparison runs only with both providers eligible and eligibility already requires a known weekly
+comparison runs only over eligible candidates and eligibility already requires a known weekly
 window, so that decision carries `weekly_unknown` instead, which names the reason rather than the
 consequence.
 
 Setting `weekly_routing = false` disables weekly balancing along with every other usage-driven rule.
-Claude's five hour usage does not pace automatic routing. Claude is selected by capability pins or
-the bounded shared capability comparison described under `provider_capabilities`.
+Claude's five hour usage does not pace automatic routing. Claude is selected by the
+capability pins, or as an ordinary candidate only when `[routing] priority` lists it.
 
 ### `classifier_timeout_secs`
 
@@ -178,13 +184,13 @@ A classifier the router could not *launch* is tagged `classifier_unlaunchable` a
 provider is excluded as one conjunct of the automatic capacity eligibility test — the same test
 that already excludes a provider over the hard ceiling or carrying an unread weekly number. That
 test only runs for ordinary auto-routed work; a capability pin or an explicit `--provider` skips it
-entirely, so unlaunchability never touches either of those paths. Within the test, an unlaunchable
+entirely, so unlaunchability never touches either of those paths. Within the test, under the default priority an unlaunchable
 Codex commonly leaves nothing eligible, because Grok is ineligible whenever its own weekly reading
 is unavailable, which is Grok's normal state. `decide` does not invent a fallback for that case: it
 deliberately keeps the work on Codex, adds the `over_ceiling` gate, and lets the dispatch fail loudly
-with a named `launch failed:` error — the router routes, and rerouting an unlaunchable classifier's
-task to Claude would make Claude an automatic destination, contradicting the rule that Claude is a
-capability destination only. The measured call is 3.4-7.0s, so this default is headroom for a slow
+with a named `launch failed:` error. The router routes, and moving the task to a provider
+outside `[routing] priority` would make it an automatic destination the operator never listed.
+The measured call is 3.4-7.0s, so this default is headroom for a slow
 tail rather than a target. It is viable only because the classifier invocation strips both CLI
 startup cost and the model's thinking tokens; see the note in `classify.rs` for the measured numbers
 behind that.
@@ -223,27 +229,57 @@ For an Auto route, providers without a matching inventory entry are excluded bef
 existing capacity policy runs whenever the task or rationale names a configured inventory
 connector, even if the classifier left `missing_connector` false. An unmatched classifier
 miss (no inventory name in the task or rationale) records `missing_connector` and continues
-ordinary Codex or Grok routing; it is not `capability_blocked`. Names are whole words, and a
+ordinary priority routing; it is not `capability_blocked`. Names are whole words, and a
 Title-Case inventory name such as `Notion` does not match English `notion`. Grok stays out
 of that pool unless it is listed here. Explicit `--provider` requests remain exact and do
 not use this automatic eligibility filter. The decision log records which names hit and
 whether they came from the task, the rationale, or both.
 
-When a matched capability is registered for both Claude and Codex, weekly routing may choose
-between those two providers. Both must have authoritative weekly capacity below the hard ceiling,
-neither may be marked unlaunchable, and both projected draws must exist. Claude is selected only
-when its projection is strictly lower, and the decision records `capability_projected_draw`. A tie
-or either missing projection stays on Codex. If either provider is ineligible, the existing capable
-workhorse routing applies. This rule does not apply to ordinary unmatched work.
+A matched capability narrows the `[routing] priority` candidates to the providers that
+hold it, in the same order; the ordinary selection rule then applies. A capable provider that
+`priority` does not list is never an automatic candidate, and when no listed provider holds the
+capability the task is `capability_blocked`. The one exception is a capability held only by
+Claude, which pins Claude regardless of `priority`. The retired shared Claude and Codex
+comparison no longer records `capability_projected_draw`; see
+[0012](decisions/0012-configurable-provider-priority.md).
+
+## `[routing]`
+
+### `priority`
+
+Default `["codex", "grok"]`. Ordered list of ordinary automatic candidates,
+lowercase `"claude"`, `"codex"`, `"grok"`. First is preferred. Claude is an ordinary candidate
+only when listed; orchestration, the implement context window, and a Claude-only capability pin
+Claude regardless. Must name at least one provider and none twice; an unknown name is a
+configuration error. A matched capability narrows the list, in order.
+
+### `priority_margin_pct`
+
+Default `0.0`. Points of projected weekly draw (or of weekly percent
+when any eligible candidate lacks a projection) a higher-priority eligible candidate may sit
+above the lowest and still win. Must be finite and 0 or more.
+
+Selection rule, stated plainly: eligible = known weekly reading, under the hard ceiling,
+launchable. One eligible wins. Otherwise best = lowest score; the first eligible candidate in
+priority order with score at or below best plus the margin wins. A usage move off an eligible
+first candidate records `priority_overridden_by_usage` and counts toward the stats flip rate;
+a move off an ineligible first candidate records `flipped_on_exhaustion`. A large margin makes
+`priority` a strict preference among eligible providers.
+
+A worked example: `priority = ["claude", "grok", "codex"]`, margin 10, draws 70, 90, 55: best
+is 55, Claude (70) is 15 over, Grok (90) is 35 over, Codex wins with
+`priority_overridden_by_usage`. With Claude at 65 Claude wins.
 
 ## `[policy]`
 
 ### `weekly_routing`
 
-Default `true`. Whether usage is allowed to move a task off the default provider at all.
+Default `true`. Whether usage is allowed to move a task off the first capable provider in
+`[routing] priority` at all.
 
-Set to `false` to route purely on task shape. Decisions are then tagged `weekly_routing_disabled`,
-and neither the exhaustion flip, the projection override, nor the 5 hour pacing rule can fire.
+Set to `false` to route purely on task shape and priority.
+Decisions are then tagged `weekly_routing_disabled`, the first capable candidate takes the task,
+and neither the exhaustion flip nor the priority override can fire.
 Capability pins still apply, because those are not usage decisions.
 
 ## `[classifier]`
@@ -321,7 +357,8 @@ provider and model. This keeps every omitted value downstream of the values befo
 Codex and Claude share one four-position effort ladder: low complexity uses `high`, medium uses
 `medium`, high uses `low`, and ultra uses `high`. Their model tables remain provider-specific. With
 the defaults this produces Terra/high, Sol/medium, Astra/low, and Astra/high for Codex, and
-Sonnet/high, Opus/medium, Fable/low, and Fable/high for Claude. An explicit provider and model with
+Opus 5.5/high, Opus 5.5/medium, Opus 5.5/low, and Opus 5.5/high for Claude. An explicit
+provider and model with
 omitted effort uses the same ladder. Grok has no derived model and receives no derived effort from
 classification.
 

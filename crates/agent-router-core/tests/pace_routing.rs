@@ -1,5 +1,7 @@
-//! Workhorse routing: automatic tasks balance between Codex and Grok from projected weekly
-//! draw (pace), while Claude remains reserved for capability and context pins.
+//! Priority routing: automatic tasks balance across the providers listed in `[routing] priority`
+//! from projected weekly draw (pace). The default priority is Codex then Grok, so Claude is an
+//! ordinary candidate only when the operator lists it; otherwise it is reached only through
+//! capability and context pins.
 //!
 //! The engine under test is pure, so `decide` takes the instant it is deciding at rather than
 //! reading the clock: every case below fixes `NOW` and states each provider's reset as a distance
@@ -14,7 +16,7 @@
 use agent_router_core::classify::{
     Classification, Complexity, TaskContextHorizon, parse_classification,
 };
-use agent_router_core::config::Config;
+use agent_router_core::config::{Config, Routing};
 use agent_router_core::decide::{Gate, decide, decide_explicit, decide_with_task};
 use agent_router_core::{Headroom, Provider, UsageSnapshot};
 use std::collections::BTreeMap;
@@ -112,6 +114,18 @@ fn shared_capability_config(include_grok: bool) -> Config {
     }
 }
 
+/// The shared capability inventory with an explicit provider priority, so Claude competes only
+/// when a case lists it.
+fn shared_capability_config_with_priority(include_grok: bool, priority: Vec<Provider>) -> Config {
+    Config {
+        routing: Routing {
+            priority,
+            priority_margin_pct: 0.0,
+        },
+        ..shared_capability_config(include_grok)
+    }
+}
+
 fn shared_capability_classification(unlaunchable: Option<Provider>) -> Classification {
     Classification {
         rationale: "requires Granola meeting notes".to_string(),
@@ -169,7 +183,7 @@ fn an_orchestration_task_pins_to_claude_past_every_usage_rule() {
     );
 
     assert_eq!(decision.provider, Provider::Claude);
-    assert_eq!(decision.model.as_deref(), Some("fable"));
+    assert_eq!(decision.model.as_deref(), Some("claude-opus-5-5[1m]"));
     assert_eq!(decision.effort.as_deref(), Some("low"));
     assert!(decision.gates.contains(&Gate::Orchestration));
 }
@@ -255,8 +269,8 @@ fn a_provider_scoped_capability_keeps_auto_routing_inside_the_eligible_pool() {
     assert!(!decision.capability_blocked);
 }
 
-/// A capability available only on Codex remains on Codex even when Claude has the lower projected
-/// draw. The shared capability exception requires both providers in the matched inventory.
+/// A capability available only on Codex remains on Codex even when Claude and Grok have the lower
+/// projected draw: neither is capable, so Codex is the only candidate and nothing moved.
 #[test]
 fn a_codex_only_capability_does_not_compare_claude_projection() {
     let config = Config {
@@ -276,13 +290,13 @@ fn a_codex_only_capability_does_not_compare_claude_projection() {
 
     assert_eq!(decision.provider, Provider::Codex);
     assert!(!decision.capability_blocked);
-    assert!(!decision.gates.contains(&Gate::CapabilityProjectedDraw));
+    assert!(!decision.gates.contains(&Gate::PriorityOverriddenByUsage));
 }
 
-/// A capability shared by Claude and Codex may use Claude only when both providers pass the
-/// existing capacity checks and Claude has a strictly lower projected draw.
+/// A capability shared by Claude and Codex moves to Claude when the operator lists Claude and it
+/// has the lower projected draw. The move off the first listed candidate is recorded.
 #[test]
-fn a_shared_capability_selects_claude_on_strictly_lower_projected_draw() {
+fn a_listed_claude_wins_a_shared_capability_on_lower_projected_draw() {
     let decision = decide(
         shared_capability_classification(None),
         usage_with_grok(
@@ -291,20 +305,23 @@ fn a_shared_capability_selects_claude_on_strictly_lower_projected_draw() {
             window(1.0, HALF_WEEK, 0.0),
         ),
         NOW,
-        &shared_capability_config(false),
+        &shared_capability_config_with_priority(false, vec![Provider::Codex, Provider::Claude]),
     );
 
     assert_eq!(decision.provider, Provider::Claude);
-    assert!(decision.gates.contains(&Gate::CapabilityProjectedDraw));
-    assert!(decision.rationale.contains("capability_projected_draw"));
+    assert!(decision.gates.contains(&Gate::PriorityOverriddenByUsage));
+    assert!(!decision.gates.contains(&Gate::CapabilityProjectedDraw));
+    assert!(!decision.gates.contains(&Gate::FlippedOnExhaustion));
+    assert!(decision.rationale.contains("priority_overridden_by_usage"));
     assert!(!decision.capability_blocked);
 }
 
-/// Disabling weekly routing keeps the configured Codex default even when Claude has the lower
-/// shared capability projection.
+/// Disabling weekly routing keeps the first listed capable provider even when a later listed
+/// Claude has the lower shared capability projection.
 #[test]
 fn disabled_weekly_routing_prevents_the_shared_capability_comparison() {
-    let mut config = shared_capability_config(false);
+    let mut config =
+        shared_capability_config_with_priority(false, vec![Provider::Codex, Provider::Claude]);
     config.policy.weekly_routing = false;
     let decision = decide(
         shared_capability_classification(None),
@@ -319,55 +336,79 @@ fn disabled_weekly_routing_prevents_the_shared_capability_comparison() {
 
     assert_eq!(decision.provider, Provider::Codex);
     assert!(decision.gates.contains(&Gate::WeeklyRoutingDisabled));
-    assert!(!decision.gates.contains(&Gate::CapabilityProjectedDraw));
+    assert!(!decision.gates.contains(&Gate::PriorityOverriddenByUsage));
 }
 
-/// Missing projections, equal projections, and a lower Codex projection all preserve Codex.
-/// The capability comparison has no raw percentage fallback.
+/// Listed candidates compare by projected draw when every eligible one has a projection, and by
+/// current weekly percent otherwise (never a draw against a percent). A lower or equal Codex
+/// projection stays on the first listed Codex with no gate; a missing projection on either side
+/// falls back to percent, where Claude's 1 beats Codex's 20.
 #[test]
-fn a_shared_capability_requires_two_projections_and_a_strict_claude_win() {
+fn a_shared_capability_compares_listed_candidates_with_percent_fallback() {
     let cases = [
         (
             window(40.0, HALF_WEEK, 0.0),
             window(20.0, HALF_WEEK, 0.0),
+            Provider::Codex,
+            false,
             "Codex has the lower projection",
         ),
         (
             window(20.0, HALF_WEEK, 0.0),
             window(20.0, HALF_WEEK, 0.0),
-            "equal projections preserve Codex",
+            Provider::Codex,
+            false,
+            "equal projections preserve the first listed Codex",
         ),
         (
             projectionless_window(1.0, 0.0),
             window(20.0, HALF_WEEK, 0.0),
-            "Claude has no projection",
+            Provider::Claude,
+            true,
+            "Claude has no projection, so percent decides",
         ),
         (
             window(1.0, HALF_WEEK, 0.0),
             projectionless_window(20.0, 0.0),
-            "Codex has no projection",
+            Provider::Claude,
+            true,
+            "Codex has no projection, so percent decides",
         ),
     ];
 
-    for (claude, codex, reason) in cases {
+    for (claude, codex, expected, fell_back, reason) in cases {
         let decision = decide(
             shared_capability_classification(None),
             usage_with_grok(claude, codex, window(0.5, HALF_WEEK, 0.0)),
             NOW,
-            &shared_capability_config(false),
+            &shared_capability_config_with_priority(false, vec![Provider::Codex, Provider::Claude]),
         );
 
-        assert_eq!(decision.provider, Provider::Codex, "{reason}");
+        assert_eq!(decision.provider, expected, "{reason}");
+        assert_eq!(
+            decision.gates.contains(&Gate::ProjectionUnavailable),
+            fell_back,
+            "{reason}"
+        );
+        assert_eq!(
+            decision.gates.contains(&Gate::PriorityOverriddenByUsage),
+            expected == Provider::Claude,
+            "{reason}"
+        );
         assert!(
             !decision.gates.contains(&Gate::CapabilityProjectedDraw),
             "{reason}"
         );
-        assert!(!decision.gates.contains(&Gate::ProjectionUnavailable));
+        assert!(
+            !decision.gates.contains(&Gate::FlippedOnExhaustion),
+            "{reason}"
+        );
     }
 }
 
-/// When either member of the Claude and Codex pair is ineligible, routing returns to the existing
-/// capable workhorse rules. Grok is capable in this fixture and has the lowest projected draw.
+/// An ineligible listed candidate drops out of the comparison and the remaining capable candidates
+/// compete as usual. Grok is capable and listed in this fixture and has the lowest projected draw,
+/// so every case lands on Grok with the diagnostic gate that explains the excluded provider.
 #[test]
 fn an_ineligible_shared_capability_provider_preserves_existing_routing() {
     let unread = Headroom {
@@ -426,22 +467,22 @@ fn an_ineligible_shared_capability_provider_preserves_existing_routing() {
             shared_capability_classification(unlaunchable),
             usage_with_grok(claude, codex, window(5.0, HALF_WEEK, 0.0)),
             NOW,
-            &shared_capability_config(true),
+            &shared_capability_config_with_priority(
+                true,
+                vec![Provider::Codex, Provider::Claude, Provider::Grok],
+            ),
         );
 
         assert_eq!(decision.provider, Provider::Grok, "{reason}");
         assert!(decision.gates.contains(&expected_gate), "{reason}");
-        assert!(
-            !decision.gates.contains(&Gate::CapabilityProjectedDraw),
-            "{reason}"
-        );
     }
 }
 
-/// Even when Grok also advertises the capability and has the lowest draw, two eligible pair
-/// members use the bounded Claude and Codex comparison. A lower Codex projection stays on Codex.
+/// With the Claude and Codex pair rule retired, a capable Grok is an ordinary default candidate:
+/// it has the lowest projected draw, so it takes the work and the move off Codex is recorded.
+/// Claude is not listed by default and never competes.
 #[test]
-fn a_lower_codex_projection_wins_the_capability_pair_when_grok_is_also_capable() {
+fn a_capable_grok_competes_on_draw_now_that_the_pair_rule_is_retired() {
     let decision = decide(
         shared_capability_classification(None),
         usage_with_grok(
@@ -453,12 +494,15 @@ fn a_lower_codex_projection_wins_the_capability_pair_when_grok_is_also_capable()
         &shared_capability_config(true),
     );
 
-    assert_eq!(decision.provider, Provider::Codex);
+    assert_eq!(decision.provider, Provider::Grok);
+    assert!(decision.gates.contains(&Gate::PriorityOverriddenByUsage));
+    assert!(!decision.gates.contains(&Gate::FlippedOnExhaustion));
     assert!(!decision.gates.contains(&Gate::CapabilityProjectedDraw));
 }
 
 /// The same Slack inventory recovers when the product name is in the task and the one-sentence
-/// rationale omits it. Grok stays ineligible because it is not in the inventory. An unmatched
+/// rationale omits it. Grok stays ineligible because it is not in the inventory, and Claude is not
+/// in the default priority, so the recovered route stays on Codex. An unmatched
 /// miss (no product name in task or rationale) is ordinary routing, not a refuse.
 #[test]
 fn a_task_named_capability_recovers_when_the_rationale_omits_the_product() {
@@ -493,9 +537,10 @@ fn a_task_named_capability_recovers_when_the_rationale_omits_the_product() {
         &config,
     );
     assert!(!recovered.capability_blocked);
-    assert_eq!(recovered.provider, Provider::Claude);
+    assert_eq!(recovered.provider, Provider::Codex);
     assert!(recovered.gates.contains(&Gate::MissingConnector));
-    assert!(recovered.gates.contains(&Gate::CapabilityProjectedDraw));
+    assert!(!recovered.gates.contains(&Gate::PriorityOverriddenByUsage));
+    assert!(!recovered.gates.contains(&Gate::CapabilityProjectedDraw));
     assert!(!recovered.gates.contains(&Gate::CapabilityBlocked));
     assert_eq!(
         recovered.matched_capabilities,
@@ -734,7 +779,11 @@ fn workhorse_routing_uses_known_weekly_headroom_and_breaks_ties_to_codex() {
         );
 
         assert_eq!(decision.provider, expected, "{reason}");
-        assert!(!decision.gates.contains(&Gate::CapabilityProjectedDraw));
+        assert_eq!(
+            decision.gates.contains(&Gate::PriorityOverriddenByUsage),
+            expected == Provider::Grok,
+            "{reason}"
+        );
     }
 }
 

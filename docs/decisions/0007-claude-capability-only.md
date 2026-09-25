@@ -1,5 +1,9 @@
 # 0007. Claude is a capability constrained destination
 
+Superseded in part by [0012](0012-configurable-provider-priority.md): Claude may be an ordinary
+candidate when `[routing] priority` lists it, and the shared Claude and Codex capability
+comparison is retired.
+
 ## Context
 
 Automatic capacity routing has two workhorses: Codex and Grok. Claude is the

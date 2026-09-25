@@ -1,5 +1,8 @@
 # 0006. Projected draw replaces a run-rate gap
 
+Superseded in part by [0012](0012-configurable-provider-priority.md): the Codex tie rule and the
+Codex and Grok only comparison.
+
 ## Context
 
 Workhorse selection used to compare current weekly percent, then a run-rate gap
