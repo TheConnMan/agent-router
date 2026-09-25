@@ -1,7 +1,8 @@
 # agent-router
 
-Route ordinary work automatically between Codex and Grok using projected weekly pace, pin
-capability-heavy work to premium Claude, or dispatch explicitly to any provider, then record why.
+Route ordinary work automatically across a configurable provider priority using projected
+weekly pace, pin capability-heavy work to Claude, or dispatch explicitly to any provider, then
+record why.
 
 The problem it solves: workhorse providers with separate weekly quotas, and a running judgement call
 about which one a given task belongs to. `agent-router` makes that call explicitly, from a fixed
@@ -33,7 +34,8 @@ log: row 87 in /home/you/.local/state/agent-router/router.db
    tools disabled: scoring needs no tool, and a task carrying an injected instruction must have
    nothing to reach for. The Jev engine is one TypeSafe HTTP call with no CLI and writes no
    prose, so it names nothing. If the call fails or times out, automatic capacity routing still
-   selects between Codex and Grok and the decision is tagged `classifier_failed`. The Claude and
+   selects among the `[routing] priority` candidates and the decision is tagged
+   `classifier_failed`. The Claude and
    Codex engines also generate the job title on that same call. A ticket ID leads the title,
    followed by two to six concise Title Case words, such as `GH-123 Sprint 2 Bug Fixes` or
    `RS-123 Input Box Searching`. A title that forgot the ticket still keeps the model's words, with
@@ -49,30 +51,31 @@ log: row 87 in /home/you/.local/state/agent-router/router.db
    server names and enabled plugins are safely discovered from its local config, while Claude.ai
    connector registrations and other providers can be
    registered in `provider_capabilities`; unavailable providers are removed before ordinary policy
-   chooses the route. When a matched capability is available on both Claude and Codex and both
-   pass weekly capacity eligibility, Claude is selected only when both projections exist and its
-   projected draw is strictly lower. A tie or a missing projection stays on Codex. A task that
+   chooses the route: capable providers compete in `[routing] priority` order under the
+   ordinary rule below, and a capability held only by Claude pins Claude. A task that
    names a configured inventory connector is treated as a miss
    even if the classifier left `missing_connector` false. A matched inventory name absent from
    every provider inventory is `capability_blocked`. An unmatched classifier miss (no inventory
-   name in the task or rationale) is ordinary Codex or Grok routing, not a refuse. The
+   name in the task or rationale) is ordinary priority routing, not a refuse. The
    context-window gate is a capability pin: Codex's window is
    258,400 tokens. It fires only when the task text actually dispatches `/implement` (read
    literally, never scored) **and** complexity is `high` or `ultra`; `low` and `medium`
    implement runs stay on ordinary routing. See
    [`docs/decisions/0003-implement-context-window.md`](docs/decisions/0003-implement-context-window.md).
-3. **Balance the workhorses by weekly pace.** Auto normal work considers Codex and Grok only. A
-   provider at or above `hard_ceiling_pct`, or whose weekly usage is unknown or non-authoritative,
-   is excluded. When both are available, each provider's current weekly percent is divided by the
+3. **Route by priority and weekly pace.** Auto ordinary work considers the providers in
+   `[routing] priority` (default Codex then Grok), narrowed by capability. A provider at or above
+   `hard_ceiling_pct`, or whose weekly usage is unknown or non-authoritative, is excluded. Among
+   the remaining candidates, each provider's current weekly percent is divided by the
    fraction of its own window that has elapsed: that projected draw is what the week finishes at
-   if spending continues at this rate. The lower projected draw wins, so a provider further into
-   its week at a higher current percent can still take work when it is under-pacing the other.
-   Ties go to Codex. When either projection cannot be computed (typically a window with less than
-   a twentieth elapsed), the comparison falls back to lower current weekly percent and records
-   `projection_unavailable`. If neither has usable capacity, the configured default (Codex by
-   default) is used and the decision visibly records the all-unavailable fallback. Claude's
-   five hour window does not pace automatic routing. Claude remains reserved for the capability
-   pins and the bounded shared capability comparison above. Grok remains available for explicit
+   if spending continues at this rate. The first candidate in priority order within
+   `priority_margin_pct` of the lowest projected draw wins, so with the default margin of 0 the
+   lower projected draw wins and an exact tie stays with the higher priority. When any eligible
+   candidate's projection cannot be computed (typically a window with less than
+   a twentieth elapsed), the comparison falls back to raw weekly percent and records
+   `projection_unavailable`. If no candidate has usable capacity, the first candidate
+   is used and the decision visibly records `over_ceiling`. Claude's
+   five hour window does not pace automatic routing. Claude is an ordinary candidate only when
+   `[routing] priority` lists it. Grok remains available for explicit
    dispatch with `--provider grok`.
 4. **Complete the provider, model, and effort pins.** With no pins, classification chooses the
    provider through usage routing, then complexity walks that provider's model tier table and
@@ -189,7 +192,7 @@ agent-router run "Fix the failing test" --dir ~/git/other-project
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `--dir <PATH>` | current directory | Working directory for the dispatched job. |
-| `--provider <NAME>` | `auto` | `auto` classifies the task, balances ordinary work between Codex and Grok, and pins Claude for capability needs. An explicit provider pins it. |
+| `--provider <NAME>` | `auto` | `auto` classifies the task, balances ordinary work across `[routing] priority`, and pins Claude for capability needs. An explicit provider pins it. |
 | `--model <NAME>` | tier table | Model pin. Requires an explicit `--provider`. With explicit Claude or Codex and no effort, classification fills effort. Pairing it with `--provider auto` is rejected. An explicit Grok model reaches the public lifecycle unchanged. |
 | `--effort <NAME>` | complexity ladder | Effort pin. Requires an explicit provider and model. Derived Codex and Claude effort is high, medium, low, or high for low, medium, high, or ultra complexity respectively. Grok rejects this flag. |
 | `--name <NAME>` | the model's title, recovered if it omitted a ticket; otherwise three to five words derived from the task, replaced after launch by [asynchronous naming](#asynchronous-session-naming) | Name for the dispatched job. Supplying it skips naming entirely, before and after launch. It reaches the `claude --bg --name` argv verbatim, names the Codex thread, and is recorded as `job_name` in the decision log for every provider, so callers that reconcile inflight jobs by exact name depend on it. An empty or whitespace only name is rejected. |
@@ -357,11 +360,11 @@ usage, and excludes Grok from automatic routing and adversarial review selection
 `unknown` for any unread workhorse window rather than claiming a measurement; unknown or ceiling
 capacity is excluded from auto selection.
 
-The weekly window places ordinary work: when both workhorses have a projected draw, the lower
-projection wins, with Codex as the tie break. Current weekly percent is the fallback when a
-projection cannot be computed. If neither workhorse has usable capacity, the default provider is
-used and the fallback is recorded. Claude's 5-hour window is informational and does not pace auto
-routing.
+The weekly window places ordinary work: among eligible `[routing] priority` candidates,
+the first within `priority_margin_pct` of the lowest projected draw wins. Current weekly percent
+is the fallback when a projection cannot be computed. If no candidate has usable capacity, the
+first candidate is used and the fallback is recorded. Claude's 5-hour window is informational and
+does not pace auto routing.
 
 ### `doctor`
 
@@ -499,7 +502,9 @@ Reported over the window: the rows considered and their oldest and newest timest
 provider, the count per gate tag, the complexity distribution (with a row that was never scored
 counted as `unscored`), the router version distribution (with a row carrying no version counted as
 `unknown`), the number of auto routes, and three rates. The flip rate is the auto routed
-rows carrying a provider moving gate (`flipped_on_exhaustion`, or `legacy_flip` for tags folded
+rows carrying a provider moving gate (`flipped_on_exhaustion`,
+`priority_overridden_by_usage`, `capability_projected_draw` on rows written before 0.30.0, or
+`legacy_flip` for tags folded
 from a pre-v2 log) over all auto routes. A
 row carrying more than one of them counts once, because
 the route moved once. The classifier failure rate is the auto routed rows carrying `classifier_failed` over the
