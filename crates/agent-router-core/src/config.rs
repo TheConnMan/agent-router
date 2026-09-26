@@ -331,6 +331,36 @@ pub enum ParityKind {
     StandaloneClaudeMd,
 }
 
+/// Where a routed job is launched. Only the launch step differs between surfaces: classification,
+/// every gate, and the decision itself are identical, so a surface never changes which provider,
+/// model, or effort a task gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Surface {
+    /// A detached provider job (`claude --bg`, a codex daemon thread, a grok session).
+    #[default]
+    Background,
+    /// A T3 Code thread, created through the external `t3-thread` launcher.
+    T3,
+}
+
+impl Surface {
+    /// The spelling the flag, the config file, and the decision log all use.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Surface::Background => "background",
+            Surface::T3 => "t3",
+        }
+    }
+}
+
+/// `[dispatch]`: how `run` launches a job when `--surface` is omitted.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct DispatchConfig {
+    pub surface: Surface,
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -376,6 +406,9 @@ pub struct Config {
     pub models: Models,
     pub adversarial_review: AdversarialReviewConfig,
     pub parity: ParityConfig,
+    /// The launch surface default. A table, so it is declared last; it rides on serde defaults
+    /// with no `config_version` bump, because a file without it already reads as background.
+    pub dispatch: DispatchConfig,
 }
 
 /// One inventory name the missing-connector recovery found in the task and/or the rationale.
@@ -431,6 +464,7 @@ impl Default for Config {
             models: Models::default(),
             adversarial_review: AdversarialReviewConfig::default(),
             parity: ParityConfig::default(),
+            dispatch: DispatchConfig::default(),
         }
     }
 }

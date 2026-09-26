@@ -23,6 +23,18 @@ use std::path::{Path, PathBuf};
 pub const CLAUDE_BIN_ENV: &str = "AGENT_ROUTER_CLAUDE_BIN";
 pub const CODEX_BIN_ENV: &str = "AGENT_ROUTER_CODEX_BIN";
 pub const GROK_BIN_ENV: &str = "AGENT_ROUTER_GROK_BIN";
+/// Pins the `t3-thread` launcher the t3 surface hands a job to. Not a provider, so it has no
+/// [`override_env`] arm; [`resolve_t3_thread`] reads it.
+pub const T3_THREAD_BIN_ENV: &str = "AGENT_ROUTER_T3_THREAD_BIN";
+
+/// The t3 launcher's name, and where the t3-thread skill installs it relative to `$HOME`.
+///
+/// PATH is deliberately not searched by default: t3-thread is a skill-local script documented to
+/// be invoked by absolute path and is not installed on PATH, so a PATH hit named `t3-thread` could
+/// be an unrelated binary. An operator who did put it on PATH says so with
+/// `AGENT_ROUTER_T3_THREAD_BIN=t3-thread`, which searches like every other name override.
+const T3_THREAD_BINARY: &str = "t3-thread";
+const T3_THREAD_SKILL_SUFFIX: &str = ".claude/skills/t3-thread/t3-thread";
 
 /// The prefix and suffix that mark an environment variable as a binary override, including the
 /// review-specific ones `adversarial_review` owns. `Environment::from_process` captures exactly
@@ -214,6 +226,31 @@ pub fn resolve_named(
 
     search(binary, environment)
         .ok_or_else(|| not_found(binary, override_envs.first().copied(), environment))
+}
+
+/// IMPURE: where the `t3-thread` launcher lives — the override, then the skill's install path under
+/// this environment's own `$HOME`. PATH is never searched without an override (see
+/// [`T3_THREAD_SKILL_SUFFIX`]), and the HOME read is the environment's, so a constructed
+/// environment never finds a host install.
+pub fn resolve_t3_thread(environment: &Environment) -> Result<PathBuf> {
+    if environment.override_value(T3_THREAD_BIN_ENV).is_some() {
+        return resolve_named(T3_THREAD_BINARY, &[T3_THREAD_BIN_ENV], environment);
+    }
+    let Some(home) = environment.home() else {
+        return Err(Error::Launch(format!(
+            "could not find the t3-thread launcher: HOME is unset; set {T3_THREAD_BIN_ENV} to pin \
+             one"
+        )));
+    };
+    let candidate = home.join(T3_THREAD_SKILL_SUFFIX);
+    if is_executable(&candidate) {
+        Ok(absolutize(candidate))
+    } else {
+        Err(Error::Launch(format!(
+            "could not find the t3-thread launcher at {}: set {T3_THREAD_BIN_ENV} to pin one",
+            candidate.display()
+        )))
+    }
 }
 
 /// The exec-format failure, as a raw OS code rather than an [`std::io::ErrorKind`].

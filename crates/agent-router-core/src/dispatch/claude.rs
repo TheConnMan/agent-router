@@ -1,4 +1,5 @@
 use crate::binary::CLAUDE_BIN_ENV;
+use crate::config::Surface;
 use crate::context::Context;
 use crate::error::{Error, Result};
 use crate::provider::Provider;
@@ -13,7 +14,7 @@ use std::time::{Duration, Instant};
 
 const ID_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
-const DEFAULT_MODEL: &str = "opus[1m]";
+pub(crate) const DEFAULT_MODEL: &str = "opus[1m]";
 
 #[derive(Debug, Deserialize)]
 struct AgentRow {
@@ -106,6 +107,8 @@ pub fn dispatch_with_binary(
         // does not know, and exits 0 having run at its own default. So nothing was observed, and
         // filling this in from the decided effort or the model would record a guess as a reading.
         effective_effort: None,
+        surface: Surface::Background,
+        url: None,
     })
 }
 

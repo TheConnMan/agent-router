@@ -1,3 +1,4 @@
+use crate::config::Surface;
 use crate::context::Context;
 use crate::error::{Error, Result};
 use crate::provider::Provider;
@@ -6,6 +7,7 @@ use crate::run::{Dispatch, Request};
 pub mod claude;
 pub mod codex;
 pub mod grok;
+pub mod t3;
 
 pub fn dispatch(
     ctx: &Context,
@@ -23,6 +25,21 @@ pub fn dispatch(
         .name
         .clone()
         .unwrap_or_else(|| crate::runtime::short_job_name(request.task));
+    if request.surface == Surface::T3 {
+        // The single launch fork: everything above, and every gate before this call, ran exactly
+        // as it does for a background launch. MCP scoping already passed `reject_mcp_scoping`,
+        // which only a claude route can; T3 has no MCP flags, so the configs are deliberately not
+        // forwarded (or even preflighted), and the caller prints the warning `run` attached.
+        return t3::dispatch(
+            ctx,
+            request.dir,
+            request.task,
+            &name,
+            decision.provider,
+            decision.model.as_deref(),
+            decision.effort.as_deref(),
+        );
+    }
     match decision.provider {
         Provider::Codex => codex::dispatch(
             ctx,

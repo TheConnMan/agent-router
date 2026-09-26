@@ -1,4 +1,5 @@
 #[cfg(target_os = "linux")]
+use agent_router_core::Surface;
 use agent_router_core::binary::{CODEX_BIN_ENV, Environment};
 #[cfg(target_os = "linux")]
 use agent_router_core::config::Config;
@@ -1186,6 +1187,7 @@ fn codex_decision_effort_reaches_turn_start_at_the_dispatch_boundary() {
         dry_run: false,
         mcp_configs: &[],
         strict_mcp_config: false,
+        surface: Surface::Background,
     };
 
     let ctx = Context::new(
@@ -1381,6 +1383,7 @@ fn mcp_scoping_on_a_non_claude_decision_fails_before_any_provider_work() {
             dry_run: false,
             mcp_configs,
             strict_mcp_config,
+            surface: Surface::Background,
         };
 
         let ctx = Context::new(

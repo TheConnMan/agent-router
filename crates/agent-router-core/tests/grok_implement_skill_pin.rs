@@ -13,6 +13,7 @@
 
 mod common;
 
+use agent_router_core::Surface;
 use agent_router_core::binary::{Environment, GROK_BIN_ENV};
 use agent_router_core::config::Config;
 use agent_router_core::log::{DecisionLog, Row};
@@ -94,6 +95,7 @@ fn request<'a>(task: &'a str, dir: &'a Path, provider: Provider) -> Request<'a> 
         dry_run: true,
         mcp_configs: &[],
         strict_mcp_config: false,
+        surface: Surface::Background,
     }
 }
 

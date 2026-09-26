@@ -13,6 +13,7 @@
 
 #![cfg(unix)]
 
+use agent_router_core::Surface;
 use agent_router_core::classify::{Classification, Complexity, TaskContextHorizon};
 use agent_router_core::config::Config;
 use agent_router_core::decide::{Decision, decide};
@@ -93,6 +94,8 @@ fn record(log: &DecisionLog, task: &str, decision: &Decision, outcome: &str) {
         outcome,
         effective_effort: None,
         note: None,
+        surface: Surface::Background,
+        thread_url: None,
     })
     .expect("records");
 }

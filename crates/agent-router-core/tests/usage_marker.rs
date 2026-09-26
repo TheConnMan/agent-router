@@ -6,6 +6,7 @@
 //! instead so the marker is exercised through the public API a caller actually has, and so the
 //! test pass touches no production source.
 
+use agent_router_core::Surface;
 use agent_router_core::config::Config;
 use agent_router_core::decide::decide_explicit;
 use agent_router_core::doctor::{self, Health};
@@ -69,6 +70,8 @@ fn entry<'a>(task: &'a str, decision: &'a agent_router_core::Decision) -> Entry<
         outcome: "dry-run",
         effective_effort: None,
         note: None,
+        surface: Surface::Background,
+        thread_url: None,
     }
 }
 

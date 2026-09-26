@@ -1,4 +1,5 @@
 use crate::binary::CODEX_BIN_ENV;
+use crate::config::Surface;
 use crate::context::Context;
 use crate::error::{Error, Result};
 use crate::provider::Provider;
@@ -336,6 +337,8 @@ pub fn dispatch(
                 job_id: Some(thread_id),
                 job_name: name.to_string(),
                 effective_effort,
+                surface: Surface::Background,
+                url: None,
             }),
             SpawnAttempt::TurnFailed { thread_id, error } => Err(Error::Command(format!(
                 "app-server started thread {thread_id} but its first turn failed: {error}"

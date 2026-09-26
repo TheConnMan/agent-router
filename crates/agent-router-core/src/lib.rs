@@ -24,6 +24,7 @@ pub mod usage;
 pub use classify::Classification;
 pub use config::{
     Classifier, ClassifierEngine, Config, ParityConfig, ParityException, ParityKind, Policy,
+    Surface,
 };
 pub use context::Context;
 pub use decide::{Decision, Gate};

@@ -35,6 +35,11 @@ pub struct Entry<'a> {
     /// and the refusal sentence on one that did not. `mark --note` writes the same column later,
     /// so a reviewer's note deliberately supersedes this one.
     pub note: Option<&'a str>,
+    /// Where the job was (or would have been) launched. Stored on every row, background included,
+    /// so a NULL in the column always means a row written before it existed.
+    pub surface: crate::config::Surface,
+    /// The T3 thread URL a t3 launch reported. None on every other row.
+    pub thread_url: Option<&'a str>,
 }
 
 /// One adversarial-review row to write: the outcome fields the CLI exit site can produce.
@@ -188,6 +193,11 @@ pub struct Row {
     /// The caller's `--model` pin. None when the caller omitted `--model` (auto, or explicit
     /// provider with complexity-scaled assignment), and on a row written before this column.
     pub requested_model: Option<String>,
+    /// `"background"` or `"t3"`. None on a row written before this column, all of which were
+    /// background launches.
+    pub surface: Option<String>,
+    /// The T3 thread URL. None on every background row and on a row written before this column.
+    pub thread_url: Option<String>,
 }
 
 /// The human judgement on one routing decision: whether sending the task there was the right call.
@@ -247,6 +257,9 @@ pub struct StatusRow {
     /// Never NULL: the query that produces these rows excludes rows carrying no job.
     pub job_id: String,
     pub outcome: String,
+    /// The launch surface. A t3 row's job id is a T3 thread id, which no provider backend knows,
+    /// so the reconciler must read this before asking one. None on a legacy (background) row.
+    pub surface: Option<String>,
 }
 
 /// One row as the stats reader needs it: the columns a metric is derived from, nothing else.
@@ -314,6 +327,8 @@ CREATE TABLE IF NOT EXISTS decisions (
     router_version      TEXT,
     matched_capabilities TEXT,
     requested_model     TEXT,
+    surface             TEXT,
+    thread_url          TEXT,
     outcome             TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS decisions_created_at ON decisions(created_at_ms);
@@ -356,7 +371,7 @@ gates, claude_weekly_pct, codex_weekly_pct, dry_run, job_id, job_name, outcome, 
 rationale, complexity, task_context_horizon, claude_usage_stale, codex_usage_stale, \
 orchestration, claude_projected_draw, codex_projected_draw, reconciled_at_ms, mark, \
 note, effective_effort, router_version, grok_weekly_pct, grok_projected_draw, \
-matched_capabilities, requested_model";
+matched_capabilities, requested_model, surface, thread_url";
 
 /// Outcomes whose route fate is known enough to judge. `completed`, `failed`, and a dispatch
 /// error are the job-fate set `stats` denominates a failure rate on. `capability-blocked` is
@@ -374,7 +389,7 @@ const STATS_COLUMNS: &str = "created_at_ms, requested, provider, complexity, gat
 mark, outcome, router_version";
 
 /// The narrower list the reconciler needs.
-const STATUS_COLUMNS: &str = "id, created_at_ms, provider, job_id, outcome";
+const STATUS_COLUMNS: &str = "id, created_at_ms, provider, job_id, outcome, surface";
 
 /// The rows a reconciliation may touch: the ones that actually produced a job. A dry run dispatched
 /// nothing, and a failed dispatch bound its `job_id` to NULL while putting the backend's own
@@ -466,7 +481,7 @@ impl DecisionLog {
                 complexity, task_context_horizon, claude_usage_stale, codex_usage_stale,
                 claude_projected_draw, codex_projected_draw, grok_projected_draw,
                 effective_effort, router_version, grok_weekly_pct, grok_weekly_reset,
-                matched_capabilities, requested_model, note
+                matched_capabilities, requested_model, note, surface, thread_url
             ) VALUES (
                 :created_at_ms, :task, :dir, :requested, :provider, :model, :effort,
                 :orchestration, :missing_connector, :gates, :rationale,
@@ -476,7 +491,8 @@ impl DecisionLog {
                 :outcome, :complexity, :task_context_horizon, :claude_usage_stale,
                 :codex_usage_stale, :claude_projected_draw, :codex_projected_draw,
                 :grok_projected_draw, :effective_effort, :router_version, :grok_weekly_pct,
-                :grok_weekly_reset, :matched_capabilities, :requested_model, :note
+                :grok_weekly_reset, :matched_capabilities, :requested_model, :note, :surface,
+                :thread_url
             )",
             rusqlite::named_params! {
                 ":created_at_ms": now_ms(),
@@ -518,6 +534,8 @@ impl DecisionLog {
                     &decision.matched_capabilities,
                 ),
                 ":requested_model": decision.requested_model,
+                ":surface": entry.surface.name(),
+                ":thread_url": entry.thread_url,
             },
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -716,6 +734,7 @@ impl DecisionLog {
                 provider: row.get(2)?,
                 job_id: row.get(3)?,
                 outcome: row.get(4)?,
+                surface: row.get(5)?,
             })
         };
         let rows = match since_ms {
@@ -924,6 +943,8 @@ fn map_decision_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
         grok_projected_draw: row.get(30)?,
         matched_capabilities: row.get(31)?,
         requested_model: row.get(32)?,
+        surface: row.get(33)?,
+        thread_url: row.get(34)?,
     })
 }
 
@@ -933,9 +954,11 @@ fn map_decision_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
 /// an existing database picks it up on open without a table rewrite.
 ///
 /// `reviews` has no versioned rewrite at all, so this list is its only migration.
-const MISSING_COLUMNS: [(&str, &str, &str); 6] = [
+const MISSING_COLUMNS: [(&str, &str, &str); 8] = [
     ("decisions", "matched_capabilities", "TEXT"),
     ("decisions", "requested_model", "TEXT"),
+    ("decisions", "surface", "TEXT"),
+    ("decisions", "thread_url", "TEXT"),
     ("reviews", "status", "TEXT"),
     ("reviews", "outcome_json", "TEXT"),
     ("reviews", "reason", "TEXT"),
@@ -947,7 +970,7 @@ const SCHEMA_VERSION: i64 = 2;
 
 /// Every column `SCHEMA` currently declares, in CREATE TABLE order, used by the v2 copy so a
 /// source table missing some of them still yields a full v2 row (NULL for the absences).
-const V2_COLUMNS: [&str; 40] = [
+const V2_COLUMNS: [&str; 42] = [
     "id",
     "created_at_ms",
     "task",
@@ -987,6 +1010,8 @@ const V2_COLUMNS: [&str; 40] = [
     "router_version",
     "matched_capabilities",
     "requested_model",
+    "surface",
+    "thread_url",
     "outcome",
 ];
 
@@ -1024,14 +1049,40 @@ fn add_missing_columns(conn: &Connection) -> Result<()> {
     }
     for (table, name, declared_type) in MISSING_COLUMNS {
         let present = columns.get(table).is_some_and(|names| names.contains(name));
-        if !present {
-            conn.execute(
-                &format!("ALTER TABLE {table} ADD COLUMN {name} {declared_type}"),
-                [],
-            )?;
-        }
+        add_missing_column(conn, table, name, declared_type, present)?;
     }
     Ok(())
+}
+
+/// IMPURE: add one column unless `present` says it is already there.
+///
+/// `present` can be stale: two processes opening a pre-column database at once both read the
+/// column as absent, and the slower one's `ALTER` then fails on a duplicate column. That is the
+/// outcome it wanted, so a failed `ALTER` re-reads the table and succeeds when the column is now
+/// there; any other failure (a missing table, a read-only file) still surfaces its own error.
+fn add_missing_column(
+    conn: &Connection,
+    table: &str,
+    name: &str,
+    declared_type: &str,
+    present: bool,
+) -> Result<()> {
+    if present {
+        return Ok(());
+    }
+    match conn.execute(
+        &format!("ALTER TABLE {table} ADD COLUMN {name} {declared_type}"),
+        [],
+    ) {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            if table_columns(conn, table).is_ok_and(|columns| columns.contains(name)) {
+                Ok(())
+            } else {
+                Err(error.into())
+            }
+        }
+    }
 }
 
 /// IMPURE: one-time v2 rewrite. Guarded by `PRAGMA user_version`, so a database already at 2 is
@@ -1266,6 +1317,8 @@ mod tests {
                 outcome: "dispatched",
                 effective_effort: None,
                 note: None,
+                surface: crate::config::Surface::Background,
+                thread_url: None,
             })
             .expect("records");
         assert!(id > 0);
@@ -1320,6 +1373,8 @@ mod tests {
             outcome: "dry-run",
             effective_effort: None,
             note: None,
+            surface: crate::config::Surface::Background,
+            thread_url: None,
         })
         .expect("records");
         let conn = rusqlite::Connection::open(&path).expect("reopen");
@@ -1358,6 +1413,8 @@ mod tests {
             outcome: "dispatched",
             effective_effort: None,
             note: None,
+            surface: crate::config::Surface::Background,
+            thread_url: None,
         })
         .expect("records");
         let row = &log.recent(1).expect("reads")[0];
@@ -1388,6 +1445,8 @@ mod tests {
                 outcome: "dry-run",
                 effective_effort: None,
                 note: None,
+                surface: crate::config::Surface::Background,
+                thread_url: None,
             })
             .expect("records");
         }
@@ -1417,6 +1476,8 @@ mod tests {
                 outcome,
                 effective_effort: None,
                 note: None,
+                surface: crate::config::Surface::Background,
+                thread_url: None,
             })
             .expect("records")
         };
@@ -1470,6 +1531,8 @@ mod tests {
             outcome: "dispatched",
             effective_effort: None,
             note: None,
+            surface: crate::config::Surface::Background,
+            thread_url: None,
         };
 
         let schema_path = dir.path().join("schema.db");
@@ -1732,6 +1795,8 @@ mod tests {
             outcome: "dry-run",
             effective_effort: None,
             note: None,
+            surface: crate::config::Surface::Background,
+            thread_url: None,
         })
         .expect("records");
 
@@ -1772,6 +1837,8 @@ mod tests {
             outcome: "dry-run",
             effective_effort: None,
             note: None,
+            surface: crate::config::Surface::Background,
+            thread_url: None,
         })
         .expect("records");
 
@@ -1828,6 +1895,8 @@ mod tests {
                 outcome: "dispatched",
                 effective_effort: None,
                 note: None,
+                surface: crate::config::Surface::Background,
+                thread_url: None,
             })
             .expect("records");
 
@@ -1924,6 +1993,8 @@ mod tests {
             outcome: "dry-run",
             effective_effort: None,
             note: None,
+            surface: crate::config::Surface::Background,
+            thread_url: None,
         })
         .expect("records recovered");
         let pinned = crate::decide::decide_explicit(
@@ -1945,6 +2016,8 @@ mod tests {
             outcome: "dry-run",
             effective_effort: None,
             note: None,
+            surface: crate::config::Surface::Background,
+            thread_url: None,
         })
         .expect("records pin");
 
@@ -1974,6 +2047,8 @@ mod tests {
             outcome: "dry-run",
             effective_effort: None,
             note: None,
+            surface: crate::config::Surface::Background,
+            thread_url: None,
         };
         log.record(&entry).expect("a dry run row");
         entry.dry_run = false;
@@ -2008,6 +2083,8 @@ mod tests {
                 outcome: "dry-run",
                 effective_effort: None,
                 note: None,
+                surface: crate::config::Surface::Background,
+                thread_url: None,
             })
             .expect("records");
         }

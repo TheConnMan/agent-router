@@ -5,6 +5,7 @@
 //! one observation into a `State`, and the PURE `settle` decides whether that state may be
 //! written over what the row already holds. See docs/decisions/0009-reconcile-monotonicity.md.
 
+use crate::config::Surface;
 use crate::context::Context;
 use crate::error::Result;
 use crate::log::{DecisionLog, StatusRow};
@@ -108,6 +109,9 @@ pub struct Reconciled {
     /// `dispatched` among them. It differs from `state` above exactly where the monotonicity rule
     /// refused a write, which is the case any verdict over the window has to read this field for.
     pub persisted: String,
+    /// The launch surface: `"t3"`, or `"background"` for a legacy NULL row, since only background
+    /// launches predate the column.
+    pub surface: String,
 }
 
 /// One reconciliation over one window.
@@ -202,6 +206,10 @@ fn report_row(
     Reconciled {
         id: row.id,
         provider: row.provider.clone(),
+        surface: row
+            .surface
+            .clone()
+            .unwrap_or_else(|| Surface::Background.name().to_string()),
         job_id: row.job_id.clone(),
         state: classify(observation.clone()),
         observation,
@@ -211,6 +219,14 @@ fn report_row(
             None => row.outcome.clone(),
         },
     }
+}
+
+/// PURE: whether a row was launched on the t3 surface. Its job id is a T3 thread id, which is not a
+/// claude short id, codex thread id, or grok session id, so no provider backend may be asked about
+/// it: every backend query and the transcript sweep skip it, and it reports `Unsupported` until
+/// T3 threads can be reconciled.
+fn on_t3(row: &StatusRow) -> bool {
+    row.surface.as_deref() == Some(Surface::T3.name())
 }
 
 /// IMPURE: read the window, ask each backend about the jobs in it, and record what came back.
@@ -224,36 +240,42 @@ pub fn reconcile(ctx: &Context, log: &DecisionLog, window: Window) -> Result<Rep
     let grok = grok_states(ctx, &rows);
     let transcripts = rows
         .iter()
-        .any(|row| row.provider == "claude")
+        .any(|row| row.provider == "claude" && !on_t3(row))
         .then(|| list_claude_transcripts(&ctx.claude_projects()));
 
     let mut reported = Vec::with_capacity(rows.len());
     for row in &rows {
-        let observation = match row.provider.as_str() {
-            "claude" => match &claude {
-                Some(states) => match states.get(&row.job_id) {
-                    Some(state) => Observation::ClaudeState(state.clone()),
-                    None => Observation::Absent,
+        // A T3 thread id asked of the claude list or the codex daemon would be misread as a job
+        // that backend lost, so a t3 row is never looked up at all.
+        let observation = if on_t3(row) {
+            Observation::Unsupported
+        } else {
+            match row.provider.as_str() {
+                "claude" => match &claude {
+                    Some(states) => match states.get(&row.job_id) {
+                        Some(state) => Observation::ClaudeState(state.clone()),
+                        None => Observation::Absent,
+                    },
+                    None => Observation::Unavailable,
                 },
-                None => Observation::Unavailable,
-            },
-            "codex" => codex
-                .get(&row.job_id)
-                .cloned()
-                .unwrap_or(Observation::Unavailable),
-            "grok" => match &grok {
-                Some(states) => states
+                "codex" => codex
                     .get(&row.job_id)
                     .cloned()
-                    .unwrap_or(Observation::Absent),
-                None => Observation::Unavailable,
-            },
-            _ => Observation::Unsupported,
+                    .unwrap_or(Observation::Unavailable),
+                "grok" => match &grok {
+                    Some(states) => states
+                        .get(&row.job_id)
+                        .cloned()
+                        .unwrap_or(Observation::Absent),
+                    None => Observation::Unavailable,
+                },
+                _ => Observation::Unsupported,
+            }
         };
         // Selected by the row's own provider column, never by the shape of the id string, so a
         // codex thread id that happens to look like a short id is never swept for.
         let traced = match row.provider.as_str() {
-            "claude" => transcripts.as_ref().and_then(|names| {
+            "claude" if !on_t3(row) => transcripts.as_ref().and_then(|names| {
                 names
                     .as_ref()
                     .map(|names| transcript_exists(names, &row.job_id))
@@ -283,7 +305,10 @@ pub fn reconcile(ctx: &Context, log: &DecisionLog, window: Window) -> Result<Rep
 /// IMPURE: the claude job list, or None when the router could not read it. One call serves the
 /// whole window, and a window holding no claude row never runs `claude` at all.
 fn claude_states(ctx: &Context, rows: &[StatusRow]) -> Option<BTreeMap<String, String>> {
-    if !rows.iter().any(|row| row.provider == "claude") {
+    if !rows
+        .iter()
+        .any(|row| row.provider == "claude" && !on_t3(row))
+    {
         return None;
     }
     crate::dispatch::claude::agent_states(ctx, AGENTS_TIMEOUT).ok()
@@ -294,7 +319,7 @@ fn claude_states(ctx: &Context, rows: &[StatusRow]) -> Option<BTreeMap<String, S
 fn codex_states(ctx: &Context, rows: &[StatusRow]) -> BTreeMap<String, Observation> {
     let thread_ids: Vec<String> = rows
         .iter()
-        .filter(|row| row.provider == "codex")
+        .filter(|row| row.provider == "codex" && !on_t3(row))
         .map(|row| row.job_id.clone())
         .collect();
     if thread_ids.is_empty() {
@@ -306,7 +331,7 @@ fn codex_states(ctx: &Context, rows: &[StatusRow]) -> BTreeMap<String, Observati
 /// IMPURE: one public lifecycle listing serves every Grok row in the window. Exact duplicate
 /// identities are ambiguous rather than whichever row happened to be listed last.
 fn grok_states(ctx: &Context, rows: &[StatusRow]) -> Option<BTreeMap<String, Observation>> {
-    if !rows.iter().any(|row| row.provider == "grok") {
+    if !rows.iter().any(|row| row.provider == "grok" && !on_t3(row)) {
         return None;
     }
     // Resolved rather than named: a bare "grok" here would keep reaching `execvp` with whatever
