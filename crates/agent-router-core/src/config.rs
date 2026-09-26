@@ -601,7 +601,8 @@ impl Config {
 /// Whole-word mention of a configured capability name.
 ///
 /// Case-insensitive, except a Title-Case inventory name must not match an all-lowercase English
-/// word: `Notion` matches `Notion` and `NOTION`, not `the notion that`.
+/// word: `Notion` matches `Notion` and `NOTION`, not `the notion that`. A lowercase hit that is a
+/// hostname label still counts, so `inboundsquare.slack.com` and `notion.so` name their service.
 fn mentions_capability(text: &str, capability: &str) -> bool {
     let capability = capability.trim();
     if capability.is_empty() {
@@ -616,13 +617,27 @@ fn mentions_capability(text: &str, capability: &str) -> bool {
         let end = start + needle.len();
         if is_word_span(text, start, end) {
             let original = &text[start..end];
-            if !(require_capital && original.chars().all(|c| !c.is_ascii_uppercase())) {
+            let lowercase = original.chars().all(|c| !c.is_ascii_uppercase());
+            if !(require_capital && lowercase) || is_host_label(text, start, end) {
                 return true;
             }
         }
         from = start + 1;
     }
     false
+}
+
+/// A span bordered by a dot that joins it to another label, as in `x.slack.com`. A sentence-ending
+/// period is followed by whitespace or nothing, so `the notion.` stays English.
+fn is_host_label(text: &str, start: usize, end: usize) -> bool {
+    let after = text[end..]
+        .strip_prefix('.')
+        .and_then(|rest| rest.chars().next());
+    let before = text[..start]
+        .strip_suffix('.')
+        .and_then(|rest| rest.chars().next_back());
+    after.is_some_and(|c| c.is_ascii_alphanumeric())
+        || before.is_some_and(|c| c.is_ascii_alphanumeric())
 }
 
 fn is_word_span(text: &str, start: usize, end: usize) -> bool {
@@ -760,6 +775,23 @@ mod tests {
         assert!(!mentions_capability("slacken the rope", "Slack"));
         assert!(mentions_capability("the Slack thread", "Slack"));
         assert!(mentions_capability("requires Granola notes", "Granola"));
+    }
+
+    #[test]
+    fn a_service_hostname_names_its_capability() {
+        assert!(mentions_capability(
+            "run this down: https://inboundsquare.slack.com/archives/C03/p17",
+            "Slack"
+        ));
+        assert!(mentions_capability(
+            "see https://www.notion.so/page",
+            "Notion"
+        ));
+        assert!(!mentions_capability(
+            "I had the notion. Then I left",
+            "Notion"
+        ));
+        assert!(!mentions_capability("the notion.", "Notion"));
     }
 
     #[test]
