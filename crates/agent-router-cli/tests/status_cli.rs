@@ -11,6 +11,7 @@
 //! which is the idiom `stats_cli.rs` and `doctor_cli.rs` already use.
 #![cfg(unix)]
 
+use agent_router_core::Surface;
 use agent_router_core::config::Config;
 use agent_router_core::decide::decide_explicit;
 use agent_router_core::log::{DecisionLog, Entry};
@@ -178,6 +179,8 @@ impl StatusFixture {
             outcome,
             effective_effort: None,
             note: None,
+            surface: Surface::Background,
+            thread_url: None,
         })
         .expect("seed a decision row")
     }

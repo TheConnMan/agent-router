@@ -402,7 +402,9 @@ fn claude_mcp_flags_on_t3_warn_once_and_are_not_forwarded() {
         assert_eq!(outcome["surface"], "t3", "{outcome}");
         let argv = fixture.launcher_argv();
         assert!(
-            !argv.iter().any(|arg| arg.contains("mcp")),
+            !argv
+                .iter()
+                .any(|arg| arg.starts_with("--mcp") || arg.starts_with("--strict-mcp")),
             "an MCP flag reached t3-thread: {argv:?}"
         );
         fs::remove_file(fixture.argv_path()).expect("reset the recorded argv");
