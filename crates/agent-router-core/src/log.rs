@@ -2494,4 +2494,154 @@ CREATE TABLE IF NOT EXISTS reviews (
             Some("secure Grok storage requires openat2")
         );
     }
+
+    /// AC4. A live v2 database written before the t3 surface picks up `surface` and `thread_url`
+    /// on open, additively and without a table rewrite. Its old row reads NULL for both, which
+    /// every reader treats as a background launch, the only kind that predates the columns.
+    #[test]
+    fn a_v2_database_gains_the_surface_and_thread_url_columns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("router.db");
+        let older = SCHEMA
+            .replace("    surface             TEXT,\n", "")
+            .replace("    thread_url          TEXT,\n", "");
+        assert!(!older.contains("surface"), "the older schema fixture");
+        assert!(!older.contains("thread_url"), "the older schema fixture");
+        {
+            let conn = rusqlite::Connection::open(&path).expect("create older database");
+            conn.execute_batch(&older).expect("older schema");
+            conn.execute_batch("PRAGMA user_version = 2")
+                .expect("stamp v2");
+            conn.execute(
+                "INSERT INTO decisions (
+                    created_at_ms, task, dir, requested, provider, gates, rationale,
+                    claude_five_hour_pct, claude_five_hour_reset, claude_weekly_pct,
+                    claude_weekly_reset, codex_five_hour_pct, codex_five_hour_reset,
+                    codex_weekly_pct, codex_weekly_reset, dry_run, job_id, outcome
+                ) VALUES (1, 'older row', '/tmp', 'auto', 'claude', '', 'why', 0, 0, 0, 0, 0, 0, \
+                 0, 0, 0, 'c0ffee42', 'dispatched')",
+                [],
+            )
+            .expect("older row");
+        }
+
+        let log = DecisionLog::open_at(&path).expect("migrates on open");
+        let columns = table_columns(&log.conn, "decisions").expect("read the columns");
+        assert!(columns.contains("surface"), "{columns:?}");
+        assert!(columns.contains("thread_url"), "{columns:?}");
+        let rows = log.recent(10).expect("reads the older row back");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].surface, None);
+        assert_eq!(rows[0].thread_url, None);
+        let status = log.status_rows(10, None).expect("reads the status window");
+        assert_eq!(status.len(), 1);
+        assert_eq!(status[0].surface, None);
+        DecisionLog::open_at(&path).expect("reopens without adding the columns twice");
+    }
+
+    /// AC4/AC7. A t3 row round-trips its surface and thread URL through both readers, and a
+    /// background row stores `"background"` explicitly rather than NULL, so a NULL means legacy.
+    #[test]
+    fn a_t3_row_round_trips_its_surface_and_thread_url() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = DecisionLog::open_at(&dir.path().join("router.db")).expect("opens");
+        let decision = decision();
+        let background = log
+            .record(&Entry {
+                task: "a background job",
+                dir: Path::new("/tmp"),
+                requested: "auto",
+                decision: &decision,
+                dry_run: false,
+                job_id: Some("thread-bg"),
+                job_name: Some("Background Job"),
+                outcome: "dispatched",
+                effective_effort: None,
+                note: None,
+                surface: crate::config::Surface::Background,
+                thread_url: None,
+            })
+            .expect("records the background row");
+        let t3 = log
+            .record(&Entry {
+                task: "a t3 job",
+                dir: Path::new("/tmp"),
+                requested: "auto",
+                decision: &decision,
+                dry_run: false,
+                job_id: Some("thr_1"),
+                job_name: Some("T3 Job"),
+                outcome: "dispatched",
+                effective_effort: None,
+                note: None,
+                surface: crate::config::Surface::T3,
+                thread_url: Some("http://127.0.0.1:3773/t/thr_1"),
+            })
+            .expect("records the t3 row");
+
+        let rows = log.recent(10).expect("reads back");
+        let t3_row = rows.iter().find(|row| row.id == t3).expect("the t3 row");
+        assert_eq!(t3_row.surface.as_deref(), Some("t3"));
+        assert_eq!(
+            t3_row.thread_url.as_deref(),
+            Some("http://127.0.0.1:3773/t/thr_1")
+        );
+        assert_eq!(t3_row.job_id.as_deref(), Some("thr_1"));
+        let background_row = rows
+            .iter()
+            .find(|row| row.id == background)
+            .expect("the background row");
+        assert_eq!(background_row.surface.as_deref(), Some("background"));
+        assert_eq!(background_row.thread_url, None);
+
+        let status = log.status_rows(10, None).expect("reads the status window");
+        let t3_status = status.iter().find(|row| row.id == t3).expect("t3 status");
+        assert_eq!(t3_status.surface.as_deref(), Some("t3"));
+        let background_status = status
+            .iter()
+            .find(|row| row.id == background)
+            .expect("background status");
+        assert_eq!(background_status.surface.as_deref(), Some("background"));
+    }
+
+    /// R3. Two processes opening a pre-column database at once both read the column as absent;
+    /// the loser's `ALTER TABLE ADD COLUMN` then fails with a duplicate column. That must be
+    /// success, not an open failure. Reproduced deterministically: the per-column step is handed a
+    /// stale `present = false` for a column that already exists.
+    #[test]
+    fn adding_a_column_a_concurrent_opener_already_added_is_not_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = DecisionLog::open_at(&dir.path().join("router.db")).expect("opens");
+        assert!(
+            table_columns(&log.conn, "decisions")
+                .expect("columns")
+                .contains("surface"),
+            "the fixture starts with the column present"
+        );
+
+        add_missing_column(&log.conn, "decisions", "surface", "TEXT", false)
+            .expect("a column added by a concurrent opener is tolerated");
+
+        let count: i64 = log
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('decisions') WHERE name = 'surface'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count the column");
+        assert_eq!(count, 1, "the column exists exactly once");
+    }
+
+    /// R3. The tolerance is narrow: an ALTER that fails for any other reason (here, a table that
+    /// does not exist) still surfaces its error.
+    #[test]
+    fn adding_a_column_to_a_missing_table_still_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = DecisionLog::open_at(&dir.path().join("router.db")).expect("opens");
+        assert!(
+            add_missing_column(&log.conn, "no_such_table", "surface", "TEXT", false).is_err(),
+            "only a column that is now present is forgiven"
+        );
+    }
 }
