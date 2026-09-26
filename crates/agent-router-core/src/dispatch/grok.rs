@@ -1,4 +1,5 @@
 use crate::binary::GROK_BIN_ENV;
+use crate::config::Surface;
 use crate::context::Context;
 use crate::error::{Error, Result};
 use crate::provider::Provider;
@@ -73,6 +74,8 @@ where
         job_id: Some(session_id),
         job_name: name.to_string(),
         effective_effort: None,
+        surface: Surface::Background,
+        url: None,
     })
 }
 

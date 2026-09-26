@@ -3,6 +3,22 @@
 All notable changes to this project are documented here. Versions are the
 workspace `package.version` stamped on every decision-log row.
 
+## 0.31.0 - 2026-09-26
+
+- Add `run --surface <background|t3>` and the `[dispatch] surface` config key (default
+  `background`). The `t3` surface routes exactly as before and launches the job as a T3 Code thread
+  through the `t3-thread` launcher, resolved from `AGENT_ROUTER_T3_THREAD_BIN` and then
+  `~/.claude/skills/t3-thread/t3-thread`. The task goes over stdin, a Claude model's `[1m]` suffix
+  is stripped, and the launch is bounded at 120 seconds, after which the launcher's process group is
+  killed.
+- A T3 launch reports the thread id as `job_id` and the thread URL as `dispatch.url`. The decision
+  log gains `surface` and `thread_url` columns, `run --json` and `log --json` carry them, and adding
+  a column now tolerates a concurrent first open that added it already.
+- On the `t3` surface a Claude job drops `--mcp-config` and `--strict-mcp-config` with one stderr
+  warning. Codex and Grok still refuse them.
+- The naming worker never renames a T3 thread and records why in `naming_skipped`. `status`
+  reports T3 rows as unsupported and never reconciles them.
+
 ## 0.30.0 - 2026-09-25
 
 - Add configurable `[routing]` priority and margin with the selection rule. `priority` is the

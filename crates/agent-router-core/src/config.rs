@@ -331,6 +331,36 @@ pub enum ParityKind {
     StandaloneClaudeMd,
 }
 
+/// Where a routed job is launched. Only the launch step differs between surfaces: classification,
+/// every gate, and the decision itself are identical, so a surface never changes which provider,
+/// model, or effort a task gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Surface {
+    /// A detached provider job (`claude --bg`, a codex daemon thread, a grok session).
+    #[default]
+    Background,
+    /// A T3 Code thread, created through the external `t3-thread` launcher.
+    T3,
+}
+
+impl Surface {
+    /// The spelling the flag, the config file, and the decision log all use.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Surface::Background => "background",
+            Surface::T3 => "t3",
+        }
+    }
+}
+
+/// `[dispatch]`: how `run` launches a job when `--surface` is omitted.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct DispatchConfig {
+    pub surface: Surface,
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -376,6 +406,9 @@ pub struct Config {
     pub models: Models,
     pub adversarial_review: AdversarialReviewConfig,
     pub parity: ParityConfig,
+    /// The launch surface default. A table, so it is declared last; it rides on serde defaults
+    /// with no `config_version` bump, because a file without it already reads as background.
+    pub dispatch: DispatchConfig,
 }
 
 /// One inventory name the missing-connector recovery found in the task and/or the rationale.
@@ -431,6 +464,7 @@ impl Default for Config {
             models: Models::default(),
             adversarial_review: AdversarialReviewConfig::default(),
             parity: ParityConfig::default(),
+            dispatch: DispatchConfig::default(),
         }
     }
 }
@@ -1132,5 +1166,85 @@ mod tests {
         };
         assert_eq!(classifier.model(), "haiku");
         assert_eq!(classifier.naming().model(), "gpt-6-luna");
+    }
+
+    /// AC1. With no flag and no configured table, a job launches exactly as it did before the t3
+    /// surface existed.
+    #[test]
+    fn the_default_dispatch_surface_is_background() {
+        assert_eq!(Config::default().dispatch.surface, Surface::Background);
+        assert_eq!(Surface::default(), Surface::Background);
+        assert_eq!(Surface::Background.name(), "background");
+        assert_eq!(Surface::T3.name(), "t3");
+    }
+
+    /// AC1, decision 3. A current file written before `[dispatch]` existed loads as background and
+    /// is NOT rewritten: the new table rides on serde defaults, not on a version bump that would
+    /// strip an operator's comments for a cosmetic gain.
+    #[test]
+    fn a_current_file_without_a_dispatch_table_loads_background_and_is_not_rewritten() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let text = format!(
+            "# the operator's own comment\nconfig_version = {CURRENT_CONFIG_VERSION}\nhard_ceiling_pct = 90.0\n"
+        );
+        std::fs::write(&path, &text).expect("write");
+
+        let config = Config::load_from(&path).expect("loads");
+        assert_eq!(config.dispatch.surface, Surface::Background);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("re-read"),
+            text,
+            "a current file must not be rewritten to add the dispatch table"
+        );
+    }
+
+    /// AC1. `[dispatch] surface = "t3"` selects the t3 surface; an unknown value is a load error
+    /// rather than a silent fall back to background.
+    #[test]
+    fn the_dispatch_surface_reads_t3_and_rejects_an_unknown_value() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+
+        let t3 = load_config("[dispatch]\nsurface = \"t3\"\n", &path).expect("loads t3");
+        assert_eq!(t3.dispatch.surface, Surface::T3);
+
+        let background =
+            load_config("[dispatch]\nsurface = \"background\"\n", &path).expect("loads");
+        assert_eq!(background.dispatch.surface, Surface::Background);
+
+        assert!(
+            load_config("[dispatch]\nsurface = \"bogus\"\n", &path).is_err(),
+            "an unknown surface must be rejected"
+        );
+        assert!(
+            load_config("[dispatch]\nsurface = \"T3\"\n", &path).is_err(),
+            "surface values are lowercase"
+        );
+    }
+
+    /// AC1. A freshly created default file writes every key, including `[dispatch]`, in an order
+    /// TOML accepts (a table after the scalars), and reads back equal.
+    #[test]
+    fn a_created_default_config_writes_the_dispatch_table_and_reads_it_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let created = Config::load_from(&path).expect("creates defaults");
+
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(text.contains("[dispatch]"), "{text}");
+        assert!(text.contains("surface = \"background\""), "{text}");
+        assert_eq!(Config::load_from(&path).expect("re-reads"), created);
+
+        let t3 = Config {
+            dispatch: DispatchConfig {
+                surface: Surface::T3,
+            },
+            ..Config::default()
+        };
+        t3.write_to(&path).expect("write a t3 config");
+        let written = std::fs::read_to_string(&path).expect("read");
+        assert!(written.contains("surface = \"t3\""), "{written}");
+        assert_eq!(Config::load_from(&path).expect("re-reads t3"), t3);
     }
 }

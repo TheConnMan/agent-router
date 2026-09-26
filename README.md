@@ -170,7 +170,7 @@ Usage comes from:
 
 ### `run`
 
-Route one task and dispatch it as a background job.
+Route one task and dispatch it as a background job, or as a T3 Code thread with `--surface t3`.
 
 ```bash
 # Classify and route automatically, in the current directory.
@@ -187,6 +187,9 @@ agent-router run "Review this migration plan" --provider grok --model grok-4
 
 # Route work in another directory.
 agent-router run "Fix the failing test" --dir ~/git/other-project
+
+# Route as usual, but open the job as a T3 Code thread you can watch and steer.
+agent-router run "Fix the failing test" --surface t3
 ```
 
 | Flag | Default | Meaning |
@@ -197,8 +200,9 @@ agent-router run "Fix the failing test" --dir ~/git/other-project
 | `--effort <NAME>` | complexity ladder | Effort pin. Requires an explicit provider and model. Derived Codex and Claude effort is high, medium, low, or high for low, medium, high, or ultra complexity respectively. Grok rejects this flag. |
 | `--name <NAME>` | the model's title, recovered if it omitted a ticket; otherwise three to five words derived from the task, replaced after launch by [asynchronous naming](#asynchronous-session-naming) | Name for the dispatched job. Supplying it skips naming entirely, before and after launch. It reaches the `claude --bg --name` argv verbatim, names the Codex thread, and is recorded as `job_name` in the decision log for every provider, so callers that reconcile inflight jobs by exact name depend on it. An empty or whitespace only name is rejected. |
 | `--dry-run` | off | Decide and log, dispatch nothing, and project the weekly draw the job is likely to cost on the provider it landed on. |
-| `--mcp-config <PATH>` | none | MCP config file for the dispatched Claude job. Repeatable. Rejected for every other provider, including Grok, and the check runs after routing, so pairing it with `--provider auto` fails whenever classification lands on a provider other than Claude. |
-| `--strict-mcp-config` | off | Use only the `--mcp-config` files and drop every inherited MCP server. See the warning below before using it. |
+| `--mcp-config <PATH>` | none | MCP config file for the dispatched Claude job. Repeatable. Rejected for every other provider, including Grok, and the check runs after routing, so pairing it with `--provider auto` fails whenever classification lands on a provider other than Claude. On the `t3` surface a Claude job accepts it but drops it with one stderr warning, because T3 has no MCP flags and the thread inherits the project's MCP servers. |
+| `--strict-mcp-config` | off | Use only the `--mcp-config` files and drop every inherited MCP server. See the warning below before using it. Dropped with the same warning on the `t3` surface. |
+| `--surface <NAME>` | `[dispatch] surface`, which defaults to `background` | Where the job launches. `background` is the existing detached launch. `t3` opens the job as a T3 Code thread through the `t3-thread` launcher; see [T3 surface](#t3-surface). Routing is identical on both. |
 | `--json` | off | Emit the full decision, including gates, classification, and usage. |
 
 The projection is an upper bound, not the job's own cost. It is the median gap between this
@@ -213,6 +217,26 @@ data line instead of a number.
 them. That interacts badly with routing: a task sent to Claude precisely because Codex was missing
 a connector can lose the very connector it was routed for. Pass it only when the job genuinely
 needs nothing beyond the files given.
+
+### T3 surface
+
+With `--surface t3` (or `[dispatch] surface = "t3"`), classification, gates, priority, model, and
+effort are decided exactly as for a background launch. Only the launch changes: the router runs the
+`t3-thread` launcher with the canonical `--dir` as the project, the decided provider as the engine,
+the decided model and effort (a Claude model's `[1m]` suffix is stripped, since T3 Claude threads
+always use the 1M window), the job name as the title, and the task on stdin. It does not wait for
+the turn.
+
+- The launcher is `AGENT_ROUTER_T3_THREAD_BIN` when set, otherwise
+  `~/.claude/skills/t3-thread/t3-thread`. `PATH` is not searched.
+- A missing launcher, a nonzero exit, or a launch that has not returned within 120 seconds is a
+  launch error carrying the launcher's stderr. Exit 3 means the local T3 server version is one the
+  launcher has not verified.
+- `job_id` is the T3 thread id. The decision log records `surface` and `thread_url`, and `--json`
+  output carries `surface` plus `dispatch.url`.
+- The asynchronous naming worker never renames a T3 thread; `naming_skipped` says so.
+- `agent-router status` reports T3 rows as unsupported. They are never reconciled as Claude, Codex,
+  or Grok jobs.
 
 An explicit Grok dispatch reuses `agent-viewer-core`'s public `GrokLifecycle`. That crate is a git
 dependency pinned by rev, so Grok behaviour changes ship in lockstep with agent-viewer. Router does not
@@ -653,6 +677,9 @@ capabilities are separate: Codex MCP server names and enabled plugins are discov
 other provider inventories in `provider_capabilities`. Matching searches the task and
 rationale even when the classifier left `missing_connector` false. A miss is refused
 only when no provider establishes the named capability.
+
+`[dispatch] surface` sets where `run` launches a job when `--surface` is omitted: `background`
+(the default) or `t3`.
 
 See [docs/configuration.md](docs/configuration.md) for the full reference.
 

@@ -50,7 +50,7 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
         /// MCP config file for the claude job, repeatable. Rejected for every other provider,
-        /// including grok.
+        /// including grok. Ignored, with a warning, when a claude job launches on the t3 surface.
         #[arg(long = "mcp-config")]
         mcp_configs: Vec<PathBuf>,
         /// Use only the --mcp-config files, dropping every inherited MCP server. This also strips
@@ -58,6 +58,10 @@ enum Command {
         /// for a connector can lose the very connector it was routed for.
         #[arg(long)]
         strict_mcp_config: bool,
+        /// Where the job launches: background, or t3 to open it as a T3 Code thread through the
+        /// t3-thread launcher. Defaults to `[dispatch] surface` in the config.
+        #[arg(long)]
+        surface: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -912,6 +916,7 @@ fn status_json(report: &Report) -> serde_json::Value {
                 // Null on a row that was never swept, which is not the same as a sweep that found
                 // nothing.
                 "traced": row.traced,
+                "surface": row.surface,
             })
         })
         .collect::<Vec<_>>();
@@ -932,8 +937,9 @@ fn print_status(report: &Report) {
     );
     for row in &report.rows {
         println!(
-            "#{id} {provider} {state} {observation} job {job}{trace}",
+            "#{id} {provider} {state} {observation} job {job} surface {surface}{trace}",
             id = row.id,
+            surface = escape_terminal_controls(&row.surface),
             provider = escape_terminal_controls(&row.provider),
             state = row.state.tag(),
             observation = escape_terminal_controls(&row.observation.label()),
@@ -964,6 +970,7 @@ fn run(cli: Cli, ctx: &mut agent_router_core::Context) -> agent_router_core::Res
             dry_run,
             mcp_configs,
             strict_mcp_config,
+            surface,
             json,
         } => route(
             ctx,
@@ -976,6 +983,7 @@ fn run(cli: Cli, ctx: &mut agent_router_core::Context) -> agent_router_core::Res
             dry_run,
             &mcp_configs,
             strict_mcp_config,
+            surface.as_deref(),
             json,
         ),
         Command::Usage { json } => usage(ctx, json),
@@ -1029,6 +1037,7 @@ fn route(
     dry_run: bool,
     mcp_configs: &[PathBuf],
     strict_mcp_config: bool,
+    surface: Option<&str>,
     json: bool,
 ) -> agent_router_core::Result<()> {
     let dir = match dir {
@@ -1036,6 +1045,10 @@ fn route(
         None => std::env::current_dir()?,
     };
     ctx.load_config()?;
+    let surface = match surface {
+        Some(surface) => agent_router_core::run::parse_surface(surface)?,
+        None => ctx.config.dispatch.surface,
+    };
     let request = Request {
         task: &task,
         dir: &dir,
@@ -1046,8 +1059,14 @@ fn route(
         dry_run,
         mcp_configs,
         strict_mcp_config,
+        surface,
     };
     let outcome = agent_router_core::run::run(&request, ctx)?;
+    // Printed once, in both output modes, because a JSON caller still needs to see on its own
+    // terminal that the scoping it asked for did not happen.
+    if let Some(warning) = &outcome.mcp_warning {
+        eprintln!("agent-router: warning: {warning}");
+    }
     if json {
         println!("{}", serde_json::to_string_pretty(&outcome_json(&outcome))?);
     } else {
@@ -1114,6 +1133,7 @@ fn outcome_json(outcome: &Outcome) -> serde_json::Value {
         "classification": decision.classification,
         "usage": decision.usage,
         "rationale": decision.rationale,
+        "surface": outcome.surface.name(),
         "dispatch": outcome.dispatch,
         "dry_run": outcome.dispatch.is_none()
             && outcome.capability_blocked.is_none()
@@ -1160,11 +1180,22 @@ fn print_outcome(outcome: &Outcome, ctx: &agent_router_core::Context) {
     match &outcome.dispatch {
         Some(dispatch) => {
             let id = dispatch.job_id.as_deref().unwrap_or("(id unresolved)");
-            line.push_str(&format!(" job {id} name {:?}", dispatch.job_name));
+            line.push_str(&format!(
+                " job {id} name {:?} on {}",
+                dispatch.job_name,
+                dispatch.surface.name()
+            ));
         }
         None => line.push_str(" (dry run, nothing dispatched)"),
     }
     println!("{line}");
+    if let Some(url) = outcome
+        .dispatch
+        .as_ref()
+        .and_then(|dispatch| dispatch.url.as_ref())
+    {
+        println!("url: {url}");
+    }
     println!("why: {}", decision.rationale);
     if outcome.naming_started {
         println!(
@@ -1574,6 +1605,9 @@ fn row_json(row: &Row) -> serde_json::Value {
         // version: the point of the column is that an aggregate spanning several of these is
         // visibly mixed rather than pooled as one population.
         "router_version": row.router_version,
+        // Null on a row written before the column, which only a background launch can be.
+        "surface": row.surface,
+        "thread_url": row.thread_url,
     })
 }
 

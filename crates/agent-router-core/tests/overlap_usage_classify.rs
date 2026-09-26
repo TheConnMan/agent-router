@@ -8,6 +8,7 @@
 mod common;
 
 use agent_router_core::Context;
+use agent_router_core::Surface;
 use agent_router_core::binary::{CLAUDE_BIN_ENV, Environment};
 use agent_router_core::config::{ClassifierEngine, Config};
 use agent_router_core::log::DecisionLog;
@@ -118,6 +119,7 @@ fn usage_read_overlaps_classification_on_the_auto_route() {
         dry_run: true,
         mcp_configs: &[],
         strict_mcp_config: false,
+        surface: Surface::Background,
     };
 
     let started = Instant::now();

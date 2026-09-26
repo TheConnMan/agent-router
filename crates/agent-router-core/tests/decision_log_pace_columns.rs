@@ -7,6 +7,7 @@
 //! These assertions go through SQL rather than the flattened read model on purpose. The contract
 //! under test is the shape of the table, which is what a later backtest reads.
 
+use agent_router_core::Surface;
 use agent_router_core::classify::{Classification, Complexity, TaskContextHorizon};
 use agent_router_core::config::{Config, Routing};
 use agent_router_core::decide::{Decision, Gate, decide};
@@ -62,6 +63,8 @@ fn record(log: &DecisionLog, decision: &Decision) {
         outcome: "dispatched",
         effective_effort: None,
         note: None,
+        surface: Surface::Background,
+        thread_url: None,
     })
     .expect("records the decision");
 }
@@ -270,6 +273,8 @@ fn fresh_auto_rows_persist_and_expose_each_context_horizon() {
             outcome: "dry-run",
             effective_effort: None,
             note: None,
+            surface: Surface::Background,
+            thread_url: None,
         })
         .expect("records");
     }
@@ -328,6 +333,8 @@ fn reconciliation_and_marking_leave_context_horizon_unchanged() {
             outcome: "dispatched",
             effective_effort: None,
             note: None,
+            surface: Surface::Background,
+            thread_url: None,
         })
         .expect("records");
 

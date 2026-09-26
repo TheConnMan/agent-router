@@ -2,6 +2,7 @@
 //! and log. When classification runs, the usage snapshot is taken concurrently with it.
 
 use crate::classify::classify_with_name;
+use crate::config::Surface;
 use crate::context::Context;
 use crate::decide::{Decision, decide_explicit, decide_with_task};
 use crate::error::{Error, Result};
@@ -10,6 +11,12 @@ use crate::log::{DecisionLog, Entry};
 use crate::provider::Provider;
 use crate::usage::UsageSnapshot;
 use std::path::{Path, PathBuf};
+
+/// The warning a t3 launch carries when it was handed MCP scoping. Claude is the only provider
+/// that passes the MCP refusal, and T3 has no MCP flags to forward the configs to, so the thread
+/// inherits the project's servers instead. The caller prints it; core never writes stderr.
+pub const T3_MCP_DROPPED: &str = "--mcp-config and --strict-mcp-config are ignored on the t3 \
+surface: T3 has no MCP flags, so the thread inherits the project's MCP servers";
 
 /// What the caller asked for.
 #[derive(Debug, Clone)]
@@ -32,6 +39,9 @@ pub struct Request<'a> {
     pub mcp_configs: &'a [PathBuf],
     /// Replace the claude job's inherited MCP servers with the named configs.
     pub strict_mcp_config: bool,
+    /// Where the job launches. Resolved by the caller (flag, then `[dispatch] surface`), never
+    /// re-read from config here, so every gate below sees one value.
+    pub surface: Surface,
 }
 
 /// What the dispatch produced.
@@ -43,8 +53,13 @@ pub struct Dispatch {
     /// still locatable.
     pub job_name: String,
     /// The reasoning effort Codex accepted as a turn override, or its reported thread default when
-    /// no override was sent. None for Claude and Grok: neither exposes an effective value.
+    /// no override was sent. None for Claude, Grok, and every T3 launch: none of them exposes an
+    /// effective value the backend itself observed.
     pub effective_effort: Option<String>,
+    /// Where the job was launched.
+    pub surface: Surface,
+    /// The T3 thread URL. None on every background launch, which has no URL to report.
+    pub url: Option<String>,
 }
 
 /// The whole outcome, including the decision log row id.
@@ -72,6 +87,11 @@ pub struct Outcome {
     /// Why no naming worker runs, when a dispatch would otherwise have had one. None on a dispatch
     /// that started a worker, and on every path that dispatched nothing.
     pub naming_skipped: Option<String>,
+    /// Where the job launched, or would have on a dry run or refusal.
+    pub surface: Surface,
+    /// Set only on a t3 dry run or dispatch that carried MCP flags, which only a claude route can
+    /// reach (every other provider refuses them first). The caller prints it once.
+    pub mcp_warning: Option<String>,
 }
 
 /// IMPURE: run one task through the router.
@@ -236,6 +256,11 @@ where
         .provider
         .map(|provider| provider.name())
         .unwrap_or("auto");
+    // Computed up front but attached only to the dry-run and dispatched outcomes: those are the two
+    // paths that reached the MCP refusal and passed it, so a route that then refuses never warns.
+    let mcp_warning = (request.surface == Surface::T3
+        && (!request.mcp_configs.is_empty() || request.strict_mcp_config))
+        .then(|| T3_MCP_DROPPED.to_string());
     // The Grok `/implement` skill pin. It runs after `decide` because an automatic route only
     // learns it landed on Grok here, and before every `record` below so the row a refusal writes
     // and the row a pinned launch writes are produced by the same code path.
@@ -263,6 +288,8 @@ where
                 outcome: "skill-pin-blocked",
                 effective_effort: None,
                 note: Some(&reason),
+                surface: request.surface,
+                thread_url: None,
             })?;
             return Ok(Outcome {
                 decision,
@@ -274,6 +301,8 @@ where
                 estimate: None,
                 naming_started: false,
                 naming_skipped: None,
+                surface: request.surface,
+                mcp_warning: None,
             });
         }
         Some(Ok(pin)) => Some(pin),
@@ -300,6 +329,8 @@ where
             outcome: "capability-blocked",
             effective_effort: None,
             note,
+            surface: request.surface,
+            thread_url: None,
         })?;
         return Ok(Outcome {
             decision,
@@ -311,6 +342,8 @@ where
             estimate: None,
             naming_started: false,
             naming_skipped: None,
+            surface: request.surface,
+            mcp_warning: None,
         });
     }
 
@@ -334,6 +367,8 @@ where
             // A dry run dispatched nothing, so no backend said anything about an effort.
             effective_effort: None,
             note,
+            surface: request.surface,
+            thread_url: None,
         })?;
         return Ok(Outcome {
             decision,
@@ -345,6 +380,10 @@ where
             estimate: Some(estimate),
             naming_started: false,
             naming_skipped: None,
+            surface: request.surface,
+            // The dry run passed the MCP check above, so a t3 claude dry run reports the drop the
+            // real run would make.
+            mcp_warning,
         });
     }
 
@@ -358,8 +397,15 @@ where
         dry_run: request.dry_run,
         mcp_configs: request.mcp_configs,
         strict_mcp_config: request.strict_mcp_config,
+        surface: request.surface,
     };
     let dispatched = crate::dispatch::dispatch(ctx, &decision, &dispatch_request);
+    // Taken separately from `recorded_fields`: only a t3 launch has a URL, and the row keeps it so
+    // the thread is reachable from the log without asking T3.
+    let thread_url = dispatched
+        .as_ref()
+        .ok()
+        .and_then(|dispatch| dispatch.url.clone());
     // The decision is logged either way: a dispatch that failed is exactly the row worth
     // keeping, and losing it would hide the failure from the tuning data.
     let (job_id, job_name, effective_effort, outcome) = recorded_fields(&dispatched);
@@ -374,6 +420,8 @@ where
         outcome: &outcome,
         effective_effort: effective_effort.as_deref(),
         note,
+        surface: request.surface,
+        thread_url: thread_url.as_deref(),
     });
     // The dispatch decides the result, not the logging: once a job is running, returning Err
     // because a row could not be written would hide the job identity from the caller, who would
@@ -386,38 +434,52 @@ where
     // After the dispatch, after the row: the worker renames a session that provably launched and
     // keeps a row that provably exists in step with it. It is detached, so this returns as soon as
     // it is spawned and the naming outlives this process.
-    let (naming_started, naming_skipped) = if wants_async_name && dispatch.job_id.is_none() {
-        // A model call would be paid for and then thrown away: with no resolved identity the
-        // worker could only find the session by the very field it is trying to change.
-        (
-            false,
-            Some(format!(
-                "{} dispatch resolved no job id, so there is no session to rename",
-                decision.provider.name()
-            )),
-        )
-    } else if wants_async_name && spawn_naming_worker {
-        let job = crate::naming::NameJob {
-            provider: decision.provider,
-            job_id: dispatch.job_id.clone(),
-            launch_name: dispatch.job_name.clone(),
-            log_id,
-            task: task.to_string(),
+    //
+    // A T3 thread keeps its launch title: the worker renames claude, codex, and grok sessions
+    // through their own backends, none of which owns a T3 thread. This is not gated on
+    // `wants_async_name`, because an unnamed job the scoring call already titled still gets no
+    // rename, and the reason belongs on the outcome either way.
+    let (naming_started, naming_skipped) =
+        if request.surface == Surface::T3 && request.name.is_none() {
+            (
+                false,
+                Some(
+                    "the router does not rename T3 threads; the thread keeps its launch title"
+                        .to_string(),
+                ),
+            )
+        } else if wants_async_name && dispatch.job_id.is_none() {
+            // A model call would be paid for and then thrown away: with no resolved identity the
+            // worker could only find the session by the very field it is trying to change.
+            (
+                false,
+                Some(format!(
+                    "{} dispatch resolved no job id, so there is no session to rename",
+                    decision.provider.name()
+                )),
+            )
+        } else if wants_async_name && spawn_naming_worker {
+            let job = crate::naming::NameJob {
+                provider: decision.provider,
+                job_id: dispatch.job_id.clone(),
+                launch_name: dispatch.job_name.clone(),
+                log_id,
+                task: task.to_string(),
+            };
+            match crate::naming::spawn_worker(ctx, &job) {
+                // Not waited on and not killed: the child is reaped by init once this process exits,
+                // which is the same contract the detached review worker runs under.
+                Ok(_) => (true, None),
+                Err(error) => (false, Some(error.to_string())),
+            }
+        } else if wants_async_name {
+            (
+                false,
+                Some("naming worker suppressed by the caller".to_string()),
+            )
+        } else {
+            (false, None)
         };
-        match crate::naming::spawn_worker(ctx, &job) {
-            // Not waited on and not killed: the child is reaped by init once this process exits,
-            // which is the same contract the detached review worker runs under.
-            Ok(_) => (true, None),
-            Err(error) => (false, Some(error.to_string())),
-        }
-    } else if wants_async_name {
-        (
-            false,
-            Some("naming worker suppressed by the caller".to_string()),
-        )
-    } else {
-        (false, None)
-    };
     Ok(Outcome {
         decision,
         dispatch: Some(dispatch),
@@ -428,6 +490,8 @@ where
         estimate: None,
         naming_started,
         naming_skipped,
+        surface: request.surface,
+        mcp_warning,
     })
 }
 
@@ -452,6 +516,17 @@ pub fn recorded_fields(
             "dispatched".to_string(),
         ),
         Err(e) => (None, None, None, format!("error: {e}")),
+    }
+}
+
+/// PURE: the surface a `--surface` value names.
+pub fn parse_surface(value: &str) -> Result<Surface> {
+    match value {
+        "background" => Ok(Surface::Background),
+        "t3" => Ok(Surface::T3),
+        other => Err(Error::Command(format!(
+            "unknown surface {other:?}: expected background or t3"
+        ))),
     }
 }
 

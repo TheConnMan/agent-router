@@ -4,6 +4,7 @@
 //! silently pooled. These assertions go through SQL rather than the flattened read model
 //! wherever the contract under test is the shape of the table.
 
+use agent_router_core::Surface;
 use agent_router_core::config::Config;
 use agent_router_core::decide::decide_explicit;
 use agent_router_core::log::{DecisionLog, Entry, Mark};
@@ -32,6 +33,8 @@ fn record(log: &DecisionLog, task: &str) -> i64 {
         outcome: "dispatched",
         effective_effort: None,
         note: None,
+        surface: Surface::Background,
+        thread_url: None,
     })
     .expect("records the decision")
 }

@@ -70,6 +70,9 @@ ultra = "claude-opus-5-5[1m]"
 [parity]
 roots = []
 exceptions = []
+
+[dispatch]
+surface = "background"
 ```
 
 ## Runtime usage cache
@@ -472,6 +475,18 @@ A `reason` is mandatory by design. An exception without one would let a real gap
 behaviour, which is the exact failure the parity command exists to prevent. A project whose
 differences are all covered by exceptions reports as `intentional` rather than `aligned`, so the
 divergence stays visible even though it does not fail the command.
+
+## `[dispatch]`
+
+### `surface`
+
+Default `"background"`. Where `agent-router run` launches a job when `--surface` is omitted.
+`background` is the detached launch every earlier version used. `t3` opens the job as a T3 Code
+thread through the `t3-thread` launcher, after routing exactly as a background launch would. An
+explicit `--surface` always wins. Any other value is a load error.
+
+The table was added without a `config_version` bump: a file written before it loads as
+`background`, which is what that file already did.
 
 ## Adding a section
 

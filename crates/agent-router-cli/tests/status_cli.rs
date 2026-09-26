@@ -11,6 +11,7 @@
 //! which is the idiom `stats_cli.rs` and `doctor_cli.rs` already use.
 #![cfg(unix)]
 
+use agent_router_core::Surface;
 use agent_router_core::config::Config;
 use agent_router_core::decide::decide_explicit;
 use agent_router_core::log::{DecisionLog, Entry};
@@ -178,6 +179,8 @@ impl StatusFixture {
             outcome,
             effective_effort: None,
             note: None,
+            surface: Surface::Background,
+            thread_url: None,
         })
         .expect("seed a decision row")
     }
@@ -707,5 +710,106 @@ fn status_on_an_empty_database_exits_zero_and_reports_no_rows() {
     assert!(
         reported(&status).is_empty(),
         "an empty log reported rows: {status}"
+    );
+}
+
+/// AC7. A T3 thread id is neither a claude short id nor a codex thread id, and there is no T3
+/// reconciliation yet. Rows launched on the t3 surface are therefore reported `unsupported` with
+/// state `unknown` and no trace probe, no backend is asked about them (the claude stub logs every
+/// invocation and must stay silent), and nothing is written back: both rows stay `dispatched` with
+/// no reconciliation stamp.
+#[test]
+fn t3_surface_rows_are_reported_unsupported_and_never_reconciled_as_claude_or_codex() {
+    use agent_router_core::config::Surface;
+
+    let fixture = StatusFixture::new("t3-unsupported");
+    let invocations = fixture.root.path.join("claude.invocations");
+    common::write_stub(
+        &fixture.root.path.join("bin/claude"),
+        &format!(
+            "printf '%s\\n' \"$*\" >> {}\nprintf '[]\\n'\n",
+            shell_quote(&invocations.to_string_lossy())
+        ),
+    );
+    // A transcript whose name matches the claude-shaped row's id, so a sweep that wrongly ran on a
+    // t3 row would find it and report `traced`.
+    fixture.write_transcript("thr_a");
+    let seed_t3 = |provider: Provider, job_id: &str| -> i64 {
+        let decision = decide_explicit(
+            provider,
+            None,
+            None,
+            None,
+            UsageSnapshot::full(),
+            &Config::default(),
+        );
+        let url = format!("http://127.0.0.1:3773/t/{job_id}");
+        DecisionLog::open_at(&fixture.db_path())
+            .expect("open the fixture log")
+            .record(&Entry {
+                task: "a seeded t3 launch",
+                dir: Path::new("/tmp"),
+                requested: provider.name(),
+                decision: &decision,
+                dry_run: false,
+                job_id: Some(job_id),
+                job_name: Some("A T3 Thread"),
+                outcome: "dispatched",
+                effective_effort: None,
+                note: None,
+                surface: Surface::T3,
+                thread_url: Some(&url),
+            })
+            .expect("seed a t3 row")
+    };
+    let claude = seed_t3(Provider::Claude, "thr_a");
+    let codex = seed_t3(Provider::Codex, "thr_b");
+
+    let status = fixture.status_json();
+    for id in [claude, codex] {
+        let row = reported_row(&status, id);
+        assert_eq!(row["observation"], "unsupported", "the reported row: {row}");
+        assert_eq!(row["state"], "unknown", "the reported row: {row}");
+        assert_eq!(row["surface"], "t3", "the reported row: {row}");
+        assert_eq!(
+            row["traced"],
+            Value::Null,
+            "a t3 row was swept for a claude transcript: {row}"
+        );
+    }
+    assert!(
+        !invocations.exists(),
+        "a t3 row made the router ask claude about it: {}",
+        fs::read_to_string(&invocations).unwrap_or_default()
+    );
+
+    for id in [claude, codex] {
+        let logged = fixture.logged(id);
+        assert_eq!(
+            logged["outcome"], "dispatched",
+            "a t3 row was rewritten: {logged}"
+        );
+        assert_eq!(
+            logged["reconciled_at_ms"],
+            Value::Null,
+            "a t3 row was stamped reconciled: {logged}"
+        );
+        assert_eq!(
+            logged["surface"], "t3",
+            "log --json carries the surface: {logged}"
+        );
+    }
+
+    let output = fixture.status();
+    assert!(
+        output.status.success(),
+        "unsupported rows are not failures, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        text.matches(" surface t3").count(),
+        2,
+        "text mode marks each t3 row: {text}"
     );
 }

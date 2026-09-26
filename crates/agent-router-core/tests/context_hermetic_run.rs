@@ -8,6 +8,7 @@
 
 mod common;
 
+use agent_router_core::Surface;
 use agent_router_core::binary::{CLAUDE_BIN_ENV, Environment};
 use agent_router_core::config::Config;
 use agent_router_core::run::{Request, run};
@@ -121,6 +122,7 @@ fn run_uses_a_constructed_context_and_ignores_poisoned_process_home_and_path() {
         dry_run: false,
         mcp_configs: &[],
         strict_mcp_config: false,
+        surface: Surface::Background,
     };
 
     let _poison = EnvGuard::poison();

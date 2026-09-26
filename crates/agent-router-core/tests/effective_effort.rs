@@ -5,6 +5,7 @@
 //! instead so the column is exercised through the public API a caller actually has, and so the
 //! test pass touches no production source, exactly as `usage_marker.rs` already does.
 
+use agent_router_core::Surface;
 use agent_router_core::config::Config;
 use agent_router_core::decide::decide_explicit;
 use agent_router_core::error::Error;
@@ -42,6 +43,8 @@ fn entry<'a>(
         outcome: "dispatched",
         effective_effort,
         note: None,
+        surface: Surface::Background,
+        thread_url: None,
     }
 }
 
@@ -126,6 +129,8 @@ fn a_dispatch_reporting_an_effort_carries_it_into_the_row_it_is_logged_as() {
         job_id: Some("thread abc123".to_string()),
         job_name: "Bonus: abc 123".to_string(),
         effective_effort: Some("high".to_string()),
+        surface: Surface::Background,
+        url: None,
     });
 
     let (job_id, job_name, effective_effort, outcome) = recorded_fields(&dispatched);
