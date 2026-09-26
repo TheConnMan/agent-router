@@ -937,9 +937,14 @@ fn print_status(report: &Report) {
     );
     for row in &report.rows {
         println!(
-            "#{id} {provider} {state} {observation} job {job} surface {surface}{trace}",
+            "#{id} {provider} {state} {observation} job {job}{surface}{trace}",
             id = row.id,
-            surface = escape_terminal_controls(&row.surface),
+            // Background rows keep their earlier line; only a t3 row carries the suffix.
+            surface = if row.surface == "background" {
+                String::new()
+            } else {
+                format!(" surface {}", escape_terminal_controls(&row.surface))
+            },
             provider = escape_terminal_controls(&row.provider),
             state = row.state.tag(),
             observation = escape_terminal_controls(&row.observation.label()),
@@ -1180,11 +1185,12 @@ fn print_outcome(outcome: &Outcome, ctx: &agent_router_core::Context) {
     match &outcome.dispatch {
         Some(dispatch) => {
             let id = dispatch.job_id.as_deref().unwrap_or("(id unresolved)");
-            line.push_str(&format!(
-                " job {id} name {:?} on {}",
-                dispatch.job_name,
-                dispatch.surface.name()
-            ));
+            line.push_str(&format!(" job {id} name {:?}", dispatch.job_name));
+            // Only a t3 launch is labeled, so background output stays byte identical to earlier
+            // versions for anything that parses it.
+            if dispatch.surface == agent_router_core::Surface::T3 {
+                line.push_str(" on t3");
+            }
         }
         None => line.push_str(" (dry run, nothing dispatched)"),
     }
