@@ -540,7 +540,10 @@ fn the_app_server_account_reply_reads_the_weekly_window_by_duration() {
     assert_eq!(got.weekly_reset_epoch, 1_791_046_719);
     assert!(got.weekly_known());
     assert!(!got.stale, "a daemon reply is a live read");
-    assert_eq!(got.five_hour_pct, 0.0, "a weekly-only plan has no 5h window");
+    assert_eq!(
+        got.five_hour_pct, 0.0,
+        "a weekly-only plan has no 5h window"
+    );
     assert_eq!(
         got.weekly_pct, 19.0,
         "the codex bucket wins over the zeroed base_model_inference bucket"

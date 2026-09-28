@@ -184,7 +184,10 @@ fn is_fresh(path: &Path, max_age: Duration) -> bool {
 }
 
 pub use claude::{claude_headroom, parse_claude_usage};
-pub use codex::{codex_headroom, codex_headroom_in, parse_codex_rate_limits};
+pub use codex::{
+    codex_account_headroom_on_rpc, codex_headroom, codex_headroom_in,
+    parse_codex_account_rate_limits, parse_codex_rate_limits,
+};
 pub use grok::{grok_headroom, grok_headroom_in, grok_usage};
 pub use time::{now_epoch, parse_rfc3339_epoch};
 
