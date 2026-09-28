@@ -79,82 +79,20 @@ fn write_file(path: &Path, contents: &str) {
     fs::write(path, contents).expect("write fixture");
 }
 
-fn write_claude_usage(path: &Path, weekly_pct: f64) {
-    write_file(
-        path,
-        &json!({
-            "five_hour": {
-                "utilization": 11.0,
-                "resets_at": "2099-01-01T00:00:00Z"
-            },
-            "seven_day": {
-                "utilization": weekly_pct,
-                "resets_at": "2099-01-07T00:00:00Z"
-            }
-        })
-        .to_string(),
-    );
-}
-
-fn write_codex_usage(path: &Path, weekly_pct: i64) {
-    let resets_at = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .expect("clock")
-        .as_secs() as i64
-        + 3_600;
-    write_file(
-        &path.join("rollout.jsonl"),
-        &format!(
-            "{}\n",
-            json!({
-                "payload": {
-                    "rate_limits": {
-                        "primary": {
-                            "window_minutes": 10080,
-                            "used_percent": weekly_pct,
-                            "resets_at": resets_at,
-                        },
-                        "secondary": null,
-                    }
-                }
-            })
-        ),
-    );
-}
-
-fn write_grok_usage(path: &Path, weekly_pct: f64) {
-    write_file(
-        &path.join("logs/unified.jsonl"),
-        &format!(
-            "{}\n",
-            json!({
-                "msg": "billing: fetched credits config",
-                "ctx": {
-                    "subscriptionTier": "SuperGrok Plus",
-                    "config": {
-                        "creditUsagePercent": weekly_pct,
-                        "currentPeriod": {
-                            "type": "USAGE_PERIOD_TYPE_WEEKLY",
-                            "end": "2099-01-07T00:00:00Z",
-                        },
-                    },
-                },
-            })
-        ),
-    );
-}
+/// Codex primary tries claude first, so a codex-primary review never touches the grok leader.
+/// Selection reads this order and nothing else: no usage cache is written by this fixture.
+const FIXTURE_CONFIG: &str = "config_version = 4\n\n[classifier]\nengine = \"codex\"\n\n[adversarial_review]\nreviewer_priority = [\"codex\", \"claude\", \"grok\"]\n";
 
 struct ReviewFixture {
     root: TempDir,
     cwd: PathBuf,
     claude_log: PathBuf,
     codex_log: PathBuf,
-    usage_cache: PathBuf,
     sessions: PathBuf,
 }
 
 impl ReviewFixture {
-    fn new(label: &str, weekly_pct: Option<f64>) -> Self {
+    fn new(label: &str) -> Self {
         let root = TempDir::new(label);
         let home = root.path.join("home");
         let config_home = home.join(".config");
@@ -163,17 +101,13 @@ impl ReviewFixture {
         let sessions = root.path.join("empty codex sessions");
         let claude_log = root.path.join("claude calls");
         let codex_log = root.path.join("codex calls");
-        let usage_cache = root.path.join("claude usage.json");
         fs::create_dir_all(&bin).expect("create binary directory");
         fs::create_dir_all(&cwd).expect("create working tree");
         fs::create_dir_all(&sessions).expect("create codex sessions");
         write_file(
             &config_home.join("agent-router/config.toml"),
-            "config_version = 4\n\n[classifier]\nengine = \"codex\"\n",
+            FIXTURE_CONFIG,
         );
-        if let Some(weekly_pct) = weekly_pct {
-            write_claude_usage(&usage_cache, weekly_pct);
-        }
 
         // The BLOCK mode below is what makes a review observable while it is still in flight: the
         // stub publishes its own pid and then waits for a file this test writes, so a test can
@@ -215,10 +149,18 @@ impl ReviewFixture {
 
         let codex_body = format!(
             "printf '%s\\n' \"$@\" >> {}\n\
+             if [ \"${{AGENT_ROUTER_FIXTURE_CODEX_FAIL:-0}}\" = \"1\" ]; then\n\
+               printf 'ERROR: rate limit exceeded, usage limit reached\\n' >&2\n\
+               exit 1\n\
+             fi\n\
              if [ -n \"${{AGENT_ROUTER_FIXTURE_REVIEW_DELAY:-}}\" ]; then\n\
                sleep \"$AGENT_ROUTER_FIXTURE_REVIEW_DELAY\"\n\
              fi\n\
-             printf '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":\"codex completed review\"}}}}\\n'\n",
+             printf '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":\"codex completed review\"}}}}\\n'\n\
+             if [ \"${{AGENT_ROUTER_FIXTURE_CODEX_EXIT_AFTER_REVIEW:-0}}\" = \"1\" ]; then\n\
+               printf 'codex exited nonzero after the review\\n' >&2\n\
+               exit 1\n\
+             fi\n",
             shell_quote(&codex_log.to_string_lossy()),
         );
         common::write_stub(&bin.join("codex"), &codex_body);
@@ -228,7 +170,6 @@ impl ReviewFixture {
             cwd,
             claude_log,
             codex_log,
-            usage_cache,
             sessions,
         }
     }
@@ -317,7 +258,10 @@ impl ReviewFixture {
             )
             .env("XDG_CONFIG_HOME", self.root.path.join("home/.config"))
             .env("CODEX_SESSIONS_DIR", &self.sessions)
-            .env("CLAUDE_USAGE_CACHE", &self.usage_cache)
+            .env(
+                "CLAUDE_USAGE_CACHE",
+                self.root.path.join("claude usage.json"),
+            )
             .env("AGENT_ROUTER_CLAUDE_REVIEW_BIN", bin.join("claude-review"))
             .env("AGENT_ROUTER_CODEX_REVIEW_BIN", bin.join("codex"))
             .env("PATH", path);
@@ -476,7 +420,7 @@ fn poll_review_status(fixture: &ReviewFixture, id: i64, expected: i32, extra: &[
 
 #[test]
 fn completed_json_excludes_primary_skips_classifier_and_waits_for_review() {
-    let fixture = ReviewFixture::new("completed", Some(23.0));
+    let fixture = ReviewFixture::new("completed");
     let started = Instant::now();
     let output = fixture
         .command()
@@ -500,14 +444,15 @@ fn completed_json_excludes_primary_skips_classifier_and_waits_for_review() {
             .as_str()
             .is_some_and(|model| !model.is_empty())
     );
-    assert_eq!(value["usage"]["weekly_pct"], 23.0);
-    assert_eq!(value["usage"]["weekly_capacity_known"], true);
-    assert_eq!(value["usage"]["stale"], false);
+    assert_eq!(value["usage"], Value::Null);
+    assert_eq!(value["fallback_from"], Value::Null);
     assert_eq!(value["reason"], Value::Null);
     assert_eq!(value["result"], "completed review body");
-    assert!(value["rationale"].as_str().is_some_and(|why| {
-        why.contains("claude") && why.contains("23") && why.contains("codex")
-    }));
+    assert!(
+        value["rationale"]
+            .as_str()
+            .is_some_and(|why| { why.contains("claude") && why.contains("codex") })
+    );
 
     assert!(
         !fixture.codex_log.exists(),
@@ -539,7 +484,7 @@ fn completed_json_excludes_primary_skips_classifier_and_waits_for_review() {
 
 #[test]
 fn completed_human_output_is_the_review_body() {
-    let fixture = ReviewFixture::new("human", Some(23.0));
+    let fixture = ReviewFixture::new("human");
     let output = fixture
         .command()
         .output()
@@ -553,15 +498,8 @@ fn completed_human_output_is_the_review_body() {
 }
 
 #[test]
-fn registered_reviewer_provenance_includes_grok_and_excludes_grok_primary() {
-    let fixture = ReviewFixture::new("grok reviewer provenance", Some(23.0));
-
-    let output = fixture.run_json();
-    assert_exit(&output, 0);
-    let value = parse_json(&output);
-    let grok = candidate_provenance(&value, "grok");
-    assert_eq!(grok["provider"], "grok");
-
+fn a_grok_primary_is_never_a_review_candidate() {
+    let fixture = ReviewFixture::new("grok primary");
     let output = fixture
         .command_for("grok", &fixture.cwd)
         .arg("--json")
@@ -571,85 +509,62 @@ fn registered_reviewer_provenance_includes_grok_and_excludes_grok_primary() {
     assert_exit(&output, 0);
     let value = parse_json(&output);
     assert_eq!(value["primary_provider"], "grok");
-    assert_ne!(value["reviewer_provider"], "grok");
-    let grok = candidate_provenance(&value, "grok");
-    assert_eq!(grok["eligible"], false);
+    assert_eq!(value["reviewer_provider"], "codex");
+    assert!(
+        value["usage_provenance"]
+            .as_array()
+            .expect("usage provenance array")
+            .iter()
+            .all(|candidate| candidate["provider"] != "grok"),
+        "{value}"
+    );
 }
 
+/// A priority that puts grok first still needs its authoritative leader: the refusal is a
+/// pre-review failure, so the next candidate runs and the outcome records where it came from.
 #[test]
-fn registered_grok_reviewer_requires_an_authoritative_live_leader() {
-    let fixture = ReviewFixture::new("grok leader unavailable", Some(23.0));
-    write_grok_usage(&fixture.grok_state_dir(), 1.0);
+fn an_unavailable_grok_candidate_fails_over_to_the_next_in_priority() {
+    let fixture = ReviewFixture::new("grok leader unavailable");
+    write_file(
+        &fixture
+            .root
+            .path
+            .join("home/.config/agent-router/config.toml"),
+        "config_version = 4\n\n[classifier]\nengine = \"codex\"\n\n[adversarial_review]\nreviewer_priority = [\"grok\", \"claude\", \"codex\"]\n",
+    );
 
     let output = fixture.run_json();
     assert_exit(&output, 0);
     let value = parse_json(&output);
 
+    assert_eq!(value["status"], "completed");
     assert_eq!(value["reviewer_provider"], "claude");
+    assert_eq!(value["fallback_from"], "grok");
     let grok = candidate_provenance(&value, "grok");
     assert_eq!(grok["weekly_pct"], Value::Null);
     assert_eq!(grok["eligible"], false);
+    // A box with no grok binary (CI runners) fails one step before the leader probe.
     assert!(
-        grok["rejection_reason"]
-            .as_str()
-            .is_some_and(|reason| reason.contains("leader")),
+        grok["rejection_reason"].as_str().is_some_and(|reason| {
+            reason.contains("leader") || reason.contains("grok executable")
+        }),
         "unexpected Grok rejection: {grok}"
     );
-}
-
-#[test]
-fn stale_or_over_limit_alternative_returns_json_skip_and_exit_three() {
-    for (label, weekly_pct, expected_rationale) in
-        [("stale", None, "stale"), ("ceiling", Some(90.0), "90")]
-    {
-        let fixture = ReviewFixture::new(label, weekly_pct);
-        let output = fixture.run_json();
-
-        assert_exit(&output, 3);
-        let value = parse_json(&output);
-        assert_eq!(value["status"], "skipped");
-        assert_eq!(value["primary_provider"], "codex");
-        assert_eq!(value["reviewer_provider"], Value::Null);
-        assert_eq!(value["reviewer_model"], Value::Null);
-        assert_eq!(value["usage"], Value::Null);
-        assert_eq!(value["reason"], "no eligible alternative provider");
-        assert_eq!(value["result"], Value::Null);
-        assert!(
-            value["rationale"]
-                .as_str()
-                .is_some_and(|why| why.contains("claude") && why.contains(expected_rationale))
-        );
-        let claude = candidate_provenance(&value, "claude");
-        assert_eq!(claude["provider"], "claude");
-        assert_eq!(claude["eligible"], false);
-        assert!(claude["rejection_reason"].is_string());
-        let codex = candidate_provenance(&value, "codex");
-        assert_eq!(codex["provider"], "codex");
-        assert_eq!(codex["eligible"], false);
-        assert!(codex["rejection_reason"].is_string());
-        assert_eq!(codex["weekly_pct"], Value::Null);
-        assert_eq!(codex["stale"], true);
-        if weekly_pct.is_none() {
-            assert_eq!(claude["weekly_pct"], Value::Null);
-            assert_eq!(claude["stale"], true);
-        } else {
-            assert_eq!(weekly_pct, Some(90.0));
-            assert_eq!(claude["weekly_pct"], 90.0);
-            assert_eq!(claude["stale"], false);
-            assert!(
-                claude["rejection_reason"]
-                    .as_str()
-                    .is_some_and(|reason| reason.contains("90"))
-            );
-        }
-        assert!(!fixture.claude_log.exists());
-        assert!(!fixture.codex_log.exists());
-    }
+    assert!(
+        value["rationale"]
+            .as_str()
+            .is_some_and(|why| why.contains("grok") && why.contains("claude")),
+        "{}",
+        value["rationale"]
+    );
+    let rows = fixture.reviews();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].fallback_from.as_deref(), Some("grok"));
 }
 
 #[test]
 fn invalid_directory_fails_before_an_empty_candidate_set_can_skip() {
-    let fixture = ReviewFixture::new("invalid directory", None);
+    let fixture = ReviewFixture::new("invalid directory");
     let missing = fixture.root.path.join("does not exist");
     let output = fixture
         .command_for("codex", &missing)
@@ -685,7 +600,7 @@ fn invalid_directory_fails_before_an_empty_candidate_set_can_skip() {
 
 #[test]
 fn claude_primary_runs_codex_synchronously_in_a_read_only_sandbox() {
-    let fixture = ReviewFixture::new("claude primary", None);
+    let fixture = ReviewFixture::new("claude primary");
     write_file(
         &fixture
             .root
@@ -693,7 +608,6 @@ fn claude_primary_runs_codex_synchronously_in_a_read_only_sandbox() {
             .join("home/.config/agent-router/config.toml"),
         "config_version = 4\n\n[classifier]\nengine = \"claude\"\n",
     );
-    write_codex_usage(&fixture.sessions, 17);
     let started = Instant::now();
     let output = fixture
         .command_for("claude", &fixture.cwd)
@@ -711,7 +625,8 @@ fn claude_primary_runs_codex_synchronously_in_a_read_only_sandbox() {
     assert_eq!(value["status"], "completed");
     assert_eq!(value["primary_provider"], "claude");
     assert_eq!(value["reviewer_provider"], "codex");
-    assert_eq!(value["usage"]["weekly_pct"], 17.0);
+    assert_eq!(value["usage"], Value::Null);
+    assert_eq!(value["fallback_from"], Value::Null);
     assert_eq!(value["result"], "codex completed review");
     assert!(
         !fixture.claude_log.exists(),
@@ -730,9 +645,11 @@ fn claude_primary_runs_codex_synchronously_in_a_read_only_sandbox() {
     );
 }
 
+/// Codex primary: claude fails with a nonzero exit, then grok has no authoritative leader. Every
+/// candidate failed, so the review fails and the reason names each one with its error.
 #[test]
-fn invocation_failure_returns_json_failure_and_exit_one() {
-    let fixture = ReviewFixture::new("failure", Some(23.0));
+fn every_candidate_failing_returns_json_failure_naming_each_and_exit_one() {
+    let fixture = ReviewFixture::new("failure");
     let output = fixture
         .command()
         .arg("--json")
@@ -744,26 +661,93 @@ fn invocation_failure_returns_json_failure_and_exit_one() {
     let value = parse_json(&output);
     assert_eq!(value["status"], "failed");
     assert_eq!(value["primary_provider"], "codex");
-    assert_eq!(value["reviewer_provider"], "claude");
-    assert!(
-        value["reviewer_model"]
-            .as_str()
-            .is_some_and(|model| !model.is_empty())
-    );
-    assert_eq!(value["usage"]["weekly_pct"], 23.0);
-    assert!(
-        value["reason"]
-            .as_str()
-            .is_some_and(|reason| reason.contains("review provider failed"))
-    );
+    assert_eq!(value["usage"], Value::Null);
     assert_eq!(value["result"], Value::Null);
-    assert!(!fixture.codex_log.exists());
+    let reason = value["reason"].as_str().unwrap_or_default();
+    assert!(reason.contains("claude: "), "{reason}");
+    assert!(reason.contains("review provider failed"), "{reason}");
+    assert!(reason.contains("grok: "), "{reason}");
+    assert!(!fixture.codex_log.exists(), "the primary was invoked");
     assert!(!argv(&fixture.claude_log).is_empty());
+    let rows = fixture.reviews();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].exit_status, 1);
+}
+
+/// End to end failover: grok primary, codex first in priority exits nonzero with only a rate limit
+/// error on stderr, and claude completes the review.
+#[test]
+fn a_rate_limited_codex_reviewer_fails_over_to_claude_and_records_it() {
+    let fixture = ReviewFixture::new("codex rate limited");
+    let output = fixture
+        .command_for("grok", &fixture.cwd)
+        .arg("--json")
+        .env("AGENT_ROUTER_FIXTURE_CODEX_FAIL", "1")
+        .output()
+        .expect("run failover adversarial review");
+
+    assert_exit(&output, 0);
+    let value = parse_json(&output);
+    assert_eq!(value["status"], "completed");
+    assert_eq!(value["primary_provider"], "grok");
+    assert_eq!(value["reviewer_provider"], "claude");
+    assert_eq!(value["fallback_from"], "codex");
+    assert_eq!(value["result"], "completed review body");
+    assert!(
+        value["rationale"].as_str().is_some_and(|why| {
+            why.contains("codex") && why.contains("rate limit") && why.contains("claude")
+        }),
+        "{}",
+        value["rationale"]
+    );
+    let codex = candidate_provenance(&value, "codex");
+    assert_eq!(codex["eligible"], false);
+    assert!(
+        codex["rejection_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("rate limit")),
+        "{codex}"
+    );
+    assert!(
+        !argv(&fixture.codex_log).is_empty(),
+        "codex was never tried"
+    );
+    assert!(!argv(&fixture.claude_log).is_empty());
+
+    let rows = fixture.reviews();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].exit_status, 0);
+    assert_eq!(rows[0].reviewer_provider.as_deref(), Some("claude"));
+    assert_eq!(rows[0].fallback_from.as_deref(), Some("codex"));
+}
+
+/// A reviewer that printed a complete review body and then exited nonzero still completed the
+/// review: the body is returned and nothing fails over.
+#[test]
+fn a_completed_codex_review_that_exits_nonzero_does_not_fail_over() {
+    let fixture = ReviewFixture::new("codex exits after review");
+    let output = fixture
+        .command_for("grok", &fixture.cwd)
+        .arg("--json")
+        .env("AGENT_ROUTER_FIXTURE_CODEX_EXIT_AFTER_REVIEW", "1")
+        .output()
+        .expect("run adversarial review");
+
+    assert_exit(&output, 0);
+    let value = parse_json(&output);
+    assert_eq!(value["status"], "completed");
+    assert_eq!(value["reviewer_provider"], "codex");
+    assert_eq!(value["fallback_from"], Value::Null);
+    assert_eq!(value["result"], "codex completed review");
+    assert!(
+        !fixture.claude_log.exists(),
+        "claude was tried as a failover"
+    );
 }
 
 #[test]
 fn a_review_exit_writes_one_reviews_row() {
-    let fixture = ReviewFixture::new("persist review", Some(23.0));
+    let fixture = ReviewFixture::new("persist review");
     let output = fixture.run_json();
     assert_exit(&output, 0);
     let value = parse_json(&output);
@@ -792,7 +776,7 @@ fn a_review_exit_writes_one_reviews_row() {
 
 #[test]
 fn a_read_only_reviews_db_does_not_change_the_review_exit_status() {
-    let fixture = ReviewFixture::new("readonly reviews db", Some(23.0));
+    let fixture = ReviewFixture::new("readonly reviews db");
     DecisionLog::open_at(&fixture.db_path()).expect("create the fixture log");
     fs::set_permissions(fixture.db_path(), fs::Permissions::from_mode(0o444))
         .expect("make the log read only");
@@ -815,7 +799,7 @@ fn a_read_only_reviews_db_does_not_change_the_review_exit_status() {
 /// result byte for byte.
 #[test]
 fn timeout_returns_pending_with_an_id_and_status_attaches_to_the_retained_result() {
-    let fixture = ReviewFixture::new("timeout pending", Some(23.0));
+    let fixture = ReviewFixture::new("timeout pending");
     let block = fixture.block_dir();
     let output = fixture
         .command()
@@ -863,9 +847,8 @@ fn timeout_returns_pending_with_an_id_and_status_attaches_to_the_retained_result
     assert_eq!(value["result"], "completed review body");
     assert_eq!(value["primary_provider"], "codex");
     assert_eq!(value["reviewer_provider"], "claude");
-    // These two would be gone if the terminal outcome envelope were reconstructed from the row's
-    // own columns instead of retained: the reviews table has no column for either.
-    assert_eq!(value["usage"]["weekly_pct"], 23.0);
+    // This would be gone if the terminal outcome envelope were reconstructed from the row's own
+    // columns instead of retained: the reviews table has no column for it.
     assert!(
         value["reviewer_model"]
             .as_str()
@@ -885,7 +868,7 @@ fn timeout_returns_pending_with_an_id_and_status_attaches_to_the_retained_result
 /// Cancel stops the reviewer that is actually running, and the cancel is what settles the row.
 #[test]
 fn cancel_stops_the_in_flight_reviewer() {
-    let fixture = ReviewFixture::new("cancel in flight", Some(23.0));
+    let fixture = ReviewFixture::new("cancel in flight");
     let block = fixture.block_dir();
     let output = fixture
         .command()
@@ -984,7 +967,7 @@ fn cancel_stops_the_in_flight_reviewer() {
 /// worker abandons the drain and the note appears within a second.
 #[test]
 fn cancel_is_observed_while_draining_an_orphaned_reviewer_pipe() {
-    let fixture = ReviewFixture::new("orphaned pipe cancel", Some(23.0));
+    let fixture = ReviewFixture::new("orphaned pipe cancel");
     let orphan = fixture.orphan_dir();
     let output = fixture
         .command()
@@ -1067,7 +1050,7 @@ fn cancel_is_observed_while_draining_an_orphaned_reviewer_pipe() {
 /// still there afterwards, addressable by the id the caller had already printed.
 #[test]
 fn a_killed_caller_does_not_lose_the_review() {
-    let fixture = ReviewFixture::new("killed caller", Some(23.0));
+    let fixture = ReviewFixture::new("killed caller");
     let block = fixture.block_dir();
     let mut child = fixture
         .command()
@@ -1098,7 +1081,7 @@ fn a_killed_caller_does_not_lose_the_review() {
 
 #[test]
 fn review_status_on_an_unknown_id_fails_and_names_it() {
-    let fixture = ReviewFixture::new("unknown review", Some(23.0));
+    let fixture = ReviewFixture::new("unknown review");
     let output = fixture
         .review_subcommand(&["status", "4242"])
         .output()
@@ -1118,7 +1101,7 @@ fn review_status_on_an_unknown_id_fails_and_names_it() {
 #[test]
 fn a_request_beginning_with_a_dash_survives_the_worker_re_exec() {
     const REQUEST: &str = "--- not a flag: review this tree ---";
-    let fixture = ReviewFixture::new("dash request", Some(23.0));
+    let fixture = ReviewFixture::new("dash request");
     let mut command = Command::new(env!("CARGO_BIN_EXE_agent-router"));
     command
         .arg("adversarial-review")
@@ -1165,7 +1148,7 @@ fn flag_value(invocation: &[String], flag: &str) -> Option<String> {
 
 #[test]
 fn automatic_selection_records_no_pin_and_keeps_the_configured_high_tier() {
-    let fixture = ReviewFixture::new("automatic unchanged", Some(23.0));
+    let fixture = ReviewFixture::new("automatic unchanged");
     let output = fixture.run_json();
     assert_exit(&output, 0);
     let value = parse_json(&output);
@@ -1181,7 +1164,7 @@ fn automatic_selection_records_no_pin_and_keeps_the_configured_high_tier() {
 
 #[test]
 fn an_explicit_fable_pin_reaches_the_claude_argv_exactly_and_stays_ephemeral() {
-    let fixture = ReviewFixture::new("fable pin", Some(35.0));
+    let fixture = ReviewFixture::new("fable pin");
     let output = pinned(
         &fixture,
         "codex",
@@ -1196,7 +1179,6 @@ fn an_explicit_fable_pin_reaches_the_claude_argv_exactly_and_stays_ephemeral() {
     assert_eq!(value["requested_model"], "fable");
     assert_eq!(value["reviewer_provider"], "claude");
     assert_eq!(value["reviewer_model"], "fable");
-    assert_eq!(value["usage"]["weekly_pct"], 35.0);
     assert_eq!(value["result"], "completed review body");
     assert!(
         value["rationale"]
@@ -1242,7 +1224,7 @@ fn an_explicit_fable_pin_reaches_the_claude_argv_exactly_and_stays_ephemeral() {
 
 #[test]
 fn a_provider_pin_without_a_model_runs_the_configured_high_tier() {
-    let fixture = ReviewFixture::new("provider only pin", Some(35.0));
+    let fixture = ReviewFixture::new("provider only pin");
     let output = pinned(&fixture, "codex", &["--provider", "claude"]);
 
     assert_exit(&output, 0);
@@ -1254,8 +1236,7 @@ fn a_provider_pin_without_a_model_runs_the_configured_high_tier() {
 
 #[test]
 fn a_pinned_codex_reviewer_keeps_the_read_only_ephemeral_sandbox_with_the_exact_model() {
-    let fixture = ReviewFixture::new("codex pin", None);
-    write_codex_usage(&fixture.sessions, 17);
+    let fixture = ReviewFixture::new("codex pin");
     let output = pinned(
         &fixture,
         "claude",
@@ -1284,7 +1265,7 @@ fn a_pinned_codex_reviewer_keeps_the_read_only_ephemeral_sandbox_with_the_exact_
 
 #[test]
 fn pinning_the_primary_provider_fails_before_any_invocation() {
-    let fixture = ReviewFixture::new("primary pin", Some(35.0));
+    let fixture = ReviewFixture::new("primary pin");
     let output = pinned(
         &fixture,
         "claude",
@@ -1325,7 +1306,7 @@ fn pinning_the_primary_provider_fails_before_any_invocation() {
 
 #[test]
 fn a_pin_is_still_reported_when_the_config_fails_to_load() {
-    let fixture = ReviewFixture::new("config failure pin", Some(35.0));
+    let fixture = ReviewFixture::new("config failure pin");
     write_file(
         &fixture
             .root
@@ -1358,7 +1339,7 @@ fn a_pin_is_still_reported_when_the_config_fails_to_load() {
 
 #[test]
 fn a_model_without_an_explicit_provider_is_rejected() {
-    let fixture = ReviewFixture::new("orphan model", Some(35.0));
+    let fixture = ReviewFixture::new("orphan model");
     for args in [
         vec!["--model", "fable"],
         vec!["--provider", "auto", "--model", "fable"],
@@ -1382,7 +1363,7 @@ fn a_model_without_an_explicit_provider_is_rejected() {
 
 #[test]
 fn a_model_pin_on_grok_and_a_malformed_model_are_rejected() {
-    let fixture = ReviewFixture::new("bad model pins", Some(35.0));
+    let fixture = ReviewFixture::new("bad model pins");
 
     let output = pinned(
         &fixture,
@@ -1425,109 +1406,14 @@ fn a_model_pin_on_grok_and_a_malformed_model_are_rejected() {
 }
 
 #[test]
-fn an_ineligible_pin_skips_with_exit_three_and_never_falls_back() {
-    // Grok is the primary, so codex is the eligible automatic alternative a stale pin must not use.
-    let fixture = ReviewFixture::new("stale", None);
-    write_codex_usage(&fixture.sessions, 17);
-    let output = pinned(
-        &fixture,
-        "grok",
-        &["--provider", "claude", "--model", "fable"],
-    );
-
-    assert_exit(&output, 3);
-    let value = parse_json(&output);
-    assert_eq!(value["status"], "skipped");
-    assert_eq!(value["primary_provider"], "grok");
-    assert_eq!(value["requested_provider"], "claude");
-    assert_eq!(value["requested_model"], "fable");
-    assert_eq!(value["reviewer_provider"], Value::Null);
-    assert_eq!(value["reviewer_model"], Value::Null);
-    assert_eq!(value["result"], Value::Null);
-    assert_eq!(value["fallback_from"], Value::Null);
-    assert!(
-        value["reason"].as_str().is_some_and(|reason| {
-            reason.starts_with("requested reviewer claude is not eligible: ")
-                && reason.contains("stale")
-        }),
-        "{}",
-        value["reason"]
-    );
-    assert!(
-        value["rationale"]
-            .as_str()
-            .is_some_and(|why| why.contains("stale")),
-        "{}",
-        value["rationale"]
-    );
-    let claude = candidate_provenance(&value, "claude");
-    assert_eq!(claude["eligible"], false);
-    assert!(!fixture.codex_log.exists(), "the pin fell back to codex");
-    assert!(!fixture.claude_log.exists());
-    let rows = fixture.reviews();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].exit_status, 3);
-    assert_eq!(rows[0].reviewer_provider, None);
-    assert_eq!(rows[0].fallback_from, None);
-}
-
-#[test]
-fn a_usage_gate_pin_refusal_fails_over_to_the_next_eligible_reviewer() {
-    // Grok is the primary, Claude is pinned at the ceiling, Codex is the remaining eligible reviewer.
-    let fixture = ReviewFixture::new("ceiling failover", Some(90.0));
-    write_codex_usage(&fixture.sessions, 17);
-    let output = pinned(
-        &fixture,
-        "grok",
-        &["--provider", "claude", "--model", "fable"],
-    );
-
-    assert_exit(&output, 0);
-    let value = parse_json(&output);
-    assert_eq!(value["status"], "completed");
-    assert_eq!(value["primary_provider"], "grok");
-    assert_eq!(value["requested_provider"], "claude");
-    assert_eq!(value["requested_model"], "fable");
-    assert_eq!(value["reviewer_provider"], "codex");
-    assert_eq!(value["fallback_from"], "claude");
-    assert_eq!(value["result"], "codex completed review");
-    assert!(
-        value["reason"].as_str().is_some_and(|reason| {
-            reason.starts_with("requested reviewer claude is not eligible: ")
-                && reason.contains("90")
-        }),
-        "{}",
-        value["reason"]
-    );
-    assert!(
-        fixture.codex_log.exists(),
-        "the usage-gate pin did not fail over to codex"
-    );
-    assert!(!fixture.claude_log.exists());
-    let rows = fixture.reviews();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].exit_status, 0);
-    assert_eq!(rows[0].reviewer_provider.as_deref(), Some("codex"));
-    assert_eq!(rows[0].fallback_from.as_deref(), Some("claude"));
-    assert!(
-        rows[0]
-            .reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("90")),
-        "{:?}",
-        rows[0].reason
-    );
-}
-
-#[test]
 fn a_pinned_grok_reviewer_still_needs_the_authoritative_leader() {
-    let fixture = ReviewFixture::new("grok pin", Some(35.0));
-    write_grok_usage(&fixture.grok_state_dir(), 1.0);
+    let fixture = ReviewFixture::new("grok pin");
     let output = pinned(&fixture, "codex", &["--provider", "grok"]);
 
-    assert_exit(&output, 3);
+    assert_ne!(output.status.code(), Some(0), "{}", text(&output.stdout));
     let value = parse_json(&output);
-    assert_eq!(value["status"], "skipped");
+    assert_ne!(value["status"], "completed");
+    assert_eq!(value["fallback_from"], Value::Null);
     assert_eq!(value["requested_provider"], "grok");
     assert_eq!(value["reviewer_provider"], Value::Null);
     let grok = candidate_provenance(&value, "grok");
@@ -1544,7 +1430,7 @@ fn a_pinned_grok_reviewer_still_needs_the_authoritative_leader() {
     assert!(
         value["reason"]
             .as_str()
-            .is_some_and(|reason| reason.starts_with("requested reviewer grok is not eligible: ")),
+            .is_some_and(|reason| reason.contains("grok")),
         "{}",
         value["reason"]
     );
@@ -1552,71 +1438,15 @@ fn a_pinned_grok_reviewer_still_needs_the_authoritative_leader() {
         !fixture.claude_log.exists(),
         "the grok pin fell back to claude"
     );
-}
-
-#[test]
-fn a_pinned_claude_reviewer_honors_the_reserve_as_a_floor() {
-    let fixture = ReviewFixture::new("reserve floor", Some(70.0));
-    let output = pinned(
-        &fixture,
-        "codex",
-        &["--provider", "claude", "--model", "fable"],
-    );
-
-    assert_exit(&output, 3);
-    let value = parse_json(&output);
-    assert_eq!(value["status"], "skipped");
     assert!(
-        value["rationale"]
-            .as_str()
-            .is_some_and(|why| why.contains("reserve") && why.contains("70.0")),
-        "{}",
-        value["rationale"]
+        !fixture.codex_log.exists(),
+        "the grok pin fell back to codex"
     );
-    assert!(!fixture.claude_log.exists());
-
-    // Text mode prints the reason alone, so the reason itself has to carry the refusing gate.
-    let output = fixture
-        .command()
-        .arg("--provider")
-        .arg("claude")
-        .arg("--model")
-        .arg("fable")
-        .output()
-        .expect("run text mode pinned review");
-    assert_exit(&output, 3);
-    assert!(text(&output.stdout).is_empty());
-    let stderr = text(&output.stderr);
-    assert!(
-        stderr.contains("requested reviewer claude is not eligible")
-            && stderr.contains("reserve")
-            && stderr.contains("70.0"),
-        "{stderr}"
-    );
-
-    // The operator's reserve setting is what decides it: zero the reserve and the same reading
-    // passes, so the refusal above is the configured reserve rather than the raw ceiling.
-    write_file(
-        &fixture
-            .root
-            .path
-            .join("home/.config/agent-router/config.toml"),
-        "config_version = 4\n\n[classifier]\nengine = \"codex\"\n\n[adversarial_review]\nclaude_usage_reserve_pct = 0.0\n",
-    );
-    let output = pinned(
-        &fixture,
-        "codex",
-        &["--provider", "claude", "--model", "fable"],
-    );
-    assert_exit(&output, 0);
-    let value = parse_json(&output);
-    assert_eq!(value["status"], "completed");
-    assert_eq!(value["reviewer_model"], "fable");
 }
 
 #[test]
 fn a_pinned_reviewer_failure_is_reported_with_the_pin_and_no_fallback() {
-    let fixture = ReviewFixture::new("pinned failure", Some(35.0));
+    let fixture = ReviewFixture::new("pinned failure");
     let output = fixture
         .command_for("grok", &fixture.cwd)
         .arg("--json")
@@ -1640,6 +1470,7 @@ fn a_pinned_reviewer_failure_is_reported_with_the_pin_and_no_fallback() {
             .is_some_and(|reason| reason.contains("review provider failed"))
     );
     assert_eq!(value["result"], Value::Null);
+    assert_eq!(value["fallback_from"], Value::Null);
     assert!(
         !fixture.codex_log.exists(),
         "the failed pin fell back to codex"
@@ -1661,5 +1492,5 @@ fn help_documents_the_pin_flags_honestly() {
     assert!(help.contains("--provider"), "{help}");
     assert!(help.contains("--model"), "{help}");
     assert!(help.contains("primary"), "{help}");
-    assert!(help.contains("eligib"), "{help}");
+    assert!(help.contains("priority"), "{help}");
 }

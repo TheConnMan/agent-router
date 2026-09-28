@@ -3,6 +3,23 @@
 All notable changes to this project are documented here. Versions are the
 workspace `package.version` stamped on every decision-log row.
 
+## 0.32.0 - 2026-09-28
+
+- Adversarial review selection follows `[adversarial_review] reviewer_priority` (default
+  `["codex", "grok", "claude"]`) minus the primary provider, and reads no usage, ceiling, or
+  reserve. `claude_usage_reserve_pct` is removed and the 90 percent review ceiling is gone.
+- A candidate that fails before producing a review (rate limit or quota, authentication, launch
+  failure, availability refusal, nonzero exit with no body) fails over to the next candidate, and
+  the completed row records `fallback_from` as the candidate that failed immediately before. A
+  completed review or a cancel never fails over. When every candidate fails the review fails with
+  a reason listing each `provider: error`. The Grok-only timeout and `openat2` failover and the
+  pinned usage-gate retry are replaced by this one loop.
+- `--provider` / `--model` pins bypass the order: only the pin runs, with no failover.
+- Outcome JSON keeps its shape: `usage` is always `null`, and `usage_provenance` has one entry per
+  candidate tried with its failure reason. Selection no longer produces `skipped`.
+- `config_version` is 7. The migration drops `claude_usage_reserve_pct` and writes
+  `reviewer_priority`.
+
 ## 0.31.0 - 2026-09-26
 
 - Add `run --surface <background|t3>` and the `[dispatch] surface` config key (default

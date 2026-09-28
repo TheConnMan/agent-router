@@ -1,51 +1,49 @@
 use agent_router_core::adversarial_review::{
-    ReviewProvider, ReviewRequest, ReviewStatus, ReviewerPin, review_pinned_with_providers,
-    review_with_claude_usage_reserve, review_with_providers, reviewer_pin,
+    ReviewOutcome, ReviewProvider, ReviewRequest, ReviewStatus, ReviewerPin,
+    review_pinned_with_providers, review_with_providers, reviewer_pin,
 };
 use agent_router_core::log::{DecisionLog, ReviewEntry};
-use agent_router_core::{Error, Headroom, Provider, Result};
+use agent_router_core::{Error, Provider, Result};
 use std::cell::Cell;
 use std::path::Path;
+
+const PRIORITY: [Provider; 3] = [Provider::Codex, Provider::Grok, Provider::Claude];
 
 struct StubReviewer<'a> {
     provider: &'a str,
     model: &'a str,
-    usage: Option<Headroom>,
+    availability: std::result::Result<(), &'a str>,
     result: Result<&'a str>,
     calls: Cell<usize>,
 }
 
 impl<'a> StubReviewer<'a> {
-    fn successful(
-        provider: &'a str,
-        model: &'a str,
-        usage: Option<Headroom>,
-        result: &'a str,
-    ) -> Self {
+    fn successful(provider: &'a str, model: &'a str, result: &'a str) -> Self {
         Self {
             provider,
             model,
-            usage,
+            availability: Ok(()),
             result: Ok(result),
             calls: Cell::new(0),
         }
     }
 
-    fn failing(provider: &'a str, model: &'a str, usage: Option<Headroom>) -> Self {
-        Self::failing_with(provider, model, usage, "review invocation failed")
-    }
-
-    fn failing_with(
-        provider: &'a str,
-        model: &'a str,
-        usage: Option<Headroom>,
-        message: &'a str,
-    ) -> Self {
+    fn failing_with(provider: &'a str, model: &'a str, message: &'a str) -> Self {
         Self {
             provider,
             model,
-            usage,
+            availability: Ok(()),
             result: Err(Error::Command(message.to_string())),
+            calls: Cell::new(0),
+        }
+    }
+
+    fn unavailable(provider: &'a str, model: &'a str, reason: &'a str) -> Self {
+        Self {
+            provider,
+            model,
+            availability: Err(reason),
+            result: Ok("must not run"),
             calls: Cell::new(0),
         }
     }
@@ -60,8 +58,8 @@ impl ReviewProvider for StubReviewer<'_> {
         self.model
     }
 
-    fn usage(&self) -> Option<Headroom> {
-        self.usage
+    fn authoritative_availability(&self) -> std::result::Result<(), String> {
+        self.availability.map_err(str::to_string)
     }
 
     fn review(&self, request: &ReviewRequest<'_>) -> Result<String> {
@@ -78,212 +76,12 @@ impl ReviewProvider for StubReviewer<'_> {
     }
 }
 
-fn fresh(weekly_pct: f64) -> Headroom {
-    Headroom {
-        five_hour_pct: 12.0,
-        five_hour_reset_epoch: 1_800_000_000,
-        weekly_pct,
-        weekly_reset_epoch: 1_800_500_000,
-        weekly_capacity_known: true,
-        stale: false,
-    }
-}
-
 fn request<'a>(primary_provider: &'a str) -> ReviewRequest<'a> {
     ReviewRequest {
         primary_provider,
         body: "Review this working tree for regressions",
         dir: Path::new("/tmp/review target"),
     }
-}
-
-#[test]
-fn primary_provider_is_a_hard_exclusion_and_is_never_invoked() {
-    let primary =
-        StubReviewer::successful("codex", "primary model", Some(fresh(1.0)), "wrong review");
-    let alternative = StubReviewer::successful(
-        "claude",
-        "alternative model",
-        Some(fresh(35.0)),
-        "completed adversarial review",
-    );
-
-    let outcome = review_with_providers(&request("codex"), &[&primary, &alternative])
-        .expect("eligible alternative completes");
-
-    assert_eq!(outcome.status, ReviewStatus::Completed);
-    assert_eq!(outcome.primary_provider, "codex");
-    assert_eq!(outcome.reviewer_provider.as_deref(), Some("claude"));
-    assert_eq!(outcome.reviewer_model.as_deref(), Some("alternative model"));
-    assert_eq!(
-        outcome.result.as_deref(),
-        Some("completed adversarial review")
-    );
-    assert_eq!(primary.calls.get(), 0, "the primary provider was invoked");
-    assert_eq!(alternative.calls.get(), 1);
-
-    // Mutation check: removing the primary exclusion makes the one percent primary win the
-    // headroom ordering. This assertion then fails because its call count becomes one.
-    assert_eq!(primary.calls.get(), 0);
-}
-
-#[test]
-fn stale_unknown_unavailable_and_ceiling_candidates_are_ineligible() {
-    let mut stale_usage = fresh(5.0);
-    stale_usage.stale = true;
-    let mut unknown_usage = fresh(6.0);
-    unknown_usage.weekly_capacity_known = false;
-    let primary = StubReviewer::successful("codex", "primary", Some(fresh(2.0)), "wrong");
-    let stale = StubReviewer::successful("claude", "stale", Some(stale_usage), "wrong");
-    let unknown = StubReviewer::successful("openrouter", "unknown", Some(unknown_usage), "wrong");
-    let unavailable = StubReviewer::successful("grok", "unavailable", None, "wrong");
-    let at_ceiling = StubReviewer::successful("local", "ceiling", Some(fresh(90.0)), "wrong");
-    let eligible =
-        StubReviewer::successful("future", "eligible", Some(fresh(41.0)), "right review");
-
-    let outcome = review_with_providers(
-        &request("codex"),
-        &[
-            &stale,
-            &unknown,
-            &unavailable,
-            &at_ceiling,
-            &eligible,
-            &primary,
-        ],
-    )
-    .expect("one registered alternative remains eligible");
-
-    assert_eq!(outcome.reviewer_provider.as_deref(), Some("future"));
-    assert_eq!(outcome.usage, Some(fresh(41.0)));
-    assert_eq!(outcome.result.as_deref(), Some("right review"));
-    for rejected in [&primary, &stale, &unknown, &unavailable, &at_ceiling] {
-        assert_eq!(rejected.calls.get(), 0, "{} was invoked", rejected.provider);
-    }
-    assert_eq!(eligible.calls.get(), 1);
-    assert!(outcome.rationale.contains("future"));
-    assert!(outcome.rationale.contains("41"));
-}
-
-#[test]
-fn unknown_grok_capacity_falls_back_to_claude_without_misreporting_it_as_full() {
-    let primary = StubReviewer::successful("codex", "primary", Some(fresh(2.0)), "wrong");
-    let grok = StubReviewer::successful("grok", "grok", Some(Headroom::closed()), "wrong");
-    let claude = StubReviewer::successful("claude", "claude", Some(fresh(12.0)), "claude review");
-
-    let outcome = review_with_providers(&request("codex"), &[&primary, &grok, &claude])
-        .expect("low-usage Claude remains the eligible alternative");
-
-    assert_eq!(outcome.reviewer_provider.as_deref(), Some("claude"));
-    assert_eq!(claude.calls.get(), 1);
-    assert_eq!(
-        grok.calls.get(),
-        0,
-        "unknown Grok capacity must never be invoked"
-    );
-    assert!(
-        outcome.rationale.contains("no billing data available"),
-        "the fail-closed sentinel is no data, not measured utilization: {}",
-        outcome.rationale
-    );
-    assert!(
-        !outcome
-            .rationale
-            .contains("stale at 100.0 percent weekly usage"),
-        "the sentinel must not be rendered as real billing: {}",
-        outcome.rationale
-    );
-    let grok_provenance = outcome
-        .usage_provenance
-        .iter()
-        .find(|candidate| candidate.provider == "grok")
-        .expect("Grok rejection provenance");
-    assert_eq!(grok_provenance.weekly_pct, None);
-    assert!(
-        grok_provenance
-            .rejection_reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("no billing data available"))
-    );
-}
-
-#[test]
-fn equal_capacity_selection_is_deterministic_across_registration_order() {
-    let alpha_first = StubReviewer::successful("alpha", "a", Some(fresh(20.0)), "alpha review");
-    let zeta_first = StubReviewer::successful("zeta", "z", Some(fresh(20.0)), "zeta review");
-    let first = review_with_providers(&request("codex"), &[&zeta_first, &alpha_first])
-        .expect("first ordering completes");
-
-    let alpha_second = StubReviewer::successful("alpha", "a", Some(fresh(20.0)), "alpha review");
-    let zeta_second = StubReviewer::successful("zeta", "z", Some(fresh(20.0)), "zeta review");
-    let second = review_with_providers(&request("codex"), &[&alpha_second, &zeta_second])
-        .expect("second ordering completes");
-
-    assert_eq!(first.reviewer_provider.as_deref(), Some("alpha"));
-    assert_eq!(second.reviewer_provider.as_deref(), Some("alpha"));
-    assert_eq!(first.result, second.result);
-    assert_eq!(zeta_first.calls.get(), 0);
-    assert_eq!(zeta_second.calls.get(), 0);
-}
-
-#[test]
-fn claude_reserve_preserves_premium_capacity_without_changing_eligibility() {
-    let claude = StubReviewer::successful("claude", "claude", Some(fresh(0.0)), "claude review");
-    let grok = StubReviewer::successful("grok", "grok", Some(fresh(20.0)), "grok review");
-
-    let outcome = review_with_claude_usage_reserve(&request("codex"), &[&claude, &grok], 25.0)
-        .expect("Grok wins while Claude's reserve remains larger than the usage gap");
-
-    assert_eq!(outcome.reviewer_provider.as_deref(), Some("grok"));
-    assert_eq!(grok.calls.get(), 1);
-    assert_eq!(claude.calls.get(), 0);
-    assert!(outcome.rationale.contains("25.0 point reserve"));
-
-    // Mutation check: without the reserve, the raw 0 percent Claude reading wins.
-    let raw_claude =
-        StubReviewer::successful("claude", "claude", Some(fresh(0.0)), "claude review");
-    let raw_grok = StubReviewer::successful("grok", "grok", Some(fresh(20.0)), "grok review");
-    let raw = review_with_providers(&request("codex"), &[&raw_claude, &raw_grok])
-        .expect("the raw-usage selection completes");
-    assert_eq!(raw.reviewer_provider.as_deref(), Some("claude"));
-}
-
-#[test]
-fn no_eligible_alternative_returns_a_rationalized_skip_without_invocation() {
-    let primary = StubReviewer::successful("codex", "primary", Some(fresh(1.0)), "wrong");
-    let at_ceiling = StubReviewer::successful("claude", "full", Some(fresh(90.0)), "wrong");
-
-    let outcome = review_with_providers(&request("codex"), &[&primary, &at_ceiling])
-        .expect("no capacity is a skip rather than infrastructure failure");
-
-    assert_eq!(outcome.status, ReviewStatus::Skipped);
-    assert_eq!(outcome.primary_provider, "codex");
-    assert_eq!(outcome.reviewer_provider, None);
-    assert_eq!(outcome.reviewer_model, None);
-    assert_eq!(outcome.usage, None);
-    assert_eq!(outcome.result, None);
-    assert_eq!(
-        outcome.reason.as_deref(),
-        Some("no eligible alternative provider")
-    );
-    assert!(outcome.rationale.contains("codex"));
-    assert!(outcome.rationale.contains("claude"));
-    assert!(outcome.rationale.contains("90"));
-    assert_eq!(primary.calls.get(), 0);
-    assert_eq!(at_ceiling.calls.get(), 0);
-}
-
-#[test]
-fn selected_provider_failure_is_an_invocation_error_and_does_not_fall_through() {
-    let selected = StubReviewer::failing("alpha", "a", Some(fresh(10.0)));
-    let fallback = StubReviewer::successful("zeta", "z", Some(fresh(20.0)), "must not run");
-
-    let error = review_with_providers(&request("codex"), &[&fallback, &selected])
-        .expect_err("selected invocation failure must be reported");
-
-    assert!(error.to_string().contains("review invocation failed"));
-    assert_eq!(selected.calls.get(), 1);
-    assert_eq!(fallback.calls.get(), 0);
 }
 
 fn pin(provider: Provider, model: Option<&str>) -> ReviewerPin {
@@ -293,69 +91,292 @@ fn pin(provider: Provider, model: Option<&str>) -> ReviewerPin {
     }
 }
 
-#[test]
-fn automatic_selection_records_no_requested_reviewer() {
-    let primary = StubReviewer::successful("codex", "primary", Some(fresh(1.0)), "wrong");
-    let alternative = StubReviewer::successful("claude", "opus[1m]", Some(fresh(35.0)), "ok");
-
-    let outcome = review_with_providers(&request("codex"), &[&primary, &alternative])
-        .expect("eligible alternative completes");
-
-    assert_eq!(outcome.status, ReviewStatus::Completed);
-    assert_eq!(outcome.requested_provider, None);
-    assert_eq!(outcome.requested_model, None);
-    assert_eq!(outcome.reviewer_model.as_deref(), Some("opus[1m]"));
+/// A review that did not complete may surface as an `Err` or as a non-completed outcome; either
+/// way the user sees no review body.
+fn assert_not_completed(result: &Result<ReviewOutcome>) {
+    if let Ok(outcome) = result {
+        assert_ne!(outcome.status, ReviewStatus::Completed, "{outcome:?}");
+        assert_eq!(outcome.result, None);
+    }
 }
 
 #[test]
-fn explicit_pin_selects_the_requested_provider_and_records_the_pin() {
-    let primary = StubReviewer::successful("codex", "primary", Some(fresh(1.0)), "wrong");
-    let cheaper = StubReviewer::successful("grok", "default", Some(fresh(5.0)), "wrong");
-    let pinned = StubReviewer::successful("claude", "fable", Some(fresh(35.0)), "fable review");
+fn candidates_follow_priority_order_minus_the_primary() {
+    let codex = StubReviewer::successful("codex", "gpt", "wrong");
+    let grok = StubReviewer::successful("grok", "default", "grok review");
+    let claude = StubReviewer::successful("claude", "opus", "wrong");
 
-    let outcome = review_pinned_with_providers(
-        &request("codex"),
-        &[&primary, &cheaper, &pinned],
-        &pin(Provider::Claude, Some("fable")),
-        25.0,
-    )
-    .expect("an eligible pinned reviewer completes");
+    // Registration order deliberately differs from the priority order.
+    let outcome = review_with_providers(&request("codex"), &[&claude, &codex, &grok], &PRIORITY)
+        .expect("grok completes");
 
     assert_eq!(outcome.status, ReviewStatus::Completed);
     assert_eq!(outcome.primary_provider, "codex");
+    assert_eq!(outcome.reviewer_provider.as_deref(), Some("grok"));
+    assert_eq!(outcome.reviewer_model.as_deref(), Some("default"));
+    assert_eq!(outcome.result.as_deref(), Some("grok review"));
+    assert_eq!(outcome.fallback_from, None);
+    assert_eq!(outcome.usage, None);
+    assert_eq!(outcome.requested_provider, None);
+    assert_eq!(outcome.requested_model, None);
+    assert_eq!(codex.calls.get(), 0, "the primary provider was invoked");
+    assert_eq!(grok.calls.get(), 1);
+    assert_eq!(claude.calls.get(), 0);
+    assert!(outcome.rationale.contains("codex"), "{}", outcome.rationale);
+    assert!(outcome.rationale.contains("grok"), "{}", outcome.rationale);
+
+    // With claude primary the first candidate is codex.
+    let codex = StubReviewer::successful("codex", "gpt", "codex review");
+    let grok = StubReviewer::successful("grok", "default", "wrong");
+    let claude = StubReviewer::successful("claude", "opus", "wrong");
+    let outcome = review_with_providers(&request("claude"), &[&claude, &grok, &codex], &PRIORITY)
+        .expect("codex completes");
+    assert_eq!(outcome.reviewer_provider.as_deref(), Some("codex"));
+    assert_eq!(codex.calls.get(), 1);
+    assert_eq!(grok.calls.get(), 0);
+    assert_eq!(claude.calls.get(), 0);
+}
+
+#[test]
+fn a_custom_priority_is_respected() {
+    let grok = StubReviewer::successful("grok", "default", "wrong");
+    let claude = StubReviewer::successful("claude", "opus", "claude review");
+
+    let outcome = review_with_providers(
+        &request("codex"),
+        &[&grok, &claude],
+        &[Provider::Claude, Provider::Grok, Provider::Codex],
+    )
+    .expect("claude completes");
+
+    assert_eq!(outcome.reviewer_provider.as_deref(), Some("claude"));
+    assert_eq!(claude.calls.get(), 1);
+    assert_eq!(grok.calls.get(), 0);
+}
+
+#[test]
+fn a_rate_limited_candidate_fails_over_to_the_next() {
+    let codex = StubReviewer::failing_with(
+        "codex",
+        "gpt",
+        "codex review failed: rate limit exceeded, usage quota reached",
+    );
+    let grok = StubReviewer::successful("grok", "default", "grok review");
+    let claude = StubReviewer::successful("claude", "opus", "must not run");
+
+    let outcome = review_with_providers(&request("claude"), &[&codex, &grok, &claude], &PRIORITY)
+        .expect("failover completes");
+
+    assert_eq!(outcome.status, ReviewStatus::Completed);
+    assert_eq!(outcome.reviewer_provider.as_deref(), Some("grok"));
+    assert_eq!(outcome.fallback_from.as_deref(), Some("codex"));
+    assert_eq!(outcome.result.as_deref(), Some("grok review"));
+    assert_eq!(codex.calls.get(), 1);
+    assert_eq!(grok.calls.get(), 1);
+    assert_eq!(claude.calls.get(), 0);
+    assert!(outcome.rationale.contains("codex"), "{}", outcome.rationale);
+    assert!(
+        outcome.rationale.contains("rate limit exceeded"),
+        "{}",
+        outcome.rationale
+    );
+    assert!(outcome.rationale.contains("grok"), "{}", outcome.rationale);
+
+    let codex_row = outcome
+        .usage_provenance
+        .iter()
+        .find(|candidate| candidate.provider == "codex")
+        .expect("the failed candidate is in the provenance");
+    assert!(!codex_row.eligible);
+    assert!(
+        codex_row
+            .rejection_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("rate limit"))
+    );
+    let grok_row = outcome
+        .usage_provenance
+        .iter()
+        .find(|candidate| candidate.provider == "grok")
+        .expect("the completing candidate is in the provenance");
+    assert!(grok_row.eligible);
+    assert!(
+        outcome
+            .usage_provenance
+            .iter()
+            .all(|candidate| candidate.provider != "claude"),
+        "the primary is never a candidate"
+    );
+}
+
+#[test]
+fn fallback_from_names_the_candidate_immediately_before_the_completing_one() {
+    let codex = StubReviewer::failing_with("codex", "gpt", "usage limit reached");
+    let grok = StubReviewer::failing_with("grok", "default", "authentication failed");
+    let claude = StubReviewer::successful("claude", "opus", "claude review");
+
+    let outcome = review_with_providers(&request("gemini"), &[&codex, &grok, &claude], &PRIORITY)
+        .expect("third candidate completes");
+
+    assert_eq!(outcome.status, ReviewStatus::Completed);
+    assert_eq!(outcome.reviewer_provider.as_deref(), Some("claude"));
+    assert_eq!(outcome.fallback_from.as_deref(), Some("grok"));
+    assert!(
+        outcome.rationale.contains("usage limit reached"),
+        "{}",
+        outcome.rationale
+    );
+    assert!(
+        outcome.rationale.contains("authentication failed"),
+        "{}",
+        outcome.rationale
+    );
+    assert_eq!(codex.calls.get(), 1);
+    assert_eq!(grok.calls.get(), 1);
+    assert_eq!(claude.calls.get(), 1);
+}
+
+#[test]
+fn an_authoritative_availability_refusal_skips_to_the_next_candidate() {
+    let codex = StubReviewer::unavailable("codex", "gpt", "codex binary not found");
+    let grok = StubReviewer::successful("grok", "default", "grok review");
+
+    let outcome = review_with_providers(&request("claude"), &[&codex, &grok], &PRIORITY)
+        .expect("grok completes");
+
+    assert_eq!(outcome.status, ReviewStatus::Completed);
+    assert_eq!(outcome.reviewer_provider.as_deref(), Some("grok"));
+    assert_eq!(outcome.fallback_from.as_deref(), Some("codex"));
+    assert_eq!(codex.calls.get(), 0, "an unavailable reviewer was invoked");
+    assert_eq!(grok.calls.get(), 1);
+    assert!(
+        outcome.rationale.contains("codex binary not found"),
+        "{}",
+        outcome.rationale
+    );
+}
+
+#[test]
+fn a_completed_review_with_findings_never_fails_over() {
+    let codex = StubReviewer::successful(
+        "codex",
+        "gpt",
+        "BLOCKING: the migration drops data. Verdict: REQUEST-CHANGES",
+    );
+    let grok = StubReviewer::successful("grok", "default", "must not run");
+
+    let outcome = review_with_providers(&request("claude"), &[&codex, &grok], &PRIORITY)
+        .expect("codex completes");
+
+    assert_eq!(outcome.status, ReviewStatus::Completed);
+    assert_eq!(outcome.reviewer_provider.as_deref(), Some("codex"));
+    assert_eq!(outcome.fallback_from, None);
+    assert!(
+        outcome
+            .result
+            .as_deref()
+            .is_some_and(|body| body.contains("REQUEST-CHANGES"))
+    );
+    assert_eq!(codex.calls.get(), 1);
+    assert_eq!(grok.calls.get(), 0);
+}
+
+#[test]
+fn when_every_candidate_fails_the_outcome_is_failed_and_lists_each_error() {
+    let codex = StubReviewer::failing_with("codex", "gpt", "rate limit exceeded");
+    let grok = StubReviewer::unavailable("grok", "default", "grok is not installed");
+    let claude = StubReviewer::failing_with("claude", "opus", "claude exited 1");
+
+    let outcome = review_with_providers(&request("gemini"), &[&codex, &grok, &claude], &PRIORITY)
+        .expect("exhausting the list is a reported failure");
+
+    assert_eq!(outcome.status, ReviewStatus::Failed);
+    assert_eq!(outcome.result, None);
+    let reason = outcome.reason.as_deref().unwrap_or_default();
+    for expected in [
+        "codex: rate limit exceeded",
+        "grok: grok is not installed",
+        "claude: claude exited 1",
+    ] {
+        assert!(
+            reason.contains(expected),
+            "{expected} missing from {reason}"
+        );
+    }
+    assert_eq!(codex.calls.get(), 1);
+    assert_eq!(grok.calls.get(), 0);
+    assert_eq!(claude.calls.get(), 1);
+}
+
+#[test]
+fn a_primary_only_registry_has_no_candidate_and_invokes_nothing() {
+    let codex = StubReviewer::successful("codex", "gpt", "wrong");
+
+    let result = review_with_providers(&request("codex"), &[&codex], &PRIORITY);
+
+    assert_not_completed(&result);
+    assert_eq!(codex.calls.get(), 0);
+}
+
+#[test]
+fn a_cancelled_review_does_not_fail_over() {
+    let codex = StubReviewer::failing_with("codex", "gpt", "review cancelled");
+    let grok = StubReviewer::successful("grok", "default", "must not run");
+
+    let result = review_with_providers(&request("claude"), &[&codex, &grok], &PRIORITY);
+
+    assert_not_completed(&result);
+    match &result {
+        Err(error) => assert!(error.to_string().contains("cancelled"), "{error}"),
+        Ok(outcome) => assert!(
+            outcome
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("cancelled")),
+            "{outcome:?}"
+        ),
+    }
+    assert_eq!(codex.calls.get(), 1);
+    assert_eq!(
+        grok.calls.get(),
+        0,
+        "a cancel fell through to the next reviewer"
+    );
+}
+
+#[test]
+fn a_pin_runs_only_the_pinned_provider_even_when_it_is_last_in_priority() {
+    let codex = StubReviewer::successful("codex", "gpt", "must not run");
+    let grok = StubReviewer::successful("grok", "default", "must not run");
+    let claude = StubReviewer::successful("claude", "fable", "fable review");
+
+    let outcome = review_pinned_with_providers(
+        &request("gemini"),
+        &[&codex, &grok, &claude],
+        &pin(Provider::Claude, Some("fable")),
+    )
+    .expect("the pin completes");
+
+    assert_eq!(outcome.status, ReviewStatus::Completed);
     assert_eq!(outcome.requested_provider.as_deref(), Some("claude"));
     assert_eq!(outcome.requested_model.as_deref(), Some("fable"));
     assert_eq!(outcome.reviewer_provider.as_deref(), Some("claude"));
     assert_eq!(outcome.reviewer_model.as_deref(), Some("fable"));
     assert_eq!(outcome.result.as_deref(), Some("fable review"));
-    assert_eq!(outcome.usage.map(|usage| usage.weekly_pct), Some(35.0));
+    assert_eq!(outcome.fallback_from, None);
     assert!(outcome.rationale.contains("requested explicitly"));
-    assert!(outcome.rationale.contains("25.0 point reserve"));
-    // The automatic policy would have picked the 5 percent Grok reviewer. The pin overrides the
-    // headroom ordering, never the eligibility gates.
-    assert_eq!(
-        cheaper.calls.get(),
-        0,
-        "the cheaper alternative was invoked"
-    );
-    assert_eq!(primary.calls.get(), 0);
-    assert_eq!(pinned.calls.get(), 1);
-    assert_eq!(outcome.usage_provenance.len(), 1);
-    assert_eq!(outcome.usage_provenance[0].provider, "claude");
-    assert!(outcome.usage_provenance[0].eligible);
+    assert_eq!(codex.calls.get(), 0);
+    assert_eq!(grok.calls.get(), 0);
+    assert_eq!(claude.calls.get(), 1);
 }
 
 #[test]
 fn explicit_pin_without_a_model_records_the_registered_model_as_the_actual_one() {
-    let pinned = StubReviewer::successful("claude", "opus[1m]", Some(fresh(35.0)), "review");
+    let pinned = StubReviewer::successful("claude", "opus[1m]", "review");
 
-    let outcome = review_pinned_with_providers(
-        &request("codex"),
-        &[&pinned],
-        &pin(Provider::Claude, None),
-        25.0,
-    )
-    .expect("completes");
+    let outcome =
+        review_pinned_with_providers(&request("codex"), &[&pinned], &pin(Provider::Claude, None))
+            .expect("completes");
 
     assert_eq!(outcome.status, ReviewStatus::Completed);
     assert_eq!(outcome.requested_provider.as_deref(), Some("claude"));
@@ -364,175 +385,47 @@ fn explicit_pin_without_a_model_records_the_registered_model_as_the_actual_one()
 }
 
 #[test]
-fn an_ineligible_pin_is_a_skip_and_never_falls_back_to_an_eligible_alternative() {
-    for (label, usage, expected) in [
-        (
-            "stale",
-            Some(Headroom {
-                stale: true,
-                ..fresh(10.0)
-            }),
-            "stale",
-        ),
-        (
-            "unknown",
-            Some(Headroom {
-                weekly_capacity_known: false,
-                ..fresh(0.0)
-            }),
-            "unknown",
-        ),
-        ("unavailable", None, "unavailable"),
-    ] {
-        let primary = StubReviewer::successful("codex", "primary", Some(fresh(1.0)), "wrong");
-        let fallback = StubReviewer::successful("grok", "default", Some(fresh(5.0)), "wrong");
-        let pinned = StubReviewer::successful("claude", "fable", usage, "must not run");
+fn a_failing_pin_does_not_fail_over() {
+    let codex = StubReviewer::successful("codex", "gpt", "must not run");
+    let pinned = StubReviewer::failing_with("claude", "fable", "rate limit exceeded");
 
-        let outcome = review_pinned_with_providers(
-            &request("codex"),
-            &[&primary, &fallback, &pinned],
-            &pin(Provider::Claude, Some("fable")),
-            25.0,
-        )
-        .expect("an ineligible pin is a skip rather than an infrastructure failure");
+    let result = review_pinned_with_providers(
+        &request("grok"),
+        &[&codex, &pinned],
+        &pin(Provider::Claude, Some("fable")),
+    );
 
-        assert_eq!(outcome.status, ReviewStatus::Skipped, "{label}");
-        assert_eq!(outcome.requested_provider.as_deref(), Some("claude"));
-        assert_eq!(outcome.requested_model.as_deref(), Some("fable"));
-        assert_eq!(outcome.reviewer_provider, None, "{label}");
-        assert_eq!(outcome.reviewer_model, None, "{label}");
-        assert_eq!(outcome.result, None, "{label}");
-        assert_eq!(outcome.fallback_from, None, "{label}");
-        let reason = outcome.reason.as_deref().unwrap_or_default();
-        assert!(
-            reason.starts_with("requested reviewer claude is not eligible: "),
-            "{label}: {reason}"
-        );
-        assert!(reason.contains(expected), "{label}: {reason}");
-        assert!(
-            outcome.rationale.contains(expected),
-            "{label}: {}",
-            outcome.rationale
-        );
-        assert_eq!(
-            fallback.calls.get(),
-            0,
-            "{label}: the pin fell back to grok"
-        );
-        assert_eq!(pinned.calls.get(), 0, "{label}");
-        assert_eq!(primary.calls.get(), 0, "{label}");
-        let claude = outcome
-            .usage_provenance
-            .iter()
-            .find(|candidate| candidate.provider == "claude")
-            .expect("the pinned candidate is in the provenance");
-        assert!(!claude.eligible);
-        assert!(claude.rejection_reason.is_some());
+    assert_not_completed(&result);
+    if let Ok(outcome) = &result {
+        assert_eq!(outcome.fallback_from, None);
     }
+    assert_eq!(pinned.calls.get(), 1);
+    assert_eq!(codex.calls.get(), 0, "the pin failed over");
 }
 
 #[test]
-fn a_usage_gate_pin_refusal_runs_the_next_eligible_reviewer_once() {
-    let primary = StubReviewer::successful("codex", "primary", Some(fresh(1.0)), "wrong");
-    let fallback = StubReviewer::successful("grok", "default", Some(fresh(5.0)), "grok review");
-    let pinned = StubReviewer::successful("claude", "fable", Some(fresh(90.0)), "must not run");
+fn an_unavailable_pin_does_not_fail_over() {
+    let codex = StubReviewer::successful("codex", "gpt", "must not run");
+    let pinned = StubReviewer::unavailable("grok", "default", "grok is not installed");
 
-    let outcome = review_pinned_with_providers(
-        &request("codex"),
-        &[&primary, &fallback, &pinned],
-        &pin(Provider::Claude, Some("fable")),
-        25.0,
-    )
-    .expect("usage-gate refusal fails over");
-
-    assert_eq!(outcome.status, ReviewStatus::Completed);
-    assert_eq!(outcome.requested_provider.as_deref(), Some("claude"));
-    assert_eq!(outcome.reviewer_provider.as_deref(), Some("grok"));
-    assert_eq!(outcome.fallback_from.as_deref(), Some("claude"));
-    assert_eq!(outcome.result.as_deref(), Some("grok review"));
-    let reason = outcome.reason.as_deref().unwrap_or_default();
-    assert!(
-        reason.starts_with("requested reviewer claude is not eligible: "),
-        "{reason}"
-    );
-    assert!(reason.contains("90"), "{reason}");
-    assert_eq!(pinned.calls.get(), 0);
-    assert_eq!(fallback.calls.get(), 1);
-    assert_eq!(primary.calls.get(), 0);
-}
-
-#[test]
-fn a_pinned_claude_reviewer_is_refused_once_usage_plus_the_reserve_reaches_the_ceiling() {
-    let at_seventy = StubReviewer::successful("claude", "fable", Some(fresh(70.0)), "review");
-
-    let refused = review_pinned_with_providers(
-        &request("codex"),
-        &[&at_seventy],
-        &pin(Provider::Claude, Some("fable")),
-        25.0,
-    )
-    .expect("a reserve refusal is a skip");
-    assert_eq!(refused.status, ReviewStatus::Skipped);
-    assert!(
-        refused
-            .reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("reserve") && reason.contains("70.0")),
-        "{:?}",
-        refused.reason
-    );
-    assert!(
-        refused.rationale.contains("reserve"),
-        "{}",
-        refused.rationale
-    );
-    assert!(refused.rationale.contains("70.0"), "{}", refused.rationale);
-    assert_eq!(at_seventy.calls.get(), 0);
-    let claude = &refused.usage_provenance[0];
-    assert_eq!(claude.weekly_pct, Some(70.0));
-    assert!(!claude.eligible);
-    assert!(
-        claude
-            .rejection_reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("reserve"))
-    );
-
-    // Mutation check: the same reading passes with no reserve, so the refusal above is the
-    // reserve floor and not the raw ceiling.
-    let allowed = review_pinned_with_providers(
-        &request("codex"),
-        &[&at_seventy],
-        &pin(Provider::Claude, Some("fable")),
-        0.0,
-    )
-    .expect("completes without a reserve");
-    assert_eq!(allowed.status, ReviewStatus::Completed);
-    assert_eq!(at_seventy.calls.get(), 1);
-
-    // The reserve is Claude's alone: a pinned codex reviewer at the same reading is unaffected.
-    let codex = StubReviewer::successful("codex", "gpt-6-sol", Some(fresh(70.0)), "review");
-    let outcome = review_pinned_with_providers(
+    let result = review_pinned_with_providers(
         &request("claude"),
-        &[&codex],
-        &pin(Provider::Codex, Some("gpt-6-sol")),
-        25.0,
-    )
-    .expect("completes");
-    assert_eq!(outcome.status, ReviewStatus::Completed);
+        &[&codex, &pinned],
+        &pin(Provider::Grok, None),
+    );
+
+    assert_not_completed(&result);
+    assert_eq!(pinned.calls.get(), 0);
+    assert_eq!(codex.calls.get(), 0, "the pin failed over");
 }
 
 #[test]
 fn a_pin_naming_an_unregistered_reviewer_fails_without_invocation() {
-    let only = StubReviewer::successful("claude", "fable", Some(fresh(10.0)), "wrong");
+    let only = StubReviewer::successful("claude", "fable", "wrong");
 
-    let outcome = review_pinned_with_providers(
-        &request("codex"),
-        &[&only],
-        &pin(Provider::Grok, None),
-        25.0,
-    )
-    .expect("an unregistered pin is a reported failure");
+    let outcome =
+        review_pinned_with_providers(&request("codex"), &[&only], &pin(Provider::Grok, None))
+            .expect("an unregistered pin is a reported failure");
 
     assert_eq!(outcome.status, ReviewStatus::Failed);
     assert_eq!(outcome.requested_provider.as_deref(), Some("grok"));
@@ -550,13 +443,12 @@ fn a_pin_naming_an_unregistered_reviewer_fails_without_invocation() {
 
 #[test]
 fn a_registered_reviewer_that_would_run_a_different_model_than_requested_is_refused() {
-    let substituted = StubReviewer::successful("claude", "opus[1m]", Some(fresh(10.0)), "wrong");
+    let substituted = StubReviewer::successful("claude", "opus[1m]", "wrong");
 
     let outcome = review_pinned_with_providers(
         &request("codex"),
         &[&substituted],
         &pin(Provider::Claude, Some("fable")),
-        0.0,
     )
     .expect("a model mismatch is a reported failure");
 
@@ -576,24 +468,6 @@ fn a_registered_reviewer_that_would_run_a_different_model_than_requested_is_refu
         0,
         "a substituted model was invoked"
     );
-}
-
-#[test]
-fn a_pinned_reviewer_failure_is_an_invocation_error_and_names_the_pin() {
-    let pinned = StubReviewer::failing("claude", "fable", Some(fresh(10.0)));
-    let fallback = StubReviewer::successful("grok", "default", Some(fresh(1.0)), "must not run");
-
-    let error = review_pinned_with_providers(
-        &request("codex"),
-        &[&fallback, &pinned],
-        &pin(Provider::Claude, Some("fable")),
-        0.0,
-    )
-    .expect_err("the pinned invocation failure is reported");
-
-    assert!(error.to_string().contains("review invocation failed"));
-    assert_eq!(pinned.calls.get(), 1);
-    assert_eq!(fallback.calls.get(), 0);
 }
 
 #[test]
@@ -635,28 +509,12 @@ fn reviewer_pin_validation_rejects_the_primary_orphan_models_and_malformed_model
 }
 
 #[test]
-fn a_forced_grok_timeout_with_codex_primary_selects_claude_and_keeps_both_fields() {
-    let grok = StubReviewer::failing_with(
-        "grok",
-        "default",
-        Some(fresh(1.0)),
-        "Grok review sess-1 did not finish before the timeout",
-    );
-    let claude = StubReviewer::successful("claude", "opus", Some(fresh(20.0)), "claude review");
+fn a_failover_review_persists_fallback_from() {
+    let codex = StubReviewer::failing_with("codex", "gpt", "rate limit exceeded");
+    let grok = StubReviewer::successful("grok", "default", "grok review");
 
-    let outcome = review_with_providers(&request("codex"), &[&grok, &claude])
-        .expect("Grok timeout fails over to Claude");
-
-    assert_eq!(outcome.status, ReviewStatus::Completed);
-    assert_eq!(outcome.reviewer_provider.as_deref(), Some("claude"));
-    assert_eq!(outcome.fallback_from.as_deref(), Some("grok"));
-    assert_eq!(
-        outcome.reason.as_deref(),
-        Some("Grok review sess-1 did not finish before the timeout")
-    );
-    assert_eq!(outcome.result.as_deref(), Some("claude review"));
-    assert_eq!(grok.calls.get(), 1);
-    assert_eq!(claude.calls.get(), 1);
+    let outcome = review_with_providers(&request("claude"), &[&codex, &grok], &PRIORITY)
+        .expect("failover completes");
 
     let dir = tempfile::tempdir().expect("tempdir");
     let log = DecisionLog::open_at(&dir.path().join("router.db")).expect("opens");
@@ -677,205 +535,5 @@ fn a_forced_grok_timeout_with_codex_primary_selects_claude_and_keeps_both_fields
     .expect("records the failover review");
     let row = &log.recent_reviews(1).expect("reads")[0];
     assert_eq!(row.exit_status, 0);
-    assert_eq!(row.fallback_from.as_deref(), Some("grok"));
-    assert!(
-        row.reason
-            .as_deref()
-            .is_some_and(|reason| !reason.is_empty()),
-        "{:?}",
-        row.reason
-    );
-}
-
-#[test]
-fn a_grok_openat2_storage_error_fails_over_once() {
-    let grok = StubReviewer::failing_with(
-        "grok",
-        "default",
-        Some(fresh(1.0)),
-        "secure Grok storage requires openat2",
-    );
-    let claude = StubReviewer::successful("claude", "opus", Some(fresh(20.0)), "claude review");
-
-    let outcome = review_with_providers(&request("codex"), &[&grok, &claude])
-        .expect("Grok storage error fails over to Claude");
-
-    assert_eq!(outcome.status, ReviewStatus::Completed);
-    assert_eq!(outcome.reviewer_provider.as_deref(), Some("claude"));
-    assert_eq!(outcome.fallback_from.as_deref(), Some("grok"));
-    assert_eq!(
-        outcome.reason.as_deref(),
-        Some("secure Grok storage requires openat2")
-    );
-    assert_eq!(grok.calls.get(), 1);
-    assert_eq!(claude.calls.get(), 1);
-}
-
-#[test]
-fn a_cancelled_grok_review_does_not_fail_over() {
-    let grok = StubReviewer::failing_with("grok", "default", Some(fresh(1.0)), "review cancelled");
-    let claude = StubReviewer::successful("claude", "opus", Some(fresh(20.0)), "must not run");
-
-    let error = review_with_providers(&request("codex"), &[&grok, &claude])
-        .expect_err("a cancel must not be rewritten as a fallback review");
-
-    assert_eq!(error.to_string(), "review cancelled");
-    assert_eq!(grok.calls.get(), 1);
-    assert_eq!(claude.calls.get(), 0);
-}
-
-#[test]
-fn a_generic_grok_failure_does_not_fail_over() {
-    let grok = StubReviewer::failing_with(
-        "grok",
-        "default",
-        Some(fresh(1.0)),
-        "Grok review sess-1 ended with an error",
-    );
-    let claude = StubReviewer::successful("claude", "opus", Some(fresh(20.0)), "must not run");
-
-    let error = review_with_providers(&request("codex"), &[&grok, &claude])
-        .expect_err("only timeout and openat2 fail over");
-
-    assert!(error.to_string().contains("ended with an error"));
-    assert_eq!(grok.calls.get(), 1);
-    assert_eq!(claude.calls.get(), 0);
-}
-
-#[test]
-fn a_failed_fallback_reviewer_is_reported_as_failed_with_both_fields() {
-    let grok = StubReviewer::failing_with(
-        "grok",
-        "default",
-        Some(fresh(1.0)),
-        "Grok review sess-1 did not finish before the timeout",
-    );
-    let claude = StubReviewer::failing("claude", "opus", Some(fresh(20.0)));
-
-    let outcome = review_with_providers(&request("codex"), &[&grok, &claude])
-        .expect("a failed fallback is a reported failure, not a dropped one");
-
-    assert_eq!(outcome.status, ReviewStatus::Failed);
-    assert_eq!(outcome.reviewer_provider.as_deref(), Some("claude"));
-    assert_eq!(outcome.fallback_from.as_deref(), Some("grok"));
-    assert_eq!(
-        outcome.reason.as_deref(),
-        Some("Grok review sess-1 did not finish before the timeout")
-    );
-    assert!(
-        outcome
-            .rationale
-            .contains("fallback reviewer failed: review invocation failed"),
-        "{}",
-        outcome.rationale
-    );
-    assert_eq!(grok.calls.get(), 1);
-    assert_eq!(claude.calls.get(), 1);
-}
-
-#[test]
-fn a_failed_usage_gate_fallback_is_reported_as_failed_not_skipped() {
-    let pinned = StubReviewer::successful("claude", "fable", Some(fresh(90.0)), "must not run");
-    let fallback = StubReviewer::failing("grok", "default", Some(fresh(5.0)));
-
-    let outcome = review_pinned_with_providers(
-        &request("codex"),
-        &[&pinned, &fallback],
-        &pin(Provider::Claude, Some("fable")),
-        25.0,
-    )
-    .expect("a failed fallback after a usage-gate pin is a failure");
-
-    assert_eq!(outcome.status, ReviewStatus::Failed);
-    assert_eq!(outcome.requested_provider.as_deref(), Some("claude"));
-    assert_eq!(outcome.reviewer_provider.as_deref(), Some("grok"));
-    assert_eq!(outcome.fallback_from.as_deref(), Some("claude"));
-    assert!(
-        outcome
-            .reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("not eligible") && reason.contains("90")),
-        "{:?}",
-        outcome.reason
-    );
-    assert_eq!(pinned.calls.get(), 0);
-    assert_eq!(fallback.calls.get(), 1);
-}
-
-#[test]
-fn grok_timeout_with_no_other_eligible_reviewer_still_fails() {
-    let grok = StubReviewer::failing_with(
-        "grok",
-        "default",
-        Some(fresh(1.0)),
-        "Grok review sess-1 did not finish before the timeout",
-    );
-    let claude = StubReviewer::successful("claude", "full", Some(fresh(90.0)), "must not run");
-
-    let error = review_with_providers(&request("codex"), &[&grok, &claude])
-        .expect_err("no eligible fallback keeps the original failure");
-
-    assert!(
-        error
-            .to_string()
-            .contains("did not finish before the timeout")
-    );
-    assert_eq!(grok.calls.get(), 1);
-    assert_eq!(claude.calls.get(), 0);
-}
-
-#[test]
-fn a_usage_gate_pin_with_no_eligible_fallback_still_skips() {
-    let pinned = StubReviewer::successful("claude", "fable", Some(fresh(90.0)), "must not run");
-    let other = StubReviewer::successful("grok", "default", Some(fresh(90.0)), "must not run");
-
-    let outcome = review_pinned_with_providers(
-        &request("codex"),
-        &[&pinned, &other],
-        &pin(Provider::Claude, Some("fable")),
-        25.0,
-    )
-    .expect("all ineligible stays a skip");
-
-    assert_eq!(outcome.status, ReviewStatus::Skipped);
-    assert_eq!(outcome.reviewer_provider, None);
-    assert_eq!(outcome.fallback_from, None);
-    assert!(
-        outcome
-            .reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("not eligible") && reason.contains("90")),
-        "{:?}",
-        outcome.reason
-    );
-    assert_eq!(pinned.calls.get(), 0);
-    assert_eq!(other.calls.get(), 0);
-}
-
-#[test]
-fn a_reserve_floor_pin_refusal_fails_over_when_another_reviewer_is_eligible() {
-    let pinned = StubReviewer::successful("claude", "fable", Some(fresh(70.0)), "must not run");
-    let fallback = StubReviewer::successful("grok", "default", Some(fresh(5.0)), "grok review");
-
-    let outcome = review_pinned_with_providers(
-        &request("codex"),
-        &[&pinned, &fallback],
-        &pin(Provider::Claude, Some("fable")),
-        25.0,
-    )
-    .expect("reserve refusal fails over");
-
-    assert_eq!(outcome.status, ReviewStatus::Completed);
-    assert_eq!(outcome.reviewer_provider.as_deref(), Some("grok"));
-    assert_eq!(outcome.fallback_from.as_deref(), Some("claude"));
-    assert!(
-        outcome
-            .reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("reserve") && reason.contains("70.0")),
-        "{:?}",
-        outcome.reason
-    );
-    assert_eq!(pinned.calls.get(), 0);
-    assert_eq!(fallback.calls.get(), 1);
+    assert_eq!(row.fallback_from.as_deref(), Some("codex"));
 }

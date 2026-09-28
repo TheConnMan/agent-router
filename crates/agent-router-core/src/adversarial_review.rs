@@ -4,14 +4,13 @@ use crate::context::Context;
 use crate::dispatch::grok::spawn_with_lifecycle;
 use crate::error::{Error, Result};
 use crate::provider::Provider;
-use crate::usage::{Headroom, claude_headroom, codex_headroom, grok_headroom};
+use crate::usage::Headroom;
 use agent_viewer_core::{Backend, GrokBackend, GrokLifecycle, Status as GrokStatus, TailEvent};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-const WEEKLY_USAGE_CEILING: f64 = 90.0;
 const CLAUDE_REVIEW_BIN_ENV: &str = "AGENT_ROUTER_CLAUDE_REVIEW_BIN";
 const CODEX_REVIEW_BIN_ENV: &str = "AGENT_ROUTER_CODEX_REVIEW_BIN";
 const GROK_REVIEW_MODEL: &str = "default";
@@ -136,9 +135,9 @@ pub struct CandidateUsage {
     pub rejection_reason: Option<String>,
 }
 
-/// An explicit reviewer the caller pinned. The pin chooses among the registered reviewers; it does
-/// not bypass any eligibility gate. A pin refused on the usage or reserve gate is retried once on
-/// the next eligible reviewer that is not the primary. Any other refusal stays skipped or failed.
+/// An explicit reviewer the caller pinned. The pin bypasses the reviewer priority order: only the
+/// pinned reviewer runs, and a pinned reviewer that fails leaves the review failed with no
+/// failover.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewerPin {
     pub provider: Provider,
@@ -215,7 +214,6 @@ fn validate_model(model: &str) -> Result<()> {
 pub trait ReviewProvider {
     fn provider_name(&self) -> &str;
     fn reviewer_model(&self) -> &str;
-    fn usage(&self) -> Option<Headroom>;
     fn review(&self, request: &ReviewRequest<'_>) -> Result<String>;
 
     fn authoritative_availability(&self) -> std::result::Result<(), String> {
@@ -242,125 +240,26 @@ pub trait ReviewProvider {
     }
 }
 
-enum Selection<'a> {
-    Selected {
-        provider: &'a dyn ReviewProvider,
-        usage: Headroom,
-        rationale: String,
-        usage_provenance: Vec<CandidateUsage>,
-    },
-    Skipped {
-        rationale: String,
-        usage_provenance: Vec<CandidateUsage>,
-    },
-    /// The pinned path alone: the request cannot be honored as asked, which is a failure and not a
-    /// capacity skip.
-    Failed { reason: String },
-}
-
+/// Run a review on the first candidate in `priority` that completes. Candidates are the priority
+/// list minus the primary provider, restricted to the registered reviewers. A candidate that fails
+/// before producing a review hands over to the next one; a completed review never does, and a
+/// cancel never does.
 pub fn review_with_providers(
     request: &ReviewRequest<'_>,
     providers: &[&dyn ReviewProvider],
+    priority: &[Provider],
 ) -> Result<ReviewOutcome> {
-    review_with_claude_usage_reserve(request, providers, 0.0)
+    Ok(review_in_priority(request, providers, priority, &|| false))
 }
 
-/// Run a review with an optional Claude capacity reserve. The reserve is a soft preference: raw
-/// usage still determines eligibility, while the reserve affects only the final choice.
-pub fn review_with_claude_usage_reserve(
-    request: &ReviewRequest<'_>,
-    providers: &[&dyn ReviewProvider],
-    claude_usage_reserve_pct: f64,
-) -> Result<ReviewOutcome> {
-    review_selected(request, providers, None, claude_usage_reserve_pct)
-}
-
-/// Run a review on the pinned provider. The pin narrows the candidate set to one; every gate the
-/// automatic policy applies still applies, and the reserve becomes a floor because there is no
-/// alternative left for it to bias the choice against.
+/// Run a review on the pinned provider alone. The pin bypasses the priority order: nothing else
+/// runs, and a pinned reviewer that fails leaves the review failed.
 pub fn review_pinned_with_providers(
     request: &ReviewRequest<'_>,
     providers: &[&dyn ReviewProvider],
     pin: &ReviewerPin,
-    claude_usage_reserve_pct: f64,
 ) -> Result<ReviewOutcome> {
-    review_selected(request, providers, Some(pin), claude_usage_reserve_pct)
-}
-
-fn review_selected(
-    request: &ReviewRequest<'_>,
-    providers: &[&dyn ReviewProvider],
-    pin: Option<&ReviewerPin>,
-    claude_usage_reserve_pct: f64,
-) -> Result<ReviewOutcome> {
-    let pass = ReviewPass {
-        request,
-        providers,
-        pin,
-        claude_usage_reserve_pct,
-        cancelled: &|| false,
-    };
-    match select(
-        request.primary_provider,
-        providers,
-        pin,
-        claude_usage_reserve_pct,
-    ) {
-        Selection::Selected {
-            provider,
-            usage,
-            rationale,
-            usage_provenance,
-        } => match provider.review_with_identity(request) {
-            Ok(result) => Ok(completed_outcome(
-                request,
-                pin,
-                provider,
-                usage,
-                usage_provenance,
-                rationale,
-                result,
-            )),
-            Err(error) => {
-                if let Some(outcome) = failover_from_grok_failure(
-                    &pass,
-                    provider,
-                    &rationale,
-                    usage_provenance,
-                    &error.to_string(),
-                ) {
-                    Ok(outcome)
-                } else {
-                    Err(error)
-                }
-            }
-        },
-        Selection::Skipped {
-            rationale,
-            usage_provenance,
-        } => Ok(failover_from_pin_usage_skip(
-            &pass,
-            usage_provenance,
-            rationale,
-        )),
-        Selection::Failed { reason } => Ok(with_pin(
-            failed_outcome(request.primary_provider, reason),
-            pin,
-        )),
-    }
-}
-
-/// PURE: the automatic selection, or the pinned one when a pin is present.
-fn select<'a>(
-    primary_provider: &str,
-    providers: &[&'a dyn ReviewProvider],
-    pin: Option<&ReviewerPin>,
-    claude_usage_reserve_pct: f64,
-) -> Selection<'a> {
-    match pin {
-        None => select_provider(primary_provider, providers, claude_usage_reserve_pct),
-        Some(pin) => select_pinned(primary_provider, providers, pin, claude_usage_reserve_pct),
-    }
+    Ok(review_pinned(request, providers, pin, &|| false))
 }
 
 pub fn review_registered(request: &ReviewRequest<'_>, ctx: &Context) -> ReviewOutcome {
@@ -422,76 +321,15 @@ fn review_registered_selected(
     };
     let grok = GrokReviewProvider { ctx };
     let providers: [&dyn ReviewProvider; 3] = [&claude, &codex, &grok];
-    let claude_usage_reserve_pct = ctx.config.adversarial_review.claude_usage_reserve_pct;
-    let pass = ReviewPass {
-        request,
-        providers: &providers,
-        pin,
-        claude_usage_reserve_pct,
-        cancelled,
-    };
 
-    match select(
-        request.primary_provider,
-        &providers,
-        pin,
-        claude_usage_reserve_pct,
-    ) {
-        Selection::Selected {
-            provider,
-            usage,
-            rationale,
-            usage_provenance,
-        } => match provider.review_cancellable(request, cancelled) {
-            Ok(result) => completed_outcome(
-                request,
-                pin,
-                provider,
-                usage,
-                usage_provenance,
-                rationale,
-                result,
-            ),
-            Err(error) => {
-                let reason = error.to_string();
-                if let Some(outcome) = failover_from_grok_failure(
-                    &pass,
-                    provider,
-                    &rationale,
-                    usage_provenance.clone(),
-                    &reason,
-                ) {
-                    outcome
-                } else {
-                    with_pin(
-                        ReviewOutcome {
-                            status: ReviewStatus::Failed,
-                            primary_provider: request.primary_provider.to_string(),
-                            requested_provider: None,
-                            requested_model: None,
-                            reviewer_provider: Some(provider.provider_name().to_string()),
-                            reviewer_model: Some(provider.reviewer_model().to_string()),
-                            reviewer_session_id: None,
-                            usage: Some(usage),
-                            usage_provenance,
-                            rationale,
-                            reason: Some(reason),
-                            fallback_from: None,
-                            result: None,
-                            review_id: None,
-                        },
-                        pin,
-                    )
-                }
-            }
-        },
-        Selection::Skipped {
-            rationale,
-            usage_provenance,
-        } => failover_from_pin_usage_skip(&pass, usage_provenance, rationale),
-        Selection::Failed { reason } => {
-            with_pin(failed_outcome(request.primary_provider, reason), pin)
-        }
+    match pin {
+        Some(pin) => review_pinned(request, &providers, pin, cancelled),
+        None => review_in_priority(
+            request,
+            &providers,
+            &ctx.config.adversarial_review.reviewer_priority,
+            cancelled,
+        ),
     }
 }
 
@@ -522,524 +360,260 @@ fn with_pin(mut outcome: ReviewOutcome, pin: Option<&ReviewerPin>) -> ReviewOutc
     outcome
 }
 
-fn completed_outcome(
-    request: &ReviewRequest<'_>,
-    pin: Option<&ReviewerPin>,
-    provider: &dyn ReviewProvider,
-    usage: Headroom,
-    usage_provenance: Vec<CandidateUsage>,
-    rationale: String,
-    result: (String, Option<String>),
-) -> ReviewOutcome {
-    let (result, reviewer_session_id) = result;
-    with_pin(
-        ReviewOutcome {
-            status: ReviewStatus::Completed,
-            primary_provider: request.primary_provider.to_string(),
-            requested_provider: None,
-            requested_model: None,
-            reviewer_provider: Some(provider.provider_name().to_string()),
-            reviewer_model: Some(provider.reviewer_model().to_string()),
-            reviewer_session_id,
-            usage: Some(usage),
-            usage_provenance,
-            rationale,
-            reason: None,
-            fallback_from: None,
-            result: Some(result),
-            review_id: None,
-        },
-        pin,
-    )
-}
-
-fn skipped_outcome(
-    request: &ReviewRequest<'_>,
-    pin: Option<&ReviewerPin>,
-    usage_provenance: Vec<CandidateUsage>,
-    rationale: String,
-) -> ReviewOutcome {
-    // A pinned skip names the gate that refused the pin, because text mode prints `reason` alone
-    // and "not eligible" by itself leaves the caller guessing between stale capacity, the ceiling,
-    // and the reserve floor. The automatic wording is unchanged.
-    let reason = match pin {
-        None => "no eligible alternative provider".to_string(),
-        Some(pin) => {
-            let name = pin.provider.name();
-            let cause = usage_provenance
-                .iter()
-                .find(|candidate| candidate.provider.eq_ignore_ascii_case(name))
-                .and_then(|candidate| candidate.rejection_reason.as_deref())
-                .map(|cause| format!(": {cause}"))
-                .unwrap_or_default();
-            format!("requested reviewer {name} is not eligible{cause}")
-        }
-    };
-    with_pin(
-        ReviewOutcome {
-            status: ReviewStatus::Skipped,
-            primary_provider: request.primary_provider.to_string(),
-            requested_provider: None,
-            requested_model: None,
-            reviewer_provider: None,
-            reviewer_model: None,
-            reviewer_session_id: None,
-            usage: None,
-            usage_provenance,
-            rationale,
-            reason: Some(reason),
-            fallback_from: None,
-            result: None,
-            review_id: None,
-        },
-        pin,
-    )
-}
-
-const GROK_CLEANUP_SUFFIX: &str = "; exact session cleanup also failed: ";
-
-/// PURE: a Grok timeout or Grok storage error may fail over; a cancel never does.
-fn grok_failure_is_failover(provider_name: &str, reason: &str, cancelled: bool) -> bool {
-    if cancelled || review_reason_is_cancel(reason) {
-        return false;
-    }
-    if !provider_name.eq_ignore_ascii_case("grok") {
-        return false;
-    }
-    let (body, cleanup) = match reason.split_once(GROK_CLEANUP_SUFFIX) {
-        Some((body, cleanup)) => (body, Some(cleanup)),
-        None => (reason, None),
-    };
-    if cleanup.is_some_and(|cleanup| cleanup.contains("cancel failed")) {
-        return false;
-    }
-    grok_timeout_or_storage_reason(body)
-}
-
 /// PURE: the reviewer observed its own cancellation, including when session cleanup appended
 /// detail after the cancel reason.
 fn review_reason_is_cancel(reason: &str) -> bool {
-    reason == REVIEW_CANCELLED_REASON || reason.starts_with(REVIEW_CANCELLED_REASON)
+    reason.starts_with(REVIEW_CANCELLED_REASON)
 }
 
-/// PURE: the two Grok failure shapes that retry once on another eligible reviewer.
-fn grok_timeout_or_storage_reason(reason: &str) -> bool {
-    reason.contains("did not finish before the timeout")
-        || reason.contains("did not appear before the timeout")
-        || reason.contains("openat2")
-}
-
-/// PURE: a pin refused because weekly usage or the Claude reserve reached the ceiling, not
-/// because the reviewer was missing, stale, or unavailable. Those two refusals are the only
-/// provenance rows that are ineligible and still carry a weekly reading.
-fn pin_refusal_is_usage_gate(usage_provenance: &[CandidateUsage], pin: &ReviewerPin) -> bool {
-    usage_provenance
-        .iter()
-        .find(|candidate| candidate.provider.eq_ignore_ascii_case(pin.provider.name()))
-        .is_some_and(|candidate| !candidate.eligible && candidate.weekly_pct.is_some())
-}
-
-fn merge_provenance(
-    mut original: Vec<CandidateUsage>,
-    extra: Vec<CandidateUsage>,
-) -> Vec<CandidateUsage> {
-    for candidate in extra {
-        if !original
-            .iter()
-            .any(|existing| existing.provider.eq_ignore_ascii_case(&candidate.provider))
-        {
-            original.push(candidate);
-        }
-    }
-    original
-}
-
-struct ReviewPass<'a> {
-    request: &'a ReviewRequest<'a>,
-    providers: &'a [&'a dyn ReviewProvider],
-    pin: Option<&'a ReviewerPin>,
-    claude_usage_reserve_pct: f64,
-    cancelled: &'a dyn Fn() -> bool,
-}
-
-fn failover_from_grok_failure(
-    pass: &ReviewPass<'_>,
-    provider: &dyn ReviewProvider,
-    original_rationale: &str,
-    original_provenance: Vec<CandidateUsage>,
-    reason: &str,
-) -> Option<ReviewOutcome> {
-    if !grok_failure_is_failover(provider.provider_name(), reason, (pass.cancelled)()) {
-        return None;
-    }
-    run_fallback(
-        pass,
-        provider.provider_name(),
-        original_rationale,
-        original_provenance,
-        reason.to_string(),
-    )
-}
-
-fn failover_from_pin_usage_skip(
-    pass: &ReviewPass<'_>,
-    usage_provenance: Vec<CandidateUsage>,
-    rationale: String,
-) -> ReviewOutcome {
-    let skipped = skipped_outcome(pass.request, pass.pin, usage_provenance, rationale);
-    let Some(pin) = pass.pin else {
-        return skipped;
-    };
-    if !pin_refusal_is_usage_gate(&skipped.usage_provenance, pin) {
-        return skipped;
-    }
-    let original_reason = skipped
-        .reason
-        .clone()
-        .unwrap_or_else(|| format!("requested reviewer {} is not eligible", pin.provider.name()));
-    run_fallback(
-        pass,
-        pin.provider.name(),
-        &skipped.rationale,
-        skipped.usage_provenance.clone(),
-        original_reason,
-    )
-    .unwrap_or(skipped)
-}
-
-fn run_fallback(
-    pass: &ReviewPass<'_>,
-    exclude: &str,
-    original_rationale: &str,
-    original_provenance: Vec<CandidateUsage>,
-    original_reason: String,
-) -> Option<ReviewOutcome> {
-    if (pass.cancelled)() {
-        return None;
-    }
-    let remaining: Vec<&dyn ReviewProvider> = pass
-        .providers
-        .iter()
-        .copied()
-        .filter(|provider| !provider.provider_name().eq_ignore_ascii_case(exclude))
-        .collect();
-    match select_provider(
-        pass.request.primary_provider,
-        &remaining,
-        pass.claude_usage_reserve_pct,
-    ) {
-        Selection::Selected {
-            provider,
-            usage,
-            rationale,
-            usage_provenance,
-        } => match provider.review_cancellable(pass.request, pass.cancelled) {
-            Ok(result) => {
-                let mut outcome = completed_outcome(
-                    pass.request,
-                    pass.pin,
-                    provider,
-                    usage,
-                    merge_provenance(original_provenance, usage_provenance),
-                    format!(
-                        "{original_rationale}; falling back from {exclude} after {original_reason}; {rationale}"
-                    ),
-                    result,
-                );
-                outcome.reason = Some(original_reason);
-                outcome.fallback_from = Some(exclude.to_string());
-                Some(outcome)
-            }
-            Err(error) => {
-                let fallback_reason = error.to_string();
-                let cancelled_fallback =
-                    review_reason_is_cancel(&fallback_reason) || (pass.cancelled)();
-                Some(with_pin(
-                    ReviewOutcome {
-                        status: ReviewStatus::Failed,
-                        primary_provider: pass.request.primary_provider.to_string(),
-                        requested_provider: None,
-                        requested_model: None,
-                        reviewer_provider: Some(provider.provider_name().to_string()),
-                        reviewer_model: Some(provider.reviewer_model().to_string()),
-                        reviewer_session_id: None,
-                        usage: Some(usage),
-                        usage_provenance: merge_provenance(original_provenance, usage_provenance),
-                        rationale: format!(
-                            "{original_rationale}; falling back from {exclude} after {original_reason}; {rationale}; fallback reviewer failed: {fallback_reason}"
-                        ),
-                        reason: Some(if cancelled_fallback {
-                            fallback_reason
-                        } else {
-                            original_reason
-                        }),
-                        fallback_from: Some(exclude.to_string()),
-                        result: None,
-                        review_id: None,
-                    },
-                    pass.pin,
-                ))
-            }
-        },
-        Selection::Skipped { .. } | Selection::Failed { .. } => None,
-    }
-}
-
-/// PURE: one candidate through the eligibility gates, in the order the automatic policy has
-/// always applied them: not the primary, authoritatively available, capacity present, fresh, known,
-/// below the ceiling. Appends its rationale and provenance and returns the reading plus the reserve
-/// the caller weighs it with, or None when it was rejected.
-fn judge_candidate(
-    provider: &dyn ReviewProvider,
-    primary_provider: &str,
-    claude_usage_reserve_pct: f64,
-    rationale: &mut Vec<String>,
-    usage_provenance: &mut Vec<CandidateUsage>,
-) -> Option<(Headroom, f64)> {
-    let name = provider.provider_name();
-    if name.eq_ignore_ascii_case(primary_provider) {
-        rationale.push(format!("{name} excluded as primary provider"));
-        usage_provenance.push(CandidateUsage {
-            provider: name.to_string(),
-            weekly_pct: None,
-            stale: true,
-            eligible: false,
-            rejection_reason: Some("primary provider excluded".to_string()),
-        });
-        return None;
-    }
-
-    if let Err(reason) = provider.authoritative_availability() {
-        rationale.push(format!("{name} rejected because {reason}"));
-        usage_provenance.push(CandidateUsage {
-            provider: name.to_string(),
-            weekly_pct: None,
-            stale: true,
-            eligible: false,
-            rejection_reason: Some(reason),
-        });
-        return None;
-    }
-
-    let Some(usage) = provider.usage() else {
-        rationale.push(format!("{name} rejected because capacity is unavailable"));
-        usage_provenance.push(CandidateUsage {
-            provider: name.to_string(),
-            weekly_pct: None,
-            stale: true,
-            eligible: false,
-            rejection_reason: Some("capacity unavailable".to_string()),
-        });
-        return None;
-    };
-    if usage.stale {
-        let reason = if name.eq_ignore_ascii_case("grok") && !usage.weekly_capacity_known {
-            "no billing data available".to_string()
-        } else {
-            format!(
-                "capacity is stale at {:.1} percent weekly usage",
-                usage.weekly_pct
-            )
-        };
-        rationale.push(format!("{name} rejected because {reason}"));
-        usage_provenance.push(CandidateUsage {
-            provider: name.to_string(),
-            weekly_pct: None,
-            stale: true,
-            eligible: false,
-            rejection_reason: Some(reason),
-        });
-        return None;
-    }
-    if !usage.weekly_capacity_known || !usage.weekly_pct.is_finite() {
-        let reason = format!(
-            "weekly capacity is unknown at {:.1} percent usage",
-            usage.weekly_pct
-        );
-        rationale.push(format!("{name} rejected because {reason}"));
-        usage_provenance.push(CandidateUsage {
-            provider: name.to_string(),
-            weekly_pct: None,
-            stale: false,
-            eligible: false,
-            rejection_reason: Some(reason),
-        });
-        return None;
-    }
-    if usage.weekly_pct >= WEEKLY_USAGE_CEILING {
-        let reason = format!(
-            "weekly usage {:.1} reaches the {:.1} ceiling",
-            usage.weekly_pct, WEEKLY_USAGE_CEILING
-        );
-        rationale.push(format!("{name} rejected because {reason}"));
-        usage_provenance.push(CandidateUsage {
-            provider: name.to_string(),
-            weekly_pct: Some(usage.weekly_pct),
-            stale: false,
-            eligible: false,
-            rejection_reason: Some(reason),
-        });
-        return None;
-    }
-
-    usage_provenance.push(CandidateUsage {
-        provider: name.to_string(),
-        weekly_pct: Some(usage.weekly_pct),
+/// PURE: one provenance row for a candidate that was tried.
+fn tried(provider: &str, failure: Option<String>) -> CandidateUsage {
+    CandidateUsage {
+        provider: provider.to_string(),
+        weekly_pct: None,
         stale: false,
-        eligible: true,
-        rejection_reason: None,
-    });
-    let reserve = if name.eq_ignore_ascii_case("claude") {
-        claude_usage_reserve_pct
-    } else {
-        0.0
-    };
-    rationale.push(format!(
-        "{name} eligible at {:.1} percent weekly usage with {:.1} point reserve",
-        usage.weekly_pct, reserve
-    ));
-    Some((usage, reserve))
+        eligible: failure.is_none(),
+        rejection_reason: failure,
+    }
 }
 
-fn select_provider<'a>(
-    primary_provider: &str,
-    providers: &[&'a dyn ReviewProvider],
-    claude_usage_reserve_pct: f64,
-) -> Selection<'a> {
-    let mut rationale = Vec::with_capacity(providers.len() + 1);
-    let mut eligible = Vec::new();
-    let mut usage_provenance = Vec::with_capacity(providers.len());
+/// How one candidate's attempt ended.
+enum Attempt {
+    Completed((String, Option<String>)),
+    /// Refused by its authoritative availability check; it never ran.
+    Unavailable(String),
+    /// Failed before producing a review; the next candidate may run.
+    Failed(String),
+    /// The review was cancelled; nothing else runs.
+    Cancelled(String),
+}
 
-    for provider in providers {
-        if let Some((usage, reserve)) = judge_candidate(
-            *provider,
-            primary_provider,
-            claude_usage_reserve_pct,
-            &mut rationale,
-            &mut usage_provenance,
-        ) {
-            eligible.push((*provider, usage, reserve));
-        }
+fn attempt(
+    provider: &dyn ReviewProvider,
+    request: &ReviewRequest<'_>,
+    cancelled: &dyn Fn() -> bool,
+) -> Attempt {
+    if cancelled() {
+        return Attempt::Cancelled(REVIEW_CANCELLED_REASON.to_string());
     }
-
-    eligible.sort_by(
-        |(left_provider, left_usage, left_reserve),
-         (right_provider, right_usage, right_reserve)| {
-            (left_usage.weekly_pct + left_reserve)
-                .total_cmp(&(right_usage.weekly_pct + right_reserve))
-                .then_with(|| left_usage.weekly_pct.total_cmp(&right_usage.weekly_pct))
-                .then_with(|| {
-                    left_provider
-                        .provider_name()
-                        .cmp(right_provider.provider_name())
-                })
-        },
-    );
-
-    match eligible.first().copied() {
-        Some((provider, usage, reserve)) => {
-            rationale.push(format!(
-                "selected {} at {:.1} percent weekly usage with {:.1} point reserve after excluding primary {}",
-                provider.provider_name(),
-                usage.weekly_pct, reserve,
-                primary_provider
-            ));
-            Selection::Selected {
-                provider,
-                usage,
-                rationale: rationale.join("; "),
-                usage_provenance,
+    if let Err(reason) = provider.authoritative_availability() {
+        return Attempt::Unavailable(reason);
+    }
+    match provider.review_cancellable(request, cancelled) {
+        Ok(result) => Attempt::Completed(result),
+        Err(error) => {
+            let reason = error.to_string();
+            if review_reason_is_cancel(&reason) || cancelled() {
+                Attempt::Cancelled(reason)
+            } else {
+                Attempt::Failed(reason)
             }
         }
-        None => Selection::Skipped {
-            rationale: format!(
-                "{}; no eligible alternative to primary {}",
-                rationale.join("; "),
-                primary_provider
-            ),
-            usage_provenance,
-        },
     }
 }
 
-/// PURE: the pinned selection. One candidate, the same gates, plus the reserve as a floor: under
-/// the automatic policy the Claude reserve biases a comparison against another eligible reviewer,
-/// and a pin removes that comparison, so here it protects the reserved band outright. A pin at a
-/// reading the automatic policy would still have selected can therefore be refused; that is the
-/// documented asymmetry, not an accident.
-fn select_pinned<'a>(
-    primary_provider: &str,
-    providers: &[&'a dyn ReviewProvider],
+struct Settled<'a> {
+    request: &'a ReviewRequest<'a>,
+    pin: Option<&'a ReviewerPin>,
+    rationale: Vec<String>,
+    usage_provenance: Vec<CandidateUsage>,
+}
+
+impl Settled<'_> {
+    fn completed(
+        self,
+        provider: &dyn ReviewProvider,
+        result: (String, Option<String>),
+        fallback_from: Option<String>,
+    ) -> ReviewOutcome {
+        let (result, reviewer_session_id) = result;
+        with_pin(
+            ReviewOutcome {
+                status: ReviewStatus::Completed,
+                primary_provider: self.request.primary_provider.to_string(),
+                requested_provider: None,
+                requested_model: None,
+                reviewer_provider: Some(provider.provider_name().to_string()),
+                reviewer_model: Some(provider.reviewer_model().to_string()),
+                reviewer_session_id,
+                usage: None,
+                usage_provenance: self.usage_provenance,
+                rationale: self.rationale.join("; "),
+                reason: None,
+                fallback_from,
+                result: Some(result),
+                review_id: None,
+            },
+            self.pin,
+        )
+    }
+
+    fn failed(
+        self,
+        provider: Option<&dyn ReviewProvider>,
+        reason: String,
+        fallback_from: Option<String>,
+    ) -> ReviewOutcome {
+        with_pin(
+            ReviewOutcome {
+                status: ReviewStatus::Failed,
+                primary_provider: self.request.primary_provider.to_string(),
+                requested_provider: None,
+                requested_model: None,
+                reviewer_provider: provider.map(|provider| provider.provider_name().to_string()),
+                reviewer_model: provider.map(|provider| provider.reviewer_model().to_string()),
+                reviewer_session_id: None,
+                usage: None,
+                usage_provenance: self.usage_provenance,
+                rationale: self.rationale.join("; "),
+                reason: Some(reason),
+                fallback_from,
+                result: None,
+                review_id: None,
+            },
+            self.pin,
+        )
+    }
+}
+
+/// The ordered loop: each candidate in `priority`, minus the primary, that is registered.
+fn review_in_priority(
+    request: &ReviewRequest<'_>,
+    providers: &[&dyn ReviewProvider],
+    priority: &[Provider],
+    cancelled: &dyn Fn() -> bool,
+) -> ReviewOutcome {
+    let primary = request.primary_provider;
+    let mut settled = Settled {
+        request,
+        pin: None,
+        rationale: vec![format!("{primary} excluded as primary provider")],
+        usage_provenance: Vec::new(),
+    };
+    let mut failures: Vec<String> = Vec::new();
+    let mut previous: Option<String> = None;
+
+    for wanted in priority {
+        let name = wanted.name();
+        if name.eq_ignore_ascii_case(primary) {
+            continue;
+        }
+        let Some(provider) = providers
+            .iter()
+            .copied()
+            .find(|provider| provider.provider_name().eq_ignore_ascii_case(name))
+        else {
+            continue;
+        };
+        let provider_name = provider.provider_name().to_string();
+        match attempt(provider, request, cancelled) {
+            Attempt::Completed(result) => {
+                settled.usage_provenance.push(tried(&provider_name, None));
+                settled.rationale.push(format!(
+                    "selected {provider_name} in reviewer priority order after excluding primary {primary}"
+                ));
+                return settled.completed(provider, result, previous);
+            }
+            Attempt::Unavailable(reason) | Attempt::Failed(reason) => {
+                settled
+                    .rationale
+                    .push(format!("{provider_name} failed: {reason}"));
+                settled
+                    .usage_provenance
+                    .push(tried(&provider_name, Some(reason.clone())));
+                failures.push(format!("{provider_name}: {reason}"));
+                previous = Some(provider_name);
+            }
+            Attempt::Cancelled(reason) => {
+                settled
+                    .rationale
+                    .push(format!("{provider_name} cancelled: {reason}"));
+                settled
+                    .usage_provenance
+                    .push(tried(&provider_name, Some(reason.clone())));
+                return settled.failed(Some(provider), reason, previous);
+            }
+        }
+    }
+
+    let reason = if failures.is_empty() {
+        settled.rationale.push(format!(
+            "no registered reviewer in the priority order other than primary {primary}"
+        ));
+        format!("no registered reviewer other than primary {primary}")
+    } else {
+        settled
+            .rationale
+            .push("every reviewer candidate failed".to_string());
+        format!("every reviewer candidate failed: {}", failures.join("; "))
+    };
+    settled.failed(None, reason, None)
+}
+
+/// The pinned path: the pinned provider alone, validated as registered, running the requested
+/// model, and not the primary. No failover.
+fn review_pinned(
+    request: &ReviewRequest<'_>,
+    providers: &[&dyn ReviewProvider],
     pin: &ReviewerPin,
-    claude_usage_reserve_pct: f64,
-) -> Selection<'a> {
+    cancelled: &dyn Fn() -> bool,
+) -> ReviewOutcome {
+    let primary = request.primary_provider;
     let name = pin.provider.name();
+    let refuse = |reason: String| with_pin(failed_outcome(primary, reason), Some(pin));
+    if name.eq_ignore_ascii_case(primary) {
+        return refuse(format!(
+            "requested reviewer {name} is the primary provider; an adversarial review needs a \
+             provider other than the one that produced the work"
+        ));
+    }
     let Some(provider) = providers
         .iter()
         .copied()
         .find(|provider| provider.provider_name().eq_ignore_ascii_case(name))
     else {
-        return Selection::Failed {
-            reason: format!("requested reviewer {name} is not registered as review capable"),
-        };
+        return refuse(format!(
+            "requested reviewer {name} is not registered as review capable"
+        ));
     };
     if let Some(model) = pin.model.as_deref()
         && provider.reviewer_model() != model
     {
-        return Selection::Failed {
-            reason: format!(
-                "requested model {model} but the registered {name} reviewer would run {}",
-                provider.reviewer_model()
-            ),
-        };
+        return refuse(format!(
+            "requested model {model} but the registered {name} reviewer would run {}",
+            provider.reviewer_model()
+        ));
     }
 
-    let mut rationale = vec![format!(
-        "{name} requested explicitly as the reviewer for primary {primary_provider}"
-    )];
-    let mut usage_provenance = Vec::with_capacity(1);
-    let Some((usage, reserve)) = judge_candidate(
-        provider,
-        primary_provider,
-        claude_usage_reserve_pct,
-        &mut rationale,
-        &mut usage_provenance,
-    ) else {
-        return Selection::Skipped {
-            rationale: rationale.join("; "),
-            usage_provenance,
-        };
+    let mut settled = Settled {
+        request,
+        pin: Some(pin),
+        rationale: vec![format!(
+            "{name} requested explicitly as the reviewer for primary {primary}"
+        )],
+        usage_provenance: Vec::new(),
     };
-    if reserve > 0.0 && usage.weekly_pct + reserve >= WEEKLY_USAGE_CEILING {
-        let reason = format!(
-            "weekly usage {:.1} plus the {:.1} point reserve reaches the {:.1} ceiling",
-            usage.weekly_pct, reserve, WEEKLY_USAGE_CEILING
-        );
-        rationale.push(format!("{name} rejected because {reason}"));
-        // judge_candidate recorded the candidate as eligible; the reserve floor is the last word.
-        usage_provenance.pop();
-        usage_provenance.push(CandidateUsage {
-            provider: name.to_string(),
-            weekly_pct: Some(usage.weekly_pct),
-            stale: false,
-            eligible: false,
-            rejection_reason: Some(reason),
-        });
-        return Selection::Skipped {
-            rationale: rationale.join("; "),
-            usage_provenance,
-        };
-    }
-
-    rationale.push(format!(
-        "selected {name} at {:.1} percent weekly usage with {:.1} point reserve as the requested reviewer for primary {primary_provider}",
-        usage.weekly_pct, reserve
-    ));
-    Selection::Selected {
-        provider,
-        usage,
-        rationale: rationale.join("; "),
-        usage_provenance,
+    match attempt(provider, request, cancelled) {
+        Attempt::Completed(result) => {
+            settled.usage_provenance.push(tried(name, None));
+            settled.completed(provider, result, None)
+        }
+        Attempt::Unavailable(reason) => {
+            settled
+                .rationale
+                .push(format!("{name} unavailable: {reason}"));
+            settled
+                .usage_provenance
+                .push(tried(name, Some(reason.clone())));
+            settled.failed(None, format!("{name}: {reason}"), None)
+        }
+        Attempt::Failed(reason) | Attempt::Cancelled(reason) => {
+            settled.rationale.push(format!("{name} failed: {reason}"));
+            settled
+                .usage_provenance
+                .push(tried(name, Some(reason.clone())));
+            settled.failed(Some(provider), reason, None)
+        }
     }
 }
 
@@ -1057,10 +631,6 @@ impl ReviewProvider for ClaudeReviewProvider<'_> {
         self.model
     }
 
-    fn usage(&self) -> Option<Headroom> {
-        Some(claude_headroom(self.ctx))
-    }
-
     fn review(&self, request: &ReviewRequest<'_>) -> Result<String> {
         self.review_cancellable(request, &|| false)
             .map(|(result, _)| result)
@@ -1072,8 +642,14 @@ impl ReviewProvider for ClaudeReviewProvider<'_> {
         cancelled: &dyn Fn() -> bool,
     ) -> Result<(String, Option<String>)> {
         let (command, binary) = self.review_command(request)?;
-        parse_claude_output(run_review(command, &binary, Provider::Claude, cancelled)?)
-            .map(|result| (result, None))
+        run_review(
+            command,
+            &binary,
+            Provider::Claude,
+            cancelled,
+            parse_claude_output,
+        )
+        .map(|result| (result, None))
     }
 }
 
@@ -1125,10 +701,6 @@ impl ReviewProvider for CodexReviewProvider<'_> {
         self.model
     }
 
-    fn usage(&self) -> Option<Headroom> {
-        Some(codex_headroom(self.ctx))
-    }
-
     fn review(&self, request: &ReviewRequest<'_>) -> Result<String> {
         self.review_cancellable(request, &|| false)
             .map(|(result, _)| result)
@@ -1140,8 +712,14 @@ impl ReviewProvider for CodexReviewProvider<'_> {
         cancelled: &dyn Fn() -> bool,
     ) -> Result<(String, Option<String>)> {
         let (command, binary) = self.review_command(request)?;
-        parse_codex_output(run_review(command, &binary, Provider::Codex, cancelled)?)
-            .map(|result| (result, None))
+        run_review(
+            command,
+            &binary,
+            Provider::Codex,
+            cancelled,
+            parse_codex_output,
+        )
+        .map(|result| (result, None))
     }
 }
 
@@ -1184,10 +762,6 @@ impl ReviewProvider for GrokReviewProvider<'_> {
 
     fn reviewer_model(&self) -> &str {
         GROK_REVIEW_MODEL
-    }
-
-    fn usage(&self) -> Option<Headroom> {
-        Some(grok_headroom(self.ctx))
     }
 
     fn authoritative_availability(&self) -> std::result::Result<(), String> {
@@ -1425,7 +999,11 @@ fn review_binary(ctx: &Context, review_env: &'static str, provider: Provider) ->
     )
 }
 
-/// IMPURE: run one reviewer child to completion, or kill it when `cancelled` goes true.
+/// IMPURE: run one reviewer child to completion, or kill it when `cancelled` goes true, and
+/// return the review body `parse` extracts from its stdout.
+///
+/// A nonzero exit is a failure only when stdout holds no review body: a reviewer that printed a
+/// complete review and then exited nonzero still completed the review, so failover must not fire.
 ///
 /// Both pipes are drained by their own threads for the whole life of the child. That is not an
 /// optimization: polling `try_wait` while reading neither pipe deadlocks as soon as a reviewer
@@ -1439,6 +1017,7 @@ fn run_review(
     binary: &Path,
     provider: Provider,
     cancelled: &dyn Fn() -> bool,
+    parse: fn(String) -> Result<String>,
 ) -> Result<String> {
     let override_env = review_override(provider);
     let provider = provider.name();
@@ -1478,19 +1057,23 @@ fn run_review(
     let stdout = stdout_drain.join().unwrap_or_default();
     let stderr = stderr_drain.join().unwrap_or_default();
 
-    if !status.success() {
-        let detail = String::from_utf8_lossy(&stderr).trim().to_string();
-        let suffix = if detail.is_empty() {
-            String::new()
-        } else {
-            format!(": {detail}")
-        };
-        return Err(Error::Command(format!(
-            "{provider} review exited {status}{suffix}"
-        )));
-    }
-    String::from_utf8(stdout)
+    let review = String::from_utf8(stdout)
         .map_err(|_| Error::Command(format!("{provider} review printed non UTF-8 output")))
+        .and_then(parse);
+    // A reviewer that printed a complete review and then exited nonzero still reviewed; only a
+    // nonzero exit with no parseable body is a failure the next candidate should cover.
+    if status.success() || review.is_ok() {
+        return review;
+    }
+    let detail = String::from_utf8_lossy(&stderr).trim().to_string();
+    let suffix = if detail.is_empty() {
+        String::new()
+    } else {
+        format!(": {detail}")
+    };
+    Err(Error::Command(format!(
+        "{provider} review exited {status}{suffix}"
+    )))
 }
 
 /// IMPURE: read one of the child's pipes to EOF on its own thread.
@@ -1616,102 +1199,5 @@ mod tests {
             }),
             GrokReviewPoll::Fail
         );
-    }
-
-    #[test]
-    fn grok_timeout_and_openat2_are_failover_failures_and_cancel_is_not() {
-        assert!(grok_failure_is_failover(
-            "grok",
-            "Grok review abc did not finish before the timeout",
-            false
-        ));
-        assert!(grok_failure_is_failover(
-            "grok",
-            "Grok review abc did not appear before the timeout",
-            false
-        ));
-        assert!(grok_failure_is_failover(
-            "grok",
-            "secure Grok storage requires openat2",
-            false
-        ));
-        assert!(!grok_failure_is_failover(
-            "grok",
-            REVIEW_CANCELLED_REASON,
-            false
-        ));
-        assert!(!grok_failure_is_failover(
-            "grok",
-            &format!("{REVIEW_CANCELLED_REASON}; exact session cleanup also failed: x"),
-            false
-        ));
-        assert!(!grok_failure_is_failover(
-            "grok",
-            "Grok review abc did not finish before the timeout",
-            true
-        ));
-        assert!(!grok_failure_is_failover(
-            "claude",
-            "Grok review abc did not finish before the timeout",
-            false
-        ));
-        assert!(!grok_failure_is_failover(
-            "grok",
-            "Grok review abc ended with an error",
-            false
-        ));
-        assert!(!grok_failure_is_failover(
-            "grok",
-            "Grok review abc ended with an error; exact session cleanup also failed: delete failed: openat2",
-            false
-        ));
-        assert!(grok_failure_is_failover(
-            "grok",
-            "Grok review abc did not finish before the timeout; exact session cleanup also failed: delete failed: missing",
-            false
-        ));
-        assert!(!grok_failure_is_failover(
-            "grok",
-            "Grok review abc did not finish before the timeout; exact session cleanup also failed: cancel failed: still running",
-            false
-        ));
-    }
-
-    fn candidate(provider: &str, weekly_pct: Option<f64>, eligible: bool) -> CandidateUsage {
-        CandidateUsage {
-            provider: provider.to_string(),
-            weekly_pct,
-            stale: weekly_pct.is_none(),
-            eligible,
-            rejection_reason: None,
-        }
-    }
-
-    #[test]
-    fn only_ceiling_and_reserve_refusals_are_usage_gate() {
-        let pin = ReviewerPin {
-            provider: Provider::Claude,
-            model: Some("fable".to_string()),
-        };
-        assert!(pin_refusal_is_usage_gate(
-            &[candidate("claude", Some(90.0), false)],
-            &pin
-        ));
-        assert!(pin_refusal_is_usage_gate(
-            &[candidate("claude", Some(70.0), false)],
-            &pin
-        ));
-        assert!(!pin_refusal_is_usage_gate(
-            &[candidate("claude", None, false)],
-            &pin
-        ));
-        assert!(!pin_refusal_is_usage_gate(
-            &[candidate("claude", Some(10.0), true)],
-            &pin
-        ));
-        assert!(!pin_refusal_is_usage_gate(
-            &[candidate("grok", Some(90.0), false)],
-            &pin
-        ));
     }
 }

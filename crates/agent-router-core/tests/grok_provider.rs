@@ -55,10 +55,6 @@ impl ReviewProvider for EligibleGrokReviewer {
         "grok-review"
     }
 
-    fn usage(&self) -> Option<Headroom> {
-        Some(known(20.0))
-    }
-
     fn review(&self, _: &ReviewRequest<'_>) -> Result<String> {
         Ok("completed Grok adversarial review".to_string())
     }
@@ -272,7 +268,12 @@ fn grok_can_be_an_eligible_adversarial_reviewer() {
         dir: Path::new("/tmp"),
     };
 
-    let outcome = review_with_providers(&request, &[&grok]).expect("eligible reviewer completes");
+    let outcome = review_with_providers(
+        &request,
+        &[&grok],
+        &[Provider::Codex, Provider::Grok, Provider::Claude],
+    )
+    .expect("eligible reviewer completes");
 
     assert_eq!(outcome.status, ReviewStatus::Completed);
     assert_eq!(outcome.reviewer_provider.as_deref(), Some("grok"));

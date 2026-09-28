@@ -148,9 +148,9 @@ Codex has no known weekly capacity and is ineligible for automatic routing. If n
 has known capacity, the router still dispatches to the configured default. `agent-router doctor`
 reports the source status and exits nonzero for a stale read, `agent-router usage` names the source
 per provider, and every decision row records `claude_usage_stale` and `codex_usage_stale`.
-Grok capacity participates in ordinary automatic task routing and adversarial review eligibility.
-No Grok billing data at all is an unknown capacity verdict, not a reading of 100 percent usage;
-it fails closed and makes Grok ineligible for both paths.
+Grok capacity participates in ordinary automatic task routing. No Grok billing data at all is an
+unknown capacity verdict, not a reading of 100 percent usage; it fails closed and makes Grok
+ineligible for automatic routing. Adversarial review selection reads no usage.
 
 Usage comes from:
 
@@ -251,11 +251,12 @@ uses `grok --leader --resume <session-id>` so attaching cannot replace the share
 
 ### `adversarial-review`
 
-Run a review synchronously with an eligible provider other than the provider that initiated the
-request. The primary provider is always excluded, including Grok. Candidate providers must be
-registered as review capable, have an authoritative known and fresh weekly capacity reading, and
-be below 90 percent usage. Grok is a registered alternative when its public lifecycle reports an
-authoritative leader and capacity is available.
+Run a review synchronously with a provider other than the provider that initiated the request.
+The primary provider is always excluded, including Grok. Candidates are the registered review
+capable providers in `[adversarial_review] reviewer_priority` order (default
+`["codex", "grok", "claude"]`) minus the primary. Selection reads that order and nothing else: no
+usage reading, ceiling, or reserve. Grok is a usable candidate when its public lifecycle reports an
+authoritative leader.
 The command still does not classify the request. Once a provider is selected it persists a review
 id and prints `agent-router: adversarial review <id> started` to stderr before any provider work
 begins, then hands the review to a detached worker process (`setsid`, logged to
@@ -272,23 +273,17 @@ waits exactly as it always has.
 Every review, whether it settled synchronously or is still pending, gets an id. JSON output always
 carries `review_id`.
 
-The eligible provider with the lowest effective weekly usage is selected. By default, Claude has a
-25-point reserve (`[adversarial_review] claude_usage_reserve_pct = 25.0`), protecting its premium
-capacity: Claude is selected only when its raw weekly usage is at least 25 points lower than the
-other eligible reviewer. Set the reserve to `0.0` for raw-usage-only selection. The reserve never
-makes an ineligible provider eligible.
+Candidates are tried in order. A candidate that fails before producing a review (a rate limit or
+quota error, an authentication or launch failure, an authoritative availability refusal, or a
+nonzero exit with no review body) hands over to the next one, and the completed row records
+`fallback_from` as the candidate that failed immediately before the one that completed. A review
+that completes, findings included, never fails over, and neither does a cancel. When every
+candidate fails, the review fails with exit `1` and a reason listing each `provider: error`.
 
-`--provider` pins the reviewer instead of letting headroom choose it, and `--model` pins the model
-that reviewer runs. A pin chooses among the same registered reviewers; it bypasses nothing. It must
-name a provider other than `--primary`, and the pinned reviewer still passes every eligibility gate:
-authoritative availability, a fresh known weekly reading, and usage below the 90 percent ceiling.
-Because a pin removes the comparison the Claude reserve normally biases, the reserve becomes a floor
-on the pinned path: a pinned Claude reviewer is refused once its weekly usage plus
-`claude_usage_reserve_pct` reaches the ceiling, even at a reading the automatic policy would still
-have selected. A pin refused on that usage or reserve gate is retried once on the next eligible
-reviewer that is not the primary; the row records `fallback_from` and keeps the original `reason`.
-Any other ineligible pin is reported as `skipped` with exit `3` and a reason that names the
-refusing gate. `--model` requires an explicit `--provider` other than `grok`, whose
+`--provider` pins the reviewer instead of the priority order, and `--model` pins the model that
+reviewer runs. Only the pinned reviewer runs: it must be registered, must name a provider other
+than `--primary`, and a pinned reviewer that fails or is unavailable leaves the review failed with
+no failover. `--model` requires an explicit `--provider` other than `grok`, whose
 review lifecycle has no model selection, and is passed to the reviewer verbatim: a model the
 provider rejects fails the review with exit `1` rather than being replaced. Without `--model` a pin
 runs the provider's configured `high` review tier. A pinned reviewer is launched exactly like an
@@ -304,22 +299,20 @@ agent-router adversarial-review --primary codex "Review the proposed authenticat
 # Return the decision and review body as machine-readable JSON.
 agent-router adversarial-review --primary codex --json "Review the proposed authentication change"
 
-# Pin the reviewer to Claude Fable, or be told exactly why it cannot run. Same gates; usage-gate
-# refusal retries once on the next eligible reviewer.
+# Pin the reviewer to Claude Fable, or be told exactly why it cannot run. No failover.
 agent-router adversarial-review --primary codex --provider claude --model fable --json \
     "Review the proposed authentication change"
 ```
 
 Text mode prints the completed review body. JSON reports `status`, `primary_provider`,
 `requested_provider` and `requested_model` (what a pin asked for, `null` under the automatic
-policy), `reviewer_provider` and `reviewer_model` (what actually ran), usage provenance, the
-selection rationale, `fallback_from` when a Grok timeout, Grok `openat2` storage error, or usage-gate
-pin refusal was retried once on another eligible reviewer, and `result` when the review completes.
+policy), `reviewer_provider` and `reviewer_model` (what actually ran), `usage` (always `null`),
+`usage_provenance` with one entry per candidate tried and its failure reason, the selection
+rationale naming the excluded primary, each failed candidate, and the reviewer chosen,
+`fallback_from` when an earlier candidate failed, and `result` when the review completes.
 The reviews table records the reviewer that ran; it has no requested columns, so its rationale names
-the pin instead, whether the pin was selected, refused by a gate, or rejected before selection.
-When no eligible alternative exists, or the pinned reviewer is ineligible for a reason other than
-the usage or reserve gate, it reports the reason and exits `3`. A user-issued `review cancel` never
-fails over. A completed review exits `0`; an invocation or infrastructure failure exits `1`. Review
+the pin instead, whether the pin was selected, failed, or rejected before selection. A user-issued
+`review cancel` never fails over. A completed review exits `0`; an invocation or infrastructure failure exits `1`. Review
 execution uses the provider's review contract and is never routed through an ordinary task. Claude and Codex
 are launched with enforced read only restrictions. Grok's persistent lifecycle currently registers
 in YOLO mode: its prompt asks for read only review behavior and supplies no MCP servers, but Grok's
@@ -380,7 +373,7 @@ and `fail-open` when no usable capacity verdict was read. Grok preserves its own
 event found by the whole-file reverse scan, and `none` no usable billing data. A `log` event without
 `creditUsagePercent` retains `log` provenance but supplies no weekly capacity: it prints `unknown`
 and is unhealthy in doctor. `none` also fails closed: it prints `unknown`, never claims 100 percent
-usage, and excludes Grok from automatic routing and adversarial review selection. `weekly` prints
+usage, and excludes Grok from automatic routing. `weekly` prints
 `unknown` for any unread workhorse window rather than claiming a measurement; unknown or ceiling
 capacity is excluded from auto selection.
 

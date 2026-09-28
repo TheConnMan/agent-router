@@ -17,7 +17,7 @@ const DEFAULT_CLAUDE_MODEL: &str = "claude-opus-5-5[1m]";
 
 /// The migration level a config file written by this build carries. A file stamped below this is
 /// rewritten once so dead keys drop off disk; serde already ignores them on parse.
-const CURRENT_CONFIG_VERSION: u32 = 5;
+const CURRENT_CONFIG_VERSION: u32 = 7;
 
 /// The level a file that predates versioning reads as. This is deliberately NOT
 /// `CURRENT_CONFIG_VERSION`: an absent key has to be distinguishable from a stamped one, or every
@@ -263,21 +263,37 @@ pub struct ParityConfig {
     pub exceptions: Vec<ParityException>,
 }
 
-/// Capacity preferences for adversarial reviews. These adjust selection only after a candidate
-/// has passed the independent, fresh-capacity, and raw-usage eligibility gates.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+/// Reviewer order for adversarial reviews. Selection reads this list and nothing else: no usage,
+/// no ceiling, no reserve.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct AdversarialReviewConfig {
-    /// Reserve Claude capacity for work that needs its stronger sealed review environment. A
-    /// positive value makes Claude win only when its raw weekly use is this many points lower than
-    /// another eligible reviewer.
-    pub claude_usage_reserve_pct: f64,
+    /// Reviewers in the order they are tried. The primary provider is skipped, and a reviewer that
+    /// fails before producing a review hands over to the next one.
+    pub reviewer_priority: Vec<crate::provider::Provider>,
+}
+
+impl AdversarialReviewConfig {
+    /// PURE: reject a reviewer list that names a provider twice. A repeat would retry the same
+    /// failed reviewer and record a failover from a provider to itself.
+    fn validate(&self) -> Result<()> {
+        for (index, provider) in self.reviewer_priority.iter().enumerate() {
+            if self.reviewer_priority[..index].contains(provider) {
+                return Err(crate::error::Error::Command(format!(
+                    "invalid [adversarial_review] in config: reviewer_priority lists {} more than once",
+                    provider.name()
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Default for AdversarialReviewConfig {
     fn default() -> AdversarialReviewConfig {
+        use crate::provider::Provider;
         AdversarialReviewConfig {
-            claude_usage_reserve_pct: 25.0,
+            reviewer_priority: vec![Provider::Codex, Provider::Grok, Provider::Claude],
         }
     }
 }
@@ -583,13 +599,14 @@ impl Config {
     /// IMPURE: the config at `path`, created with defaults when absent, and migrated in place when
     /// it predates the current version. A file that exists but does not parse is an Err: silently
     /// substituting defaults would route jobs against ceilings and a connector list the operator
-    /// never wrote. An invalid `[routing]` table is an Err for the same reason, and is checked
+    /// never wrote. An invalid `[routing]` or `[adversarial_review]` table is an Err for the same reason, and is checked
     /// before migration so a rejected file is never rewritten.
     pub fn load_from(path: &Path) -> Result<Config> {
         match std::fs::read_to_string(path) {
             Ok(text) => {
                 let mut config: Config = toml::from_str(&text)?;
                 config.routing.validate()?;
+                config.adversarial_review.validate()?;
                 if config.migrate() {
                     config.write_to(path)?;
                 }
@@ -608,7 +625,9 @@ impl Config {
     /// whether it now needs rewriting. The rewrite is what drops dead keys from disk: serde
     /// already ignores unknown keys on parse, so a v4 file still carrying `default_provider` or
     /// `projection_overdraw_pct` keeps routing the same either way, and the one rewrite is what
-    /// stops the file from naming keys the router no longer has.
+    /// stops the file from naming keys the router no longer has. Version 7 drops the removed
+    /// `claude_usage_reserve_pct` and writes `reviewer_priority`; version 6 was stamped by a
+    /// reverted build and carries nothing of its own.
     ///
     /// Operator-chosen values are left alone. The v1–v4 steps that used to correct generated
     /// defaults this tool itself wrote are gone: those corrections already ran on every stamped
@@ -852,12 +871,12 @@ mod tests {
 
         let text = std::fs::read_to_string(&path).expect("re-read");
         assert!(text.contains("classifier_timeout_secs = 30"), "{text}");
-        assert!(text.contains("config_version = 5"), "{text}");
+        assert!(text.contains("config_version = 7"), "{text}");
     }
 
-    /// A v4 file carrying the three dead keys parses, is rewritten without them, and is stamped 5.
+    /// A v4 file carrying the three dead keys parses, is rewritten without them, and is stamped 7.
     #[test]
-    fn a_v4_file_carrying_dead_keys_is_rewritten_without_them_and_stamped_five() {
+    fn a_v4_file_carrying_dead_keys_is_rewritten_without_them_and_stamped_current() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
         std::fs::write(
@@ -877,7 +896,7 @@ mod tests {
         assert!(config.policy.weekly_routing);
 
         let text = std::fs::read_to_string(&path).expect("re-read");
-        assert!(text.contains("config_version = 5"), "{text}");
+        assert!(text.contains("config_version = 7"), "{text}");
         assert!(
             !text.contains("default_provider"),
             "dead policy key must leave the file: {text}"
@@ -1145,23 +1164,81 @@ mod tests {
     }
 
     #[test]
-    fn adversarial_review_claude_reserve_defaults_and_is_operator_configurable() {
+    fn adversarial_review_priority_defaults_to_codex_grok_claude() {
+        use crate::provider::Provider;
         assert_eq!(
-            Config::default()
-                .adversarial_review
-                .claude_usage_reserve_pct,
-            25.0
+            Config::default().adversarial_review.reviewer_priority,
+            vec![Provider::Codex, Provider::Grok, Provider::Claude]
         );
+    }
 
+    #[test]
+    fn a_configured_reviewer_priority_is_loaded() {
+        use crate::provider::Provider;
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
         let config = load_config(
-            "[adversarial_review]\nclaude_usage_reserve_pct = 12.5\n",
+            "[adversarial_review]\nreviewer_priority = [\"claude\", \"codex\"]\n",
             &path,
         )
-        .expect("load the configured reserve");
+        .expect("load the configured priority");
 
-        assert_eq!(config.adversarial_review.claude_usage_reserve_pct, 12.5);
+        assert_eq!(
+            config.adversarial_review.reviewer_priority,
+            vec![Provider::Claude, Provider::Codex]
+        );
+    }
+
+    #[test]
+    fn a_reviewer_priority_naming_a_provider_twice_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let error = load_config(
+            "[adversarial_review]\nreviewer_priority = [\"codex\", \"claude\", \"codex\"]\n",
+            &path,
+        )
+        .expect_err("a duplicate reviewer is a configuration error");
+
+        assert!(
+            error
+                .to_string()
+                .contains("reviewer_priority lists codex more than once"),
+            "{error}"
+        );
+    }
+
+    /// The live box is stamped 6 with the removed reserve key; the rewrite drops it, writes the
+    /// priority, and stamps 7.
+    #[test]
+    fn a_v6_file_with_the_claude_reserve_is_rewritten_to_v7_with_reviewer_priority() {
+        use crate::provider::Provider;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "config_version = 6\n\
+             \n\
+             [adversarial_review]\n\
+             claude_usage_reserve_pct = 25.0\n",
+        )
+        .expect("write");
+
+        let config = Config::load_from(&path).expect("loads");
+        assert_eq!(config.config_version, CURRENT_CONFIG_VERSION);
+        assert_eq!(
+            config.adversarial_review.reviewer_priority,
+            vec![Provider::Codex, Provider::Grok, Provider::Claude]
+        );
+
+        let text = std::fs::read_to_string(&path).expect("re-read");
+        assert!(text.contains("config_version = 7"), "{text}");
+        assert!(
+            !text.contains("claude_usage_reserve_pct"),
+            "the removed reserve key must leave the file: {text}"
+        );
+        assert!(text.contains("reviewer_priority"), "{text}");
+        let reread = Config::load_from(&path).expect("re-loads");
+        assert_eq!(reread, config);
     }
 
     #[test]
