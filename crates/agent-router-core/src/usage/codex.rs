@@ -15,9 +15,66 @@ const WINDOW_FIVE_HOUR: i64 = 300;
 /// `window_minutes` of the weekly window.
 const WINDOW_WEEKLY: i64 = 10080;
 
-/// IMPURE: the Codex snapshot from the newest rollout carrying a `rate_limits` event.
+/// IMPURE: the Codex snapshot, read live from the running app-server daemon when one answers and
+/// otherwise from the newest rollout carrying a `rate_limits` verdict.
+///
+/// The daemon comes first because codex-cli 0.158 writes only null windows into rollouts, so a
+/// rollout verdict is at best days old. The rollout scan stays as the fallback for a box with no
+/// daemon up, and for older CLIs that still fill the event.
 pub fn codex_headroom(ctx: &Context) -> Headroom {
-    codex_headroom_in(&ctx.codex_sessions_dir, (ctx.now_epoch)(), CODEX_SCAN_N)
+    let now = (ctx.now_epoch)();
+    crate::dispatch::codex::account_rate_limits(ctx)
+        .and_then(|line| live_reading(&line, now))
+        .unwrap_or_else(|| codex_headroom_in(&ctx.codex_sessions_dir, now, CODEX_SCAN_N))
+}
+
+/// IMPURE only in the RPC it is handed: the daemon's account reading, when it supplies a verdict.
+pub fn codex_account_headroom_on_rpc(
+    rpc: &mut impl crate::dispatch::codex::CodexRpc,
+    now: i64,
+) -> Option<Headroom> {
+    crate::dispatch::codex::account_rate_limits_on_rpc(rpc)
+        .and_then(|line| live_reading(&line, now))
+}
+
+/// PURE: a daemon reply as a reading only when it carried a capacity verdict. An all-null reply is
+/// no better than no reply, so it defers to the rollouts rather than closing capacity outright.
+fn live_reading(line: &str, now: i64) -> Option<Headroom> {
+    parse_codex_account_rate_limits(line, now).filter(|headroom| !headroom.stale)
+}
+
+/// PURE: an `account/rateLimits/read` reply into a snapshot, under the same rules as a rollout
+/// event. The reply is the rollout payload in camelCase, so it is renamed field for field and
+/// handed to the shared parser. None for an error reply or one without `rateLimits`.
+pub fn parse_codex_account_rate_limits(line: &str, now: i64) -> Option<Headroom> {
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    if value.get("error").is_some_and(|error| !error.is_null()) {
+        return None;
+    }
+    let limits = value
+        .pointer("/result/rateLimits")
+        .filter(|limits| limits.is_object())?;
+    let window = |key: &str| {
+        limits.get(key).filter(|w| w.is_object()).map(|w| {
+            serde_json::json!({
+                "used_percent": w.get("usedPercent"),
+                "window_minutes": w.get("windowDurationMins"),
+                "resets_at": w.get("resetsAt"),
+            })
+        })
+    };
+    let credits = limits
+        .get("credits")
+        .filter(|c| c.is_object())
+        .map(|c| serde_json::json!({"has_credits": c.get("hasCredits")}));
+    Some(headroom_from_limits(
+        &serde_json::json!({
+            "primary": window("primary"),
+            "secondary": window("secondary"),
+            "credits": credits,
+        }),
+        now,
+    ))
 }
 
 /// The Codex snapshot from `sessions_dir`, scanning the `scan_n` newest rollouts newest-first.
@@ -186,49 +243,52 @@ fn collect_rollouts(dir: &Path, found: &mut Vec<(SystemTime, PathBuf)>) {
 pub fn parse_codex_rate_limits(line: &str, now: i64) -> Option<Headroom> {
     let value: serde_json::Value = serde_json::from_str(line).ok()?;
     let limits = value.pointer("/payload/rate_limits")?;
+    Some(headroom_from_limits(limits, now))
+}
+
+/// PURE: a rollout-shaped `rate_limits` object into a snapshot. See `parse_codex_rate_limits`.
+fn headroom_from_limits(limits: &serde_json::Value, now: i64) -> Headroom {
     if let Some(weekly) = window_with_minutes(limits, WINDOW_WEEKLY) {
         let five_hour = window_with_minutes(limits, WINDOW_FIVE_HOUR);
         let (five_hour_pct, five_hour_reset_epoch) = expire(five_hour, now);
         let (weekly_pct, weekly_reset_epoch) = expire(Some(weekly), now);
         if weekly_reset_epoch == 0 {
-            return Some(Headroom::closed());
+            return Headroom::closed();
         }
-        return Some(Headroom {
+        return Headroom {
             five_hour_pct,
             five_hour_reset_epoch,
             weekly_pct,
             weekly_reset_epoch,
             weekly_capacity_known: true,
             stale: false,
-        });
+        };
     }
     if let Some(credits) = limits.get("credits").filter(|credits| credits.is_object()) {
-        return Some(
-            match credits
-                .get("has_credits")
-                .and_then(serde_json::Value::as_bool)
-            {
-                Some(false) => Headroom {
-                    five_hour_pct: 0.0,
-                    five_hour_reset_epoch: 0,
-                    weekly_pct: 100.0,
-                    weekly_reset_epoch: 0,
-                    weekly_capacity_known: true,
-                    stale: false,
-                },
-                Some(true) => Headroom {
-                    five_hour_pct: 0.0,
-                    five_hour_reset_epoch: 0,
-                    weekly_pct: 0.0,
-                    weekly_reset_epoch: 0,
-                    weekly_capacity_known: true,
-                    stale: false,
-                },
-                None => Headroom::closed(),
+        return match credits
+            .get("has_credits")
+            .and_then(serde_json::Value::as_bool)
+        {
+            Some(false) => Headroom {
+                five_hour_pct: 0.0,
+                five_hour_reset_epoch: 0,
+                weekly_pct: 100.0,
+                weekly_reset_epoch: 0,
+                weekly_capacity_known: true,
+                stale: false,
             },
-        );
+            Some(true) => Headroom {
+                five_hour_pct: 0.0,
+                five_hour_reset_epoch: 0,
+                weekly_pct: 0.0,
+                weekly_reset_epoch: 0,
+                weekly_capacity_known: true,
+                stale: false,
+            },
+            None => Headroom::closed(),
+        };
     }
-    Some(Headroom::closed())
+    Headroom::closed()
 }
 
 /// PURE: the `primary`/`secondary` window whose `window_minutes` is `minutes`, if either is.

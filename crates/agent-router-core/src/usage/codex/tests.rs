@@ -508,3 +508,95 @@ fn codex_headroom_skips_a_newer_rollout_with_invalid_utf8() {
         "a newer unreadable rollout must fall through like read_to_string failure"
     );
 }
+
+/// The `token_count` line codex-cli 0.158 writes on every turn, verbatim from this box on
+/// 2026-09-28. Every window and the credits object are null, so no line in a current rollout
+/// carries a capacity verdict and the reader must look elsewhere for one.
+const ROLLOUT_0_158_NULL_LIMITS: &str = r#"{"timestamp":"2026-09-28T12:21:04.114Z","type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"limit_id":"codex","limit_name":null,"primary":null,"secondary":null,"credits":null,"individual_limit":null,"spend_control_reached":null,"plan_type":null,"rate_limit_reached_type":null}}}"#;
+
+/// The `account/rateLimits/read` reply the 0.158 app-server daemon gave on this box on
+/// 2026-09-28, trimmed of the reset-credit list it does not use.
+const ACCOUNT_RATE_LIMITS_0_158: &str = r#"{"id":2,"result":{"ordinaryUsageAllowed":true,"rateLimits":{"limitId":"codex","limitName":null,"normalModelSlug":null,"primary":{"usedPercent":19,"windowDurationMins":10080,"resetsAt":1791046719},"secondary":null,"credits":{"hasCredits":false,"unlimited":false,"balance":"0"},"individualLimit":null,"spendControlReached":false,"planType":"pro","rateLimitReachedType":null},"rateLimitsByLimitId":{"codex":{"limitId":"codex","primary":{"usedPercent":19,"windowDurationMins":10080,"resetsAt":1791046719},"secondary":null},"base_model_inference":{"limitId":"base_model_inference","limitName":"gpt-reserve","primary":{"usedPercent":0,"windowDurationMins":10080,"resetsAt":1791205389},"secondary":null}},"accountId":"x","rateLimitUpsell":null}}"#;
+
+#[test]
+fn a_current_rollout_of_only_null_limits_supplies_no_verdict() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let body = format!("{ROLLOUT_0_158_NULL_LIMITS}\n{ROLLOUT_0_158_NULL_LIMITS}\n");
+    rollout(dir.path(), "current.jsonl", &body, 100);
+    let got = codex_headroom_in(dir.path(), 1_790_000_000, 20);
+    assert_eq!(
+        got,
+        Headroom::closed(),
+        "a null-only rollout must fail closed rather than read as a verdict"
+    );
+}
+
+#[test]
+fn the_app_server_account_reply_reads_the_weekly_window_by_duration() {
+    let now = 1_790_600_000;
+    let got = parse_codex_account_rate_limits(ACCOUNT_RATE_LIMITS_0_158, now)
+        .expect("a real reply parses");
+    assert_eq!(got.weekly_pct, 19.0);
+    assert_eq!(got.weekly_reset_epoch, 1_791_046_719);
+    assert!(got.weekly_known());
+    assert!(!got.stale, "a daemon reply is a live read");
+    assert_eq!(
+        got.five_hour_pct, 0.0,
+        "a weekly-only plan has no 5h window"
+    );
+    assert_eq!(
+        got.weekly_pct, 19.0,
+        "the codex bucket wins over the zeroed base_model_inference bucket"
+    );
+}
+
+#[test]
+fn the_app_server_account_reply_reads_both_windows() {
+    let now = 1_000_000;
+    let reply = format!(
+        r#"{{"id":2,"result":{{"rateLimits":{{"primary":{{"usedPercent":41,"windowDurationMins":300,"resetsAt":{}}},"secondary":{{"usedPercent":72,"windowDurationMins":10080,"resetsAt":{}}},"credits":null}}}}}}"#,
+        now + 600,
+        now + 9000
+    );
+    let got = parse_codex_account_rate_limits(&reply, now).expect("parses");
+    assert_eq!((got.five_hour_pct, got.weekly_pct), (41.0, 72.0));
+    assert_eq!(got.five_hour_reset_epoch, now + 600);
+}
+
+#[test]
+fn an_app_server_error_or_empty_reply_is_not_a_reading() {
+    assert!(parse_codex_account_rate_limits(r#"{"id":2,"error":{"code":-1}}"#, 0).is_none());
+    assert!(parse_codex_account_rate_limits(r#"{"id":2,"result":{}}"#, 0).is_none());
+    assert!(parse_codex_account_rate_limits("not json", 0).is_none());
+}
+
+struct OneReply(String, Vec<String>);
+
+impl crate::dispatch::codex::CodexRpc for OneReply {
+    fn request(&mut self, _request_id: i64, request: &str) -> crate::error::Result<String> {
+        self.1.push(request.to_string());
+        Ok(self.0.clone())
+    }
+}
+
+#[test]
+fn the_account_read_asks_the_daemon_for_rate_limits() {
+    let mut rpc = OneReply(ACCOUNT_RATE_LIMITS_0_158.to_string(), Vec::new());
+    let got = codex_account_headroom_on_rpc(&mut rpc, 1_790_600_000).expect("reading");
+    assert_eq!(got.weekly_pct, 19.0);
+    assert!(
+        rpc.1[0].contains("\"account/rateLimits/read\""),
+        "the request names the method: {}",
+        rpc.1[0]
+    );
+}
+
+#[test]
+fn an_all_null_daemon_reply_defers_to_the_rollouts_rather_than_reading_as_a_verdict() {
+    let reply = r#"{"id":2,"result":{"rateLimits":{"limitId":"codex","primary":null,"secondary":null,"credits":null}}}"#;
+    let mut rpc = OneReply(reply.to_string(), Vec::new());
+    assert!(
+        codex_account_headroom_on_rpc(&mut rpc, 1_790_600_000).is_none(),
+        "a reply with no windows and no credits is no reading at all"
+    );
+}

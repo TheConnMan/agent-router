@@ -3,6 +3,14 @@
 All notable changes to this project are documented here. Versions are the
 workspace `package.version` stamped on every decision-log row.
 
+## 0.33.0 - 2026-09-28
+
+- Codex usage is now read live from the app-server daemon's `account/rateLimits/read` reply.
+  codex-cli 0.158 writes `rate_limits` events with null windows and null credits into rollouts, so
+  the rollout scan found no verdict and Codex failed closed, reported as `fail-open` with an unknown
+  weekly percent. The rollout
+  scan remains the fallback when no daemon answers.
+
 ## 0.32.0 - 2026-09-28
 
 - Adversarial review selection follows `[adversarial_review] reviewer_priority` (default

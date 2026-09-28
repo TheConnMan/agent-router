@@ -157,8 +157,11 @@ Usage comes from:
 - **Claude**: `/tmp/claude-usage-cache.json` when it is under five minutes old, otherwise the OAuth
   usage endpoint authenticated with `~/.claude/.credentials.json`. A successful fetch refreshes
   that shared cache, which the statusline and other tooling also read.
-- **Codex**: the newest rollout under `$CODEX_HOME/sessions` (default `~/.codex/sessions`) that
-  carries a `rate_limits` event. Override the scan root with `$CODEX_SESSIONS_DIR`.
+- **Codex**: the running app-server daemon's `account/rateLimits/read` reply. The router only
+  probes for a daemon and never starts one. With no daemon up, it falls back to the newest rollout
+  under `$CODEX_HOME/sessions` (default `~/.codex/sessions`) that carries a `rate_limits` verdict.
+  Override the scan root with `$CODEX_SESSIONS_DIR`. codex-cli 0.158 writes only null windows into
+  rollouts, so on current CLIs the fallback usually finds nothing and Codex fails closed.
 - **Grok**: a read-through cache at `/tmp/grok-usage-cache.json`, overridden with
   `$GROK_USAGE_CACHE`. A valid cache under 300 seconds old is used directly. Otherwise Router
   fetches live Grok billing and writes a normalized, non-secret cache entry on success; if that

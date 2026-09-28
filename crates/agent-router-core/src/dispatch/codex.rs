@@ -232,6 +232,37 @@ pub fn rename_thread(ctx: &Context, thread_id: &str, expected: &str, name: &str)
     }
 }
 
+/// The account-wide rate-limit read. codex-cli 0.158 stopped filling the `rate_limits` event in
+/// rollouts (every window and the credits object are null), so this reply is where the real
+/// Codex windows now live.
+pub fn account_rate_limits_request(id: i64) -> String {
+    request(id, "account/rateLimits/read", serde_json::Value::Null)
+}
+
+/// IMPURE only in the RPC it is handed: the raw `account/rateLimits/read` reply, or None when the
+/// daemon would not answer. Id 2 because the handshake owns id 1.
+pub fn account_rate_limits_on_rpc(rpc: &mut impl CodexRpc) -> Option<String> {
+    rpc.request(2, &account_rate_limits_request(2)).ok()
+}
+
+/// IMPURE: the account rate-limit reply from the running daemon.
+///
+/// Probes and never starts a daemon: a usage read must not create provider state, and no daemon
+/// means the caller falls back to the rollouts.
+pub fn account_rate_limits(ctx: &Context) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let daemon = probe_daemon(ctx)?;
+        let mut client = Client::connect(&daemon).ok()?;
+        account_rate_limits_on_rpc(&mut client)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = ctx;
+        None
+    }
+}
+
 /// IMPURE: what the app-server knows about each thread, one `thread/read` apiece.
 ///
 /// This probes for a daemon and never starts one: a command reporting on jobs that already exist
