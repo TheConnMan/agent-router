@@ -590,3 +590,13 @@ fn the_account_read_asks_the_daemon_for_rate_limits() {
         rpc.1[0]
     );
 }
+
+#[test]
+fn an_all_null_daemon_reply_defers_to_the_rollouts_rather_than_reading_as_a_verdict() {
+    let reply = r#"{"id":2,"result":{"rateLimits":{"limitId":"codex","primary":null,"secondary":null,"credits":null}}}"#;
+    let mut rpc = OneReply(reply.to_string(), Vec::new());
+    assert!(
+        codex_account_headroom_on_rpc(&mut rpc, 1_790_600_000).is_none(),
+        "a reply with no windows and no credits is no reading at all"
+    );
+}

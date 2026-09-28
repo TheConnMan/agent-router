@@ -322,9 +322,9 @@ TypeSafe key is `TYPESAFE_API_KEY` or `TYPESAFE_AI_KEY` in the environment, neve
 
 Two consequences of `"codex"` worth knowing. Scoring runs with every tool disabled, so it cannot
 read a file even though the sandbox is read only. And it writes a session rollout per scored task
-rather than running ephemeral, deliberately: `codex_headroom` reads the newest rollout carrying a
-`rate_limits` event, so an ephemeral classifier would spend Codex quota invisibly and leave the
-router deciding against a frozen percentage. The cost is one session file per automatically routed
+rather than running ephemeral, deliberately: when no app-server daemon answers, `codex_headroom`
+falls back to the newest rollout carrying a `rate_limits` verdict, so an ephemeral classifier would
+spend Codex quota invisibly and leave that fallback deciding against a frozen percentage. The cost is one session file per automatically routed
 task.
 
 ### `claude_model` and `codex_model`

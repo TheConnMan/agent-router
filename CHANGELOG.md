@@ -7,7 +7,8 @@ workspace `package.version` stamped on every decision-log row.
 
 - Codex usage is now read live from the app-server daemon's `account/rateLimits/read` reply.
   codex-cli 0.158 writes `rate_limits` events with null windows and null credits into rollouts, so
-  the rollout scan found no verdict and Codex read as fail-open whatever it had spent. The rollout
+  the rollout scan found no verdict and Codex failed closed, reported as `fail-open` with an unknown
+  weekly percent. The rollout
   scan remains the fallback when no daemon answers.
 
 ## 0.32.0 - 2026-09-28
