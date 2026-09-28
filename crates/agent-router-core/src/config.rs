@@ -852,12 +852,12 @@ mod tests {
 
         let text = std::fs::read_to_string(&path).expect("re-read");
         assert!(text.contains("classifier_timeout_secs = 30"), "{text}");
-        assert!(text.contains("config_version = 5"), "{text}");
+        assert!(text.contains("config_version = 7"), "{text}");
     }
 
-    /// A v4 file carrying the three dead keys parses, is rewritten without them, and is stamped 5.
+    /// A v4 file carrying the three dead keys parses, is rewritten without them, and is stamped 7.
     #[test]
-    fn a_v4_file_carrying_dead_keys_is_rewritten_without_them_and_stamped_five() {
+    fn a_v4_file_carrying_dead_keys_is_rewritten_without_them_and_stamped_current() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
         std::fs::write(
@@ -877,7 +877,7 @@ mod tests {
         assert!(config.policy.weekly_routing);
 
         let text = std::fs::read_to_string(&path).expect("re-read");
-        assert!(text.contains("config_version = 5"), "{text}");
+        assert!(text.contains("config_version = 7"), "{text}");
         assert!(
             !text.contains("default_provider"),
             "dead policy key must leave the file: {text}"
@@ -1145,23 +1145,63 @@ mod tests {
     }
 
     #[test]
-    fn adversarial_review_claude_reserve_defaults_and_is_operator_configurable() {
+    fn adversarial_review_priority_defaults_to_codex_grok_claude() {
+        use crate::provider::Provider;
         assert_eq!(
-            Config::default()
-                .adversarial_review
-                .claude_usage_reserve_pct,
-            25.0
+            Config::default().adversarial_review.reviewer_priority,
+            vec![Provider::Codex, Provider::Grok, Provider::Claude]
         );
+    }
 
+    #[test]
+    fn a_configured_reviewer_priority_is_loaded() {
+        use crate::provider::Provider;
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
         let config = load_config(
-            "[adversarial_review]\nclaude_usage_reserve_pct = 12.5\n",
+            "[adversarial_review]\nreviewer_priority = [\"claude\", \"codex\"]\n",
             &path,
         )
-        .expect("load the configured reserve");
+        .expect("load the configured priority");
 
-        assert_eq!(config.adversarial_review.claude_usage_reserve_pct, 12.5);
+        assert_eq!(
+            config.adversarial_review.reviewer_priority,
+            vec![Provider::Claude, Provider::Codex]
+        );
+    }
+
+    /// The live box is stamped 6 with the removed reserve key; the rewrite drops it, writes the
+    /// priority, and stamps 7.
+    #[test]
+    fn a_v6_file_with_the_claude_reserve_is_rewritten_to_v7_with_reviewer_priority() {
+        use crate::provider::Provider;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "config_version = 6\n\
+             \n\
+             [adversarial_review]\n\
+             claude_usage_reserve_pct = 25.0\n",
+        )
+        .expect("write");
+
+        let config = Config::load_from(&path).expect("loads");
+        assert_eq!(config.config_version, CURRENT_CONFIG_VERSION);
+        assert_eq!(
+            config.adversarial_review.reviewer_priority,
+            vec![Provider::Codex, Provider::Grok, Provider::Claude]
+        );
+
+        let text = std::fs::read_to_string(&path).expect("re-read");
+        assert!(text.contains("config_version = 7"), "{text}");
+        assert!(
+            !text.contains("claude_usage_reserve_pct"),
+            "the removed reserve key must leave the file: {text}"
+        );
+        assert!(text.contains("reviewer_priority"), "{text}");
+        let reread = Config::load_from(&path).expect("re-loads");
+        assert_eq!(reread, config);
     }
 
     #[test]
