@@ -156,7 +156,11 @@ impl ReviewFixture {
              if [ -n \"${{AGENT_ROUTER_FIXTURE_REVIEW_DELAY:-}}\" ]; then\n\
                sleep \"$AGENT_ROUTER_FIXTURE_REVIEW_DELAY\"\n\
              fi\n\
-             printf '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":\"codex completed review\"}}}}\\n'\n",
+             printf '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":\"codex completed review\"}}}}\\n'\n\
+             if [ \"${{AGENT_ROUTER_FIXTURE_CODEX_EXIT_AFTER_REVIEW:-0}}\" = \"1\" ]; then\n\
+               printf 'codex exited nonzero after the review\\n' >&2\n\
+               exit 1\n\
+             fi\n",
             shell_quote(&codex_log.to_string_lossy()),
         );
         common::write_stub(&bin.join("codex"), &codex_body);
@@ -715,6 +719,30 @@ fn a_rate_limited_codex_reviewer_fails_over_to_claude_and_records_it() {
     assert_eq!(rows[0].exit_status, 0);
     assert_eq!(rows[0].reviewer_provider.as_deref(), Some("claude"));
     assert_eq!(rows[0].fallback_from.as_deref(), Some("codex"));
+}
+
+/// A reviewer that printed a complete review body and then exited nonzero still completed the
+/// review: the body is returned and nothing fails over.
+#[test]
+fn a_completed_codex_review_that_exits_nonzero_does_not_fail_over() {
+    let fixture = ReviewFixture::new("codex exits after review");
+    let output = fixture
+        .command_for("grok", &fixture.cwd)
+        .arg("--json")
+        .env("AGENT_ROUTER_FIXTURE_CODEX_EXIT_AFTER_REVIEW", "1")
+        .output()
+        .expect("run adversarial review");
+
+    assert_exit(&output, 0);
+    let value = parse_json(&output);
+    assert_eq!(value["status"], "completed");
+    assert_eq!(value["reviewer_provider"], "codex");
+    assert_eq!(value["fallback_from"], Value::Null);
+    assert_eq!(value["result"], "codex completed review");
+    assert!(
+        !fixture.claude_log.exists(),
+        "claude was tried as a failover"
+    );
 }
 
 #[test]

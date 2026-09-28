@@ -642,8 +642,14 @@ impl ReviewProvider for ClaudeReviewProvider<'_> {
         cancelled: &dyn Fn() -> bool,
     ) -> Result<(String, Option<String>)> {
         let (command, binary) = self.review_command(request)?;
-        parse_claude_output(run_review(command, &binary, Provider::Claude, cancelled)?)
-            .map(|result| (result, None))
+        run_review(
+            command,
+            &binary,
+            Provider::Claude,
+            cancelled,
+            parse_claude_output,
+        )
+        .map(|result| (result, None))
     }
 }
 
@@ -706,8 +712,14 @@ impl ReviewProvider for CodexReviewProvider<'_> {
         cancelled: &dyn Fn() -> bool,
     ) -> Result<(String, Option<String>)> {
         let (command, binary) = self.review_command(request)?;
-        parse_codex_output(run_review(command, &binary, Provider::Codex, cancelled)?)
-            .map(|result| (result, None))
+        run_review(
+            command,
+            &binary,
+            Provider::Codex,
+            cancelled,
+            parse_codex_output,
+        )
+        .map(|result| (result, None))
     }
 }
 
@@ -987,7 +999,11 @@ fn review_binary(ctx: &Context, review_env: &'static str, provider: Provider) ->
     )
 }
 
-/// IMPURE: run one reviewer child to completion, or kill it when `cancelled` goes true.
+/// IMPURE: run one reviewer child to completion, or kill it when `cancelled` goes true, and
+/// return the review body `parse` extracts from its stdout.
+///
+/// A nonzero exit is a failure only when stdout holds no review body: a reviewer that printed a
+/// complete review and then exited nonzero still completed the review, so failover must not fire.
 ///
 /// Both pipes are drained by their own threads for the whole life of the child. That is not an
 /// optimization: polling `try_wait` while reading neither pipe deadlocks as soon as a reviewer
@@ -1001,6 +1017,7 @@ fn run_review(
     binary: &Path,
     provider: Provider,
     cancelled: &dyn Fn() -> bool,
+    parse: fn(String) -> Result<String>,
 ) -> Result<String> {
     let override_env = review_override(provider);
     let provider = provider.name();
@@ -1041,6 +1058,13 @@ fn run_review(
     let stderr = stderr_drain.join().unwrap_or_default();
 
     if !status.success() {
+        if let Some(review) = String::from_utf8(stdout)
+            .ok()
+            .and_then(|stdout| parse(stdout).ok())
+            .filter(|review| !review.is_empty())
+        {
+            return Ok(review);
+        }
         let detail = String::from_utf8_lossy(&stderr).trim().to_string();
         let suffix = if detail.is_empty() {
             String::new()
@@ -1053,6 +1077,7 @@ fn run_review(
     }
     String::from_utf8(stdout)
         .map_err(|_| Error::Command(format!("{provider} review printed non UTF-8 output")))
+        .and_then(parse)
 }
 
 /// IMPURE: read one of the child's pipes to EOF on its own thread.

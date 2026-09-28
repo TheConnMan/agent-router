@@ -23,13 +23,14 @@ Two rules govern the whole file:
 ## `config_version` and in-place migrations
 
 `config_version` is the stamp that says this file has already been rewritten to the current schema.
-On load, a file stamped below 5 is rewritten once and stamped 5. The rewrite is what drops keys the
+On load, a file stamped below 7 is rewritten once and stamped 7. The rewrite is what drops keys the
 router no longer has (`policy.default_provider`, `projection_overdraw_pct`,
 `claude_five_hour_pacing_pct`, and older aliases such as `pace_flip_gap`): serde already ignores
 unknown keys on parse, so routing does not change, and the one rewrite stops the file from naming
-them.
+them. Version 7 also writes `[adversarial_review] reviewer_priority` into the file. Version 6 was
+stamped by a reverted build and carries no change of its own.
 
-Operator-chosen values are left alone. A file already stamped `config_version = 5` is not rewritten.
+Operator-chosen values are left alone. A file already stamped `config_version = 7` is not rewritten.
 
 Two consequences worth knowing. The rewrite serializes the whole config, so hand-added comments in
 the file are lost the one time a migration runs. And a file with no `config_version` key is treated
@@ -38,7 +39,7 @@ as predating versioning, so do not delete the key to "reset" anything.
 ## Defaults in full
 
 ```toml
-config_version = 5
+config_version = 7
 hard_ceiling_pct = 98.0
 classifier_timeout_secs = 60
 connectors = ["local shell"]
@@ -66,6 +67,9 @@ low = "claude-opus-5-5[1m]"
 medium = "claude-opus-5-5[1m]"
 high = "claude-opus-5-5[1m]"
 ultra = "claude-opus-5-5[1m]"
+
+[adversarial_review]
+reviewer_priority = ["codex", "grok", "claude"]
 
 [parity]
 roots = []
@@ -272,6 +276,21 @@ a move off an ineligible first candidate records `flipped_on_exhaustion`. A larg
 A worked example: `priority = ["claude", "grok", "codex"]`, margin 10, draws 70, 90, 55: best
 is 55, Claude (70) is 15 over, Grok (90) is 35 over, Codex wins with
 `priority_overridden_by_usage`. With Claude at 65 Claude wins.
+
+## `[adversarial_review]`
+
+### `reviewer_priority`
+
+Default `["codex", "grok", "claude"]`. The order `agent-router adversarial-review` tries
+reviewers in, lowercase `"claude"`, `"codex"`, `"grok"`. Selection reads this list and nothing
+else: no usage reading, ceiling, or reserve moves a review. The primary provider named by
+`--primary` is always skipped.
+
+A reviewer that fails before producing a review (unavailable, a launch error, or a nonzero exit
+with no review body) hands the review to the next one in the list, and the result records
+`fallback_from`. A reviewer that printed a complete review body is the review, even when it then
+exits nonzero, so a completed review never fails over. A cancelled review stops and does not fail
+over. Naming a provider twice is a configuration error.
 
 ## `[policy]`
 

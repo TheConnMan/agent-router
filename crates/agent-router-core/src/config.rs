@@ -273,6 +273,22 @@ pub struct AdversarialReviewConfig {
     pub reviewer_priority: Vec<crate::provider::Provider>,
 }
 
+impl AdversarialReviewConfig {
+    /// PURE: reject a reviewer list that names a provider twice. A repeat would retry the same
+    /// failed reviewer and record a failover from a provider to itself.
+    fn validate(&self) -> Result<()> {
+        for (index, provider) in self.reviewer_priority.iter().enumerate() {
+            if self.reviewer_priority[..index].contains(provider) {
+                return Err(crate::error::Error::Command(format!(
+                    "invalid [adversarial_review] in config: reviewer_priority lists {} more than once",
+                    provider.name()
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Default for AdversarialReviewConfig {
     fn default() -> AdversarialReviewConfig {
         use crate::provider::Provider;
@@ -583,13 +599,14 @@ impl Config {
     /// IMPURE: the config at `path`, created with defaults when absent, and migrated in place when
     /// it predates the current version. A file that exists but does not parse is an Err: silently
     /// substituting defaults would route jobs against ceilings and a connector list the operator
-    /// never wrote. An invalid `[routing]` table is an Err for the same reason, and is checked
+    /// never wrote. An invalid `[routing]` or `[adversarial_review]` table is an Err for the same reason, and is checked
     /// before migration so a rejected file is never rewritten.
     pub fn load_from(path: &Path) -> Result<Config> {
         match std::fs::read_to_string(path) {
             Ok(text) => {
                 let mut config: Config = toml::from_str(&text)?;
                 config.routing.validate()?;
+                config.adversarial_review.validate()?;
                 if config.migrate() {
                     config.write_to(path)?;
                 }
@@ -1169,6 +1186,24 @@ mod tests {
         assert_eq!(
             config.adversarial_review.reviewer_priority,
             vec![Provider::Claude, Provider::Codex]
+        );
+    }
+
+    #[test]
+    fn a_reviewer_priority_naming_a_provider_twice_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let error = load_config(
+            "[adversarial_review]\nreviewer_priority = [\"codex\", \"claude\", \"codex\"]\n",
+            &path,
+        )
+        .expect_err("a duplicate reviewer is a configuration error");
+
+        assert!(
+            error
+                .to_string()
+                .contains("reviewer_priority lists codex more than once"),
+            "{error}"
         );
     }
 
