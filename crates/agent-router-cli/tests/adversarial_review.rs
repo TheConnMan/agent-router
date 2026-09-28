@@ -1492,5 +1492,5 @@ fn help_documents_the_pin_flags_honestly() {
     assert!(help.contains("--provider"), "{help}");
     assert!(help.contains("--model"), "{help}");
     assert!(help.contains("primary"), "{help}");
-    assert!(help.contains("eligib"), "{help}");
+    assert!(help.contains("priority"), "{help}");
 }

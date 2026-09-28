@@ -65,7 +65,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Run a synchronous read only review on an eligible alternative provider.
+    /// Run a synchronous read only review on the first reviewer in priority order that is not the primary.
     AdversarialReview {
         /// The review request.
         request: String,
