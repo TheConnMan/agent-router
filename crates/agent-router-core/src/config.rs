@@ -17,7 +17,7 @@ const DEFAULT_CLAUDE_MODEL: &str = "claude-opus-5-5[1m]";
 
 /// The migration level a config file written by this build carries. A file stamped below this is
 /// rewritten once so dead keys drop off disk; serde already ignores them on parse.
-const CURRENT_CONFIG_VERSION: u32 = 5;
+const CURRENT_CONFIG_VERSION: u32 = 7;
 
 /// The level a file that predates versioning reads as. This is deliberately NOT
 /// `CURRENT_CONFIG_VERSION`: an absent key has to be distinguishable from a stamped one, or every
@@ -263,21 +263,21 @@ pub struct ParityConfig {
     pub exceptions: Vec<ParityException>,
 }
 
-/// Capacity preferences for adversarial reviews. These adjust selection only after a candidate
-/// has passed the independent, fresh-capacity, and raw-usage eligibility gates.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+/// Reviewer order for adversarial reviews. Selection reads this list and nothing else: no usage,
+/// no ceiling, no reserve.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct AdversarialReviewConfig {
-    /// Reserve Claude capacity for work that needs its stronger sealed review environment. A
-    /// positive value makes Claude win only when its raw weekly use is this many points lower than
-    /// another eligible reviewer.
-    pub claude_usage_reserve_pct: f64,
+    /// Reviewers in the order they are tried. The primary provider is skipped, and a reviewer that
+    /// fails before producing a review hands over to the next one.
+    pub reviewer_priority: Vec<crate::provider::Provider>,
 }
 
 impl Default for AdversarialReviewConfig {
     fn default() -> AdversarialReviewConfig {
+        use crate::provider::Provider;
         AdversarialReviewConfig {
-            claude_usage_reserve_pct: 25.0,
+            reviewer_priority: vec![Provider::Codex, Provider::Grok, Provider::Claude],
         }
     }
 }
@@ -608,7 +608,9 @@ impl Config {
     /// whether it now needs rewriting. The rewrite is what drops dead keys from disk: serde
     /// already ignores unknown keys on parse, so a v4 file still carrying `default_provider` or
     /// `projection_overdraw_pct` keeps routing the same either way, and the one rewrite is what
-    /// stops the file from naming keys the router no longer has.
+    /// stops the file from naming keys the router no longer has. Version 7 drops the removed
+    /// `claude_usage_reserve_pct` and writes `reviewer_priority`; version 6 was stamped by a
+    /// reverted build and carries nothing of its own.
     ///
     /// Operator-chosen values are left alone. The v1–v4 steps that used to correct generated
     /// defaults this tool itself wrote are gone: those corrections already ran on every stamped

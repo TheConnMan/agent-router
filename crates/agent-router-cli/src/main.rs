@@ -75,12 +75,10 @@ enum Command {
         /// Working directory for the review. Defaults to the current directory.
         #[arg(long)]
         dir: Option<PathBuf>,
-        /// auto selects the eligible alternative with the most headroom. codex, claude, or grok
-        /// pins the reviewer instead. A pin must differ from --primary and still passes every
-        /// eligibility gate (authoritative fresh capacity below the ceiling, and for claude the
-        /// configured reserve as a floor). A pin refused on the usage or reserve gate is retried
-        /// once on the next eligible reviewer that is not the primary. Any other ineligible pin
-        /// is reported as skipped, never rerouted.
+        /// auto tries reviewers in the `[adversarial_review] reviewer_priority` order, skipping
+        /// the primary and moving to the next when one fails before producing a review. codex,
+        /// claude, or grok pins the reviewer instead: only the pin runs, it must differ from
+        /// --primary, and a pinned reviewer that fails leaves the review failed, never rerouted.
         #[arg(long, default_value = "auto")]
         provider: String,
         /// Reviewer model, passed to the pinned provider verbatim. Requires an explicit

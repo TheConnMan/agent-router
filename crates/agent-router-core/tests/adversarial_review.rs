@@ -28,10 +28,6 @@ impl<'a> StubReviewer<'a> {
         }
     }
 
-    fn failing(provider: &'a str, model: &'a str) -> Self {
-        Self::failing_with(provider, model, "review invocation failed")
-    }
-
     fn failing_with(provider: &'a str, model: &'a str, message: &'a str) -> Self {
         Self {
             provider,
