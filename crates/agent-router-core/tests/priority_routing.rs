@@ -150,7 +150,7 @@ fn a_first_listed_claude_keeps_ordinary_work_on_an_even_week() {
     assert_eq!(decision.provider, Provider::Claude);
     assert_no_move_gate(&decision, "Claude led and stayed");
     assert_eq!(decision.model.as_deref(), Some("claude-opus-5-5[1m]"));
-    assert_eq!(decision.effort.as_deref(), Some("low"));
+    assert_eq!(decision.effort.as_deref(), Some("medium"));
     assert!(!decision.capability_blocked);
 }
 

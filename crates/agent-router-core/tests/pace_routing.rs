@@ -184,7 +184,7 @@ fn an_orchestration_task_pins_to_claude_past_every_usage_rule() {
 
     assert_eq!(decision.provider, Provider::Claude);
     assert_eq!(decision.model.as_deref(), Some("claude-opus-5-5[1m]"));
-    assert_eq!(decision.effort.as_deref(), Some("low"));
+    assert_eq!(decision.effort.as_deref(), Some("medium"));
     assert!(decision.gates.contains(&Gate::Orchestration));
 }
 
@@ -1056,7 +1056,8 @@ fn codex_effort_follows_the_complexity_ladder_with_custom_models() {
     }
 }
 
-/// Claude uses the same effort ladder as Codex, against its own configured model table.
+/// Claude uses the Codex effort ladder against its own configured model table, except that high
+/// complexity holds at medium.
 #[test]
 fn claude_effort_follows_the_complexity_ladder() {
     let mut config = Config::default();
@@ -1068,7 +1069,7 @@ fn claude_effort_follows_the_complexity_ladder() {
     let cases = [
         (Complexity::Low, "sonnet", "high"),
         (Complexity::Medium, "opus[1m]", "medium"),
-        (Complexity::High, "fable", "low"),
+        (Complexity::High, "fable", "medium"),
         (Complexity::Ultra, "fable", "high"),
     ];
 

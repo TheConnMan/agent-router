@@ -81,6 +81,7 @@ log: row 87 in /home/you/.local/state/agent-router/router.db
    provider through usage routing, then complexity walks that provider's model tier table and
    shared effort ladder: low uses the workhorse at high effort, medium uses the stronger model at
    medium, high uses the top model at low, and ultra keeps the top model but raises effort to high.
+   Claude holds high complexity at medium effort, since every Claude tier is the same model.
    Grok uses its lifecycle default model and effort. An explicit
    Claude or Codex provider preserves that provider while classification fills omitted model and
    effort. An explicit Claude or Codex provider and model preserves both while classification fills
@@ -200,7 +201,7 @@ agent-router run "Fix the failing test" --surface t3
 | `--dir <PATH>` | current directory | Working directory for the dispatched job. |
 | `--provider <NAME>` | `auto` | `auto` classifies the task, balances ordinary work across `[routing] priority`, and pins Claude for capability needs. An explicit provider pins it. |
 | `--model <NAME>` | tier table | Model pin. Requires an explicit `--provider`. With explicit Claude or Codex and no effort, classification fills effort. Pairing it with `--provider auto` is rejected. An explicit Grok model reaches the public lifecycle unchanged. |
-| `--effort <NAME>` | complexity ladder | Effort pin. Requires an explicit provider and model. Derived Codex and Claude effort is high, medium, low, or high for low, medium, high, or ultra complexity respectively. Grok rejects this flag. |
+| `--effort <NAME>` | complexity ladder | Effort pin. Requires an explicit provider and model. Derived Codex effort is high, medium, low, or high for low, medium, high, or ultra complexity respectively; Claude is the same except high complexity stays at medium. Grok rejects this flag. |
 | `--name <NAME>` | the model's title, recovered if it omitted a ticket; otherwise three to five words derived from the task, replaced after launch by [asynchronous naming](#asynchronous-session-naming) | Name for the dispatched job. Supplying it skips naming entirely, before and after launch. It reaches the `claude --bg --name` argv verbatim, names the Codex thread, and is recorded as `job_name` in the decision log for every provider, so callers that reconcile inflight jobs by exact name depend on it. An empty or whitespace only name is rejected. |
 | `--dry-run` | off | Decide and log, dispatch nothing, and project the weekly draw the job is likely to cost on the provider it landed on. |
 | `--mcp-config <PATH>` | none | MCP config file for the dispatched Claude job. Repeatable. Rejected for every other provider, including Grok, and the check runs after routing, so pairing it with `--provider auto` fails whenever classification lands on a provider other than Claude. On the `t3` surface a Claude job accepts it but drops it with one stderr warning, because T3 has no MCP flags and the thread inherits the project's MCP servers. |

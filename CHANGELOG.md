@@ -3,6 +3,13 @@
 All notable changes to this project are documented here. Versions are the
 workspace `package.version` stamped on every decision-log row.
 
+## 0.34.0 - 2026-09-29
+
+- Claude jobs classified high complexity now run at medium effort instead of low. The effort
+  ladder lowers effort at high because Codex moves to a stronger model there, but every Claude
+  tier is the same Opus model, so a harder task was getting less reasoning than a medium one.
+  Codex is unchanged, and an explicit `--model` now follows the same per-provider rule.
+
 ## 0.33.0 - 2026-09-28
 
 - Codex usage is now read live from the app-server daemon's `account/rateLimits/read` reply.
