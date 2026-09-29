@@ -439,15 +439,7 @@ pub fn decide_explicit(
         .map(|classification| classification.complexity);
     let requested_model = model.clone();
     let model = model.or_else(|| complexity.and_then(|value| model_for(provider, value, config)));
-    let effort = effort.or_else(|| {
-        complexity.and_then(|value| {
-            if requested_model.is_some() && provider != Provider::Grok {
-                Some(complexity_effort(value).to_string())
-            } else {
-                effort_for(provider, value)
-            }
-        })
-    });
+    let effort = effort.or_else(|| complexity.and_then(|value| effort_for(provider, value)));
     let rationale = classification
         .as_ref()
         .map(|classification| {
@@ -498,10 +490,15 @@ fn model_for(provider: Provider, complexity: Complexity, config: &Config) -> Opt
 /// Each stronger model enters at a lower reasoning setting: low-complexity work uses the workhorse
 /// at high effort, medium uses the stronger model at medium, and high uses the top model at low.
 /// Ultra keeps the top model and raises its effort to high.
+///
+/// Claude is the exception at high: its tiers all resolve to the same Opus model, so dropping to
+/// low would give a harder task the same model with less reasoning than a medium one. It holds at
+/// medium instead.
 fn effort_for(provider: Provider, complexity: Complexity) -> Option<String> {
-    match provider {
-        Provider::Codex | Provider::Claude => Some(complexity_effort(complexity).to_string()),
-        Provider::Grok => None,
+    match (provider, complexity) {
+        (Provider::Claude, Complexity::High) => Some("medium".to_string()),
+        (Provider::Codex | Provider::Claude, _) => Some(complexity_effort(complexity).to_string()),
+        (Provider::Grok, _) => None,
     }
 }
 
@@ -632,7 +629,9 @@ mod tests {
             &config,
         );
         assert_eq!(claude.model.as_deref(), Some("claude-opus-5-5[1m]"));
-        assert_eq!(claude.effort.as_deref(), Some("low"));
+        // Claude has one model for every tier, so high complexity holds at medium rather than
+        // trading reasoning for a stronger model it does not get.
+        assert_eq!(claude.effort.as_deref(), Some("medium"));
     }
 
     #[test]

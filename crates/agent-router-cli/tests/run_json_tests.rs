@@ -1662,7 +1662,7 @@ fn provider_and_model_pins_preserve_model_and_derive_only_effort() {
 
     assert_eq!(value["provider"], "claude");
     assert_eq!(value["model"], "claude-custom-model");
-    assert_eq!(value["effort"], "low");
+    assert_eq!(value["effort"], "medium");
     assert_eq!(value["classification"]["complexity"], "high");
     assert_eq!(fixture.classifier_calls(), 1);
 
@@ -1675,7 +1675,7 @@ fn provider_and_model_pins_preserve_model_and_derive_only_effort() {
             "--model",
             "claude-custom-model",
             "--effort",
-            "low",
+            "medium",
             "--name",
             name,
             &fixture.task
