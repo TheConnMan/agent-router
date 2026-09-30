@@ -10,6 +10,9 @@ pub enum Error {
     Toml(#[from] toml::de::Error),
     #[error("{0}")]
     Command(String),
+    /// A launcher refused before creating any job. Callers can release a dispatch claim safely.
+    #[error("{0}")]
+    NotLaunched(String),
     /// A provider CLI could not be turned into a runnable path, or could not be exec'd once it
     /// was. Distinct from `Io` on purpose: this variant names the binary, the override that pins
     /// it, and where the resolver looked. See

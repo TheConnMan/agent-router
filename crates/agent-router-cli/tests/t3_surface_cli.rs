@@ -583,6 +583,17 @@ fn an_unverified_t3_version_fails_the_run_with_a_clear_message() {
     let text = stderr(&output);
     assert!(text.contains("VERIFIED_T3_VERSIONS"), "{text}");
     assert!(text.contains("unverified T3 version 0.0.99"), "{text}");
+    assert_eq!(output.status.code(), Some(1));
+    let failure: Value = serde_json::from_slice(&output.stdout).expect("failure JSON");
+    assert_eq!(failure["launched"], false, "{failure}");
+    assert!(failure.get("job_id").is_none(), "{failure}");
+    assert!(failure.get("dispatch").is_none(), "{failure}");
+    assert!(
+        failure["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("unverified T3 version 0.0.99")),
+        "{failure}"
+    );
 
     let row = fixture.newest_logged_row();
     assert!(
@@ -592,6 +603,46 @@ fn an_unverified_t3_version_fails_the_run_with_a_clear_message() {
         "{row}"
     );
     assert_eq!(row["surface"], "t3", "{row}");
+}
+
+/// Usage errors fail with a machine readable guarantee that no job exists.
+#[test]
+fn a_t3_usage_error_reports_not_launched_json_with_its_diagnostic() {
+    let fixture = T3Fixture::new("t3-exit2");
+    fixture.launcher_answers("", "unknown option --bad\n", 2);
+    let output = fixture.run(&with(&CODEX_PINNED, &["--surface", "t3", "--json"]));
+    assert_eq!(output.status.code(), Some(1));
+    let failure: Value = serde_json::from_slice(&output.stdout).expect("failure JSON");
+    assert_eq!(failure["launched"], false, "{failure}");
+    assert!(failure.get("job_id").is_none(), "{failure}");
+    assert!(failure.get("dispatch").is_none(), "{failure}");
+    assert!(
+        failure["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("unknown option --bad")),
+        "{failure}"
+    );
+    assert!(stderr(&output).contains("unknown option --bad"));
+}
+
+/// Runtime failures and contradictory thread evidence must preserve the ambiguous contract.
+#[test]
+fn possible_t3_launches_never_report_not_launched_json() {
+    let fixture = T3Fixture::new("t3-ambiguous");
+    for (code, stdout) in [
+        (1, String::new()),
+        (1, format!("THREAD_ID {THREAD_ID}\n")),
+        (2, format!("THREAD_ID {THREAD_ID}\n")),
+        (3, format!("THREAD_ID {THREAD_ID}\n")),
+        (2, launched_json()),
+        (3, launched_json()),
+    ] {
+        fixture.launcher_answers(&stdout, "runtime failure\n", code);
+        let output = fixture.run(&with(&CODEX_PINNED, &["--surface", "t3", "--json"]));
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty(), "exit {code}: {output:?}");
+        assert!(stderr(&output).contains("runtime failure"));
+    }
 }
 
 /// AC3. An override pinned to a missing launcher names the override; with no override and no
