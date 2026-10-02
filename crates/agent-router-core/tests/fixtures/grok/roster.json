@@ -1,0 +1,8 @@
+{
+  "sessions": [
+    {"sessionId":"session-durable","title":"Resident title","cwd":"/home/user/project","isWorktree":false,"modelId":"grok-4","reasoningEffort":null,"yolo":false,"activity":"working","lastTurnSummary":"Leader is authoritative","resident":true,"lastChangeUnixMs":1787289000000,"origin":{"kind":"local"}},
+    {"sessionId":"session-dead","title":"Dead leader row","cwd":"/home/user/project","isWorktree":false,"modelId":"grok-4","reasoningEffort":null,"yolo":false,"activity":"dead","lastTurnSummary":"Leader died","resident":true,"lastChangeUnixMs":1787289100000,"origin":{"kind":"local"}},
+    {"sessionId":"session-dormant","title":"Dormant leader row","cwd":"/home/user/project","isWorktree":false,"modelId":"grok-4","reasoningEffort":null,"yolo":false,"activity":"dormant","lastTurnSummary":"Not resident now","resident":true,"lastChangeUnixMs":1787289200000,"origin":{"kind":"local"}},
+    {"sessionId":"leader-only","title":"Leader only row","cwd":"/home/user/other","isWorktree":false,"modelId":"grok-4","reasoningEffort":null,"yolo":false,"activity":"needs_input","lastTurnSummary":"Waiting for approval","resident":true,"lastChangeUnixMs":1787289300000,"origin":{"kind":"local"}}
+  ]
+}

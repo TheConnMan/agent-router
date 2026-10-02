@@ -1,0 +1,6 @@
+{"type":"user","content":[{"type":"text","text":"earliest request"}]}
+{"type":"assistant","content":"older response","tool_calls":[]}
+{"type":"assistant","content":"","tool_calls":[{"id":"tool-1","name":"read_file","arguments":"{\"path\":\"/home/user/project/src/main.rs\"}"}]}
+{"type":"user","content":[{"type":"text","text":"latest request\nwith context"}]}
+{"type":"assistant","content":"latest answer","tool_calls":[]}
+{"type":"assistant","content":"torn

@@ -5,10 +5,10 @@ use agent_router_core::classify::{Classification, Complexity, TaskContextHorizon
 use agent_router_core::config::Config;
 use agent_router_core::decide::{Gate, decide, decide_explicit};
 use agent_router_core::dispatch::grok::dispatch_with_lifecycle;
+use agent_router_core::grok_leader::SpawnResult;
 use agent_router_core::run::parse_provider;
 use agent_router_core::usage::{Headroom, UsageSnapshot, grok_headroom_in};
 use agent_router_core::{Provider, Result};
-use agent_viewer_core::SpawnResult;
 use std::path::Path;
 use std::{fs, io::Write as _};
 
@@ -85,7 +85,6 @@ fn grok_dispatch_returns_the_exact_official_lifecycle_identity() {
             assert_eq!(task, "Review the router");
             assert_eq!(model, Some("grok-4"));
             Ok(SpawnResult {
-                pid: None,
                 session_id: Some(official_identity.to_string()),
             })
         },

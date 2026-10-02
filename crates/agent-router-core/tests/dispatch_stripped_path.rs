@@ -212,9 +212,9 @@ fn a_grok_lifecycle_enoent_after_resolution_is_still_a_launch_failure() {
         "Fixture Job",
         None,
         |_, _, _| {
-            Err(agent_viewer_core::Error::Io(std::io::Error::from(
-                std::io::ErrorKind::NotFound,
-            )))
+            Err(agent_router_core::grok_leader::Error::Io(
+                std::io::Error::from(std::io::ErrorKind::NotFound),
+            ))
         },
     )
     .expect_err("a lifecycle ENOENT is a launch failure");
@@ -232,7 +232,7 @@ fn a_grok_lifecycle_failure_that_is_not_a_missing_binary_keeps_its_existing_mess
         "Fixture Job",
         None,
         |_, _, _| {
-            Err(agent_viewer_core::Error::Command(
+            Err(agent_router_core::grok_leader::Error::Command(
                 "authoritative leader is unavailable".to_string(),
             ))
         },
