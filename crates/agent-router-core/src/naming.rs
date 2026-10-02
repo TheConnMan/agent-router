@@ -142,8 +142,9 @@ fn record_rename(ctx: &Context, log_id: i64, name: &str) -> Row {
 /// so a person renamed it and their title is kept. Only Codex and Claude can answer that question;
 /// Grok's rename RPC reports success and nothing else, so a Grok job is always renamed.
 ///
-/// Every mechanism here is Agent Viewer's, either its crate directly or, for Codex, the app-server
-/// call this crate already makes at dispatch.
+/// Every mechanism here is one this crate already owns: the Codex app-server call it makes at
+/// dispatch, the Claude `state.json` writer below, and the Grok leader client in
+/// [`crate::grok_leader`].
 pub fn rename(
     ctx: &Context,
     provider: Provider,
@@ -156,7 +157,7 @@ pub fn rename(
         Provider::Claude => rename_claude(&claude_jobs_root(&ctx.home), job_id, launch_name, name),
         Provider::Grok => {
             let binary = crate::binary::resolve(Provider::Grok, &ctx.environment)?;
-            agent_viewer_core::GrokLifecycle::new(binary, ctx.grok_home())
+            crate::grok_leader::GrokLifecycle::new(binary, ctx.grok_home())
                 .rename(job_id, name)
                 .map_err(|error| Error::Command(format!("Grok session rename failed: {error}")))?;
             Ok(true)
@@ -164,8 +165,8 @@ pub fn rename(
     }
 }
 
-/// `$CLAUDE_CONFIG_DIR/jobs` when set, else `{home}/.claude/jobs`: the same precedence Agent
-/// Viewer's own jobs root uses, resolved from this context's home rather than the process
+/// `$CLAUDE_CONFIG_DIR/jobs` when set, else `{home}/.claude/jobs`: the same precedence Claude
+/// itself uses for its jobs root, resolved from this context's home rather than the process
 /// environment so a test home is honoured.
 pub fn claude_jobs_root(home: &Path) -> PathBuf {
     match std::env::var_os("CLAUDE_CONFIG_DIR").filter(|value| !value.is_empty()) {
@@ -184,17 +185,16 @@ pub fn claude_jobs_root(home: &Path) -> PathBuf {
 ///
 /// That narrows the window; it does not close it. Claude's own worker writes this file while the
 /// job runs, and nothing in claude's format offers a compare-and-swap, so a write landing between
-/// this read and `replace_atomic` is lost. Agent Viewer's own rename accepts exactly this race, for
-/// the same reason and against the same writer.
+/// this read and `replace_atomic` is lost. Any outside rename of a Claude job accepts exactly this
+/// race, for the same reason and against the same writer.
 ///
-/// The three fields are the ones Agent Viewer's writer sets, for the reasons it gives:
-/// `nameSource: "user"` is what stops claude's auto-titler overwriting the name later, and claude
-/// stamps `updatedAt` on every state write, so leaving it stale would make the rename invisible to
-/// anything sorting or invalidating on it. The write itself is Agent Viewer's `replace_atomic`,
-/// which preserves the file's mode and never exposes a half-written state.json.
+/// The three fields are the ones a human rename sets: `nameSource: "user"` is what stops claude's
+/// auto-titler overwriting the name later, and claude stamps `updatedAt` on every state write, so
+/// leaving it stale would make the rename invisible to anything sorting or invalidating on it. The
+/// write itself is [`replace_atomic`], which preserves the file's mode and never exposes a
+/// half-written state.json.
 fn rename_claude(jobs_root: &Path, short_id: &str, launch_name: &str, name: &str) -> Result<bool> {
-    let path = agent_viewer_core::claude::job_state_path_in(jobs_root, short_id)
-        .map_err(|error| Error::Command(error.to_string()))?;
+    let path = job_state_path_in(jobs_root, short_id)?;
     // A missing file means the job is gone. That is an Err the worker reports and drops, never a
     // reason to create one: a blind write would fabricate a job state with no respawn contract.
     let mut state: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
@@ -215,13 +215,132 @@ fn rename_claude(jobs_root: &Path, short_id: &str, launch_name: &str, name: &str
     object.insert("nameSource".to_string(), serde_json::Value::from("user"));
     object.insert(
         "updatedAt".to_string(),
-        serde_json::Value::from(agent_viewer_core::claude::iso8601_utc_millis(
-            std::time::SystemTime::now(),
-        )),
+        serde_json::Value::from(iso8601_utc_millis(std::time::SystemTime::now())),
     );
-    agent_viewer_core::claude::replace_atomic(&path, &serde_json::to_string_pretty(&state)?)
+    replace_atomic(&path, &serde_json::to_string_pretty(&state)?)
         .map_err(|error| Error::Command(format!("Claude job rename failed: {error}")))?;
     Ok(true)
+}
+
+/// True when `short_id` is a single path component that can be joined under the jobs root.
+/// Empty, `.`, `..`, anything with a path separator, and anything Path would split into more than
+/// one component are refused so a hostile `claude agents` listing cannot walk out of the jobs root.
+fn is_safe_job_short_id(short_id: &str) -> bool {
+    if short_id.is_empty() || short_id == "." || short_id == ".." {
+        return false;
+    }
+    if short_id.contains('/') || short_id.contains('\\') {
+        return false;
+    }
+    let mut components = Path::new(short_id).components();
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(name)), None) => name == std::ffi::OsStr::new(short_id),
+        _ => false,
+    }
+}
+
+/// PURE: `<jobs_root>/<short_id>/state.json`. Refuses a short id that is not a single path
+/// component.
+fn job_state_path_in(jobs_root: &Path, short_id: &str) -> Result<PathBuf> {
+    if !is_safe_job_short_id(short_id) {
+        return Err(Error::Command(
+            "command failed: Claude job identity is not a single path component".to_string(),
+        ));
+    }
+    Ok(jobs_root.join(short_id).join("state.json"))
+}
+
+/// PURE: `SystemTime` as `YYYY-MM-DDTHH:MM:SS.mmmZ`, the exact shape JavaScript's `toISOString()`
+/// produces, because the value lands in a field claude writes with that call. Pre-epoch times
+/// clamp to the epoch (they cannot occur for a job state and are not worth a signed path).
+fn iso8601_utc_millis(time: std::time::SystemTime) -> String {
+    let since = time
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let (secs, millis) = (since.as_secs(), since.subsec_millis());
+    let (days, secs_of_day) = ((secs / 86_400) as i64, secs % 86_400);
+    // days_to_civil (Howard Hinnant's civil-from-days), shifted to an era starting 0000-03-01.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11], March-based
+    let day = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{millis:03}Z",
+        secs_of_day / 3600,
+        (secs_of_day % 3600) / 60,
+        secs_of_day % 60,
+    )
+}
+
+/// IMPURE: create `path` for writing, owner read/write only, failing if it already exists. The
+/// security property is that the file is NEVER group/other readable, not even for the instant
+/// between creation and a later chmod. umask can only clear bits, so 0600 is an upper bound.
+#[cfg(unix)]
+fn create_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
+    std::os::unix::fs::OpenOptionsExt::mode(
+        std::fs::OpenOptions::new().write(true).create_new(true),
+        0o600,
+    )
+    .open(path)
+}
+
+/// IMPURE: replace `path`'s contents with `body` atomically: write a temp file beside it, then
+/// rename over the target, so a concurrent reader (the claude daemon) sees either the old file or
+/// the new one, never a partial write. Mirrors claude's own state writer.
+///
+/// The temp file inherits the target's mode BEFORE the rename. Claude writes state.json 0600 while
+/// the jobs dir itself is traversable, so leaving the temp at the umask default would quietly
+/// publish that job's intent, output, respawn flags, and transcript path to every local user.
+///
+/// REPLACE, never create: a missing target is an error. `claude rm` can unlink state.json between
+/// the caller's read and this write, and resurrecting the file there would leave a ghost job behind
+/// the removal.
+#[cfg(unix)]
+fn replace_atomic(path: &Path, body: &str) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let tmp = dir.join(format!(
+        ".{}.agent-router.{}.tmp",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id()
+    ));
+    // Also the freshness check: metadata on the target is what proves it still exists.
+    let mode = std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(path)?.permissions());
+    // Create OWNER-ONLY, before a single byte is written: chmod-after-write leaves a window in
+    // which another local user can open the temp and read the whole job state.
+    let write = |tmp: &Path| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut file = create_owner_only(tmp)?;
+        file.write_all(body.as_bytes())?;
+        // Widen to the target's own mode only once the content is in place.
+        file.set_permissions(
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(mode),
+        )?;
+        Ok(())
+    };
+    if let Err(error) = write(&tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
+    if let Err(error) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Claude job state is only renamed on unix; elsewhere the write is refused with the text the
+/// rename has always reported there.
+#[cfg(not(unix))]
+fn replace_atomic(_path: &Path, _body: &str) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "claude does not support this action",
+    ))
 }
 
 /// IMPURE: start the detached worker that will name `job`.
@@ -381,5 +500,78 @@ mod tests {
             matches!(&naming, Naming::Skipped(why) if why.contains("no job id")),
             "{naming:?}"
         );
+    }
+
+    #[test]
+    fn iso8601_utc_millis_formats_known_instants() {
+        use std::time::{Duration, UNIX_EPOCH};
+        assert_eq!(iso8601_utc_millis(UNIX_EPOCH), "1970-01-01T00:00:00.000Z");
+        assert_eq!(
+            iso8601_utc_millis(UNIX_EPOCH + Duration::from_millis(1_785_095_531_007)),
+            "2026-07-26T19:52:11.007Z"
+        );
+        assert_eq!(
+            iso8601_utc_millis(UNIX_EPOCH + Duration::from_secs(1_709_209_845)),
+            "2024-02-29T12:30:45.000Z"
+        );
+        assert_eq!(
+            iso8601_utc_millis(UNIX_EPOCH + Duration::from_secs(1_735_689_599)),
+            "2024-12-31T23:59:59.000Z"
+        );
+    }
+
+    #[test]
+    fn job_state_path_in_refuses_anything_but_one_path_component() {
+        let root = Path::new("/jobs");
+        for short_id in ["", ".", "..", "../escape", "foo/bar", "foo\\bar", "/abs"] {
+            match job_state_path_in(root, short_id) {
+                Err(Error::Command(message)) => assert_eq!(
+                    message, "command failed: Claude job identity is not a single path component",
+                    "{short_id:?}"
+                ),
+                other => panic!("{short_id:?} was not refused: {other:?}"),
+            }
+        }
+        assert_eq!(
+            job_state_path_in(root, "ab12").expect("a plain short id"),
+            Path::new("/jobs/ab12/state.json")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replace_atomic_keeps_an_owner_only_target_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.json");
+        std::fs::write(&path, "old").expect("seed");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+
+        replace_atomic(&path, "new body").expect("replace");
+
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "new body");
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replace_atomic_refuses_a_missing_target_and_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.json");
+
+        let error = replace_atomic(&path, "body").expect_err("a missing target is an error");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(!path.exists(), "the target was created");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .flatten()
+            .map(|entry| entry.file_name())
+            .collect();
+        assert!(leftovers.is_empty(), "left behind {leftovers:?}");
     }
 }

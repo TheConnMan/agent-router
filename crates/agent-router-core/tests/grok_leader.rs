@@ -1,4 +1,4 @@
-//! Ported from agent-viewer-core `tests/grok_tests.rs` (pinned d0f9c6f) when agent-router took
+//! Ported from the Agent Viewer Grok test suite (rev d0f9c6f) when agent-router took
 //! ownership of the Grok leader client. Only the surface agent-router exercises is kept: durable
 //! listing and status, transcript tail, and the scripted leader lifecycle. PR-ref scanning, the
 //! durable parse cache, turn activity, model discovery, the Backend trait, listing scope, and

@@ -3,9 +3,9 @@ use crate::classify::Complexity;
 use crate::context::Context;
 use crate::dispatch::grok::spawn_with_lifecycle;
 use crate::error::{Error, Result};
+use crate::grok_leader::{GrokLifecycle, Status as GrokStatus, TailEvent};
 use crate::provider::Provider;
 use crate::usage::Headroom;
-use agent_viewer_core::{Backend, GrokBackend, GrokLifecycle, Status as GrokStatus, TailEvent};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -949,18 +949,17 @@ fn run_grok_review(
 
         match grok_review_poll(&session.status) {
             GrokReviewPoll::Complete => {
-                let backend = GrokBackend::new();
-                let result = match backend.tail(&session, 256) {
-                    Ok(events) => events.into_iter().rev().find_map(|event| match event {
-                        TailEvent::Agent(text) if !text.trim().is_empty() => Some(text),
-                        _ => None,
-                    }),
-                    Err(error) => {
-                        return Err(
-                            cleanup.failure(format!("Grok review transcript read failed: {error}"))
-                        );
-                    }
-                };
+                let result =
+                    match crate::grok_leader::read_tail(session.rollout_path.as_deref(), 256) {
+                        Ok(events) => events.into_iter().rev().find_map(|event| match event {
+                            TailEvent::Agent(text) if !text.trim().is_empty() => Some(text),
+                            _ => None,
+                        }),
+                        Err(error) => {
+                            return Err(cleanup
+                                .failure(format!("Grok review transcript read failed: {error}")));
+                        }
+                    };
                 let Some(result) = result else {
                     return Err(cleanup
                         .failure(format!("Grok review {session_id} returned no review body")));

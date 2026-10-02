@@ -10,10 +10,10 @@ use crate::binary::{self, Environment};
 use crate::config::{ClassifierEngine, Config, default_config_path};
 use crate::context::Context;
 use crate::error::Error;
+use crate::grok_leader::GrokLifecycle;
 use crate::log::DecisionLog;
 use crate::provider::Provider;
 use crate::usage::UsageSnapshot;
-use agent_viewer_core::GrokLifecycle;
 use std::path::PathBuf;
 
 /// How one check landed.

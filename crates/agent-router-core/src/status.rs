@@ -8,10 +8,10 @@
 use crate::config::Surface;
 use crate::context::Context;
 use crate::error::Result;
+use crate::grok_leader::{GrokLifecycle, Status as GrokStatus};
 use crate::log::{DecisionLog, StatusRow};
 use crate::provider::Provider;
 use crate::stats::Window;
-use agent_viewer_core::{GrokLifecycle, Status as GrokStatus};
 use std::collections::BTreeMap;
 use std::time::Duration;
 

@@ -2,12 +2,12 @@ use crate::binary::GROK_BIN_ENV;
 use crate::config::Surface;
 use crate::context::Context;
 use crate::error::{Error, Result};
+use crate::grok_leader::{GrokLifecycle, SpawnResult};
 use crate::provider::Provider;
 use crate::run::Dispatch;
-use agent_viewer_core::{GrokLifecycle, SpawnResult};
 use std::path::Path;
 
-/// IMPURE: start one headless Grok task through Agent Viewer's official lifecycle.
+/// IMPURE: start one headless Grok task through the persistent Grok leader's lifecycle.
 pub fn dispatch(
     ctx: &Context,
     cwd: &Path,
@@ -45,7 +45,7 @@ pub fn dispatch_with_lifecycle<F>(
     spawn: F,
 ) -> Result<Dispatch>
 where
-    F: FnOnce(&Path, &str, Option<&str>) -> agent_viewer_core::Result<SpawnResult>,
+    F: FnOnce(&Path, &str, Option<&str>) -> crate::grok_leader::Result<SpawnResult>,
 {
     dispatch_from(
         Path::new(Provider::Grok.name()),
@@ -67,7 +67,7 @@ fn dispatch_from<F>(
     spawn: F,
 ) -> Result<Dispatch>
 where
-    F: FnOnce(&Path, &str, Option<&str>) -> agent_viewer_core::Result<SpawnResult>,
+    F: FnOnce(&Path, &str, Option<&str>) -> crate::grok_leader::Result<SpawnResult>,
 {
     let session_id = exact_session_id(binary, spawn(cwd, task, model))?;
     Ok(Dispatch {
@@ -95,7 +95,7 @@ pub(crate) fn spawn_with_lifecycle(
 
 fn exact_session_id(
     binary: &Path,
-    spawned: agent_viewer_core::Result<SpawnResult>,
+    spawned: crate::grok_leader::Result<SpawnResult>,
 ) -> Result<String> {
     spawned
         .map_err(|error| match error {
@@ -103,11 +103,11 @@ fn exact_session_id(
             // covers — ENOENT, and the `EACCES` a lost exec bit or a `noexec` mount raises.
             // Declined kinds keep the existing message; tests assert on it. See
             // docs/decisions/0005-launch-error-and-binary-resolver.md.
-            agent_viewer_core::Error::Io(error) => {
+            crate::grok_leader::Error::Io(error) => {
                 match crate::binary::launch_error(binary, GROK_BIN_ENV, error) {
                     launch @ Error::Launch(_) => launch,
                     // `Error::Io`'s `Display` is the io error's own, and
-                    // `agent_viewer_core::Error::Io` is `#[error(transparent)]`, so this is the
+                    // `crate::grok_leader::Error::Io` is `#[error(transparent)]`, so this is the
                     // same sentence the unclassified arm produced.
                     Error::Io(error) => lifecycle_failure(&error),
                     other => other,
@@ -131,8 +131,8 @@ fn lifecycle_failure(error: &dyn std::fmt::Display) -> Error {
 mod tests {
     use super::*;
 
-    fn spawn_io(kind: std::io::ErrorKind) -> agent_viewer_core::Result<SpawnResult> {
-        Err(agent_viewer_core::Error::Io(std::io::Error::from(kind)))
+    fn spawn_io(kind: std::io::ErrorKind) -> crate::grok_leader::Result<SpawnResult> {
+        Err(crate::grok_leader::Error::Io(std::io::Error::from(kind)))
     }
 
     /// A resolved binary that lost its exec bit, or that sits on a `noexec` mount, fails the
