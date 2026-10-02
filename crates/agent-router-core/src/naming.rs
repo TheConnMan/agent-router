@@ -193,7 +193,8 @@ pub fn claude_jobs_root(home: &Path) -> PathBuf {
 /// anything sorting or invalidating on it. The write itself is Agent Viewer's `replace_atomic`,
 /// which preserves the file's mode and never exposes a half-written state.json.
 fn rename_claude(jobs_root: &Path, short_id: &str, launch_name: &str, name: &str) -> Result<bool> {
-    let path = agent_viewer_core::claude::job_state_path_in(jobs_root, short_id);
+    let path = agent_viewer_core::claude::job_state_path_in(jobs_root, short_id)
+        .map_err(|error| Error::Command(error.to_string()))?;
     // A missing file means the job is gone. That is an Err the worker reports and drops, never a
     // reason to create one: a blind write would fabricate a job state with no respawn contract.
     let mut state: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
