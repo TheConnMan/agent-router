@@ -3,6 +3,19 @@
 All notable changes to this project are documented here. Versions are the
 workspace `package.version` stamped on every decision-log row.
 
+## Unreleased
+
+- Adversarial review skips with exit `3`, still recording its row, when no non-primary reviewer
+  could run: none registered, or every candidate unavailable. Claude and Codex are now unavailable
+  when their reviewer binary does not resolve. A candidate that ran and failed still fails with
+  exit `1`, and a pinned reviewer never skips.
+- An empty or whitespace-only review body fails with `review request body is empty` before any
+  reviewer runs, instead of being sent to every provider.
+- A relative `--dir` is made absolute before the row and the reviewer see it. Grok's session/new
+  rejected `.` with `Path is not absolute`.
+- The Grok review timeout grows with the request: 900 seconds up to 2 KiB, plus 180 seconds per
+  further KiB, capped at 3600 seconds. Large requests were timing out at a flat 900 seconds.
+
 ## 0.34.0 - 2026-09-29
 
 - Claude jobs classified high complexity now run at medium effort instead of low. The effort

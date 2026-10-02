@@ -282,7 +282,13 @@ quota error, an authentication or launch failure, an authoritative availability 
 nonzero exit with no review body) hands over to the next one, and the completed row records
 `fallback_from` as the candidate that failed immediately before the one that completed. A review
 that completes, findings included, never fails over, and neither does a cancel. When every
-candidate fails, the review fails with exit `1` and a reason listing each `provider: error`.
+candidate that ran fails, the review fails with exit `1` and a reason listing each
+`provider: error`. When no candidate could run at all (none registered other than the primary, or
+every one unavailable, such as a reviewer binary that does not resolve), the review is skipped with
+exit `3`, its row is still recorded, and the reason names each candidate and why it could not run.
+An empty or whitespace-only request body fails with exit `1` before any reviewer runs. A relative
+`--dir` is made absolute before the row is written or any reviewer starts. A Grok review waits 900
+seconds for a request up to 2 KiB, plus 180 seconds for each further KiB, capped at one hour.
 
 `--provider` pins the reviewer instead of the priority order, and `--model` pins the model that
 reviewer runs. Only the pinned reviewer runs: it must be registered, must name a provider other

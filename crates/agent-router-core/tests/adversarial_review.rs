@@ -312,10 +312,65 @@ fn when_every_candidate_fails_the_outcome_is_failed_and_lists_each_error() {
 fn a_primary_only_registry_has_no_candidate_and_invokes_nothing() {
     let codex = StubReviewer::successful("codex", "gpt", "wrong");
 
-    let result = review_with_providers(&request("codex"), &[&codex], &PRIORITY);
+    let outcome = review_with_providers(&request("codex"), &[&codex], &PRIORITY)
+        .expect("no candidate is a reported skip");
 
-    assert_not_completed(&result);
+    assert_eq!(outcome.status, ReviewStatus::Skipped, "{outcome:?}");
+    assert_eq!(outcome.status.exit_status(), 3);
+    assert_eq!(outcome.result, None);
     assert_eq!(codex.calls.get(), 0);
+}
+
+#[test]
+fn when_every_candidate_is_unavailable_the_outcome_is_skipped_and_names_each_reason() {
+    let codex = StubReviewer::successful("codex", "gpt", "wrong");
+    let grok = StubReviewer::unavailable("grok", "default", "grok is not installed");
+    let claude = StubReviewer::unavailable("claude", "opus", "claude binary not found");
+
+    let outcome = review_with_providers(&request("codex"), &[&codex, &grok, &claude], &PRIORITY)
+        .expect("nothing could run is a reported skip");
+
+    assert_eq!(outcome.status, ReviewStatus::Skipped, "{outcome:?}");
+    assert_eq!(outcome.status.exit_status(), 3);
+    assert_eq!(outcome.result, None);
+    let reason = outcome.reason.as_deref().unwrap_or_default();
+    for expected in ["grok is not installed", "claude binary not found"] {
+        assert!(
+            reason.contains(expected),
+            "{expected} missing from {reason}"
+        );
+    }
+    assert_eq!(codex.calls.get(), 0);
+    assert_eq!(grok.calls.get(), 0);
+    assert_eq!(claude.calls.get(), 0);
+}
+
+#[test]
+fn an_empty_body_fails_without_invoking_any_provider() {
+    for body in ["", "  \n\t "] {
+        let codex = StubReviewer::successful("codex", "gpt", "must not run");
+        let grok = StubReviewer::successful("grok", "default", "must not run");
+        let request = ReviewRequest {
+            primary_provider: "claude",
+            body,
+            dir: Path::new("/tmp/review target"),
+        };
+
+        let outcome = review_with_providers(&request, &[&codex, &grok], &PRIORITY)
+            .expect("an empty body is a reported failure");
+        assert_eq!(outcome.status, ReviewStatus::Failed, "{outcome:?}");
+        let reason = outcome.reason.as_deref().unwrap_or_default();
+        assert!(reason.contains("review request body is empty"), "{reason}");
+        assert_eq!(codex.calls.get() + grok.calls.get(), 0);
+
+        let outcome =
+            review_pinned_with_providers(&request, &[&codex, &grok], &pin(Provider::Grok, None))
+                .expect("an empty body is a reported failure");
+        assert_eq!(outcome.status, ReviewStatus::Failed, "{outcome:?}");
+        let reason = outcome.reason.as_deref().unwrap_or_default();
+        assert!(reason.contains("review request body is empty"), "{reason}");
+        assert_eq!(codex.calls.get() + grok.calls.get(), 0);
+    }
 }
 
 #[test]
@@ -415,6 +470,8 @@ fn an_unavailable_pin_does_not_fail_over() {
     );
 
     assert_not_completed(&result);
+    let outcome = result.expect("an unavailable pin is a reported failure");
+    assert_eq!(outcome.status, ReviewStatus::Failed, "pins never skip");
     assert_eq!(pinned.calls.get(), 0);
     assert_eq!(codex.calls.get(), 0, "the pin failed over");
 }

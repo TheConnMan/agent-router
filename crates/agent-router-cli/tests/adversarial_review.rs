@@ -120,7 +120,8 @@ impl ReviewFixture {
         // gone, so anything reading those pipes to end-of-file is waiting on the descendant's
         // whole lifetime rather than on the reviewer's.
         let claude_body = format!(
-            "printf '%s\\n' \"$@\" >> {}\n\
+            "pwd > {}\n\
+             printf '%s\\n' \"$@\" >> {}\n\
              if [ \"${{AGENT_ROUTER_FIXTURE_REVIEW_FAIL:-0}}\" = \"1\" ]; then\n\
                printf 'review provider failed\\n' >&2\n\
                exit 17\n\
@@ -141,6 +142,7 @@ impl ReviewFixture {
                sleep \"$AGENT_ROUTER_FIXTURE_REVIEW_DELAY\"\n\
              fi\n\
              printf '%s\\n' {}\n",
+            shell_quote(&root.path.join("claude cwd").to_string_lossy()),
             shell_quote(&claude_log.to_string_lossy()),
             shell_quote(&claude_result("completed review body")),
         );
@@ -1493,4 +1495,66 @@ fn help_documents_the_pin_flags_honestly() {
     assert!(help.contains("--model"), "{help}");
     assert!(help.contains("primary"), "{help}");
     assert!(help.contains("priority"), "{help}");
+}
+
+/// Grok's session/new rejects a relative cwd, so `--dir .` must reach the row and the reviewer as
+/// the absolute directory it names.
+#[test]
+fn a_relative_dir_is_recorded_and_run_as_an_absolute_path() {
+    let fixture = ReviewFixture::new("relative dir");
+    let output = fixture
+        .command_for("codex", Path::new("."))
+        .current_dir(&fixture.cwd)
+        .arg("--json")
+        .output()
+        .expect("run adversarial review with a relative dir");
+
+    assert_exit(&output, 0);
+    let rows = fixture.reviews();
+    assert_eq!(rows.len(), 1);
+    assert!(Path::new(&rows[0].dir).is_absolute(), "{}", rows[0].dir);
+    assert_eq!(
+        fs::canonicalize(&rows[0].dir).expect("row dir exists"),
+        fs::canonicalize(&fixture.cwd).expect("cwd exists")
+    );
+    let reviewer_cwd = fs::read_to_string(fixture.root.path.join("claude cwd"))
+        .expect("the reviewer recorded its cwd");
+    assert_eq!(
+        fs::canonicalize(reviewer_cwd.trim()).expect("reviewer cwd exists"),
+        fs::canonicalize(&fixture.cwd).expect("cwd exists")
+    );
+}
+
+/// When no reviewer other than the primary can even start, the review is a skip (exit 3), and the
+/// skip still lands in the ledger with the reason each candidate could not run.
+#[test]
+fn every_reviewer_unable_to_run_skips_with_exit_three_and_writes_a_row() {
+    let fixture = ReviewFixture::new("nothing can run");
+    let missing_claude = fixture.root.path.join("no such claude");
+    let missing_grok = fixture.root.path.join("no such grok");
+    let output = fixture
+        .command_for("codex", &fixture.cwd)
+        .env("AGENT_ROUTER_CLAUDE_REVIEW_BIN", &missing_claude)
+        .env("AGENT_ROUTER_CLAUDE_BIN", &missing_claude)
+        .env("AGENT_ROUTER_GROK_BIN", &missing_grok)
+        .env("PATH", fixture.root.path.join("bin"))
+        .arg("--json")
+        .output()
+        .expect("run adversarial review with no runnable reviewer");
+
+    assert_exit(&output, 3);
+    let value = parse_json(&output);
+    assert_eq!(value["status"], "skipped");
+    assert!(!fixture.claude_log.exists(), "claude ran");
+    assert!(!fixture.codex_log.exists(), "the primary ran");
+
+    let rows = fixture.reviews();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let row = &rows[0];
+    assert_eq!(row.exit_status, 3);
+    let reason = row.reason.as_deref().unwrap_or_default();
+    assert!(
+        reason.contains("claude") && reason.contains("grok"),
+        "reason does not name why each reviewer could not run: {reason}"
+    );
 }
