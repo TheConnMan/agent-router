@@ -320,6 +320,22 @@ fn adversarial_review_status(
             }
         },
     };
+    // Grok's session/new rejects a relative cwd, so the row, the worker, and every reviewer see
+    // the absolute directory `--dir` names.
+    let dir = match std::path::absolute(&dir) {
+        Ok(dir) => dir,
+        Err(error) => {
+            return finish_adversarial_review(
+                &requested(agent_router_core::adversarial_review::failed_outcome(
+                    primary_provider,
+                    error.to_string(),
+                )),
+                None,
+                json,
+                ctx,
+            );
+        }
+    };
     if let Err(error) = ctx.load_config() {
         return finish_adversarial_review(
             &requested(agent_router_core::adversarial_review::failed_outcome(

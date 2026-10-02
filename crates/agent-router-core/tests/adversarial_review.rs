@@ -360,10 +360,7 @@ fn an_empty_body_fails_without_invoking_any_provider() {
             .expect("an empty body is a reported failure");
         assert_eq!(outcome.status, ReviewStatus::Failed, "{outcome:?}");
         let reason = outcome.reason.as_deref().unwrap_or_default();
-        assert!(
-            reason.contains("review request body is empty"),
-            "{reason}"
-        );
+        assert!(reason.contains("review request body is empty"), "{reason}");
         assert_eq!(codex.calls.get() + grok.calls.get(), 0);
 
         let outcome =
@@ -371,10 +368,7 @@ fn an_empty_body_fails_without_invoking_any_provider() {
                 .expect("an empty body is a reported failure");
         assert_eq!(outcome.status, ReviewStatus::Failed, "{outcome:?}");
         let reason = outcome.reason.as_deref().unwrap_or_default();
-        assert!(
-            reason.contains("review request body is empty"),
-            "{reason}"
-        );
+        assert!(reason.contains("review request body is empty"), "{reason}");
         assert_eq!(codex.calls.get() + grok.calls.get(), 0);
     }
 }

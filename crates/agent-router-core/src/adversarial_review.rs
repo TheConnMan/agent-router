@@ -14,7 +14,11 @@ use std::time::{Duration, Instant};
 const CLAUDE_REVIEW_BIN_ENV: &str = "AGENT_ROUTER_CLAUDE_REVIEW_BIN";
 const CODEX_REVIEW_BIN_ENV: &str = "AGENT_ROUTER_CODEX_REVIEW_BIN";
 const GROK_REVIEW_MODEL: &str = "default";
-const GROK_REVIEW_TIMEOUT: Duration = Duration::from_secs(900);
+const GROK_REVIEW_BASE_TIMEOUT: Duration = Duration::from_secs(900);
+const GROK_REVIEW_BASE_BYTES: usize = 2048;
+const GROK_REVIEW_TIMEOUT_PER_KIB: u64 = 180;
+const GROK_REVIEW_MAX_TIMEOUT: Duration = Duration::from_secs(3600);
+const EMPTY_BODY_REASON: &str = "review request body is empty";
 
 /// One poll interval for every review wait loop: the Grok lifecycle poll, the child-process
 /// runner, and the CLI's own wait. One number, so a cancel takes the same time to be observed
@@ -242,8 +246,10 @@ pub trait ReviewProvider {
 
 /// Run a review on the first candidate in `priority` that completes. Candidates are the priority
 /// list minus the primary provider, restricted to the registered reviewers. A candidate that fails
-/// before producing a review hands over to the next one; a completed review never does, and a
-/// cancel never does.
+/// before producing a review, or cannot run at all, hands over to the next one; a completed review
+/// never does, and a cancel never does. When no candidate ran (none registered, or every one
+/// unavailable) the outcome is Skipped; when any ran and failed it is Failed. An empty body fails
+/// before any candidate is tried.
 pub fn review_with_providers(
     request: &ReviewRequest<'_>,
     providers: &[&dyn ReviewProvider],
@@ -253,7 +259,7 @@ pub fn review_with_providers(
 }
 
 /// Run a review on the pinned provider alone. The pin bypasses the priority order: nothing else
-/// runs, and a pinned reviewer that fails leaves the review failed.
+/// runs, and a pinned reviewer that fails or cannot run leaves the review failed, never skipped.
 pub fn review_pinned_with_providers(
     request: &ReviewRequest<'_>,
     providers: &[&dyn ReviewProvider],
@@ -448,6 +454,12 @@ impl Settled<'_> {
         )
     }
 
+    fn skipped(self, reason: String) -> ReviewOutcome {
+        let mut outcome = self.failed(None, reason, None);
+        outcome.status = ReviewStatus::Skipped;
+        outcome
+    }
+
     fn failed(
         self,
         provider: Option<&dyn ReviewProvider>,
@@ -484,6 +496,9 @@ fn review_in_priority(
     cancelled: &dyn Fn() -> bool,
 ) -> ReviewOutcome {
     let primary = request.primary_provider;
+    if request.body.trim().is_empty() {
+        return failed_outcome(primary, EMPTY_BODY_REASON);
+    }
     let mut settled = Settled {
         request,
         pin: None,
@@ -491,6 +506,7 @@ fn review_in_priority(
         usage_provenance: Vec::new(),
     };
     let mut failures: Vec<String> = Vec::new();
+    let mut unavailable: Vec<String> = Vec::new();
     let mut previous: Option<String> = None;
 
     for wanted in priority {
@@ -514,7 +530,17 @@ fn review_in_priority(
                 ));
                 return settled.completed(provider, result, previous);
             }
-            Attempt::Unavailable(reason) | Attempt::Failed(reason) => {
+            Attempt::Unavailable(reason) => {
+                settled
+                    .rationale
+                    .push(format!("{provider_name} unavailable: {reason}"));
+                settled
+                    .usage_provenance
+                    .push(tried(&provider_name, Some(reason.clone())));
+                unavailable.push(format!("{provider_name}: {reason}"));
+                previous = Some(provider_name);
+            }
+            Attempt::Failed(reason) => {
                 settled
                     .rationale
                     .push(format!("{provider_name} failed: {reason}"));
@@ -536,18 +562,30 @@ fn review_in_priority(
         }
     }
 
-    let reason = if failures.is_empty() {
+    if failures.is_empty() {
+        // Nothing ran, so nothing failed: no non-primary reviewer could even start.
         settled.rationale.push(format!(
-            "no registered reviewer in the priority order other than primary {primary}"
+            "no reviewer other than primary {primary} could run"
         ));
-        format!("no registered reviewer other than primary {primary}")
-    } else {
-        settled
-            .rationale
-            .push("every reviewer candidate failed".to_string());
-        format!("every reviewer candidate failed: {}", failures.join("; "))
-    };
-    settled.failed(None, reason, None)
+        let reason = if unavailable.is_empty() {
+            format!("no registered reviewer other than primary {primary}")
+        } else {
+            format!(
+                "no reviewer other than primary {primary} could run: {}",
+                unavailable.join("; ")
+            )
+        };
+        return settled.skipped(reason);
+    }
+    settled
+        .rationale
+        .push("every reviewer candidate failed".to_string());
+    failures.extend(unavailable);
+    settled.failed(
+        None,
+        format!("every reviewer candidate failed: {}", failures.join("; ")),
+        None,
+    )
 }
 
 /// The pinned path: the pinned provider alone, validated as registered, running the requested
@@ -561,6 +599,9 @@ fn review_pinned(
     let primary = request.primary_provider;
     let name = pin.provider.name();
     let refuse = |reason: String| with_pin(failed_outcome(primary, reason), Some(pin));
+    if request.body.trim().is_empty() {
+        return refuse(EMPTY_BODY_REASON.to_string());
+    }
     if name.eq_ignore_ascii_case(primary) {
         return refuse(format!(
             "requested reviewer {name} is the primary provider; an adversarial review needs a \
@@ -631,6 +672,14 @@ impl ReviewProvider for ClaudeReviewProvider<'_> {
         self.model
     }
 
+    /// Available when the reviewer binary resolves, so a missing binary is a candidate that
+    /// could not run rather than one that ran and failed.
+    fn authoritative_availability(&self) -> std::result::Result<(), String> {
+        review_binary(self.ctx, CLAUDE_REVIEW_BIN_ENV, Provider::Claude)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
     fn review(&self, request: &ReviewRequest<'_>) -> Result<String> {
         self.review_cancellable(request, &|| false)
             .map(|(result, _)| result)
@@ -699,6 +748,14 @@ impl ReviewProvider for CodexReviewProvider<'_> {
 
     fn reviewer_model(&self) -> &str {
         self.model
+    }
+
+    /// Available when the reviewer binary resolves, so a missing binary is a candidate that
+    /// could not run rather than one that ran and failed.
+    fn authoritative_availability(&self) -> std::result::Result<(), String> {
+        review_binary(self.ctx, CODEX_REVIEW_BIN_ENV, Provider::Codex)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 
     fn review(&self, request: &ReviewRequest<'_>) -> Result<String> {
@@ -801,6 +858,20 @@ impl ReviewProvider for GrokReviewProvider<'_> {
     }
 }
 
+/// PURE: how long a Grok review of a `body_len`-byte request may run. Grok's time grows with the
+/// request, so the 900s floor covers 2 KiB and each further KiB, whole or partial, adds 180s, up
+/// to an hour.
+fn grok_review_timeout(body_len: usize) -> Duration {
+    let extra_kib = body_len
+        .saturating_sub(GROK_REVIEW_BASE_BYTES)
+        .div_ceil(1024) as u64;
+    GROK_REVIEW_BASE_TIMEOUT
+        .saturating_add(Duration::from_secs(
+            extra_kib.saturating_mul(GROK_REVIEW_TIMEOUT_PER_KIB),
+        ))
+        .min(GROK_REVIEW_MAX_TIMEOUT)
+}
+
 /// PURE: classify a poll-loop status after spawn has already confirmed working.
 /// Grok's leader reports a finished review as Idle; Done is inferred later from durable
 /// `turn_completed`. After spawn waited for working, Idle on that session is the finished turn.
@@ -840,6 +911,7 @@ fn run_grok_review(
     let session_id = spawn_with_lifecycle(&lifecycle, request.dir, &prompt, None)?;
     let mut cleanup = GrokReviewCleanup::new(&lifecycle, session_id.clone());
     let started = Instant::now();
+    let timeout = grok_review_timeout(request.body.len());
 
     loop {
         // There is no child process to kill here, so the cancel returns through `cleanup.failure`,
@@ -864,7 +936,7 @@ fn run_grok_review(
                     cleanup.failure(format!("Grok review identity {session_id} is ambiguous"))
                 );
             }
-            (None, _) if started.elapsed() < GROK_REVIEW_TIMEOUT => {
+            (None, _) if started.elapsed() < timeout => {
                 std::thread::sleep(REVIEW_POLL);
                 continue;
             }
@@ -916,7 +988,7 @@ fn run_grok_review(
             GrokReviewPoll::Continue => {}
         }
 
-        if started.elapsed() >= GROK_REVIEW_TIMEOUT {
+        if started.elapsed() >= timeout {
             return Err(cleanup.failure(format!(
                 "Grok review {session_id} did not finish before the timeout"
             )));
