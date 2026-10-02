@@ -453,7 +453,9 @@ fn dispatch_with_binary_maps_exit_three_to_the_unverified_version_message_with_s
     )
     .expect_err("exit 3 is a launch failure");
 
-    let message = command_message(&error);
+    let Error::NotLaunched(message) = error else {
+        panic!("exit 3 must prove the thread was not launched: {error:?}");
+    };
     assert!(
         message.contains("VERIFIED_T3_VERSIONS"),
         "exit 3 must name the version allow-list: {message}"
@@ -464,11 +466,71 @@ fn dispatch_with_binary_maps_exit_three_to_the_unverified_version_message_with_s
     );
 }
 
-/// AC3. Any other nonzero exit is a launch error naming the code and carrying stderr.
+/// A usage refusal also proves that no thread was launched and retains the diagnostic.
+#[test]
+fn dispatch_with_binary_maps_exit_two_to_not_launched_with_stderr() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let stub = launcher(root.path(), "", "unknown option --bad\n", 2);
+    let error = dispatch_with_binary(
+        &stub.binary,
+        root.path(),
+        "a task",
+        "Usage Error",
+        Provider::Codex,
+        None,
+        None,
+        GENEROUS,
+    )
+    .expect_err("exit 2 is a launch failure");
+    let Error::NotLaunched(message) = error else {
+        panic!("exit 2 must prove the thread was not launched: {error:?}");
+    };
+    assert!(message.contains("exited 2"), "{message}");
+    assert!(message.contains("unknown option --bad"), "{message}");
+}
+
+/// Printed thread evidence overrides an otherwise safe refusal code.
+#[test]
+fn refusal_codes_with_thread_evidence_remain_ambiguous() {
+    for code in [2, 3] {
+        for (stdout, stderr) in [
+            (format!("THREAD_ID {THREAD_ID}\n"), "boom".to_string()),
+            (launched_json(), "boom".to_string()),
+            (
+                format!("{{\"threadId\":\"{THREAD_ID}\""),
+                "boom".to_string(),
+            ),
+            (String::new(), format!("THREAD_ID {THREAD_ID}\nboom")),
+        ] {
+            let root = tempfile::tempdir().expect("tempdir");
+            let stub = launcher(root.path(), &stdout, &stderr, code);
+            let error = dispatch_with_binary(
+                &stub.binary,
+                root.path(),
+                "a task",
+                "Contradictory Refusal",
+                Provider::Codex,
+                None,
+                None,
+                GENEROUS,
+            )
+            .expect_err("a failed exit stays a failure");
+            let message = command_message(&error);
+            assert!(message.contains("boom"), "{message}");
+        }
+    }
+}
+
+/// AC3. Runtime errors remain ambiguous even after a thread identity was printed.
 #[test]
 fn dispatch_with_binary_maps_a_nonzero_exit_to_an_error_carrying_stderr() {
     let root = tempfile::tempdir().expect("tempdir");
-    let stub = launcher(root.path(), "", "boom\n", 1);
+    let stub = launcher(
+        root.path(),
+        &format!("THREAD_ID {THREAD_ID}\n"),
+        "boom\n",
+        1,
+    );
 
     let error = dispatch_with_binary(
         &stub.binary,

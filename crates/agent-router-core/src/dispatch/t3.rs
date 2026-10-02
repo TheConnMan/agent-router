@@ -113,6 +113,7 @@ pub fn dispatch_with_binary(
     if !launched.status.success() {
         return Err(exit_failure(
             launched.status.code(),
+            &String::from_utf8_lossy(&launched.stdout),
             &String::from_utf8_lossy(&launched.stderr),
         ));
     }
@@ -204,11 +205,11 @@ pub fn parse_launch(stdout: &str) -> Result<(String, String)> {
     Ok((thread_id, url))
 }
 
-/// PURE: the error a failed launcher exit maps to. Exit 3 is t3-thread refusing a T3 server version
-/// it has not verified its RPC calls against, which needs a person, so it says what to do.
-fn exit_failure(code: Option<i32>, stderr: &str) -> Error {
+/// PURE: only usage and version refusals prove that no thread was created. Any printed thread
+/// identity contradicts that proof, including a partial JSON answer, so it stays ambiguous.
+fn exit_failure(code: Option<i32>, stdout: &str, stderr: &str) -> Error {
     let said = stderr_text(stderr.as_bytes());
-    Error::Command(match code {
+    let message = match code {
         Some(3) => format!(
             "t3-thread refused to launch: the local T3 server version is not one t3-thread has \
              verified (exit 3); re-verify the RPC surface and add the version to \
@@ -216,7 +217,13 @@ fn exit_failure(code: Option<i32>, stderr: &str) -> Error {
         ),
         Some(code) => format!("t3-thread exited {code}: {said}"),
         None => format!("t3-thread was terminated by a signal: {said}"),
-    })
+    };
+    let thread_evidence = |text: &str| text.contains("THREAD_ID") || text.contains("\"threadId\"");
+    if matches!(code, Some(2 | 3)) && !thread_evidence(stdout) && !thread_evidence(stderr) {
+        Error::NotLaunched(message)
+    } else {
+        Error::Command(message)
+    }
 }
 
 /// PURE: captured stderr for a message, trimmed, with an explicit marker when there was none.

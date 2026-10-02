@@ -1080,7 +1080,19 @@ fn route(
         strict_mcp_config,
         surface,
     };
-    let outcome = agent_router_core::run::run(&request, ctx)?;
+    let outcome = match agent_router_core::run::run(&request, ctx) {
+        Err(error @ agent_router_core::Error::NotLaunched(_)) if json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "launched": false,
+                    "error": error.to_string(),
+                }))?
+            );
+            return Err(error);
+        }
+        result => result?,
+    };
     // Printed once, in both output modes, because a JSON caller still needs to see on its own
     // terminal that the scoping it asked for did not happen.
     if let Some(warning) = &outcome.mcp_warning {
