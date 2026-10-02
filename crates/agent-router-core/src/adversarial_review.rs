@@ -1200,4 +1200,14 @@ mod tests {
             GrokReviewPoll::Fail
         );
     }
+
+    #[test]
+    fn grok_review_timeout_grows_with_the_request_and_is_capped() {
+        use std::time::Duration;
+        assert_eq!(grok_review_timeout(0), Duration::from_secs(900));
+        assert_eq!(grok_review_timeout(2048), Duration::from_secs(900));
+        assert_eq!(grok_review_timeout(2049), Duration::from_secs(1080));
+        assert_eq!(grok_review_timeout(7_700), Duration::from_secs(1980));
+        assert_eq!(grok_review_timeout(1_000_000), Duration::from_secs(3600));
+    }
 }
