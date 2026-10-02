@@ -45,19 +45,19 @@ use std::{
 mod common;
 
 #[test]
-fn grok_uses_the_public_viewer_lifecycle_without_owning_its_protocol() {
+fn grok_dispatch_goes_through_the_owned_leader_lifecycle_without_owning_its_protocol() {
     let core = Path::new(env!("CARGO_MANIFEST_DIR"));
     let manifest = fs::read_to_string(core.join("Cargo.toml")).expect("read core manifest");
     let grok_dispatch =
         fs::read_to_string(core.join("src/dispatch/grok.rs")).expect("read Grok dispatch");
 
     assert!(
-        manifest.contains("agent-viewer-core"),
-        "Grok dispatch must depend on agent-viewer-core's public lifecycle"
+        !manifest.contains("agent-viewer"),
+        "agent-router-core must not depend on agent-viewer; it owns the Grok leader client"
     );
     assert!(
-        grok_dispatch.contains("agent_viewer_core") && grok_dispatch.contains("GrokLifecycle"),
-        "Grok dispatch must import the public GrokLifecycle"
+        grok_dispatch.contains("grok_leader") && grok_dispatch.contains("GrokLifecycle"),
+        "Grok dispatch must go through grok_leader::GrokLifecycle"
     );
     for owned_protocol_detail in [
         "UnixStream",
@@ -73,7 +73,7 @@ fn grok_uses_the_public_viewer_lifecycle_without_owning_its_protocol() {
     ] {
         assert!(
             !grok_dispatch.contains(owned_protocol_detail),
-            "Grok dispatch must delegate {owned_protocol_detail} to agent-viewer-core"
+            "Grok dispatch must delegate {owned_protocol_detail} to grok_leader"
         );
     }
 }

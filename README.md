@@ -136,7 +136,7 @@ cargo install --path crates/agent-parity
 | --- | --- | --- |
 | `claude` | Claude dispatch, Claude usage, and classification on the default engine | Must be on `PATH` and logged in. With the default `engine = "claude"` the classifier runs on every `--provider auto` call, so `claude` is exercised even when every task ends up on Codex. |
 | `codex` | Codex dispatch, Codex usage, and classification when `engine = "codex"` | Dispatch goes through `codex app-server daemon`, which the router starts on demand. |
-| `grok` | Grok dispatch, automatic workhorse routing, and an eligible Grok adversarial review | Optional. Router reuses Agent Viewer's public lifecycle and never configures Grok itself. |
+| `grok` | Grok dispatch, automatic workhorse routing, and an eligible Grok adversarial review | Optional. Router talks to the persistent Grok leader through its own client and never configures Grok itself. |
 
 The classifier engine is a budget decision rather than a quality one: scoring is a single small
 strict JSON answer either model can produce, so `[classifier].engine` selects which weekly quota
@@ -242,16 +242,19 @@ the turn.
 - `agent-router status` reports T3 rows as unsupported. They are never reconciled as Claude, Codex,
   or Grok jobs.
 
-An explicit Grok dispatch reuses `agent-viewer-core`'s public `GrokLifecycle`. That crate is a git
-dependency pinned by rev, so Grok behaviour changes ship in lockstep with agent-viewer. Router does not
-implement an ACP client or durable Grok session parser. The lifecycle's nonempty official session
-identity is copied unchanged into the dispatch result and decision log as `job_id`; use that exact
-identity with `agent-router status`.
+An explicit Grok dispatch goes through agent-router's own Grok leader client
+(`agent_router_core::grok_leader`). It registers with the persistent leader over its Unix socket,
+opens a session with `session/new`, sends the prompt, and waits for the leader roster to confirm the
+session is working. Status and review transcripts are read from Grok's durable storage under
+`GROK_HOME/sessions` through `openat2`, so no symlink or foreign-owned file is followed. The leader's
+nonempty official session identity is copied unchanged into the dispatch result and decision log as
+`job_id`; use that exact identity with `agent-router status`.
 
-The lifecycle connects only to the persistent user leader. Install and enable the reference
-`grok-agent-leader.service` shipped by `agent-viewer-core` before dispatching. Router never starts
-or owns the leader and never runs `grok --single`. Interactive attachment remains Viewer owned and
-uses `grok --leader --resume <session-id>` so attaching cannot replace the shared leader.
+The client connects only to the persistent user leader. Install and enable a
+`grok-agent-leader.service` user unit before dispatching; when no leader is reachable the dispatch
+fails with `persistent Grok leader is not reachable; start grok-agent-leader.service`. Router never
+starts or owns the leader and never runs `grok --single`. Attach to a running session with
+`grok --leader --resume <session-id>` so attaching cannot replace the shared leader.
 
 ### `adversarial-review`
 
@@ -712,9 +715,9 @@ relaunch it. Every outcome is written to `~/.local/state/agent-router/logs/namin
 
 | Provider | Rename mechanism | Identity | Detects a manual rename |
 | --- | --- | --- | --- |
-| Claude | A read-modify-write of `~/.claude/jobs/<short-id>/state.json`, setting `name`, `nameSource: "user"`, and `updatedAt` through Agent Viewer's `replace_atomic`, with the same fields and semantics as its own `ClaudeBackend::rename`. One read serves the guard and the write, so the name compared is the name overwritten. | The short id the dispatch resolved by matching the launch name in `claude agents --json`. A job whose short id never resolved is not renamed: it could only be found by the field being changed. | Yes, from that same file |
+| Claude | A read-modify-write of `~/.claude/jobs/<short-id>/state.json`, setting `name`, `nameSource: "user"`, and `updatedAt` (the fields a human rename sets) through the router's own atomic replace, which writes an owner-only temp file beside it, copies the target's mode, and renames it over the target. A missing `state.json` is an error, never recreated. One read serves the guard and the write, so the name compared is the name overwritten. | The short id the dispatch resolved by matching the launch name in `claude agents --json`. A job whose short id never resolved is not renamed: it could only be found by the field being changed. | Yes, from that same file |
 | Codex | `thread/name/set` over the app-server daemon socket, the transport the dispatch itself used | Thread id | Yes, when `thread/read` reports a name |
-| Grok | Agent Viewer's `GrokLifecycle::rename`, an `x.ai/session/rename` call | Session id | No: the RPC reports success and nothing else, and Grok is Linux only |
+| Grok | The router's Grok leader client, an `x.ai/session/rename` call | Session id | No: the RPC reports success and nothing else, and Grok is Linux only |
 
 Where a manual rename is detectable, a name that is neither the launch name nor the generated one
 is somebody's own and is kept.
@@ -722,7 +725,7 @@ is somebody's own and is kept.
 For Claude the guard and the write share one read of `state.json`, so the name compared is the name
 overwritten. That narrows the window rather than closing it: claude's own worker writes that file
 while the job runs and its format offers no compare-and-swap, so a write landing in between is
-lost. Agent Viewer's own rename accepts the same race against the same writer.
+lost. Any outside rename of a Claude job accepts the same race against the same writer.
 
 ## State on disk
 

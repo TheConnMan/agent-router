@@ -9,9 +9,9 @@
 //! in the same shape rather than shared.
 
 use agent_router_core::dispatch::codex::{CodexRpc, thread_states_on_rpc};
+use agent_router_core::grok_leader::Status as GrokStatus;
 use agent_router_core::status::{Observation, State, classify, settle};
 use agent_router_core::{Error, Result};
-use agent_viewer_core::Status as GrokStatus;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
 

@@ -3,8 +3,12 @@
 All notable changes to this project are documented here. Versions are the
 workspace `package.version` stamped on every decision-log row.
 
-## Unreleased
+## 0.35.0 - 2026-10-02
 
+- Agent-router now owns its Grok leader client and its Claude job state writer, and no longer
+  depends on the Agent Viewer crate. Behavior and error text are unchanged; the only visible
+  difference is that the Grok leader sees the client identify itself as `agent-router` with the
+  router's own version.
 - Adversarial review skips with exit `3`, still recording its row, when no non-primary reviewer
   could run: none registered, or every candidate unavailable. Claude and Codex are now unavailable
   when their reviewer binary does not resolve. A candidate that ran and failed still fails with
