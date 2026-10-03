@@ -279,6 +279,17 @@ is 55, Claude (70) is 15 over, Grok (90) is 35 over, Codex wins with
 
 ## `[adversarial_review]`
 
+The command requires `--request-file <PATH>` to supply the review body, or `--request-file -` to
+read it from stdin. It reads the body before any provider work starts. Relative request paths use
+the caller's current directory, independently of `--dir`. A missing or unreadable file fails with
+exit `1` and names the supplied path; an empty or whitespace only body also fails before a reviewer
+runs. Positional review text is rejected. The request source is a command option and has no
+configuration setting.
+
+```bash
+agent-router adversarial-review --primary codex --request-file review-request.txt
+```
+
 ### `reviewer_priority`
 
 Default `["codex", "grok", "claude"]`. The order `agent-router adversarial-review` tries

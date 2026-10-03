@@ -3,6 +3,13 @@
 All notable changes to this project are documented here. Versions are the
 workspace `package.version` stamped on every decision-log row.
 
+## 0.36.0 (2026-10-03)
+
+`agent-router adversarial-review` now requires `--request-file <PATH>`, with `-` reading the review
+body from stdin. Positional request text is rejected. The complete body is read before any provider
+work starts; missing or unreadable files fail with exit `1` and an error naming the supplied path.
+Empty or whitespace only bodies keep the existing refusal before any reviewer runs.
+
 ## 0.35.0 - 2026-10-02
 
 - Agent-router now owns its Grok leader client and its Claude job state writer, and no longer
