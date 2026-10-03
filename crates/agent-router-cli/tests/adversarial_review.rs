@@ -6,6 +6,7 @@ mod common;
 use agent_router_core::log::{DecisionLog, ReviewRow};
 use serde_json::{Value, json};
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -86,6 +87,7 @@ const FIXTURE_CONFIG: &str = "config_version = 4\n\n[classifier]\nengine = \"cod
 struct ReviewFixture {
     root: TempDir,
     cwd: PathBuf,
+    request_file: PathBuf,
     claude_log: PathBuf,
     codex_log: PathBuf,
     sessions: PathBuf,
@@ -98,12 +100,14 @@ impl ReviewFixture {
         let config_home = home.join(".config");
         let bin = root.path.join("bin");
         let cwd = root.path.join("working tree");
+        let request_file = root.path.join("review request.md");
         let sessions = root.path.join("empty codex sessions");
         let claude_log = root.path.join("claude calls");
         let codex_log = root.path.join("codex calls");
         fs::create_dir_all(&bin).expect("create binary directory");
         fs::create_dir_all(&cwd).expect("create working tree");
         fs::create_dir_all(&sessions).expect("create codex sessions");
+        write_file(&request_file, "Review this working tree for regressions");
         write_file(
             &config_home.join("agent-router/config.toml"),
             FIXTURE_CONFIG,
@@ -170,6 +174,7 @@ impl ReviewFixture {
         Self {
             root,
             cwd,
+            request_file,
             claude_log,
             codex_log,
             sessions,
@@ -219,7 +224,8 @@ impl ReviewFixture {
         let mut command = Command::new(env!("CARGO_BIN_EXE_agent-router"));
         command
             .arg("adversarial-review")
-            .arg("Review this working tree for regressions")
+            .arg("--request-file")
+            .arg(&self.request_file)
             .arg("--primary")
             .arg(primary)
             .arg("--dir")
@@ -299,6 +305,28 @@ fn parse_json(output: &Output) -> Value {
             text(&output.stderr)
         )
     })
+}
+
+fn assert_review_failed_without_provider_calls(fixture: &ReviewFixture, output: &Output) -> Value {
+    assert_exit(output, 1);
+    let value = parse_json(output);
+    assert_eq!(value["status"], "failed");
+    assert_eq!(value["reviewer_provider"], Value::Null);
+    assert_eq!(value["reviewer_model"], Value::Null);
+    assert_eq!(value["result"], Value::Null);
+    assert_eq!(value["usage"], Value::Null);
+    assert_eq!(value["usage_provenance"], json!([]));
+    assert!(!fixture.claude_log.exists(), "Claude was invoked");
+    assert!(!fixture.codex_log.exists(), "Codex was invoked");
+    assert!(!fixture.grok_state_dir().exists(), "Grok state was created");
+    let rows = fixture.reviews();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].exit_status, 1);
+    assert_eq!(rows[0].reviewer_provider, None);
+    assert_eq!(rows[0].usage_provenance, "[]");
+    assert_eq!(rows[0].body_bytes, 0);
+    assert_ne!(rows[0].status.as_deref(), Some("completed"));
+    value
 }
 
 fn argv(path: &Path) -> Vec<String> {
@@ -418,6 +446,185 @@ fn poll_review_status(fixture: &ReviewFixture, id: i64, expected: i32, extra: &[
         );
         std::thread::sleep(POLL_INTERVAL);
     }
+}
+
+#[test]
+fn a_missing_request_file_names_the_path_and_fails_without_provider_calls() {
+    let fixture = ReviewFixture::new("missing request file");
+    fs::remove_file(&fixture.request_file).expect("remove request file");
+
+    let output = fixture.run_json();
+    let value = assert_review_failed_without_provider_calls(&fixture, &output);
+    let reason = value["reason"].as_str().expect("failure reason");
+    assert!(
+        reason.contains("could not read review request file"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains(&fixture.request_file.to_string_lossy().to_string()),
+        "{reason}"
+    );
+    assert!(!text(&output.stderr).contains(" started"));
+}
+
+#[test]
+fn a_directory_request_file_names_the_path_and_fails_without_provider_calls() {
+    let fixture = ReviewFixture::new("directory request file");
+    fs::remove_file(&fixture.request_file).expect("remove request file");
+    fs::create_dir(&fixture.request_file).expect("create request directory");
+
+    let output = fixture.run_json();
+    let value = assert_review_failed_without_provider_calls(&fixture, &output);
+    let reason = value["reason"].as_str().expect("failure reason");
+    assert!(
+        reason.contains("could not read review request file"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains(&fixture.request_file.to_string_lossy().to_string()),
+        "{reason}"
+    );
+    assert!(!text(&output.stderr).contains(" started"));
+}
+
+#[test]
+fn an_unreadable_request_file_names_the_path_and_fails_without_provider_calls() {
+    let fixture = ReviewFixture::new("unreadable request file");
+    fs::set_permissions(&fixture.request_file, fs::Permissions::from_mode(0o0))
+        .expect("make request file unreadable");
+
+    let output = fixture.run_json();
+    fs::set_permissions(&fixture.request_file, fs::Permissions::from_mode(0o600))
+        .expect("restore request file permissions");
+    let value = assert_review_failed_without_provider_calls(&fixture, &output);
+    let reason = value["reason"].as_str().expect("failure reason");
+    assert!(
+        reason.contains("could not read review request file"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains(&fixture.request_file.to_string_lossy().to_string()),
+        "{reason}"
+    );
+    assert!(!text(&output.stderr).contains(" started"));
+}
+
+#[test]
+fn empty_and_whitespace_request_files_keep_the_empty_body_refusal() {
+    for body in ["", " \n\t\r\n"] {
+        let fixture = ReviewFixture::new("empty request file");
+        write_file(&fixture.request_file, body);
+
+        let output = fixture.run_json();
+        let value = assert_review_failed_without_provider_calls(&fixture, &output);
+        assert_eq!(value["reason"], "review request body is empty");
+    }
+}
+
+#[test]
+fn a_request_file_preserves_multiline_content_and_its_trailing_newline() {
+    const REQUEST: &str = "Review this proposal.\n\nCheck café access.\r\n";
+    let fixture = ReviewFixture::new("multiline request file");
+    write_file(&fixture.request_file, REQUEST);
+
+    let output = fixture.run_json();
+    assert_exit(&output, 0);
+    let invocation = fs::read_to_string(&fixture.claude_log).expect("read provider invocation");
+    let (_, body) = invocation
+        .split_once("--strict-mcp-config\n")
+        .expect("request follows provider flags");
+    assert_eq!(body, format!("{REQUEST}\n"));
+}
+
+#[test]
+fn a_relative_request_file_is_read_from_the_callers_cwd() {
+    let mut fixture = ReviewFixture::new("relative request file");
+    fixture.request_file = PathBuf::from("review request.md");
+    let output = fixture
+        .command()
+        .current_dir(&fixture.root.path)
+        .arg("--json")
+        .output()
+        .expect("read relative request file");
+
+    assert_exit(&output, 0);
+    let invocation = argv(&fixture.claude_log);
+    assert_eq!(
+        invocation.last().map(String::as_str),
+        Some("Review this working tree for regressions")
+    );
+}
+
+#[test]
+fn stdin_request_content_reaches_the_reviewer_unchanged() {
+    const REQUEST: &str = "Review stdin content.\n\nPreserve this final line.\n";
+    let fixture = ReviewFixture::new("stdin request");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agent-router"));
+    command
+        .arg("adversarial-review")
+        .arg("--request-file")
+        .arg("-")
+        .arg("--primary")
+        .arg("codex")
+        .arg("--dir")
+        .arg(&fixture.cwd)
+        .arg("--json")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    fixture.apply_env(&mut command);
+    let mut child = command.spawn().expect("start stdin review");
+    child
+        .stdin
+        .take()
+        .expect("review stdin")
+        .write_all(REQUEST.as_bytes())
+        .expect("write stdin request");
+    let output = child.wait_with_output().expect("wait for stdin review");
+
+    assert_exit(&output, 0);
+    assert_eq!(parse_json(&output)["status"], "completed");
+    let invocation = fs::read_to_string(&fixture.claude_log).expect("read provider invocation");
+    let (_, body) = invocation
+        .split_once("--strict-mcp-config\n")
+        .expect("request follows provider flags");
+    assert_eq!(body, format!("{REQUEST}\n"));
+}
+
+#[test]
+fn request_file_is_required_before_review_work_can_start() {
+    let fixture = ReviewFixture::new("required request file");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agent-router"));
+    command.args(["adversarial-review", "--primary", "codex"]);
+    fixture.apply_env(&mut command);
+    let output = command.output().expect("run without request file option");
+
+    assert_exit(&output, 2);
+    assert!(text(&output.stderr).contains("--request-file <PATH>"));
+    assert!(!fixture.claude_log.exists());
+    assert!(!fixture.codex_log.exists());
+    assert!(!fixture.db_path().exists());
+}
+
+#[test]
+fn positional_request_text_is_rejected() {
+    let fixture = ReviewFixture::new("positional request");
+    let output = fixture
+        .command()
+        .arg("legacy positional review request")
+        .output()
+        .expect("run with positional request text");
+
+    assert_exit(&output, 2);
+    let stderr = text(&output.stderr);
+    assert!(stderr.contains("unexpected argument"), "{stderr}");
+    assert!(
+        stderr.contains("legacy positional review request"),
+        "{stderr}"
+    );
+    assert!(!fixture.claude_log.exists());
+    assert!(!fixture.codex_log.exists());
+    assert!(!fixture.db_path().exists());
 }
 
 #[test]
@@ -1104,20 +1311,12 @@ fn review_status_on_an_unknown_id_fails_and_names_it() {
 fn a_request_beginning_with_a_dash_survives_the_worker_re_exec() {
     const REQUEST: &str = "--- not a flag: review this tree ---";
     let fixture = ReviewFixture::new("dash request");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_agent-router"));
-    command
-        .arg("adversarial-review")
-        .arg("--primary")
-        .arg("codex")
-        .arg("--dir")
-        .arg(&fixture.cwd)
+    write_file(&fixture.request_file, REQUEST);
+    let output = fixture
+        .command()
         .arg("--json")
-        .arg("--")
-        .arg(REQUEST);
-    fixture.apply_env(&mut command);
-    let output = command
         .output()
-        .expect("run a dash-prefixed review request");
+        .expect("run a review request beginning with a dash");
 
     assert_exit(&output, 0);
     let value = parse_json(&output);
@@ -1495,6 +1694,9 @@ fn help_documents_the_pin_flags_honestly() {
     assert!(help.contains("--model"), "{help}");
     assert!(help.contains("primary"), "{help}");
     assert!(help.contains("priority"), "{help}");
+    assert!(help.contains("--request-file <PATH>"), "{help}");
+    assert!(help.contains("stdin"), "{help}");
+    assert!(!help.contains("<REQUEST>"), "{help}");
 }
 
 /// Grok's session/new rejects a relative cwd, so `--dir .` must reach the row and the reviewer as

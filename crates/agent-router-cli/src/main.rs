@@ -10,6 +10,7 @@ use agent_router_core::stats::{Rate, Stats, Window};
 use agent_router_core::status::Report;
 use clap::{Parser, Subcommand};
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -67,8 +68,9 @@ enum Command {
     },
     /// Run a synchronous read only review on the first reviewer in priority order that is not the primary.
     AdversarialReview {
-        /// The review request.
-        request: String,
+        /// Read the review request from this file. Use - to read from stdin.
+        #[arg(long, value_name = "PATH")]
+        request_file: PathBuf,
         /// The provider running the calling thread. This provider, including grok, is excluded.
         #[arg(long)]
         primary: String,
@@ -221,7 +223,7 @@ fn main() -> std::process::ExitCode {
         Command::Doctor => doctor_status(&ctx),
         Command::Status { limit, since, json } => status_status(&ctx, limit, since, json),
         Command::AdversarialReview {
-            request,
+            request_file,
             primary,
             dir,
             provider,
@@ -229,7 +231,14 @@ fn main() -> std::process::ExitCode {
             timeout,
             json,
         } => adversarial_review_status(
-            &mut ctx, request, primary, dir, provider, model, timeout, json,
+            &mut ctx,
+            request_file,
+            primary,
+            dir,
+            provider,
+            model,
+            timeout,
+            json,
         ),
         Command::Review { command } => review_command_status(&ctx, command),
         Command::ReviewWorker {
@@ -263,7 +272,7 @@ fn main() -> std::process::ExitCode {
 #[allow(clippy::too_many_arguments)]
 fn adversarial_review_status(
     ctx: &mut agent_router_core::Context,
-    body: String,
+    request_file: PathBuf,
     primary: String,
     dir: Option<PathBuf>,
     provider: String,
@@ -331,6 +340,29 @@ fn adversarial_review_status(
                     error.to_string(),
                 )),
                 None,
+                json,
+                ctx,
+            );
+        }
+    };
+    let body = if request_file == Path::new("-") {
+        let mut body = String::new();
+        std::io::stdin().read_to_string(&mut body).map(|_| body)
+    } else {
+        std::fs::read_to_string(&request_file)
+    };
+    let body = match body {
+        Ok(body) => body,
+        Err(error) => {
+            return finish_adversarial_review(
+                &requested(agent_router_core::adversarial_review::failed_outcome(
+                    primary_provider,
+                    format!(
+                        "could not read review request file {}: {error}",
+                        request_file.display()
+                    ),
+                )),
+                Some(&dir),
                 json,
                 ctx,
             );

@@ -259,6 +259,11 @@ starts or owns the leader and never runs `grok --single`. Attach to a running se
 ### `adversarial-review`
 
 Run a review synchronously with a provider other than the provider that initiated the request.
+The command requires `--request-file <PATH>` and reads the complete file before any provider work
+starts. Use `--request-file -` to read the request from stdin. Relative request paths are resolved
+from the caller's current directory, independently of `--dir`. A missing or unreadable file fails
+with exit `1` and an error naming the supplied path. Positional request text is rejected.
+
 The primary provider is always excluded, including Grok. Candidates are the registered review
 capable providers in `[adversarial_review] reviewer_priority` order (default
 `["codex", "grok", "claude"]`) minus the primary. Selection reads that order and nothing else: no
@@ -307,14 +312,18 @@ below, that is detached and can outlive the caller.
 
 ```bash
 # Have a provider other than Codex review the request and wait for the result.
-agent-router adversarial-review --primary codex "Review the proposed authentication change"
+agent-router adversarial-review --primary codex --request-file review-request.txt
 
-# Return the decision and review body as machine-readable JSON.
-agent-router adversarial-review --primary codex --json "Review the proposed authentication change"
+# Return the decision and review body as machine readable JSON.
+agent-router adversarial-review --primary codex --request-file review-request.txt --json
 
 # Pin the reviewer to Claude Fable, or be told exactly why it cannot run. No failover.
-agent-router adversarial-review --primary codex --provider claude --model fable --json \
-    "Review the proposed authentication change"
+agent-router adversarial-review --primary codex --request-file review-request.txt \
+    --provider claude --model fable --json
+
+# Read the request from stdin.
+printf '%s\n' "Review the proposed authentication change" | \
+    agent-router adversarial-review --primary codex --request-file -
 ```
 
 Text mode prints the completed review body. JSON reports `status`, `primary_provider`,
@@ -355,7 +364,7 @@ with the state that won rather than cancelled a second time (`agent-router: revi
 
 ```bash
 # Start a review without waiting, then check on it later.
-agent-router adversarial-review --primary codex --timeout 0 "Review the proposed authentication change"
+agent-router adversarial-review --primary codex --request-file review-request.txt --timeout 0
 agent-router review status <ID>
 ```
 
