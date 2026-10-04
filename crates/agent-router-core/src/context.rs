@@ -120,6 +120,11 @@ impl Context {
         self.home.join(".claude/projects")
     }
 
+    /// T3 Code's state database, read only by `status` for t3 surface rows.
+    pub fn t3_state_db(&self) -> PathBuf {
+        crate::t3_state::state_db_path(&self.home)
+    }
+
     pub fn claude_credentials(&self) -> PathBuf {
         self.home.join(".claude/.credentials.json")
     }

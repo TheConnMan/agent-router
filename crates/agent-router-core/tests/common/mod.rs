@@ -195,3 +195,153 @@ pub fn stripped_context(root: &Path) -> Context {
 pub fn context(environment: Environment, home: PathBuf, config: Config) -> Context {
     Context::new(environment, home, config)
 }
+
+/// One run of a fixture T3 thread.
+pub struct T3Run<'a> {
+    pub ordinal: i64,
+    pub status: &'a str,
+    pub requested_at: &'a str,
+    pub completed_at: Option<&'a str>,
+    /// A queued run the user is holding, which T3's shell never presents as the thread's status.
+    pub held: bool,
+    /// The message of the run's root `error` item, written only for a failed run.
+    pub failure: Option<&'a str>,
+}
+
+/// One thread in a fixture T3 state database.
+pub struct T3Thread<'a> {
+    pub id: &'a str,
+    pub updated_at: &'a str,
+    pub runs: &'a [T3Run<'a>],
+    /// The `lastError` of the thread's bound provider session, or None for no session at all.
+    pub session_error: Option<&'a str>,
+    pub deleted: bool,
+}
+
+/// Write `<home>/.t3/userdata/statev2.sqlite` holding exactly `threads`, with the orchestration
+/// protocol 2 projection tables the router reads shaped as T3 0.0.46 creates them (the columns the
+/// router reads, plus the NOT NULL ones a row needs). This is the T3 state boundary: nothing past
+/// it is faked.
+pub fn write_t3_state(home: &Path, threads: &[T3Thread<'_>]) -> PathBuf {
+    let dir = home.join(".t3/userdata");
+    fs::create_dir_all(&dir).expect("create the T3 userdata directory");
+    let path = dir.join("statev2.sqlite");
+    let _ = fs::remove_file(&path);
+    let conn = rusqlite::Connection::open(&path).expect("create the T3 state database");
+    conn.execute_batch(
+        "CREATE TABLE orchestration_v2_projection_threads (
+           thread_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, title TEXT NOT NULL,
+           default_provider TEXT NOT NULL, runtime_mode TEXT NOT NULL,
+           interaction_mode TEXT NOT NULL, active_provider_thread_id TEXT,
+           created_at TEXT NOT NULL, updated_at TEXT NOT NULL, archived_at TEXT,
+           deleted_at TEXT, payload_json TEXT NOT NULL, provider_instance_id TEXT);
+         CREATE TABLE orchestration_v2_projection_runs (
+           run_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, ordinal INTEGER NOT NULL,
+           provider TEXT NOT NULL, provider_thread_id TEXT, status TEXT NOT NULL,
+           requested_at TEXT NOT NULL, completed_at TEXT, payload_json TEXT NOT NULL,
+           provider_instance_id TEXT);
+         CREATE TABLE orchestration_v2_projection_provider_sessions (
+           provider_session_id TEXT PRIMARY KEY, thread_id TEXT, provider TEXT NOT NULL,
+           status TEXT NOT NULL, model TEXT, updated_at TEXT NOT NULL,
+           payload_json TEXT NOT NULL, driver TEXT, provider_instance_id TEXT);
+         CREATE TABLE orchestration_v2_projection_provider_session_bindings (
+           provider_session_id TEXT NOT NULL, thread_id TEXT NOT NULL,
+           PRIMARY KEY (provider_session_id, thread_id));
+         CREATE TABLE orchestration_v2_projection_turn_items (
+           turn_item_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, run_id TEXT, node_id TEXT,
+           provider_thread_id TEXT, provider_turn_id TEXT, parent_item_id TEXT,
+           ordinal INTEGER NOT NULL, type TEXT NOT NULL, status TEXT NOT NULL,
+           updated_at TEXT NOT NULL, payload_json TEXT NOT NULL);",
+    )
+    .expect("create the T3 projection tables");
+    for thread in threads {
+        conn.execute(
+            "INSERT INTO orchestration_v2_projection_threads (thread_id, project_id, title, \
+             default_provider, runtime_mode, interaction_mode, created_at, updated_at, \
+             deleted_at, payload_json, provider_instance_id) VALUES (?1, 'proj-1', \
+             'a fixture thread', 'claudeAgent', 'full-access', 'default', \
+             '2026-10-04T00:00:00.000Z', ?2, ?3, '{}', 'claudeAgent')",
+            rusqlite::params![
+                thread.id,
+                thread.updated_at,
+                thread.deleted.then_some("2026-10-04T00:00:01.000Z")
+            ],
+        )
+        .expect("insert a fixture thread");
+        for run in thread.runs {
+            let run_id = format!("run:{}:{}", thread.id, run.ordinal);
+            let root = format!("node:{run_id}:root");
+            let mut payload = serde_json::json!({
+                "id": run_id,
+                "threadId": thread.id,
+                "ordinal": run.ordinal,
+                "rootNodeId": root,
+                "status": run.status,
+                "startedAt": run.requested_at,
+            });
+            if run.held {
+                payload["queueHeld"] = serde_json::json!(true);
+            }
+            conn.execute(
+                "INSERT INTO orchestration_v2_projection_runs (run_id, thread_id, ordinal, \
+                 provider, status, requested_at, completed_at, payload_json, \
+                 provider_instance_id) VALUES (?1, ?2, ?3, 'claudeAgent', ?4, ?5, ?6, ?7, \
+                 'claudeAgent')",
+                rusqlite::params![
+                    run_id,
+                    thread.id,
+                    run.ordinal,
+                    run.status,
+                    run.requested_at,
+                    run.completed_at,
+                    payload.to_string()
+                ],
+            )
+            .expect("insert a fixture run");
+            if let Some(message) = run.failure {
+                let item = serde_json::json!({
+                    "type": "error",
+                    "status": "failed",
+                    "failure": {"class": "provider_error", "message": message},
+                });
+                conn.execute(
+                    "INSERT INTO orchestration_v2_projection_turn_items (turn_item_id, \
+                     thread_id, run_id, node_id, ordinal, type, status, updated_at, \
+                     payload_json) VALUES (?1, ?2, ?3, ?4, 1, 'error', 'failed', ?5, ?6)",
+                    rusqlite::params![
+                        format!("item:{run_id}"),
+                        thread.id,
+                        run_id,
+                        root,
+                        run.completed_at.unwrap_or(run.requested_at),
+                        item.to_string()
+                    ],
+                )
+                .expect("insert a fixture failure item");
+            }
+        }
+        if let Some(error) = thread.session_error {
+            let session = format!("session:{}", thread.id);
+            conn.execute(
+                "INSERT INTO orchestration_v2_projection_provider_sessions \
+                 (provider_session_id, thread_id, provider, status, updated_at, payload_json, \
+                 provider_instance_id) VALUES (?1, ?2, 'claudeAgent', 'error', ?3, ?4, \
+                 'claudeAgent')",
+                rusqlite::params![
+                    session,
+                    thread.id,
+                    thread.updated_at,
+                    serde_json::json!({"lastError": error}).to_string()
+                ],
+            )
+            .expect("insert a fixture provider session");
+            conn.execute(
+                "INSERT INTO orchestration_v2_projection_provider_session_bindings \
+                 (provider_session_id, thread_id) VALUES (?1, ?2)",
+                rusqlite::params![session, thread.id],
+            )
+            .expect("bind the fixture provider session");
+        }
+    }
+    path
+}

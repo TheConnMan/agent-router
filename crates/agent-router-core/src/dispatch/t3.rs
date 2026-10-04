@@ -11,7 +11,8 @@
 //! The launch wait is bounded. t3-thread's RPC calls carry no timeout of their own, so a down or
 //! wedged T3 server would otherwise hold `run` forever. The launcher leads its own process group,
 //! and at the deadline the whole group is signalled, because a grandchild still holding stdout or
-//! stderr would keep the pipe readers blocked long after the direct child died.
+//! stderr would keep the pipe readers blocked long after the direct child died. `nudge`, which
+//! sends one follow-up message to a thread this surface launched, shares the same bounded wait.
 
 use crate::binary::T3_THREAD_BIN_ENV;
 use crate::config::Surface;
@@ -127,6 +128,128 @@ pub fn dispatch_with_binary(
         surface: Surface::T3,
         url: Some(url),
     })
+}
+
+/// How long one nudge may take end to end. Like a launch it is a handful of local RPC calls, so
+/// this only fires on a hang.
+pub const T3_NUDGE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The nudge helper: a node module run against the t3-thread launcher's own `lib` directory, so
+/// T3 auth, origin resolution, the version gate, and the `message.dispatch` payload stay owned by
+/// t3-thread. See `t3_nudge.mjs` for its stdout protocol.
+const NUDGE_SCRIPT: &str = include_str!("t3_nudge.mjs");
+
+/// Finds node the way the t3-thread wrapper does, by sourcing the launcher's `find-node.sh`, then
+/// runs the helper. Positional: `$1` the lib directory, `$2` the helper source, `$3` the thread id.
+const NUDGE_WRAPPER: &str = r#"set -euo pipefail
+lib="$1"
+script="$2"
+shift 2
+source "$lib/find-node.sh"
+node_bin="$(find_node agent-router-nudge)"
+exec "$node_bin" --input-type=module -e "$script" -- "$lib" "$@"
+"#;
+
+/// What a nudge did. Every variant carries the helper's human-readable reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Nudge {
+    /// One follow-up user message was dispatched to the thread.
+    Sent(String),
+    /// T3 has no such thread, or it is archived. Nothing was sent.
+    NotFound(String),
+    /// The thread has an active or queued run, so a follow-up would interleave with it. Nothing was
+    /// sent.
+    Active(String),
+}
+
+/// IMPURE: send one follow-up user message to an existing T3 thread through the resolved
+/// launcher's lib modules. The thread's own model selection is reused.
+pub fn nudge(ctx: &Context, thread_id: &str, message: &str) -> Result<Nudge> {
+    let launcher = crate::binary::resolve_t3_thread(&ctx.environment)?;
+    nudge_with_launcher(&launcher, thread_id, message, T3_NUDGE_TIMEOUT)
+}
+
+/// IMPURE: the nudge against an already resolved launcher, bounded by `timeout`. The message goes
+/// to the helper on stdin, never argv, for the same reason a launch's task does.
+pub fn nudge_with_launcher(
+    launcher: &Path,
+    thread_id: &str,
+    message: &str,
+    timeout: Duration,
+) -> Result<Nudge> {
+    // The launcher is usually a symlink into the skill checkout; its lib sits beside the target.
+    let resolved = std::fs::canonicalize(launcher)
+        .map_err(|error| crate::binary::launch_error(launcher, T3_THREAD_BIN_ENV, error))?;
+    let lib = resolved
+        .parent()
+        .map(|dir| dir.join("lib"))
+        .ok_or_else(|| Error::Command(format!("{} has no parent directory", resolved.display())))?;
+    let mut command = Command::new("bash");
+    command
+        .arg("-c")
+        .arg(NUDGE_WRAPPER)
+        .arg("agent-router-nudge")
+        .arg(&lib)
+        .arg(NUDGE_SCRIPT)
+        .arg(thread_id)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+
+        command.process_group(0);
+    }
+    let mut child = command.spawn().map_err(|error| {
+        Error::Launch(format!("could not run bash for the nudge helper: {error}"))
+    })?;
+    let ran = wait_bounded(&mut child, message, timeout)?;
+    if ran.timed_out {
+        return Err(Error::Command(format!(
+            "the nudge did not finish within {}s; it was killed. A message may already have \
+             been sent. The helper said: {}",
+            timeout.as_secs_f64(),
+            stderr_text(&ran.stderr)
+        )));
+    }
+    if !ran.status.success() {
+        return Err(Error::Command(match ran.status.code() {
+            Some(code) => format!(
+                "the nudge helper exited {code}: {}",
+                stderr_text(&ran.stderr)
+            ),
+            None => format!(
+                "the nudge helper was terminated by a signal: {}",
+                stderr_text(&ran.stderr)
+            ),
+        }));
+    }
+    parse_nudge(&String::from_utf8_lossy(&ran.stdout))
+}
+
+/// PURE: the helper's verdict line. An outcome this router does not know is an error, never a
+/// guess: reading it as `Sent` could hide a refusal, and reading it as a refusal could hide a send.
+pub fn parse_nudge(stdout: &str) -> Result<Nudge> {
+    let trimmed = stdout.trim();
+    let answer: serde_json::Value = serde_json::from_str(trimmed).map_err(|error| {
+        Error::Command(format!(
+            "the nudge helper printed no parseable JSON: {error}"
+        ))
+    })?;
+    let reason = answer
+        .get("reason")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    match answer.get("outcome").and_then(serde_json::Value::as_str) {
+        Some("sent") => Ok(Nudge::Sent(reason)),
+        Some("not_found") => Ok(Nudge::NotFound(reason)),
+        Some("active") => Ok(Nudge::Active(reason)),
+        _ => Err(Error::Command(format!(
+            "the nudge helper printed an unknown outcome: {trimmed}"
+        ))),
+    }
 }
 
 /// PURE: the launcher argv, in a fixed order. Every value flag uses the `--flag=value` form,

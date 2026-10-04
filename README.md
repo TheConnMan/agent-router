@@ -248,8 +248,9 @@ the turn.
 - `job_id` is the T3 thread id. The decision log records `surface` and `thread_url`, and `--json`
   output carries `surface` plus `dispatch.url`.
 - The asynchronous naming worker never renames a T3 thread; `naming_skipped` says so.
-- `agent-router status` reports T3 rows as unsupported. They are never reconciled as Claude, Codex,
-  or Grok jobs.
+- `agent-router status` reconciles T3 rows from T3's own state database, never as Claude, Codex,
+  or Grok jobs. See [`status`](#status).
+- `agent-router nudge` sends one follow-up message to a T3 job's thread. See [`nudge`](#nudge).
 
 An explicit Grok dispatch goes through agent-router's own Grok leader client
 (`agent_router_core::grok_leader`). It registers with the persistent leader over its Unix socket,
@@ -631,8 +632,8 @@ session identity. Known lifecycle states map only where their meanings are prove
 ambiguous, unavailable, or unrecognized result remains `unknown` and never overwrites a proven
 terminal outcome.
 
-Every row settles into one of four states written to `outcome`: `running`, `completed`, `failed`,
-or `unknown`. `unknown` never overwrites an already proven `completed` or `failed`: once a job is
+Every row settles into one of these states written to `outcome`: `running`, `completed`, `failed`,
+`unknown`, or, for T3 rows only, `turn_ended`. `unknown` never overwrites an already proven `completed` or `failed`: once a job is
 proven finished, a later run that can no longer see the backend leaves that fact alone, which is
 what makes rerunning `status` safe.
 
@@ -640,13 +641,67 @@ Claude rows also carry a `traced` flag: whether a session transcript exists on d
 It is evidence only and never changes the state, so a traced but unresolvable job still reports
 `unknown`. It exists to tell "ran and we lost track of it" apart from "vanished without a trace".
 
+Rows launched on the t3 surface resolve through T3's orchestration protocol 2 state database,
+`~/.t3/userdata/statev2.sqlite`, opened read-only. In protocol 2 a thread has runs, one per
+dispatched message, and its status is that of its latest run not held in a queue, or `idle` before
+its first run. The router reads the thread, its runs, and its error the way T3's own thread shell
+does, and never writes T3 state. The job id is the T3 thread id.
+
+| `state` | T3 thread |
+| --- | --- |
+| `running` | A run is active, or the latest run is `queued`, `preparing`, `starting`, `running`, or `waiting`. |
+| `turn_ended` | The latest run is `completed`, `interrupted`, `cancelled`, or `rolled_back`, and none is active. |
+| `failed` | The latest run is `failed`, for example "Provider session did not survive a server restart". |
+| `unknown` | T3 has no such thread (or it was deleted), the thread has never run, the status is one the router does not know, or the database could not be read. |
+
+`turn_ended` is deliberately not `completed`: a Claude worker can end a run while it waits for a
+background task to wake it with another, so an ended run says nothing about whether the work is
+done. A caller that needs a finished job decides that itself, for example from `last_activity_at`,
+or wakes the thread with [`nudge`](#nudge).
+
 `--json` emits `rows_considered`, `oldest_created_at_ms`, and `newest_created_at_ms` at the top
 level, plus a `rows` array where each row carries `id`, `provider`, `job_id`, `observation`,
-`state`, and `traced`.
+`state`, `traced`, and `surface`. Every t3 row also carries `run_status` (the latest run's status
+string, `null` for a thread that has never run), `last_activity_at` (ISO8601, the newest of the
+thread's own update and its latest run's request, start, and completion), and `last_error` (the
+provider session's error, else the failed run's error), each `null` where T3 holds no value.
 
 `status` owns its own exit code the way `doctor` does: `0` when nothing in the window is known to
 have failed, `1` when something is, `2` when the command could not run at all. An `unknown` never
 moves it, since an absence of information is not a finding.
+
+### `nudge`
+
+Send one follow-up user message to the thread of a job launched on the t3 surface.
+
+```bash
+$ agent-router nudge 3f0c2a7e-5b1d-4e8a-9c6f-2d4b8a1e7c90 --message "Continue where you left off." --json
+{"job_id":"3f0c2a7e-5b1d-4e8a-9c6f-2d4b8a1e7c90","sent":true,"reason":"sent a follow-up message to T3 thread 3f0c2a7e-5b1d-4e8a-9c6f-2d4b8a1e7c90 (thread was completed)"}
+```
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--message <TEXT>` | required | The text of the follow-up user message. Must not be empty. |
+| `--json` | off | Print `{"job_id", "sent", "reason"}` on stdout instead of a line of text. |
+
+The job must be one the decision log holds as a t3 dispatch; any other id is refused without asking
+T3. The message is a `message.dispatch` that starts a new run with the thread's own model
+selection. A thread with an active run, or whose latest run is still queued, preparing, starting,
+running, or waiting, is refused rather than interleaved with; a thread whose latest run completed,
+failed, was interrupted, or that has never run may be nudged. The refusal is checked against a
+shell snapshot taken just before the send, not enforced by T3: `message.dispatch` carries no idle
+precondition, so a run another client (the T3 UI, a concurrent nudge) starts in that window is
+not detected. The send goes through the t3-thread launcher's own modules (the
+launcher located as for `run --surface t3`), so T3 auth, the orchestration protocol, the server
+version gate, and the message payload have one owner.
+
+| Exit | Meaning |
+| --- | --- |
+| `0` | Sent. |
+| `1` | Runtime error, for example an unreachable or unverified T3 server. |
+| `2` | Usage: an empty message, or a job that did not run on the t3 surface. |
+| `3` | Not found: no such dispatched job in the decision log, or T3 has no such (unarchived) thread. |
+| `4` | Refused: the thread has an active run. Nothing was sent. |
 
 ### `agent-parity`
 
