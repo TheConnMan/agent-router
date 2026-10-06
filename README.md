@@ -62,6 +62,13 @@ log: row 87 in /home/you/.local/state/agent-router/router.db
    literally, never scored) **and** complexity is `high` or `ultra`; `low` and `medium`
    implement runs stay on ordinary routing. See
    [`docs/decisions/0003-implement-context-window.md`](docs/decisions/0003-implement-context-window.md).
+   Separately, Grok never runs `/implement`: a task whose first line (ignoring blank lines and a
+   `BACKGROUND_RUN=1` line) opens with `/implement` loses Grok as a candidate, and the decision
+   records `implement_excludes_grok` when Grok was a capable candidate. If `[routing] priority`
+   lists only Grok, an ordinary implement task falls back to Codex; the Claude capability pins (such
+   as `implement_context_window`) and `capability_blocked` still apply first. An explicit
+   `--provider grok` with such a task exits `1` with `grok does not run /implement tasks: ...`,
+   dispatches nothing, and writes no decision row, dry runs included.
 3. **Route by priority and weekly pace.** Auto ordinary work considers the providers in
    `[routing] priority` (default Codex then Grok), narrowed by capability. A provider at or above
    `hard_ceiling_pct`, or whose weekly usage is unknown or non-authoritative, is excluded. Among
@@ -75,14 +82,16 @@ log: row 87 in /home/you/.local/state/agent-router/router.db
    `projection_unavailable`. If no candidate has usable capacity, the first candidate
    is used and the decision visibly records `over_ceiling`. Claude's
    five hour window does not pace automatic routing. Claude is an ordinary candidate only when
-   `[routing] priority` lists it. Grok remains available for explicit
-   dispatch with `--provider grok`.
+   `[routing] priority` lists it. Grok is also available for explicit dispatch with
+   `--provider grok`, except for `/implement` tasks.
 4. **Complete the provider, model, and effort pins.** With no pins, classification chooses the
    provider through usage routing, then complexity walks that provider's model tier table and
    shared effort ladder: low uses the workhorse at high effort, medium uses the stronger model at
    medium, high uses the top model at low, and ultra keeps the top model but raises effort to high.
    Claude holds high complexity at medium effort, since every Claude tier is the same model.
-   Grok uses its lifecycle default model and effort. An explicit
+   Grok uses its lifecycle default model and effort. A Codex `/implement` task with no `--effort`
+   gets no effort from the router and runs at Codex's configured default
+   (`model_reasoning_effort` in `~/.codex/config.toml`); Claude implement tasks keep the ladder. An explicit
    Claude or Codex provider preserves that provider while classification fills omitted model and
    effort. An explicit Claude or Codex provider and model preserves both while classification fills
    effort. Three explicit values are exact and skip routing classification. Grok accepts an explicit
@@ -186,7 +195,7 @@ agent-router run "Refactor the parity scanner" --dry-run
 # Pin the provider while classification fills omitted values.
 agent-router run "Bump the lockfile" --provider codex --model gpt-6-luna
 
-# Dispatch a Grok task explicitly (auto routing may also select it for ordinary work).
+# Dispatch a Grok task explicitly (auto routing may also select it for ordinary work, never /implement).
 agent-router run "Review this migration plan" --provider grok --model grok-4
 
 # Route work in another directory.
@@ -199,9 +208,9 @@ agent-router run "Fix the failing test" --surface t3
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `--dir <PATH>` | current directory | Working directory for the dispatched job. |
-| `--provider <NAME>` | `auto` | `auto` classifies the task, balances ordinary work across `[routing] priority`, and pins Claude for capability needs. An explicit provider pins it. |
+| `--provider <NAME>` | `auto` | `auto` classifies the task, balances ordinary work across `[routing] priority`, and pins Claude for capability needs. An explicit provider pins it. Grok never runs `/implement` tasks: auto skips it and an explicit `grok` exits 1. |
 | `--model <NAME>` | tier table | Model pin. Requires an explicit `--provider`. With explicit Claude or Codex and no effort, classification fills effort. Pairing it with `--provider auto` is rejected. An explicit Grok model reaches the public lifecycle unchanged. |
-| `--effort <NAME>` | complexity ladder | Effort pin. Requires an explicit provider and model. Derived Codex effort is high, medium, low, or high for low, medium, high, or ultra complexity respectively; Claude is the same except high complexity stays at medium. Grok rejects this flag. |
+| `--effort <NAME>` | complexity ladder | Effort pin. Requires an explicit provider and model. Derived Codex effort is high, medium, low, or high for low, medium, high, or ultra complexity respectively; Claude is the same except high complexity stays at medium. A Codex `/implement` task with no `--effort` gets no router effort and uses Codex's configured default. Grok rejects this flag. |
 | `--name <NAME>` | the model's title, recovered if it omitted a ticket; otherwise three to five words derived from the task, replaced after launch by [asynchronous naming](#asynchronous-session-naming) | Name for the dispatched job. Supplying it skips naming entirely, before and after launch. It reaches the `claude --bg --name` argv verbatim, names the Codex thread, and is recorded as `job_name` in the decision log for every provider, so callers that reconcile inflight jobs by exact name depend on it. An empty or whitespace only name is rejected. |
 | `--dry-run` | off | Decide and log, dispatch nothing, and project the weekly draw the job is likely to cost on the provider it landed on. |
 | `--mcp-config <PATH>` | none | MCP config file for the dispatched Claude job. Repeatable. Rejected for every other provider, including Grok, and the check runs after routing, so pairing it with `--provider auto` fails whenever classification lands on a provider other than Claude. On the `t3` surface a Claude job accepts it but drops it with one stderr warning, because T3 has no MCP flags and the thread inherits the project's MCP servers. |

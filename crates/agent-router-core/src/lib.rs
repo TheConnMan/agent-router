@@ -12,7 +12,6 @@ pub mod doctor;
 pub mod error;
 pub mod estimate;
 pub mod grok_leader;
-pub mod implement_pin;
 pub mod log;
 pub mod naming;
 pub mod provider;

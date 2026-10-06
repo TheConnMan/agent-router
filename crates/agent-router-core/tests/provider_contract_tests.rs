@@ -120,6 +120,35 @@ fn codex_requests_pin_security_posture_and_put_effort_on_the_turn() {
     assert_eq!(turn["params"]["effort"], "xhigh");
 }
 
+/// A Codex `/implement` task with no `--effort` leaves the decision's effort as None. The turn
+/// request must then omit the `effort` key entirely, not send null, so the app-server applies the
+/// thread's configured default instead of an override. An explicit effort still rides on the turn.
+#[test]
+fn codex_turn_start_with_an_omitted_effort_sends_no_override_so_the_thread_default_applies() {
+    let omitted: Value = serde_json::from_str(&turn_start_request(
+        4,
+        "thread exact",
+        "fix the queue",
+        None,
+    ))
+    .expect("turn request");
+    assert_eq!(omitted["method"], "turn/start");
+    assert_eq!(omitted["params"]["threadId"], "thread exact");
+    assert!(
+        omitted["params"].get("effort").is_none(),
+        "an omitted effort must send no key at all: {omitted}"
+    );
+
+    let pinned: Value = serde_json::from_str(&turn_start_request(
+        5,
+        "thread exact",
+        "fix the queue",
+        Some("high"),
+    ))
+    .expect("turn request");
+    assert_eq!(pinned["params"]["effort"], "high");
+}
+
 /// The app-server names a thread through `thread/name/set`, whose params are exactly `threadId`
 /// and `name`. A name carrying spaces has to survive as one JSON string, because job names are
 /// human phrases that the caller later matches verbatim.

@@ -289,6 +289,35 @@ fn launch_args_omits_model_and_effort_flags_that_have_no_value() {
     );
 }
 
+/// A Codex `/implement` task with no `--effort` reaches the launcher as `effort: None`. That has
+/// to mean "no override" at the T3 boundary, so t3-thread leaves Codex at its configured default;
+/// any `--effort` token here, even an empty one, would pin a level the user never asked for.
+#[test]
+fn launch_args_for_codex_with_no_effort_sends_no_effort_flag_while_an_effort_does() {
+    let unset = strings(&launch_args(
+        Path::new("/work/repo"),
+        Provider::Codex,
+        Some("gpt-6-sol"),
+        None,
+        "Default Effort",
+    ));
+    assert!(
+        !unset.iter().any(|arg| arg.contains("effort")),
+        "codex launch with no effort carried an effort argument: {unset:?}"
+    );
+    let pinned = strings(&launch_args(
+        Path::new("/work/repo"),
+        Provider::Codex,
+        Some("gpt-6-sol"),
+        Some("high"),
+        "Pinned Effort",
+    ));
+    assert!(
+        pinned.contains(&"--effort=high".to_string()),
+        "codex launch with an effort dropped it: {pinned:?}"
+    );
+}
+
 /// AC2, decision 6. t3-thread rejects a separate value starting with `--`, so a title or project
 /// path that starts with dashes must stay inside its own `=` token. The last three tokens are
 /// always title, stdin prompt, json; `--wait` and any MCP token never appear.

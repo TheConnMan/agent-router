@@ -69,7 +69,6 @@ fn entry<'a>(task: &'a str, decision: &'a agent_router_core::Decision) -> Entry<
         job_name: None,
         outcome: "dry-run",
         effective_effort: None,
-        note: None,
         surface: Surface::Background,
         thread_url: None,
     }

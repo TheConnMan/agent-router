@@ -32,7 +32,6 @@ fn record(log: &DecisionLog, task: &str) -> i64 {
         job_name: None,
         outcome: "dispatched",
         effective_effort: None,
-        note: None,
         surface: Surface::Background,
         thread_url: None,
     })

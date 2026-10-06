@@ -33,7 +33,9 @@ enum Command {
         #[arg(long)]
         dir: Option<PathBuf>,
         /// auto, or codex, claude, or grok to pin the provider while omitted values are
-        /// classified. Grok is explicit only.
+        /// classified. Automatic routing can choose grok when [routing] priority lists it. A task
+        /// opening with /implement never runs on grok: auto skips it and an explicit grok is
+        /// refused.
         #[arg(long, default_value = "auto")]
         provider: String,
         /// Model override, requires an explicit --provider.
@@ -1166,11 +1168,8 @@ fn outcome_json(outcome: &Outcome) -> serde_json::Value {
         "rationale": decision.rationale,
         "surface": outcome.surface.name(),
         "dispatch": outcome.dispatch,
-        "dry_run": outcome.dispatch.is_none()
-            && outcome.capability_blocked.is_none()
-            && outcome.skill_pin_blocked.is_none(),
+        "dry_run": outcome.dispatch.is_none() && outcome.capability_blocked.is_none(),
         "capability_blocked": outcome.capability_blocked,
-        "skill_pin_blocked": outcome.skill_pin_blocked,
         "log_id": outcome.log_id,
         "log_error": outcome.log_error,
         // Emitted on both paths, as null off the dry run one, so the JSON shape does not depend on
@@ -1198,12 +1197,6 @@ fn print_outcome(outcome: &Outcome, ctx: &agent_router_core::Context) {
     }
     if let Some(reason) = &outcome.capability_blocked {
         line.push_str(" (capability blocked, nothing dispatched)");
-        println!("{line}");
-        println!("why: {reason}");
-        return;
-    }
-    if let Some(reason) = &outcome.skill_pin_blocked {
-        line.push_str(" (implement skill pin refused, nothing dispatched)");
         println!("{line}");
         println!("why: {reason}");
         return;

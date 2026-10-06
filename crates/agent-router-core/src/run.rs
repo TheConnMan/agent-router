@@ -70,9 +70,6 @@ pub struct Outcome {
     /// The router refused to dispatch because the authoritative inventory does not establish the
     /// required capability for any provider.
     pub capability_blocked: Option<String>,
-    /// The router refused a Grok `/implement` launch because the launch directory does not resolve
-    /// the user-scope implement skill. See `implement_pin`.
-    pub skill_pin_blocked: Option<String>,
     /// None when the row could not be written. A job that is already running must still be
     /// reported to the caller, so a logging failure downgrades to `log_error` rather than
     /// swallowing the job identity behind an Err.
@@ -168,6 +165,17 @@ where
             "Grok does not support --effort; omit it".to_string(),
         ));
     }
+    // Grok no longer drives `/implement`; it stays a reviewer. An explicit Grok implement run is
+    // refused here, before classification and before the log is opened, so the refusal costs no
+    // classifier call and writes no row, dry run included. Automatic routing drops Grok on its
+    // own (see `Gate::ImplementExcludesGrok`); this is the explicit half of the same rule, and it
+    // uses the same detector the classifier stamps.
+    if request.provider == Some(Provider::Grok) && crate::classify::invokes_implement(request.task)
+    {
+        return Err(Error::Command(
+            "grok does not run /implement tasks: implement runs go to codex or claude; use --provider auto, codex, or claude".to_string(),
+        ));
+    }
     // An empty or whitespace only name beats the derived default because it is Some, so it would
     // reach the spawned job and orphan it. A loud error is correct, since a caller passing an
     // empty name believes it set a specific one.
@@ -261,65 +269,12 @@ where
     let mcp_warning = (request.surface == Surface::T3
         && (!request.mcp_configs.is_empty() || request.strict_mcp_config))
         .then(|| T3_MCP_DROPPED.to_string());
-    // The Grok `/implement` skill pin. It runs after `decide` because an automatic route only
-    // learns it landed on Grok here, and before every `record` below so the row a refusal writes
-    // and the row a pinned launch writes are produced by the same code path.
-    //
-    // Claude and Codex are untouched: `is_grok_implement` is the whole gate.
-    let is_grok_implement = decision.provider == Provider::Grok
-        && crate::implement_pin::is_implement_task(request.task);
-    let pin = is_grok_implement.then(|| {
-        crate::implement_pin::preflight(&ctx.environment, &ctx.home, request.dir, request.task)
-    });
     let log = open_log()?;
-    // A refused launch is logged like a capability block: no job started, but the router's refusal
-    // is exactly the row an operator needs, and the reason lands in `note` so `log` shows it
-    // without a second lookup.
-    let pin = match pin {
-        Some(Err(reason)) => {
-            let log_id = log.record(&Entry {
-                task: request.task,
-                dir: request.dir,
-                requested,
-                decision: &decision,
-                dry_run: request.dry_run,
-                job_id: None,
-                job_name: None,
-                outcome: "skill-pin-blocked",
-                effective_effort: None,
-                note: Some(&reason),
-                surface: request.surface,
-                thread_url: None,
-            })?;
-            return Ok(Outcome {
-                decision,
-                dispatch: None,
-                capability_blocked: None,
-                skill_pin_blocked: Some(reason),
-                log_id: Some(log_id),
-                log_error: None,
-                estimate: None,
-                naming_started: false,
-                naming_skipped: None,
-                surface: request.surface,
-                mcp_warning: None,
-            });
-        }
-        Some(Ok(pin)) => Some(pin),
-        None => None,
-    };
-    // Every row and the dispatch below read the pinned text, so the two prepended lines are in
-    // `decisions.task` byte for byte as the job received them.
-    let task = pin.as_ref().map_or(request.task, |pin| pin.task.as_str());
-    let note = pin
-        .as_ref()
-        .map(|pin| format!("implement skill pinned to {}", pin.skill.display()));
-    let note = note.as_deref();
 
     if decision.capability_blocked {
         let capability_blocked = "required capability is absent from every configured provider inventory; no provider was dispatched".to_string();
         let log_id = log.record(&Entry {
-            task,
+            task: request.task,
             dir: request.dir,
             requested,
             decision: &decision,
@@ -328,7 +283,6 @@ where
             job_name: None,
             outcome: "capability-blocked",
             effective_effort: None,
-            note,
             surface: request.surface,
             thread_url: None,
         })?;
@@ -336,7 +290,6 @@ where
             decision,
             dispatch: None,
             capability_blocked: Some(capability_blocked),
-            skill_pin_blocked: None,
             log_id: Some(log_id),
             log_error: None,
             estimate: None,
@@ -356,7 +309,7 @@ where
         // itself. It dispatched nothing, so it drew nothing.
         let estimate = crate::estimate::project(&log, &decision)?;
         let log_id = log.record(&Entry {
-            task,
+            task: request.task,
             dir: request.dir,
             requested,
             decision: &decision,
@@ -366,7 +319,6 @@ where
             outcome: "dry-run",
             // A dry run dispatched nothing, so no backend said anything about an effort.
             effective_effort: None,
-            note,
             surface: request.surface,
             thread_url: None,
         })?;
@@ -374,7 +326,6 @@ where
             decision,
             dispatch: None,
             capability_blocked: None,
-            skill_pin_blocked: None,
             log_id: Some(log_id),
             log_error: None,
             estimate: Some(estimate),
@@ -388,7 +339,7 @@ where
     }
 
     let dispatch_request = Request {
-        task,
+        task: request.task,
         dir: request.dir,
         provider: request.provider,
         model: request.model.clone(),
@@ -410,7 +361,7 @@ where
     // keeping, and losing it would hide the failure from the tuning data.
     let (job_id, job_name, effective_effort, outcome) = recorded_fields(&dispatched);
     let recorded = log.record(&Entry {
-        task,
+        task: request.task,
         dir: request.dir,
         requested,
         decision: &decision,
@@ -419,7 +370,6 @@ where
         job_name: job_name.as_deref(),
         outcome: &outcome,
         effective_effort: effective_effort.as_deref(),
-        note,
         surface: request.surface,
         thread_url: thread_url.as_deref(),
     });
@@ -464,7 +414,7 @@ where
                 job_id: dispatch.job_id.clone(),
                 launch_name: dispatch.job_name.clone(),
                 log_id,
-                task: task.to_string(),
+                task: request.task.to_string(),
             };
             match crate::naming::spawn_worker(ctx, &job) {
                 // Not waited on and not killed: the child is reaped by init once this process exits,
@@ -484,7 +434,6 @@ where
         decision,
         dispatch: Some(dispatch),
         capability_blocked: None,
-        skill_pin_blocked: None,
         log_id,
         log_error,
         estimate: None,

@@ -1208,7 +1208,9 @@ fn a_verified_claude_granola_connector_is_an_auto_capability_destination() {
 #[cfg(unix)]
 #[test]
 fn explicit_providers_without_derived_values_skip_classification() {
-    let fixture = CliFixture::new("grok-no-classifier");
+    // Not an implement task: an explicit grok refuses those (see
+    // `an_explicit_grok_implement_run_exits_nonzero_and_logs_nothing`).
+    let fixture = CliFixture::new("grok-no-classifier").with_task("review the router decision log");
     let output = fixture
         .run_command()
         .arg("--provider")
@@ -1343,6 +1345,194 @@ fn run_help_lists_grok_as_an_explicit_provider() {
         "run --help must list the Grok provider: {}",
         String::from_utf8_lossy(&output.stdout)
     );
+}
+
+/// The `--provider` paragraph of `run --help`, whitespace collapsed so clap's wrapping does not
+/// matter: from the `--provider` line up to the next option line.
+#[cfg(unix)]
+fn provider_help_paragraph(help: &str) -> String {
+    let mut lines = help
+        .lines()
+        .skip_while(|line| !line.trim_start().starts_with("--provider"));
+    let mut paragraph = lines.next().unwrap_or_default().to_string();
+    for line in lines {
+        if line.trim_start().starts_with('-') {
+            break;
+        }
+        paragraph.push(' ');
+        paragraph.push_str(line);
+    }
+    paragraph.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// AC4: the help must tell an operator that grok is reachable automatically and that an implement
+/// task never runs there, and must stop claiming grok is explicit only.
+#[cfg(unix)]
+#[test]
+fn run_help_says_implement_tasks_never_run_on_grok() {
+    let output = Command::new(env!("CARGO_BIN_EXE_agent-router"))
+        .args(["run", "--help"])
+        .output()
+        .expect("run router help");
+    assert!(
+        output.status.success(),
+        "run --help failed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let help = String::from_utf8_lossy(&output.stdout);
+    let paragraph = provider_help_paragraph(&help).to_lowercase();
+    assert!(
+        paragraph.contains("implement")
+            && paragraph.contains("grok")
+            && paragraph.contains("never"),
+        "the --provider help must say implement tasks never run on grok: {paragraph:?}"
+    );
+    assert!(
+        !help.contains("Grok is explicit only"),
+        "the stale explicit-only claim is still in the help: {help}"
+    );
+}
+
+/// AC1/AC7: an explicit grok with an implement task exits nonzero with a message naming grok and
+/// /implement, prints no JSON, never invokes grok or the classifier, and writes no decision row.
+/// The liveness neighbor is `explicit_providers_without_derived_values_skip_classification`, the
+/// same explicit grok dry run with an ordinary task.
+#[cfg(unix)]
+#[test]
+fn an_explicit_grok_implement_run_exits_nonzero_and_logs_nothing() {
+    let fixture = CliFixture::new("grok-implement-refused").with_task("/implement RS-1");
+    // Shadows any real grok on PATH, so the assertion below can prove grok was never touched.
+    let grok_log = fixture.root.path.join("grok.argv");
+    common::write_stub(
+        &fixture.root.path.join("bin/grok"),
+        &format!(
+            "printf '%s\\n' \"$@\" >> {}\nexit 0\n",
+            shell_quote(&grok_log.to_string_lossy())
+        ),
+    );
+
+    let output = fixture
+        .run_command()
+        .arg("--provider")
+        .arg("grok")
+        .arg("--dry-run")
+        .arg("--json")
+        .output()
+        .expect("run router");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "an explicit grok implement run must exit nonzero, stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        stderr.to_lowercase().contains("grok") && stderr.contains("/implement"),
+        "stderr must name grok and /implement: {stderr}"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "a refusal prints no JSON: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        fixture.classifier_calls(),
+        0,
+        "the task reached the classifier"
+    );
+    assert!(!grok_log.exists(), "grok was invoked for a refused run");
+    assert!(!fixture.spawn_log.exists(), "something was dispatched");
+
+    let logged = fixture
+        .router()
+        .args(["log", "--limit", "10", "--json"])
+        .output()
+        .expect("read decision log");
+    assert!(
+        logged.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&logged.stderr)
+    );
+    let rows: Value = serde_json::from_slice(&logged.stdout).expect("log json");
+    assert_eq!(rows, json!([]), "a refused run must write no decision row");
+}
+
+/// AC3/AC7: a codex implement dry run leaves effort to codex, in the JSON and in the logged row.
+/// The neighbor with an ordinary task is `pinned_codex_provider_uses_the_complexity_model_and_effort_mapping`.
+#[cfg(unix)]
+#[test]
+fn a_codex_implement_dry_run_reports_a_null_effort() {
+    let fixture = CliFixture::new("codex-implement-effort").with_task("/implement RS-1");
+    fixture.answers_with_complexity("high");
+
+    let output = fixture
+        .run_command()
+        .arg("--provider")
+        .arg("codex")
+        .arg("--dry-run")
+        .arg("--json")
+        .output()
+        .expect("run router");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("router json");
+    assert_eq!(value["provider"], "codex");
+    assert_eq!(
+        value["model"], "gpt-6-astra",
+        "the model ladder still applies"
+    );
+    assert_eq!(value["effort"], Value::Null, "{value}");
+    assert_eq!(value["classification"]["complexity"], "high");
+
+    let logged = fixture
+        .router()
+        .args(["log", "--limit", "1", "--json"])
+        .output()
+        .expect("read decision log");
+    let rows: Value = serde_json::from_slice(&logged.stdout).expect("log json");
+    assert_eq!(rows[0]["task"], "/implement RS-1");
+    assert_eq!(rows[0]["effort"], Value::Null, "row: {}", rows[0]);
+}
+
+/// AC2: the Grok implement pin is gone, so no `run --json` output carries its key, on any route.
+#[cfg(unix)]
+#[test]
+fn run_json_carries_no_skill_pin_blocked_key() {
+    for (label, provider, task) in [
+        ("no-pin-auto", "auto", "/implement RS-1"),
+        ("no-pin-codex", "codex", "/implement RS-1"),
+        ("no-pin-claude", "claude", "/implement RS-1"),
+        ("no-pin-grok", "grok", "review the router decision log"),
+    ] {
+        let fixture = CliFixture::new(label).with_task(task);
+        let output = fixture
+            .run_command()
+            .arg("--provider")
+            .arg(provider)
+            .arg("--dry-run")
+            .arg("--json")
+            .output()
+            .expect("run router");
+        assert!(
+            output.status.success(),
+            "{provider} stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: Value = serde_json::from_slice(&output.stdout).expect("router json");
+        assert!(
+            value.get("skill_pin_blocked").is_none(),
+            "{provider} output still carries skill_pin_blocked: {value}"
+        );
+        if task.starts_with("/implement") {
+            assert_ne!(
+                value["provider"], "grok",
+                "{provider}: an implement task landed on grok"
+            );
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -1540,9 +1730,11 @@ fn a_claude_dispatch_records_no_effective_effort() {
 fn pinned_codex_provider_uses_the_complexity_model_and_effort_mapping() {
     for (label, task, complexity, model, effort) in [
         ("codex-low", "say hi", "low", "gpt-6-terra", "high"),
+        // Not an implement task: a codex implement run derives no effort (see
+        // `a_codex_implement_dry_run_reports_a_null_effort`).
         (
             "codex-high",
-            "/implement redesign the router architecture",
+            "redesign the router architecture",
             "high",
             "gpt-6-astra",
             "low",
