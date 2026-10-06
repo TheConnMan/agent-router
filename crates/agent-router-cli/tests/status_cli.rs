@@ -178,7 +178,6 @@ impl StatusFixture {
             job_name,
             outcome,
             effective_effort: None,
-            note: None,
             surface: Surface::Background,
             thread_url: None,
         })
@@ -756,7 +755,6 @@ fn t3_surface_rows_are_reported_unsupported_and_never_reconciled_as_claude_or_co
                 job_name: Some("A T3 Thread"),
                 outcome: "dispatched",
                 effective_effort: None,
-                note: None,
                 surface: Surface::T3,
                 thread_url: Some(&url),
             })

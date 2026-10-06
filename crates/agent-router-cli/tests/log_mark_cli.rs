@@ -104,7 +104,6 @@ impl MarkFixture {
             job_name: Some("a routed job"),
             outcome,
             effective_effort: None,
-            note: None,
             surface: Surface::Background,
             thread_url: None,
         })

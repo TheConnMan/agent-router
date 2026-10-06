@@ -30,11 +30,6 @@ pub struct Entry<'a> {
     /// fact from the effort the router decided. None where the backend says nothing, which is every
     /// claude and grok dispatch and every dry run.
     pub effective_effort: Option<&'a str>,
-    /// What the router recorded about the route beyond the decision itself. Today that is the
-    /// Grok `/implement` skill pin: the resolved SKILL.md on a launch that passed the preflight,
-    /// and the refusal sentence on one that did not. `mark --note` writes the same column later,
-    /// so a reviewer's note deliberately supersedes this one.
-    pub note: Option<&'a str>,
     /// Where the job was (or would have been) launched. Stored on every row, background included,
     /// so a NULL in the column always means a row written before it existed.
     pub surface: crate::config::Surface,
@@ -174,9 +169,7 @@ pub struct Row {
     /// The human judgement on the route. None means nobody has judged this row, which is not the
     /// same as judging it good.
     pub mark: Option<String>,
-    /// What was said about this route beyond the decision. `record` writes the router's own note
-    /// (today, the Grok `/implement` skill pin or its refusal sentence); `mark --note` overwrites
-    /// it with a human's, which deliberately wins. None means neither wrote one.
+    /// What the human said alongside the mark. None means nothing was said.
     pub note: Option<String>,
     /// The effective reasoning effort established through the backend: Codex's accepted turn
     /// override, or its reported thread default when no override was sent. None means nobody
@@ -377,7 +370,9 @@ matched_capabilities, requested_model, surface, thread_url";
 /// error are the job-fate set `stats` denominates a failure rate on. `capability-blocked` is
 /// extra: no job was dispatched, but the router already refused the route, so a review pass can
 /// judge that refuse the same way it judges a finished dispatch. `skill-pin-blocked` is the same
-/// shape: the Grok `/implement` preflight refused before any job existed. A dry run's outcome is
+/// shape: the retired Grok `/implement` preflight refused before any job existed. No build after
+/// 0.36 writes that outcome, but rows written by the builds that did still carry it, so it stays
+/// settled for them. A dry run's outcome is
 /// `dry-run`, so it does not match; live jobs (`dispatched`, `running`) and `unknown` stay out
 /// because a review pass cannot judge a route whose job has not finished.
 const SETTLED_OUTCOME_SQL: &str = "outcome = 'completed' OR outcome = 'failed' \
@@ -481,7 +476,7 @@ impl DecisionLog {
                 complexity, task_context_horizon, claude_usage_stale, codex_usage_stale,
                 claude_projected_draw, codex_projected_draw, grok_projected_draw,
                 effective_effort, router_version, grok_weekly_pct, grok_weekly_reset,
-                matched_capabilities, requested_model, note, surface, thread_url
+                matched_capabilities, requested_model, surface, thread_url
             ) VALUES (
                 :created_at_ms, :task, :dir, :requested, :provider, :model, :effort,
                 :orchestration, :missing_connector, :gates, :rationale,
@@ -491,13 +486,11 @@ impl DecisionLog {
                 :outcome, :complexity, :task_context_horizon, :claude_usage_stale,
                 :codex_usage_stale, :claude_projected_draw, :codex_projected_draw,
                 :grok_projected_draw, :effective_effort, :router_version, :grok_weekly_pct,
-                :grok_weekly_reset, :matched_capabilities, :requested_model, :note, :surface,
-                :thread_url
+                :grok_weekly_reset, :matched_capabilities, :requested_model, :surface, :thread_url
             )",
             rusqlite::named_params! {
                 ":created_at_ms": now_ms(),
                 ":task": entry.task,
-                ":note": entry.note,
                 ":dir": dir,
                 ":requested": entry.requested,
                 ":provider": decision.provider.name(),
@@ -1316,7 +1309,6 @@ mod tests {
                 job_name: None,
                 outcome: "dispatched",
                 effective_effort: None,
-                note: None,
                 surface: crate::config::Surface::Background,
                 thread_url: None,
             })
@@ -1372,7 +1364,6 @@ mod tests {
             job_name: Some("t"),
             outcome: "dry-run",
             effective_effort: None,
-            note: None,
             surface: crate::config::Surface::Background,
             thread_url: None,
         })
@@ -1412,7 +1403,6 @@ mod tests {
             job_name: None,
             outcome: "dispatched",
             effective_effort: None,
-            note: None,
             surface: crate::config::Surface::Background,
             thread_url: None,
         })
@@ -1444,7 +1434,6 @@ mod tests {
                 job_name: None,
                 outcome: "dry-run",
                 effective_effort: None,
-                note: None,
                 surface: crate::config::Surface::Background,
                 thread_url: None,
             })
@@ -1475,7 +1464,6 @@ mod tests {
                 job_name: None,
                 outcome,
                 effective_effort: None,
-                note: None,
                 surface: crate::config::Surface::Background,
                 thread_url: None,
             })
@@ -1530,7 +1518,6 @@ mod tests {
             job_name: None,
             outcome: "dispatched",
             effective_effort: None,
-            note: None,
             surface: crate::config::Surface::Background,
             thread_url: None,
         };
@@ -1794,7 +1781,6 @@ mod tests {
             job_name: None,
             outcome: "dry-run",
             effective_effort: None,
-            note: None,
             surface: crate::config::Surface::Background,
             thread_url: None,
         })
@@ -1836,7 +1822,6 @@ mod tests {
             job_name: None,
             outcome: "dry-run",
             effective_effort: None,
-            note: None,
             surface: crate::config::Surface::Background,
             thread_url: None,
         })
@@ -1894,7 +1879,6 @@ mod tests {
                 job_name: None,
                 outcome: "dispatched",
                 effective_effort: None,
-                note: None,
                 surface: crate::config::Surface::Background,
                 thread_url: None,
             })
@@ -1992,7 +1976,6 @@ mod tests {
             job_name: None,
             outcome: "dry-run",
             effective_effort: None,
-            note: None,
             surface: crate::config::Surface::Background,
             thread_url: None,
         })
@@ -2015,7 +1998,6 @@ mod tests {
             job_name: None,
             outcome: "dry-run",
             effective_effort: None,
-            note: None,
             surface: crate::config::Surface::Background,
             thread_url: None,
         })
@@ -2046,7 +2028,6 @@ mod tests {
             job_name: None,
             outcome: "dry-run",
             effective_effort: None,
-            note: None,
             surface: crate::config::Surface::Background,
             thread_url: None,
         };
@@ -2082,7 +2063,6 @@ mod tests {
                 job_name: None,
                 outcome: "dry-run",
                 effective_effort: None,
-                note: None,
                 surface: crate::config::Surface::Background,
                 thread_url: None,
             })
@@ -2634,7 +2614,6 @@ CREATE TABLE IF NOT EXISTS reviews (
                 job_name: Some("Background Job"),
                 outcome: "dispatched",
                 effective_effort: None,
-                note: None,
                 surface: crate::config::Surface::Background,
                 thread_url: None,
             })
@@ -2650,7 +2629,6 @@ CREATE TABLE IF NOT EXISTS reviews (
                 job_name: Some("T3 Job"),
                 outcome: "dispatched",
                 effective_effort: None,
-                note: None,
                 surface: crate::config::Surface::T3,
                 thread_url: Some("http://127.0.0.1:3773/t/thr_1"),
             })

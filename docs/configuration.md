@@ -258,7 +258,11 @@ Default `["codex", "grok"]`. Ordered list of ordinary automatic candidates,
 lowercase `"claude"`, `"codex"`, `"grok"`. First is preferred. Claude is an ordinary candidate
 only when listed; orchestration, the implement context window, and a Claude-only capability pin
 Claude regardless. Must name at least one provider and none twice; an unknown name is a
-configuration error. A matched capability narrows the list, in order.
+configuration error. A matched capability narrows the list, in order. A task whose first line (ignoring blank lines and
+a `BACKGROUND_RUN=1` line) opens with `/implement` never runs on Grok: Grok is removed from the
+candidates and the decision records `implement_excludes_grok` when Grok was a capable candidate. If
+the list names only Grok, an ordinary implement task falls back to Codex; the Claude capability
+pins (such as `implement_context_window`) and `capability_blocked` still apply first.
 
 ### `priority_margin_pct`
 
@@ -405,7 +409,10 @@ hard to earn because it raises that model from low to high effort.
 
 The router's `effort` value is the requested effort. Classified Codex and Claude work, including an
 explicitly pinned model with omitted effort, use the shared complexity ladder above. A fully pinned
-request keeps the supplied value. Grok receives no effort from classification and rejects an
+request keeps the supplied value. The exception is a Codex `/implement` task with no `--effort`: the
+router derives no effort for it, so `effort` is null in JSON and NULL in the decision row, no
+override reaches Codex, and the run uses Codex's configured default (`model_reasoning_effort` in
+`~/.codex/config.toml`). Claude implement tasks keep the ladder. Grok receives no effort from classification and rejects an
 explicit `--effort` pin.
 
 On Claude the router passes the requested value as `--effort`. Claude reports the value it settled on

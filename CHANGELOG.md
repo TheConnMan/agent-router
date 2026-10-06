@@ -3,6 +3,30 @@
 All notable changes to this project are documented here. Versions are the
 workspace `package.version` stamped on every decision-log row.
 
+## 0.37.0 - 2026-10-06
+
+- Grok no longer runs `/implement` tasks. A task whose first line, ignoring blank lines and a
+  `BACKGROUND_RUN=1` line, opens with `/implement` is removed from Grok's automatic candidates, and
+  the decision records the new gate `implement_excludes_grok` when Grok was a capable candidate. If
+  `[routing] priority` lists only Grok, an ordinary implement task falls back to Codex; the Claude
+  capability pins (such as `implement_context_window`) and `capability_blocked` still apply first. An
+  explicit `--provider grok` with such a task exits `1` with
+  `grok does not run /implement tasks: ...`, dispatches nothing, and writes no decision row, dry
+  runs included. Grok scored lowest in a review of implement runs.
+- Removed the Grok implement skill pin: the `grok inspect --json` preflight, the two prepended
+  lines, the `skill-pin-blocked` outcome, the `skill_pin_blocked` JSON key, and the router writing
+  `decisions.note` at record time. `note` is now written only by `log mark --note`. Older rows may
+  still carry `skill-pin-blocked`, and it still counts as settled.
+- A Codex `/implement` task with no `--effort` now gets no effort from the router. `effort` is null
+  in JSON and NULL in the decision row, no override reaches Codex, and the run uses Codex's
+  configured default (`model_reasoning_effort` in `~/.codex/config.toml`). An explicit `--effort`
+  is still honored. Claude implement tasks and all non-implement tasks keep the complexity ladder.
+  The classifier fails often and its fallback scores every task high complexity, which the Codex
+  ladder mapped to `low`, so most Codex implement runs had been running at low effort.
+- `run --help` no longer says "Grok is explicit only". Automatic routing can choose Grok when
+  `[routing] priority` lists it. Adversarial review is unchanged, and Grok remains an eligible
+  reviewer.
+
 ## 0.36.0 (2026-10-03)
 
 `agent-router adversarial-review` now requires `--request-file <PATH>`, with `-` reading the review

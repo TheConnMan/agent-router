@@ -86,6 +86,13 @@ pub enum Gate {
     /// whose score beat it by more than `priority_margin_pct`. A provider-moving gate: it is in
     /// `stats.rs` `FLIP_GATES`.
     PriorityOverriddenByUsage,
+    /// An `/implement` task never runs on Grok: the owner decided Grok no longer drives
+    /// `/implement` and stays a reviewer, so automatic routing drops it from the candidates before
+    /// any usage rule runs. Recorded only when Grok was a capable priority candidate that this
+    /// filter removed, so a priority without Grok, or a capability Grok does not hold, leaves no
+    /// trace. Not a flip: the task never started on Grok, so it does not belong in `stats.rs`
+    /// `FLIP_GATES`.
+    ImplementExcludesGrok,
 }
 
 impl Gate {
@@ -106,6 +113,7 @@ impl Gate {
             Gate::ClassifierUnlaunchable => "classifier_unlaunchable",
             Gate::ProjectionUnavailable => "projection_unavailable",
             Gate::PriorityOverriddenByUsage => "priority_overridden_by_usage",
+            Gate::ImplementExcludesGrok => "implement_excludes_grok",
         }
     }
 }
@@ -123,6 +131,9 @@ pub struct Decision {
     /// after `turn/start` accepts it, the log records it separately as `effective_effort`. Without
     /// an override, Codex reports the thread default resolved from user config. Claude receives the
     /// requested value but reports no resolved value, and Grok accepts no effort value.
+    ///
+    /// None on a Codex `/implement` run with no `--effort`, so dispatch sends no override and the
+    /// run uses Codex's configured default. See `effort_for`.
     pub effort: Option<String>,
     /// None when provider, model, and effort were all pinned.
     pub classification: Option<Classification>,
@@ -244,19 +255,40 @@ pub fn decide_with_task(
     // docs/decisions/0012-configurable-provider-priority.md.
     let capability_eligible =
         |candidate: Provider| !capability_constraint || capability_providers.contains(&candidate);
+    // An `/implement` task never reaches Grok, whatever the priority or the usage picture says:
+    // Grok no longer drives `/implement`. Filtering here, before any usage rule, keeps a Grok
+    // exclusion from ever reading as a capacity flip.
+    let implement = classification.invokes_implement;
+    let routable = |candidate: Provider| !(implement && candidate == Provider::Grok);
+    if implement
+        && config
+            .routing
+            .priority
+            .iter()
+            .any(|candidate| *candidate == Provider::Grok && capability_eligible(*candidate))
+    {
+        gates.push(Gate::ImplementExcludesGrok);
+    }
     let candidates: Vec<Provider> = config
         .routing
         .priority
         .iter()
         .copied()
-        .filter(|candidate| capability_eligible(*candidate))
+        .filter(|candidate| capability_eligible(*candidate) && routable(*candidate))
         .collect();
     // With no capable candidate the ordinary route is kept for log compatibility and never
-    // dispatched. Load rejects an empty priority, so the Codex literal only keeps `decide` total
-    // for a `Config` built in code.
+    // dispatched. It still skips Grok for an implement task, so a priority of only Grok cannot
+    // route one there. Load rejects an empty priority, so the Codex literal keeps `decide` total
+    // for a `Config` built in code and for an implement task whose priority names only Grok.
     let mut provider = candidates
         .first()
-        .or(config.routing.priority.first())
+        .or_else(|| {
+            config
+                .routing
+                .priority
+                .iter()
+                .find(|candidate| routable(**candidate))
+        })
         .copied()
         .unwrap_or(Provider::Codex);
     if capability_providers == [Provider::Claude] {
@@ -379,7 +411,7 @@ pub fn decide_with_task(
     Decision {
         provider,
         model,
-        effort: effort_for(provider, complexity),
+        effort: effort_for(provider, complexity, implement),
         classification: Some(classification),
         gates,
         capability_blocked,
@@ -439,7 +471,11 @@ pub fn decide_explicit(
         .map(|classification| classification.complexity);
     let requested_model = model.clone();
     let model = model.or_else(|| complexity.and_then(|value| model_for(provider, value, config)));
-    let effort = effort.or_else(|| complexity.and_then(|value| effort_for(provider, value)));
+    let implement = classification
+        .as_ref()
+        .is_some_and(|classification| classification.invokes_implement);
+    let effort =
+        effort.or_else(|| complexity.and_then(|value| effort_for(provider, value, implement)));
     let rationale = classification
         .as_ref()
         .map(|classification| {
@@ -494,8 +530,13 @@ fn model_for(provider: Provider, complexity: Complexity, config: &Config) -> Opt
 /// Claude is the exception at high: its tiers all resolve to the same Opus model, so dropping to
 /// low would give a harder task the same model with less reasoning than a medium one. It holds at
 /// medium instead.
-fn effort_for(provider: Provider, complexity: Complexity) -> Option<String> {
+///
+/// A Codex `/implement` run gets no effort at all, so the backend runs at Codex's own configured
+/// default rather than a ladder value. An explicit `--effort` still wins, because callers only
+/// reach this when none was given.
+fn effort_for(provider: Provider, complexity: Complexity, implement: bool) -> Option<String> {
     match (provider, complexity) {
+        (Provider::Codex, _) if implement => None,
         (Provider::Claude, Complexity::High) => Some("medium".to_string()),
         (Provider::Codex | Provider::Claude, _) => Some(complexity_effort(complexity).to_string()),
         (Provider::Grok, _) => None,
