@@ -1433,6 +1433,7 @@ mod protocol {
                 Path::new("/home/user/project"),
                 "implement framing",
                 Some("grok-4-fast"),
+                &[],
             )
             .expect("official Grok spawn");
         assert_eq!(result.session_id.as_deref(), Some("session-alpha"));
@@ -1503,6 +1504,7 @@ mod protocol {
                 Path::new("/home/user/project"),
                 "detached nonworking kickoff",
                 None,
+                &[],
             )
             .expect_err("a nonworking roster must not hide the following prompt error");
 
@@ -1532,6 +1534,7 @@ mod protocol {
                 Path::new("/home/user/project"),
                 "detached nonmatching kickoff",
                 None,
+                &[],
             )
             .expect_err("an unrelated working row must not hide the following prompt error");
 
@@ -1561,6 +1564,7 @@ mod protocol {
                 Path::new("/home/user/project"),
                 "detached nonresident kickoff",
                 None,
+                &[],
             )
             .expect_err("a nonresident working row must not confirm detached execution");
 
@@ -1575,7 +1579,12 @@ mod protocol {
         let registration_for = |model: Option<&str>| {
             let (home, leader) = leader_home();
             GrokLifecycle::new("/bin/true", home.path())
-                .spawn(Path::new("/home/user/project"), "detached kickoff", model)
+                .spawn(
+                    Path::new("/home/user/project"),
+                    "detached kickoff",
+                    model,
+                    &[],
+                )
                 .expect("official Grok spawn");
             leader
                 .captured()
@@ -1620,6 +1629,7 @@ mod protocol {
                 Path::new("/home/user/project"),
                 "permission collision",
                 None,
+                &[],
             )
             .expect("spawn must survive a colliding reverse permission request");
         assert_eq!(result.session_id.as_deref(), Some("session-alpha"));
@@ -2032,7 +2042,12 @@ mod protocol {
             false,
         );
         let error = GrokLifecycle::new("/bin/true", home.path())
-            .spawn(Path::new("/home/user/project"), "rejected prompt", None)
+            .spawn(
+                Path::new("/home/user/project"),
+                "rejected prompt",
+                None,
+                &[],
+            )
             .expect_err("the official prompt JSON RPC error must surface");
         assert!(
             error.to_string().contains("prompt rejected"),
@@ -2067,7 +2082,12 @@ mod protocol {
             false,
         );
         let error = GrokLifecycle::new("/bin/true", home.path())
-            .spawn(Path::new("/home/user/project"), "rejected prompt", None)
+            .spawn(
+                Path::new("/home/user/project"),
+                "rejected prompt",
+                None,
+                &[],
+            )
             .expect_err("hostile official leader error must surface safely");
         assert_terminal_safe("leader error", &error.to_string());
     }
@@ -2076,7 +2096,12 @@ mod protocol {
     fn spawn_without_a_model_does_not_invent_registration_metadata() {
         let (home, leader) = leader_home();
         let result = GrokLifecycle::new("/bin/true", home.path())
-            .spawn(Path::new("/home/user/project"), "use runtime default", None)
+            .spawn(
+                Path::new("/home/user/project"),
+                "use runtime default",
+                None,
+                &[],
+            )
             .expect("default model Grok spawn");
         assert_eq!(result.session_id.as_deref(), Some("session-alpha"));
 
@@ -2377,6 +2402,7 @@ mod protocol {
                     Path::new("/home/user/project"),
                     "require persistent leader",
                     None,
+                    &[],
                 )
                 .expect_err("missing persistent leader must refuse spawn"),
             lifecycle
@@ -2519,7 +2545,7 @@ mod protocol {
         .expect("stale leader lock");
 
         let error = GrokLifecycle::new("/bin/true", home.path())
-            .spawn(Path::new("/home/user/project"), "stale leader", None)
+            .spawn(Path::new("/home/user/project"), "stale leader", None, &[])
             .expect_err("a refused leader socket must not spawn");
         assert_eq!(
             error.to_string(),

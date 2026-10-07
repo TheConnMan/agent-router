@@ -176,7 +176,17 @@ impl GrokLifecycle {
         }
     }
 
-    pub fn spawn(&self, cwd: &Path, task: &str, model: Option<&str>) -> Result<SpawnResult> {
+    /// IMPURE: start a session and submit `task` as its first prompt. Every tool named in
+    /// `disallowed_tools` is removed from that one session through an ACP `_meta.agentProfile`
+    /// that extends the default agent, so the leader's other sessions and the user's own Grok
+    /// configuration keep the tool.
+    pub fn spawn(
+        &self,
+        cwd: &Path,
+        task: &str,
+        model: Option<&str>,
+        disallowed_tools: &[&str],
+    ) -> Result<SpawnResult> {
         #[cfg(target_os = "linux")]
         {
             let cwd_text = cwd
@@ -191,8 +201,10 @@ impl GrokLifecycle {
                 ));
             }
             let mut client = self.connect_required(model)?;
-            let response =
-                client.request("session/new", json!({"cwd": cwd_text, "mcpServers": []}))?;
+            let response = client.request(
+                "session/new",
+                session_new_params(cwd_text, disallowed_tools),
+            )?;
             let session_id = response
                 .get("sessionId")
                 .and_then(Value::as_str)
@@ -242,7 +254,7 @@ impl GrokLifecycle {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = (cwd, task, model);
+            let _ = (cwd, task, model, disallowed_tools);
             Err(Error::Unsupported(BACKEND_NAME))
         }
     }
@@ -1380,6 +1392,25 @@ fn is_definitively_unreachable_error(error: &Error) -> bool {
                 std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
             )
     )
+}
+
+/// PURE: the `session/new` params. With no tool to remove the request stays exactly the cwd and an
+/// empty MCP server list. Otherwise it carries an agent profile whose `promptMode` is `extend`, so
+/// the session keeps the default agent's prompt and tools minus the named ones.
+#[cfg(target_os = "linux")]
+fn session_new_params(cwd: &str, disallowed_tools: &[&str]) -> Value {
+    let mut params = json!({"cwd": cwd, "mcpServers": []});
+    if !disallowed_tools.is_empty() {
+        params["_meta"] = json!({
+            "agentProfile": {
+                "name": CLIENT_TYPE,
+                "description": "agent-router session with tools removed",
+                "promptMode": "extend",
+                "disallowedTools": disallowed_tools,
+            },
+        });
+    }
+    params
 }
 
 /// One registered connection to a leader socket. ACP requests ride inside `{"type":"acp"}`
