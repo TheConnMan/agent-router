@@ -594,3 +594,278 @@ fn a_failover_review_persists_fallback_from() {
     assert_eq!(row.exit_status, 0);
     assert_eq!(row.fallback_from.as_deref(), Some("codex"));
 }
+
+/// The Grok review lane against a scripted leader that behaves like the real one: a session that
+/// still has `ask_user_question` calls it, and with no human attached the roster then reports the
+/// session as `needs_input`. Reviews failed that way before the review session removed the tool.
+#[cfg(target_os = "linux")]
+mod grok_review_needs_input {
+    use super::*;
+    use agent_router_core::Context;
+    use agent_router_core::adversarial_review::review_registered_pinned;
+    use agent_router_core::binary::{Environment, GROK_BIN_ENV};
+    use agent_router_core::config::Config;
+    use serde_json::{Value, json};
+    use std::collections::BTreeMap;
+    use std::ffi::OsString;
+    use std::fs;
+    use std::io::{self, Read, Write};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::Duration;
+
+    const SESSION: &str = "review-session";
+    const REVIEW_BODY: &str = "No findings. Assumed the request meant the whole working tree.";
+
+    #[derive(Default)]
+    struct LeaderState {
+        /// Whether the session will call `ask_user_question`, decided when it is created and seen
+        /// by every later connection, since each roster poll arrives on a fresh one.
+        asks: bool,
+        session_new: Vec<Value>,
+        deleted: bool,
+        prompted: bool,
+        lists_after_prompt: usize,
+    }
+
+    struct FakeLeader {
+        socket: PathBuf,
+        stop: Arc<AtomicBool>,
+        state: Arc<Mutex<LeaderState>>,
+        thread: Option<thread::JoinHandle<()>>,
+    }
+
+    impl FakeLeader {
+        /// `honors_profile` false models a leader that ignores the review's agent profile, so the
+        /// session asks its question whatever the request carried.
+        fn start(grok_home: &Path, honors_profile: bool) -> FakeLeader {
+            fs::create_dir_all(grok_home).expect("grok home");
+            let socket = grok_home.join("leader.sock");
+            fs::write(
+                grok_home.join("leader.lock"),
+                std::process::id().to_string(),
+            )
+            .expect("leader lock");
+            let listener = UnixListener::bind(&socket).expect("leader socket");
+            listener.set_nonblocking(true).expect("nonblocking");
+            let stop = Arc::new(AtomicBool::new(false));
+            let state = Arc::new(Mutex::new(LeaderState {
+                asks: !honors_profile,
+                ..LeaderState::default()
+            }));
+            let (thread_stop, thread_state) = (Arc::clone(&stop), Arc::clone(&state));
+            let thread = thread::spawn(move || {
+                while !thread_stop.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((stream, _)) => serve(stream, &thread_state),
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            FakeLeader {
+                socket,
+                stop,
+                state,
+                thread: Some(thread),
+            }
+        }
+    }
+
+    impl Drop for FakeLeader {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            let _ = UnixStream::connect(&self.socket);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    fn read_frame(stream: &mut UnixStream) -> Option<Value> {
+        let mut prefix = [0_u8; 4];
+        stream.read_exact(&mut prefix).ok()?;
+        let mut body = vec![0; u32::from_be_bytes(prefix) as usize];
+        stream.read_exact(&mut body).ok()?;
+        serde_json::from_slice(&body).ok()
+    }
+
+    fn write_frame(stream: &mut UnixStream, value: &Value) -> bool {
+        let body = serde_json::to_vec(value).expect("frame");
+        let mut bytes = (body.len() as u32).to_be_bytes().to_vec();
+        bytes.extend_from_slice(&body);
+        stream.write_all(&bytes).is_ok()
+    }
+
+    /// Whether the real leader would leave `ask_user_question` in a session created with `params`.
+    fn session_keeps_ask_tool(params: &Value) -> bool {
+        params
+            .pointer("/_meta/agentProfile/disallowedTools")
+            .and_then(Value::as_array)
+            .is_none_or(|tools| !tools.iter().any(|tool| tool == "ask_user_question"))
+    }
+
+    fn serve(mut stream: UnixStream, state: &Mutex<LeaderState>) {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("read timeout");
+        while let Some(outer) = read_frame(&mut stream) {
+            let reply = match outer["type"].as_str() {
+                Some("register") => json!({
+                    "type": "registered",
+                    "ready": true,
+                    "leader_protocol_version": 1,
+                    "leader_capabilities": {"control_v1": true},
+                }),
+                Some("control") => json!({
+                    "type": "control_result",
+                    "request_id": outer["request_id"],
+                    "result": {"Ok": {"type": "leader_info"}},
+                }),
+                Some("acp") => {
+                    let request: Value =
+                        serde_json::from_str(outer["payload"].as_str().unwrap_or("")).unwrap();
+                    let Some(id) = request.get("id").cloned() else {
+                        continue;
+                    };
+                    let mut state = state.lock().expect("leader state");
+                    let result = match request["method"].as_str().unwrap_or("") {
+                        "session/new" => {
+                            state.asks |= session_keeps_ask_tool(&request["params"]);
+                            state.session_new.push(request["params"].clone());
+                            json!({"sessionId": SESSION})
+                        }
+                        "session/prompt" => {
+                            state.prompted = true;
+                            continue;
+                        }
+                        "_x.ai/sessions/list" if state.prompted => {
+                            state.lists_after_prompt += 1;
+                            let activity = match state.lists_after_prompt {
+                                1 => "working",
+                                _ if state.asks => "needs_input",
+                                _ => "idle",
+                            };
+                            json!({"result": {"sessions": [{
+                                "sessionId": SESSION,
+                                "cwd": "/review/target",
+                                "activity": activity,
+                                "resident": true,
+                                "lastChangeUnixMs": 1_791_000_000_000_i64,
+                            }]}})
+                        }
+                        "_x.ai/sessions/list" => json!({"result": {"sessions": []}}),
+                        "_x.ai/session/delete" => {
+                            state.deleted = true;
+                            json!({"success": true})
+                        }
+                        _ => json!({}),
+                    };
+                    json!({
+                        "type": "acp",
+                        "payload": json!({"jsonrpc": "2.0", "id": id, "result": result})
+                            .to_string(),
+                    })
+                }
+                _ => return,
+            };
+            if !write_frame(&mut stream, &reply) {
+                return;
+            }
+        }
+    }
+
+    /// The durable record the leader writes for a session: the summary the lifecycle reads and the
+    /// chat history the review body is taken from.
+    fn durable_session(grok_home: &Path) {
+        let dir = grok_home.join("sessions/review-target").join(SESSION);
+        fs::create_dir_all(&dir).expect("durable session");
+        fs::write(
+            dir.join("summary.json"),
+            json!({
+                "info": {"id": SESSION, "cwd": "/review/target"},
+                "session_summary": "Review",
+                "created_at": "2026-10-07T01:00:00.000Z",
+                "updated_at": "2026-10-07T01:00:05.000Z",
+            })
+            .to_string(),
+        )
+        .expect("summary");
+        fs::write(
+            dir.join("chat_history.jsonl"),
+            format!(
+                "{}\n",
+                json!({"type": "assistant", "content": REVIEW_BODY, "tool_calls": []})
+            ),
+        )
+        .expect("history");
+    }
+
+    fn run_review(honors_profile: bool) -> (ReviewOutcome, Arc<Mutex<LeaderState>>) {
+        let root = tempfile::tempdir().expect("tempdir");
+        let home = root.path().join("home");
+        let grok_home = home.join(".grok");
+        let target = root.path().join("target");
+        fs::create_dir_all(&target).expect("target");
+        durable_session(&grok_home);
+        let leader = FakeLeader::start(&grok_home, honors_profile);
+        let environment = Environment::new(
+            None,
+            Some(home.clone()),
+            BTreeMap::from([(GROK_BIN_ENV.to_string(), OsString::from("/bin/true"))]),
+        );
+        let ctx = Context::new(environment, home, Config::default())
+            .with_claude_usage_cache(root.path().join("claude-usage.json"))
+            .with_grok_usage_cache(root.path().join("grok-usage.json"));
+        let request = ReviewRequest {
+            primary_provider: "codex",
+            body: "Before starting, use ask_user_question to ask which files to review.",
+            dir: &target,
+        };
+        let outcome = review_registered_pinned(&request, &pin(Provider::Grok, None), &ctx);
+        let state = Arc::clone(&leader.state);
+        drop(leader);
+        (outcome, state)
+    }
+
+    #[test]
+    fn a_review_session_is_created_without_ask_user_question_and_completes() {
+        let (outcome, state) = run_review(true);
+
+        assert_eq!(outcome.status, ReviewStatus::Completed, "{outcome:?}");
+        assert_eq!(outcome.result.as_deref(), Some(REVIEW_BODY));
+        let state = state.lock().expect("leader state");
+        assert_eq!(state.session_new.len(), 1);
+        assert_eq!(
+            state.session_new[0]["_meta"]["agentProfile"]["disallowedTools"],
+            json!(["ask_user_question"])
+        );
+        assert_eq!(
+            state.session_new[0]["_meta"]["agentProfile"]["promptMode"], "extend",
+            "the profile must extend the default agent rather than replace its prompt"
+        );
+        assert!(state.deleted, "a completed review deletes its session");
+    }
+
+    #[test]
+    fn a_review_session_that_still_needs_input_fails_and_is_cleaned_up() {
+        let (outcome, state) = run_review(false);
+
+        assert_eq!(outcome.status, ReviewStatus::Failed, "{outcome:?}");
+        assert_eq!(outcome.result, None);
+        let reason = outcome.reason.as_deref().unwrap_or_default();
+        assert!(
+            reason.contains(&format!("Grok review {SESSION} needs input")),
+            "{reason}"
+        );
+        assert!(
+            state.lock().expect("leader state").deleted,
+            "a review parked on a question must not leave a live session behind"
+        );
+    }
+}

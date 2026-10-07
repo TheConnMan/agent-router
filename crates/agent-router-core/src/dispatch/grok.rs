@@ -29,7 +29,7 @@ pub fn dispatch_with_binary(
 ) -> Result<Dispatch> {
     let lifecycle = GrokLifecycle::new(binary, grok_home);
     dispatch_from(binary, cwd, task, name, model, |cwd, task, model| {
-        lifecycle.spawn(cwd, task, model)
+        lifecycle.spawn(cwd, task, model, &[])
     })
 }
 
@@ -84,12 +84,13 @@ pub(crate) fn spawn_with_lifecycle(
     cwd: &Path,
     task: &str,
     model: Option<&str>,
+    disallowed_tools: &[&str],
 ) -> Result<String> {
     // `GrokLifecycle` does not expose the path it was built from, so the review lane names the
     // provider's binary name here exactly as it always has.
     exact_session_id(
         Path::new(Provider::Grok.name()),
-        lifecycle.spawn(cwd, task, model),
+        lifecycle.spawn(cwd, task, model, disallowed_tools),
     )
 }
 

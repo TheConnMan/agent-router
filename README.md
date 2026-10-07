@@ -348,7 +348,8 @@ execution uses the provider's review contract and is never routed through an ord
 are launched with enforced read only restrictions. Grok's persistent lifecycle currently registers
 in YOLO mode: its prompt asks for read only review behavior and supplies no MCP servers, but Grok's
 server side tools are not sandboxed. Selecting Grok therefore trusts it not to mutate the working
-tree or execute side effects. For Grok, the result also carries the exact official lifecycle
+tree or execute side effects. A Grok review session is created without the `ask_user_question` tool,
+since no human is attached to answer it; ordinary Grok dispatches keep the tool. For Grok, the result also carries the exact official lifecycle
 session identity. Grok reviewer sessions are disposable: after Router reads the final review text,
 it uses the same public lifecycle to remove only the session it created. A failed cleanup is
 reported rather than silently leaving a reviewer session behind.

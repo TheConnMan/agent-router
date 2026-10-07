@@ -3,6 +3,17 @@
 All notable changes to this project are documented here. Versions are the
 workspace `package.version` stamped on every decision-log row.
 
+## 0.37.1 - 2026-10-07
+
+- Grok adversarial reviews no longer stall on `ask_user_question`. A review session is created with
+  an ACP `_meta.agentProfile` that extends the default agent and lists `ask_user_question` under
+  `disallowedTools`, so the reviewer cannot ask a question no one is there to answer. Before this,
+  a review that called the tool sat in `needs_input` and failed or fell back. The removal applies to
+  the review session only: ordinary `run` dispatches to Grok and the user's own Grok sessions keep
+  the tool. The review contract also now says no human is present and that the reviewer should
+  state its assumption and finish when something is ambiguous. A review that reports `needs_input`
+  for any other reason still fails and deletes its session.
+
 ## 0.37.0 - 2026-10-06
 
 - Grok no longer runs `/implement` tasks. A task whose first line, ignoring blank lines and a
