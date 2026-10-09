@@ -205,7 +205,8 @@ pub fn parse_launch(stdout: &str) -> Result<(String, String)> {
     Ok((thread_id, url))
 }
 
-/// PURE: only usage and version refusals prove that no thread was created. Any printed thread
+/// PURE: only usage refusals (exit 2), version refusals (exit 3), and runtime errors raised before
+/// the thread create was sent (exit 6) prove that no thread was created. Any printed thread
 /// identity contradicts that proof, including a partial JSON answer, so it stays ambiguous.
 fn exit_failure(code: Option<i32>, stdout: &str, stderr: &str) -> Error {
     let said = stderr_text(stderr.as_bytes());
@@ -215,11 +216,12 @@ fn exit_failure(code: Option<i32>, stdout: &str, stderr: &str) -> Error {
              verified (exit 3); re-verify the RPC surface and add the version to \
              VERIFIED_T3_VERSIONS in t3-thread's lib/version.mjs. t3-thread said: {said}"
         ),
+        Some(6) => format!("t3-thread failed before creating a thread (exit 6): {said}"),
         Some(code) => format!("t3-thread exited {code}: {said}"),
         None => format!("t3-thread was terminated by a signal: {said}"),
     };
     let thread_evidence = |text: &str| text.contains("THREAD_ID") || text.contains("\"threadId\"");
-    if matches!(code, Some(2 | 3)) && !thread_evidence(stdout) && !thread_evidence(stderr) {
+    if matches!(code, Some(2 | 3 | 6)) && !thread_evidence(stdout) && !thread_evidence(stderr) {
         Error::NotLaunched(message)
     } else {
         Error::Command(message)
