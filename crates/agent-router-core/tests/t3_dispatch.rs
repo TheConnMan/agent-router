@@ -518,10 +518,39 @@ fn dispatch_with_binary_maps_exit_two_to_not_launched_with_stderr() {
     assert!(message.contains("unknown option --bad"), "{message}");
 }
 
+/// A runtime error before the thread create was sent (no t3 binary, a refused websocket, a 401
+/// session ticket) proves that no thread was launched and retains the diagnostic.
+#[test]
+fn dispatch_with_binary_maps_exit_six_to_not_launched_with_stderr() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let stub = launcher(
+        root.path(),
+        "",
+        "t3-thread: cannot find the t3 binary; pass --t3-bin or set $T3_BIN\n",
+        6,
+    );
+    let error = dispatch_with_binary(
+        &stub.binary,
+        root.path(),
+        "a task",
+        "Before Create",
+        Provider::Codex,
+        None,
+        None,
+        GENEROUS,
+    )
+    .expect_err("exit 6 is a launch failure");
+    let Error::NotLaunched(message) = error else {
+        panic!("exit 6 must prove the thread was not launched: {error:?}");
+    };
+    assert!(message.contains("before creating a thread"), "{message}");
+    assert!(message.contains("cannot find the t3 binary"), "{message}");
+}
+
 /// Printed thread evidence overrides an otherwise safe refusal code.
 #[test]
 fn refusal_codes_with_thread_evidence_remain_ambiguous() {
-    for code in [2, 3] {
+    for code in [2, 3, 6] {
         for (stdout, stderr) in [
             (format!("THREAD_ID {THREAD_ID}\n"), "boom".to_string()),
             (launched_json(), "boom".to_string()),
