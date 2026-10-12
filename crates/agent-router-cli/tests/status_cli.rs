@@ -184,6 +184,35 @@ impl StatusFixture {
         .expect("seed a decision row")
     }
 
+    /// One decision launched on the t3 surface, whose job id is the T3 thread id.
+    fn seed_t3(&self, provider: Provider, job_id: &str) -> i64 {
+        let decision = decide_explicit(
+            provider,
+            None,
+            None,
+            None,
+            UsageSnapshot::full(),
+            &Config::default(),
+        );
+        let url = format!("http://127.0.0.1:3773/t/{job_id}");
+        DecisionLog::open_at(&self.db_path())
+            .expect("open the fixture log")
+            .record(&Entry {
+                task: "a seeded t3 launch",
+                dir: Path::new("/tmp"),
+                requested: provider.name(),
+                decision: &decision,
+                dry_run: false,
+                job_id: Some(job_id),
+                job_name: Some("A T3 Thread"),
+                outcome: "dispatched",
+                effective_effort: None,
+                surface: Surface::T3,
+                thread_url: Some(&url),
+            })
+            .expect("seed a t3 row")
+    }
+
     fn router(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_agent-router"));
         command
@@ -712,16 +741,13 @@ fn status_on_an_empty_database_exits_zero_and_reports_no_rows() {
     );
 }
 
-/// AC7. A T3 thread id is neither a claude short id nor a codex thread id, and there is no T3
-/// reconciliation yet. Rows launched on the t3 surface are therefore reported `unsupported` with
-/// state `unknown` and no trace probe, no backend is asked about them (the claude stub logs every
-/// invocation and must stay silent), and nothing is written back: both rows stay `dispatched` with
-/// no reconciliation stamp.
+/// A T3 thread id is neither a claude short id nor a codex thread id, so no provider backend is
+/// asked about a t3 row: the claude stub logs every invocation and must stay silent, and no
+/// transcript sweep runs. With no T3 state database under HOME, the router cannot ask T3 either, so
+/// both rows observe `unavailable`, classify `unknown`, and carry null run fields.
 #[test]
-fn t3_surface_rows_are_reported_unsupported_and_never_reconciled_as_claude_or_codex() {
-    use agent_router_core::config::Surface;
-
-    let fixture = StatusFixture::new("t3-unsupported");
+fn t3_surface_rows_are_never_reconciled_as_claude_or_codex_and_are_unavailable_without_t3_state() {
+    let fixture = StatusFixture::new("t3-unavailable");
     let invocations = fixture.root.path.join("claude.invocations");
     common::write_stub(
         &fixture.root.path.join("bin/claude"),
@@ -733,40 +759,13 @@ fn t3_surface_rows_are_reported_unsupported_and_never_reconciled_as_claude_or_co
     // A transcript whose name matches the claude-shaped row's id, so a sweep that wrongly ran on a
     // t3 row would find it and report `traced`.
     fixture.write_transcript("thr_a");
-    let seed_t3 = |provider: Provider, job_id: &str| -> i64 {
-        let decision = decide_explicit(
-            provider,
-            None,
-            None,
-            None,
-            UsageSnapshot::full(),
-            &Config::default(),
-        );
-        let url = format!("http://127.0.0.1:3773/t/{job_id}");
-        DecisionLog::open_at(&fixture.db_path())
-            .expect("open the fixture log")
-            .record(&Entry {
-                task: "a seeded t3 launch",
-                dir: Path::new("/tmp"),
-                requested: provider.name(),
-                decision: &decision,
-                dry_run: false,
-                job_id: Some(job_id),
-                job_name: Some("A T3 Thread"),
-                outcome: "dispatched",
-                effective_effort: None,
-                surface: Surface::T3,
-                thread_url: Some(&url),
-            })
-            .expect("seed a t3 row")
-    };
-    let claude = seed_t3(Provider::Claude, "thr_a");
-    let codex = seed_t3(Provider::Codex, "thr_b");
+    let claude = fixture.seed_t3(Provider::Claude, "thr_a");
+    let codex = fixture.seed_t3(Provider::Codex, "thr_b");
 
     let status = fixture.status_json();
     for id in [claude, codex] {
         let row = reported_row(&status, id);
-        assert_eq!(row["observation"], "unsupported", "the reported row: {row}");
+        assert_eq!(row["observation"], "unavailable", "the reported row: {row}");
         assert_eq!(row["state"], "unknown", "the reported row: {row}");
         assert_eq!(row["surface"], "t3", "the reported row: {row}");
         assert_eq!(
@@ -774,24 +773,20 @@ fn t3_surface_rows_are_reported_unsupported_and_never_reconciled_as_claude_or_co
             Value::Null,
             "a t3 row was swept for a claude transcript: {row}"
         );
+        for key in ["run_status", "last_activity_at", "last_error"] {
+            assert!(
+                row.get(key).is_some_and(Value::is_null),
+                "a t3 row carries {key} as null when T3 cannot be read: {row}"
+            );
+        }
     }
     assert!(
         !invocations.exists(),
         "a t3 row made the router ask claude about it: {}",
         fs::read_to_string(&invocations).unwrap_or_default()
     );
-
     for id in [claude, codex] {
         let logged = fixture.logged(id);
-        assert_eq!(
-            logged["outcome"], "dispatched",
-            "a t3 row was rewritten: {logged}"
-        );
-        assert_eq!(
-            logged["reconciled_at_ms"],
-            Value::Null,
-            "a t3 row was stamped reconciled: {logged}"
-        );
         assert_eq!(
             logged["surface"], "t3",
             "log --json carries the surface: {logged}"
@@ -801,7 +796,7 @@ fn t3_surface_rows_are_reported_unsupported_and_never_reconciled_as_claude_or_co
     let output = fixture.status();
     assert!(
         output.status.success(),
-        "unsupported rows are not failures, stderr: {}",
+        "unknown rows are not failures, stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let text = String::from_utf8_lossy(&output.stdout);
@@ -810,4 +805,253 @@ fn t3_surface_rows_are_reported_unsupported_and_never_reconciled_as_claude_or_co
         2,
         "text mode marks each t3 row: {text}"
     );
+}
+
+/// T3 rows read their state from T3's own orchestration protocol 2 state database. A thread's
+/// status is its latest unheld run's: a queued or running run is `running`, a completed or
+/// interrupted one is `turn_ended` (never `completed`), a failed one is `failed` with its error
+/// passed through, and a thread that never ran, or that T3 does not hold (or deleted), is
+/// `unknown`. Every t3 row carries `run_status`, `last_activity_at`, and `last_error`, and a
+/// background row carries none of them.
+#[test]
+fn t3_rows_report_running_turn_ended_failed_and_unknown_from_t3_runs() {
+    use common::{T3Run, T3Thread};
+
+    let fixture = StatusFixture::new("t3-state");
+    const RESTART: &str = "Provider session did not survive a server restart";
+    const HANDOFF: &str = "Insufficient context allowance for the provider handoff";
+    let run = |ordinal, status, requested_at, completed_at| T3Run {
+        ordinal,
+        status,
+        requested_at,
+        completed_at,
+        held: false,
+        failure: None,
+    };
+    let thread = |id, updated_at, runs| T3Thread {
+        id,
+        updated_at,
+        runs,
+        session_error: None,
+        deleted: false,
+    };
+    common::write_t3_state(
+        &fixture.home(),
+        &[
+            // An earlier completed run does not hide the running one after it.
+            thread(
+                "thr_running",
+                "2026-10-04T10:00:00.000Z",
+                &[
+                    run(
+                        1,
+                        "completed",
+                        "2026-10-04T09:00:00.000Z",
+                        Some("2026-10-04T09:30:00.000Z"),
+                    ),
+                    run(2, "running", "2026-10-04T10:07:30.000Z", None),
+                ],
+            ),
+            thread(
+                "thr_queued",
+                "2026-10-04T10:00:00.000Z",
+                &[run(1, "queued", "2026-10-04T10:01:00.000Z", None)],
+            ),
+            // The run completed after the thread's own last update, so it is the newest activity.
+            thread(
+                "thr_completed",
+                "2026-10-04T10:00:00.000Z",
+                &[run(
+                    1,
+                    "completed",
+                    "2026-10-04T10:30:00.000Z",
+                    Some("2026-10-04T11:00:00.000Z"),
+                )],
+            ),
+            // A held queued run never stands for the thread: its status is the interrupted run's.
+            thread(
+                "thr_interrupted",
+                "2026-10-04T09:00:00.000Z",
+                &[
+                    run(
+                        1,
+                        "interrupted",
+                        "2026-10-04T08:00:00.000Z",
+                        Some("2026-10-04T08:30:00.000Z"),
+                    ),
+                    T3Run {
+                        held: true,
+                        ..run(2, "queued", "2026-10-04T08:45:00.000Z", None)
+                    },
+                ],
+            ),
+            // The failed run's root error item is the error when no provider session has one.
+            thread(
+                "thr_failed",
+                "2026-10-04T08:00:00.000Z",
+                &[T3Run {
+                    failure: Some(HANDOFF),
+                    ..run(
+                        1,
+                        "failed",
+                        "2026-10-04T07:00:00.000Z",
+                        Some("2026-10-04T07:59:00.000Z"),
+                    )
+                }],
+            ),
+            // A provider session error takes precedence over the run's own failure item.
+            T3Thread {
+                session_error: Some(RESTART),
+                ..thread(
+                    "thr_session_error",
+                    "2026-10-04T08:00:00.000Z",
+                    &[T3Run {
+                        failure: Some(HANDOFF),
+                        ..run(
+                            1,
+                            "failed",
+                            "2026-10-04T07:00:00.000Z",
+                            Some("2026-10-04T07:30:00.000Z"),
+                        )
+                    }],
+                )
+            },
+            thread("thr_never_ran", "2026-10-04T06:00:00.000Z", &[]),
+            T3Thread {
+                deleted: true,
+                ..thread(
+                    "thr_deleted",
+                    "2026-10-04T08:00:00.000Z",
+                    &[run(
+                        1,
+                        "completed",
+                        "2026-10-04T07:00:00.000Z",
+                        Some("2026-10-04T07:30:00.000Z"),
+                    )],
+                )
+            },
+        ],
+    );
+    let running = fixture.seed_t3(Provider::Claude, "thr_running");
+    let queued = fixture.seed_t3(Provider::Codex, "thr_queued");
+    let completed = fixture.seed_t3(Provider::Claude, "thr_completed");
+    let interrupted = fixture.seed_t3(Provider::Codex, "thr_interrupted");
+    let failed = fixture.seed_t3(Provider::Claude, "thr_failed");
+    let session_error = fixture.seed_t3(Provider::Claude, "thr_session_error");
+    let never_ran = fixture.seed_t3(Provider::Claude, "thr_never_ran");
+    let missing = fixture.seed_t3(Provider::Claude, "thr_missing");
+    let deleted = fixture.seed_t3(Provider::Claude, "thr_deleted");
+    let background = fixture.seed(
+        Provider::Codex,
+        Some("019c-background"),
+        Some("A Background Job"),
+        false,
+        "dispatched",
+    );
+
+    let output = fixture
+        .router()
+        .args(["status", "--json"])
+        .output()
+        .expect("run the router");
+    // A failed run is a known failure, so status exits 1 exactly as for any failed row.
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status: Value = serde_json::from_slice(&output.stdout).expect("status json");
+
+    let expect = |id: i64,
+                  state: &str,
+                  observation: &str,
+                  run_status: Value,
+                  last_activity_at: Value,
+                  last_error: Value| {
+        let row = reported_row(&status, id);
+        assert_eq!(row["state"], state, "the reported row: {row}");
+        assert_eq!(row["observation"], observation, "the reported row: {row}");
+        assert_eq!(row["run_status"], run_status, "the reported row: {row}");
+        assert_eq!(
+            row["last_activity_at"], last_activity_at,
+            "the reported row: {row}"
+        );
+        assert_eq!(row["last_error"], last_error, "the reported row: {row}");
+        assert_eq!(fixture.logged(id)["outcome"], state, "the logged outcome");
+    };
+    expect(
+        running,
+        "running",
+        "run running",
+        json!("running"),
+        json!("2026-10-04T10:07:30.000Z"),
+        Value::Null,
+    );
+    expect(
+        queued,
+        "running",
+        "run queued",
+        json!("queued"),
+        json!("2026-10-04T10:01:00.000Z"),
+        Value::Null,
+    );
+    expect(
+        completed,
+        "turn_ended",
+        "run completed",
+        json!("completed"),
+        json!("2026-10-04T11:00:00.000Z"),
+        Value::Null,
+    );
+    expect(
+        interrupted,
+        "turn_ended",
+        "run interrupted",
+        json!("interrupted"),
+        json!("2026-10-04T09:00:00.000Z"),
+        Value::Null,
+    );
+    expect(
+        failed,
+        "failed",
+        "run failed",
+        json!("failed"),
+        json!("2026-10-04T08:00:00.000Z"),
+        json!(HANDOFF),
+    );
+    expect(
+        session_error,
+        "failed",
+        "run failed",
+        json!("failed"),
+        json!("2026-10-04T08:00:00.000Z"),
+        json!(RESTART),
+    );
+    expect(
+        never_ran,
+        "unknown",
+        "no run",
+        Value::Null,
+        json!("2026-10-04T06:00:00.000Z"),
+        Value::Null,
+    );
+    for id in [missing, deleted] {
+        expect(
+            id,
+            "unknown",
+            "absent",
+            Value::Null,
+            Value::Null,
+            Value::Null,
+        );
+    }
+
+    let background = reported_row(&status, background);
+    for key in ["run_status", "last_activity_at", "last_error"] {
+        assert!(
+            background.get(key).is_none(),
+            "a background row grew a T3 field {key}: {background}"
+        );
+    }
 }

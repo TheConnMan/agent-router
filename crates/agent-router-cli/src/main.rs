@@ -144,6 +144,18 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Send one follow-up user message to a T3 job's thread, reusing the thread's model selection.
+    /// Exits 0 sent, 3 thread not found, 4 refused because a run is active, 2 usage, 1 runtime
+    /// error.
+    Nudge {
+        /// The job id `run` logged for a t3 surface job, which is its T3 thread id.
+        job_id: String,
+        /// The text of the follow-up user message.
+        #[arg(long)]
+        message: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Preflight the provider binaries, credentials, usage provenance, config, and decision log.
     Doctor,
     /// Report or stop an adversarial review by the id `adversarial-review` printed.
@@ -206,6 +218,10 @@ enum CliStatus {
     /// alternative, or a session naming that kept the name it found.
     Skipped,
     ReviewPending,
+    /// Exit 3 from `nudge`: no such T3 job or thread.
+    NotFound,
+    /// Exit 4 from `nudge`: refused because the thread has an active run.
+    Refused,
 }
 
 fn exit_code(status: CliStatus) -> std::process::ExitCode {
@@ -215,6 +231,8 @@ fn exit_code(status: CliStatus) -> std::process::ExitCode {
         CliStatus::Unrunnable => std::process::ExitCode::from(2),
         CliStatus::Skipped => std::process::ExitCode::from(3),
         CliStatus::ReviewPending => std::process::ExitCode::from(4),
+        CliStatus::NotFound => std::process::ExitCode::from(3),
+        CliStatus::Refused => std::process::ExitCode::from(4),
     }
 }
 
@@ -224,6 +242,11 @@ fn main() -> std::process::ExitCode {
     let status = match cli.command {
         Command::Doctor => doctor_status(&ctx),
         Command::Status { limit, since, json } => status_status(&ctx, limit, since, json),
+        Command::Nudge {
+            job_id,
+            message,
+            json,
+        } => nudge_status(&ctx, &job_id, &message, json),
         Command::AdversarialReview {
             request_file,
             primary,
@@ -941,6 +964,66 @@ fn status_status(
     }
 }
 
+/// `nudge` owns its exit code: 0 sent, 3 not found, 4 refused because a turn is active, 2 usage,
+/// 1 runtime error. Only a job the decision log holds as a t3 dispatch is ever nudged, so the
+/// command cannot be pointed at a thread the router did not launch.
+fn nudge_status(
+    ctx: &agent_router_core::Context,
+    job_id: &str,
+    message: &str,
+    json: bool,
+) -> CliStatus {
+    use agent_router_core::dispatch::t3::Nudge;
+
+    let report = |status: CliStatus, sent: bool, reason: &str| {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({"job_id": job_id, "sent": sent, "reason": reason})
+            );
+        } else if sent {
+            println!("{}", escape_terminal_controls(reason));
+        } else {
+            eprintln!("agent-router: nudge: {}", escape_terminal_controls(reason));
+        }
+        status
+    };
+
+    if job_id.trim().is_empty() {
+        return report(CliStatus::Unrunnable, false, "the job id is empty");
+    }
+    if message.trim().is_empty() {
+        return report(CliStatus::Unrunnable, false, "--message is empty");
+    }
+    let surface = match DecisionLog::open_in(&ctx.home).and_then(|log| log.job_surface(job_id)) {
+        Ok(surface) => surface,
+        Err(error) => return report(CliStatus::Failure, false, &error.to_string()),
+    };
+    match surface.as_deref() {
+        None => {
+            return report(
+                CliStatus::NotFound,
+                false,
+                &format!("the decision log holds no dispatched job {job_id}"),
+            );
+        }
+        Some(surface) if surface != agent_router_core::Surface::T3.name() => {
+            return report(
+                CliStatus::Unrunnable,
+                false,
+                &format!("job {job_id} ran on the {surface} surface; only t3 jobs can be nudged"),
+            );
+        }
+        Some(_) => {}
+    }
+    match agent_router_core::dispatch::t3::nudge(ctx, job_id, message) {
+        Ok(Nudge::Sent(reason)) => report(CliStatus::Success, true, &reason),
+        Ok(Nudge::NotFound(reason)) => report(CliStatus::NotFound, false, &reason),
+        Ok(Nudge::Active(reason)) => report(CliStatus::Refused, false, &reason),
+        Err(error) => report(CliStatus::Failure, false, &error.to_string()),
+    }
+}
+
 /// A command that never ran exits 2, which is a different fact from a window carrying a failure.
 fn status_unrunnable(error: &agent_router_core::Error) -> CliStatus {
     eprintln!(
@@ -955,7 +1038,7 @@ fn status_json(report: &Report) -> serde_json::Value {
         .rows
         .iter()
         .map(|row| {
-            serde_json::json!({
+            let mut value = serde_json::json!({
                 "id": row.id,
                 "provider": row.provider,
                 "job_id": row.job_id,
@@ -965,7 +1048,29 @@ fn status_json(report: &Report) -> serde_json::Value {
                 // nothing.
                 "traced": row.traced,
                 "surface": row.surface,
-            })
+            });
+            // Every t3 row carries the run fields, null where T3 held no run or no thread, so a
+            // consumer never has to tell a missing key from a missing value.
+            if row.surface == agent_router_core::Surface::T3.name() {
+                let thread = match &row.observation {
+                    agent_router_core::status::Observation::T3Thread(thread) => Some(thread),
+                    _ => None,
+                };
+                let fields = [
+                    ("run_status", thread.and_then(|t| t.run_status.clone())),
+                    (
+                        "last_activity_at",
+                        thread.and_then(|t| t.last_activity_at.clone()),
+                    ),
+                    ("last_error", thread.and_then(|t| t.last_error.clone())),
+                ];
+                if let Some(object) = value.as_object_mut() {
+                    for (key, field) in fields {
+                        object.insert(key.to_string(), serde_json::json!(field));
+                    }
+                }
+            }
+            value
         })
         .collect::<Vec<_>>();
     serde_json::json!({
@@ -1062,6 +1167,7 @@ fn run(cli: Cli, ctx: &mut agent_router_core::Context) -> agent_router_core::Res
         }
         Command::Doctor => unreachable!("doctor has a command specific exit path"),
         Command::Status { .. } => unreachable!("status has a command specific exit path"),
+        Command::Nudge { .. } => unreachable!("nudge has a command specific exit path"),
     }
 }
 

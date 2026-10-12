@@ -31,6 +31,10 @@ that is a prefix of another cannot match it.
   `reconciled_at_ms`.
 - `completed` → `running` is permitted: a live backend saying the job is
   running now is fresh evidence.
+- `turn_ended` (t3 surface only: the T3 thread's latest run has ended and none
+  is active) is a live reading and writes like a proven state. It is never
+  `completed`, since a worker can end a run and still be waiting on a
+  background wake.
 
 `Unsupported` is never offered to `settle`. Report `failed()` from the settled
 value, not the fresh reading.

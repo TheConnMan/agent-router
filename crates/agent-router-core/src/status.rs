@@ -12,6 +12,7 @@ use crate::grok_leader::{GrokLifecycle, Status as GrokStatus};
 use crate::log::{DecisionLog, StatusRow};
 use crate::provider::Provider;
 use crate::stats::Window;
+use crate::t3_state::{T3State, T3Thread};
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -38,6 +39,9 @@ pub enum Observation {
     GrokStatus(GrokStatus),
     /// More than one Grok lifecycle row carried the requested exact session identity.
     Ambiguous,
+    /// What T3's state database records about the runs of a thread launched on the t3 surface. A
+    /// t3 thread the database does not hold is `Absent`.
+    T3Thread(T3Thread),
     /// We could not ask: no daemon answered, `claude` is not on PATH, or the call errored.
     Unavailable,
     /// We have no way to ask. Historical or unknown provider names have no status API.
@@ -62,6 +66,10 @@ impl Observation {
                 GrokStatus::Unknown => "unknown".to_string(),
             },
             Observation::Ambiguous => "ambiguous".to_string(),
+            Observation::T3Thread(thread) => match &thread.run_status {
+                Some(status) => format!("run {status}"),
+                None => "no run".to_string(),
+            },
             Observation::Unavailable => "unavailable".to_string(),
             Observation::Unsupported => "unsupported".to_string(),
         }
@@ -73,6 +81,10 @@ impl Observation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
     Running,
+    /// T3 only: the thread's latest run has ended and none is active or queued. Deliberately not
+    /// `Completed`: a Claude worker can end a run while it waits for a background task to wake it
+    /// with another.
+    TurnEnded,
     Completed,
     Failed,
     Unknown,
@@ -82,6 +94,7 @@ impl State {
     pub const fn tag(self) -> &'static str {
         match self {
             State::Running => "running",
+            State::TurnEnded => "turn_ended",
             State::Completed => "completed",
             State::Failed => "failed",
             State::Unknown => "unknown",
@@ -171,6 +184,7 @@ pub fn classify(observation: Observation) -> State {
                 State::Unknown
             }
         },
+        Observation::T3Thread(thread) => classify_t3(&thread),
         Observation::Absent
         | Observation::Ambiguous
         | Observation::Unavailable
@@ -178,10 +192,32 @@ pub fn classify(observation: Observation) -> State {
     }
 }
 
+/// PURE: the state one T3 thread's runs prove. An active run, or a latest run that has not reached
+/// a terminal status (queued, preparing, starting, running, or waiting), is running; a latest run
+/// that failed is failed; one that completed, was interrupted, cancelled, or rolled back has ended
+/// its turn. A thread that has never run, and a run status T3 ships tomorrow, prove nothing.
+fn classify_t3(thread: &T3Thread) -> State {
+    let status = thread.run_status.as_deref();
+    if thread.active_run
+        || matches!(
+            status,
+            Some("queued" | "preparing" | "starting" | "running" | "waiting")
+        )
+    {
+        return State::Running;
+    }
+    match status {
+        Some("failed") => State::Failed,
+        Some("completed" | "interrupted" | "cancelled" | "rolled_back") => State::TurnEnded,
+        _ => State::Unknown,
+    }
+}
+
 /// PURE: the state to write over `current`, or None to leave the row alone.
 ///
 /// `unknown` writes over a whitelist of exactly three values (`dispatched`, `running`,
-/// `unknown`); every other stored outcome is kept. Writing `unknown` over `unknown` refreshes
+/// `unknown`); every other stored outcome is kept. `turn_ended` is a live reading and writes like
+/// any proven state. Writing `unknown` over `unknown` refreshes
 /// `reconciled_at_ms`. `completed` → `running` is permitted: a live backend is fresh evidence.
 /// See docs/decisions/0009-reconcile-monotonicity.md.
 pub fn settle(current: &str, observed: State) -> Option<State> {
@@ -223,8 +259,8 @@ fn report_row(
 
 /// PURE: whether a row was launched on the t3 surface. Its job id is a T3 thread id, which is not a
 /// claude short id, codex thread id, or grok session id, so no provider backend may be asked about
-/// it: every backend query and the transcript sweep skip it, and it reports `Unsupported` until
-/// T3 threads can be reconciled.
+/// it: every backend query and the transcript sweep skip it, and it is read from T3's own state
+/// database instead.
 fn on_t3(row: &StatusRow) -> bool {
     row.surface.as_deref() == Some(Surface::T3.name())
 }
@@ -238,6 +274,11 @@ pub fn reconcile(ctx: &Context, log: &DecisionLog, window: Window) -> Result<Rep
     let claude = claude_states(ctx, &rows);
     let codex = codex_states(ctx, &rows);
     let grok = grok_states(ctx, &rows);
+    let t3 = rows
+        .iter()
+        .any(on_t3)
+        .then(|| T3State::open(&ctx.t3_state_db()).ok())
+        .flatten();
     let transcripts = rows
         .iter()
         .any(|row| row.provider == "claude" && !on_t3(row))
@@ -248,7 +289,14 @@ pub fn reconcile(ctx: &Context, log: &DecisionLog, window: Window) -> Result<Rep
         // A T3 thread id asked of the claude list or the codex daemon would be misread as a job
         // that backend lost, so a t3 row is never looked up at all.
         let observation = if on_t3(row) {
-            Observation::Unsupported
+            match &t3 {
+                Some(state) => match state.lookup(&row.job_id) {
+                    Ok(Some(thread)) => Observation::T3Thread(thread),
+                    Ok(None) => Observation::Absent,
+                    Err(_) => Observation::Unavailable,
+                },
+                None => Observation::Unavailable,
+            }
         } else {
             match row.provider.as_str() {
                 "claude" => match &claude {

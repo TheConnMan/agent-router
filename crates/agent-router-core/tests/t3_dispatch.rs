@@ -18,7 +18,9 @@ use agent_router_core::binary::{
     CLAUDE_BIN_ENV, Environment, T3_THREAD_BIN_ENV, resolve_t3_thread,
 };
 use agent_router_core::config::{ClassifierEngine, Config, Surface};
-use agent_router_core::dispatch::t3::{dispatch_with_binary, launch_args, parse_launch, t3_model};
+use agent_router_core::dispatch::t3::{
+    Nudge, dispatch_with_binary, launch_args, parse_launch, parse_nudge, t3_model,
+};
 use agent_router_core::log::DecisionLog;
 use agent_router_core::run::{Dispatch, Outcome, Request, run_with};
 use agent_router_core::runtime::short_job_name;
@@ -1176,4 +1178,26 @@ fn codex_mcp_scoping_on_t3_is_still_refused() {
         "the refusal must name the flag: {error}"
     );
     assert!(!stub.was_invoked(), "t3-thread ran before the refusal");
+}
+
+/// The nudge helper's verdict line maps one to one, and an outcome this router does not know is an
+/// error rather than a guess in either direction.
+#[test]
+fn parse_nudge_maps_each_known_outcome_and_rejects_anything_else() {
+    let line = |outcome: &str| json!({"outcome": outcome, "reason": "why"}).to_string();
+    assert_eq!(
+        parse_nudge(&line("sent")).expect("sent"),
+        Nudge::Sent("why".to_string())
+    );
+    assert_eq!(
+        parse_nudge(&line("not_found")).expect("not found"),
+        Nudge::NotFound("why".to_string())
+    );
+    assert_eq!(
+        parse_nudge(&line("active")).expect("active"),
+        Nudge::Active("why".to_string())
+    );
+    for bad in [line("queued"), "{}".to_string(), "not json".to_string()] {
+        assert!(parse_nudge(&bad).is_err(), "{bad} was accepted");
+    }
 }

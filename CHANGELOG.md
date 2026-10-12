@@ -3,6 +3,23 @@
 All notable changes to this project are documented here. Versions are the
 workspace `package.version` stamped on every decision-log row.
 
+## Unreleased
+
+`agent-router status` now reconciles rows launched on the t3 surface instead of reporting them
+`unsupported`. It reads T3's orchestration protocol 2 state database at
+`~/.t3/userdata/statev2.sqlite` read-only and takes a thread's status from its latest run the way
+T3's thread shell does: `running` (a run is active, or the latest run is queued, preparing,
+starting, running, or waiting), `turn_ended` (the latest run completed, was interrupted, cancelled,
+or rolled back), `failed` (the latest run failed), or `unknown` (T3 has no such thread, or it has
+never run). `turn_ended` is not `completed`, because a Claude worker can end a run while it waits
+for a background task to wake it. T3 rows in `--json` also carry `run_status`, `last_activity_at`,
+and `last_error`.
+
+New `agent-router nudge <JOB_ID> --message <TEXT> [--json]` sends one follow-up user message to a
+t3 job's thread as a protocol 2 `message.dispatch`, reusing the thread's model selection. It exits
+`0` sent, `3` thread not found, `4` refused because a run is active, `2` usage, and `1` runtime
+error.
+
 ## 0.37.1 - 2026-10-07
 
 - Grok adversarial reviews no longer stall on `ask_user_question`. A review session is created with
@@ -38,6 +55,7 @@ workspace `package.version` stamped on every decision-log row.
   `[routing] priority` lists it. Adversarial review is unchanged, and Grok remains an eligible
   reviewer.
 
+||||||| parent of 2a33141 (Observe T3 threads in status and add a nudge command)
 ## 0.36.0 (2026-10-03)
 
 `agent-router adversarial-review` now requires `--request-file <PATH>`, with `-` reading the review

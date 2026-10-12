@@ -754,6 +754,25 @@ impl DecisionLog {
         Ok(rows)
     }
 
+    /// IMPURE: the launch surface of the newest dispatched row carrying `job_id`, or None when no
+    /// dispatched row does. A legacy NULL surface reads as `background`, since only background
+    /// launches predate the column.
+    pub fn job_surface(&self, job_id: &str) -> Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+
+        let sql = format!(
+            "SELECT surface FROM decisions WHERE job_id = ?1 AND {RECONCILABLE} \
+             ORDER BY id DESC LIMIT 1"
+        );
+        let surface = self
+            .conn
+            .query_row(&sql, [job_id], |row| row.get::<_, Option<String>>(0))
+            .optional()?;
+        Ok(surface.map(|surface| {
+            surface.unwrap_or_else(|| crate::config::Surface::Background.name().to_string())
+        }))
+    }
+
     /// IMPURE: record what the backend said about one row, and when it said it.
     ///
     /// The caller reaches here only for a state the monotonicity rule admitted, so this writes

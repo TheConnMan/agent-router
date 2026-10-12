@@ -11,6 +11,7 @@
 use agent_router_core::dispatch::codex::{CodexRpc, thread_states_on_rpc};
 use agent_router_core::grok_leader::Status as GrokStatus;
 use agent_router_core::status::{Observation, State, classify, settle};
+use agent_router_core::t3_state::T3Thread;
 use agent_router_core::{Error, Result};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
@@ -156,6 +157,49 @@ fn a_pure_classifier_maps_every_known_backend_state_and_refuses_the_unknown_ones
     }
 }
 
+fn t3(run_status: Option<&str>, active_run: bool) -> Observation {
+    Observation::T3Thread(T3Thread {
+        run_status: run_status.map(str::to_string),
+        active_run,
+        last_error: None,
+        last_activity_at: Some("2026-10-04T14:00:00.000Z".to_string()),
+    })
+}
+
+/// The T3 mapping table over orchestration protocol 2 run statuses. `turn_ended` is never
+/// `completed`: a Claude worker can end a run while it waits on a background task wake. Any run
+/// short of a terminal status is running, an active run is running whatever the latest run says,
+/// and a thread that never ran, or a status T3 ships tomorrow, proves nothing.
+#[test]
+fn a_t3_thread_maps_its_runs_to_running_turn_ended_failed_or_unknown() {
+    let cases = [
+        (t3(Some("running"), true), State::Running),
+        (t3(Some("starting"), true), State::Running),
+        (t3(Some("preparing"), true), State::Running),
+        (t3(Some("queued"), false), State::Running),
+        (t3(Some("waiting"), false), State::Running),
+        // An active run is running whatever the latest run's status string says.
+        (t3(Some("completed"), true), State::Running),
+        (t3(Some("completed"), false), State::TurnEnded),
+        (t3(Some("interrupted"), false), State::TurnEnded),
+        (t3(Some("cancelled"), false), State::TurnEnded),
+        (t3(Some("rolled_back"), false), State::TurnEnded),
+        (t3(Some("failed"), false), State::Failed),
+        (t3(None, false), State::Unknown),
+        (t3(Some("hibernating"), false), State::Unknown),
+    ];
+    for (observation, want) in cases {
+        assert_eq!(
+            classify(observation.clone()),
+            want,
+            "{observation:?} must classify {want:?}"
+        );
+    }
+    assert_eq!(State::TurnEnded.tag(), "turn_ended");
+    assert_eq!(t3(Some("completed"), false).label(), "run completed");
+    assert_eq!(t3(None, false).label(), "no run");
+}
+
 /// The rule that keeps a proven fact from being regressed into ignorance, over the whole cross
 /// product of stored outcome and fresh state. `unknown` writes over exactly three outcomes; every
 /// other state always writes, so forward progress survives and a later reading of a live backend
@@ -189,7 +233,12 @@ fn the_monotonicity_rule_admits_forward_progress_and_refuses_regression_to_unkno
     }
 
     for current in currents {
-        for observed in [State::Running, State::Completed, State::Failed] {
+        for observed in [
+            State::Running,
+            State::TurnEnded,
+            State::Completed,
+            State::Failed,
+        ] {
             assert_eq!(
                 settle(current, observed),
                 Some(observed),
